@@ -396,6 +396,113 @@ describe("optimistic concurrency (CAS)", () => {
     expect(dbMock.store.events).toHaveLength(0)
   })
 
+  it("createCharacter consumes the matching draft atomically when draftVersion is provided", async () => {
+    seedClassCatalog()
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael" },
+      version: 5,
+    })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        draftVersion: 5,
+      },
+      user
+    )
+    expect(detail.id).toBeTruthy()
+    // Character + event exist AND the matched draft is gone (one atomic unit).
+    expect(dbMock.store.characters.size).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+    expect(dbMock.store.events[0].kind).toBe("create")
+    expect(dbMock.store.drafts.size).toBe(0)
+  })
+
+  it("createCharacter rejects a stale draftVersion and rolls back the character and event", async () => {
+    seedClassCatalog()
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael" },
+      version: 5,
+    })
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          draftVersion: 3,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "draft_conflict" })
+    // No character, no create event, and the draft is preserved.
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.drafts.size).toBe(1)
+    expect(
+      ([...dbMock.store.drafts.values()][0] as { version: number }).version
+    ).toBe(5)
+  })
+
+  it("createCharacter leaves the draft untouched when draftVersion is absent", async () => {
+    seedClassCatalog()
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael" },
+      version: 5,
+    })
+    const detail = await createCharacter(
+      { name: "Kael", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      user
+    )
+    expect(detail.id).toBeTruthy()
+    // Non-wizard clients never touch the draft.
+    expect(dbMock.store.characters.size).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+    expect(dbMock.store.drafts.size).toBe(1)
+    expect(
+      ([...dbMock.store.drafts.values()][0] as { version: number }).version
+    ).toBe(5)
+  })
+
   it("updateCharacter rejects a stale version and never writes a stale event", async () => {
     seedCharacter({ version: 5 })
     const first = await updateCharacter(

@@ -155,6 +155,48 @@ bounded only by their effect duration.
   effects; derived resource multipliers.
 - **House assumptions:** as listed in `docs/rules/assumptions.md`.
 
+## Character-creation drafts (contract)
+
+A **draft** is a resumable snapshot of the character-creation questionnaire. It is
+deliberately **not** authoritative character state. The contract is:
+
+- **Scope.** At most one draft per authenticated user (a unique `userId`
+  constraint), keyed by that user. Drafts are never public; the API rejects
+  unauthenticated reads/writes.
+- **What it stores.** Only consumer-authored draft `data` validated against a
+  whitelist (`step`, `name`, `description`, `origin`, `raceId`, `classId`,
+  `professionId`, `special`, `equipment`, plus optional `nickname`, `pronouns`,
+  `ageDescription`, `appearance`, `biography`, `notes`). Each string is bounded and
+  the whole payload is capped at 20KB. It never stores uploaded binaries and never
+  stores stat vectors, awards or effects - those belong to the engine, not the
+  draft. It does not derive any numbers.
+- **Concurrency.** The draft row carries an optimistic-concurrency `version`.
+  Mutating an **existing** draft requires the exact current `version`; a mismatched
+  `version` is a 409 conflict, and omitting `version` on an existing draft is a
+  409 `version_required` (the server never guesses/auto-captures the latest
+  version, so a client editing from a stale snapshot cannot silently overwrite
+  newer work). `version` is only omitted to **create** a draft, and creation is
+  attempted only when the user has no draft - a concurrent create that wins the
+  unique per-user constraint makes the losing create 409 (it never silently
+  overwrites). Deleting an existing draft also requires the exact `version`
+  (omitted is 409 `version_required`); deleting with a stale version 409s;
+  deleting a non-existent draft with no version is an idempotent no-op.
+- **Atomic draft consume on final create (wizard).** Saving a draft and creating
+  the final `Character` (and its engine `CharacterState`) remain separate
+  operations, but the wizard's final `POST /api/characters` step can make them
+  atomic. The request accepts an optional nonnegative `draftVersion`. When
+  supplied, the matching draft (`userId` + `version`) is deleted **inside the
+  same transaction** as the character row and the `create` progression event; if
+  the delete does not match exactly one row, the whole create is rejected with a
+  409 `draft_conflict` and **rolled back** - no character row, no event, and no
+  second best-effort DELETE afterward. This guarantees the draft is consumed only
+  on a successful, confirmed creation, never leaked as a later cleanup step.
+  When `draftVersion` is present, the draft is the only source of the create
+  payload (no unvalidated state is read from it); the create fields are still
+  validated by `characterCreateSchema`. When `draftVersion` is omitted (a
+  non-wizard API client, or create-from-scratch), the draft is left untouched and
+  the create proceeds as before.
+
 ## Decisions still needed (escalate if blocking)
 
 - Whether the engine should expose a single entry point that takes a full input

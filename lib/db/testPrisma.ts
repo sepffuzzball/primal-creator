@@ -99,6 +99,15 @@ export interface TestEventRow {
   createdAt: Date
 }
 
+export interface TestDraftRow {
+  id: string
+  userId: string
+  data: unknown
+  version: number
+  createdAt: Date
+  updatedAt: Date
+}
+
 export interface TestPrismaInstance {
   prisma: {
     $transaction: (
@@ -125,6 +134,22 @@ export interface TestPrismaInstance {
         data: Record<string, unknown>
         include?: unknown
       }) => Promise<TestCharacterRow>
+    }
+    characterDraft: {
+      findUnique: (args: {
+        where: { userId: string }
+      }) => Promise<TestDraftRow | null>
+      findUniqueOrThrow: (args: {
+        where: { userId: string }
+      }) => Promise<TestDraftRow>
+      create: (args: { data: Record<string, unknown> }) => Promise<TestDraftRow>
+      updateMany: (args: {
+        where: { userId: string; version?: number }
+        data: Record<string, unknown>
+      }) => Promise<{ count: number }>
+      deleteMany: (args: {
+        where: { userId: string; version?: number }
+      }) => Promise<{ count: number }>
     }
     characterAssociation: {
       create: (args: {
@@ -185,10 +210,12 @@ export interface TestPrismaInstance {
     events: TestEventRow[]
     skillOffers: TestSkillOfferRow[]
     skillOfferOptions: TestSkillOfferOptionRow[]
+    drafts: Map<string, TestDraftRow>
     addCatalog(row: Partial<TestCatalogRow> & { id: string }): TestCatalogRow
     addCharacter(
       row: Partial<TestCharacterRow> & { id: string }
     ): TestCharacterRow
+    addDraft(row: Partial<TestDraftRow> & { userId: string }): TestDraftRow
     addAssociation(
       row: Partial<TestAssociationRow> & {
         characterId: string
@@ -213,6 +240,22 @@ interface Transaction {
     updateMany: (args: {
       where: { id: string; version?: number }
       data: Record<string, unknown>
+    }) => Promise<{ count: number }>
+  }
+  characterDraft: {
+    findUnique: (args: {
+      where: { userId: string }
+    }) => Promise<TestDraftRow | null>
+    findUniqueOrThrow: (args: {
+      where: { userId: string }
+    }) => Promise<TestDraftRow>
+    create: (args: { data: Record<string, unknown> }) => Promise<TestDraftRow>
+    updateMany: (args: {
+      where: { userId: string; version?: number }
+      data: Record<string, unknown>
+    }) => Promise<{ count: number }>
+    deleteMany: (args: {
+      where: { userId: string; version?: number }
     }) => Promise<{ count: number }>
   }
   catalogDefinition: {
@@ -286,11 +329,13 @@ export function createTestPrisma(): TestPrismaInstance {
   const events: TestEventRow[] = []
   const skillOffers: TestSkillOfferRow[] = []
   const skillOfferOptions: TestSkillOfferOptionRow[] = []
+  const drafts = new Map<string, TestDraftRow>()
   let idCounter = 0
   let eventCounter = 0
   let associationCounter = 0
   let offerCounter = 0
   let optionCounter = 0
+  let draftCounter = 0
 
   function attachAssociations(char: TestCharacterRow): TestAssociationRow[] {
     return associations
@@ -404,6 +449,77 @@ export function createTestPrisma(): TestPrismaInstance {
         if (data.state !== undefined) c.state = data.state
         c.updatedAt = new Date()
         return { count: 1 }
+      },
+    },
+    characterDraft: {
+      findUnique: async ({ where }: { where: { userId: string } }) => {
+        for (const d of drafts.values()) {
+          if (d.userId === where.userId) return { ...d }
+        }
+        return null
+      },
+      findUniqueOrThrow: async ({ where }: { where: { userId: string } }) => {
+        for (const d of drafts.values()) {
+          if (d.userId === where.userId) return { ...d }
+        }
+        throw { name: "PrismaClientKnownRequestError", code: "P2025" }
+      },
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        // Enforce the unique per-user constraint exactly as PostgreSQL would.
+        for (const d of drafts.values()) {
+          if (d.userId === (data.userId as string)) {
+            throw {
+              name: "PrismaClientKnownRequestError",
+              code: "P2002",
+              meta: { target: ["userId"] },
+            }
+          }
+        }
+        const id = (data.id as string) ?? `drf-${++draftCounter}`
+        const now = new Date()
+        const row: TestDraftRow = {
+          id,
+          userId: data.userId as string,
+          data: data.data,
+          version: (data.version as number) ?? 0,
+          createdAt: now,
+          updatedAt: now,
+        }
+        drafts.set(id, row)
+        return { ...row }
+      },
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: { userId: string; version?: number }
+        data: Record<string, unknown>
+      }) => {
+        for (const [, d] of drafts) {
+          if (d.userId !== where.userId) continue
+          if (where.version != null && d.version !== where.version) continue
+          if (data.data !== undefined) d.data = data.data
+          const versionOp = data.version as { increment?: number } | undefined
+          if (versionOp && typeof versionOp.increment === "number") {
+            d.version += versionOp.increment
+          }
+          d.updatedAt = new Date()
+          return { count: 1 }
+        }
+        return { count: 0 }
+      },
+      deleteMany: async ({
+        where,
+      }: {
+        where: { userId: string; version?: number }
+      }) => {
+        for (const [id, d] of drafts) {
+          if (d.userId !== where.userId) continue
+          if (where.version != null && d.version !== where.version) continue
+          drafts.delete(id)
+          return { count: 1 }
+        }
+        return { count: 0 }
       },
     },
     catalogDefinition: {
@@ -606,12 +722,14 @@ export function createTestPrisma(): TestPrismaInstance {
     const offerSnapshot = skillOffers.map((o) => ({ ...o }))
     const optionSnapshot = skillOfferOptions.map((o) => ({ ...o }))
     const charSnapshot = new Map([...characters].map(([k, v]) => [k, { ...v }]))
+    const draftSnapshot = new Map([...drafts].map(([k, v]) => [k, { ...v }]))
     return {
       assocSnapshot,
       eventSnapshot,
       offerSnapshot,
       optionSnapshot,
       charSnapshot,
+      draftSnapshot,
     }
   }
 
@@ -626,6 +744,8 @@ export function createTestPrisma(): TestPrismaInstance {
     )
     characters.clear()
     for (const [k, v] of snap.charSnapshot) characters.set(k, v)
+    drafts.clear()
+    for (const [k, v] of snap.draftSnapshot) drafts.set(k, v)
   }
 
   const prisma = {
@@ -653,6 +773,7 @@ export function createTestPrisma(): TestPrismaInstance {
       update: tx.catalogDefinition.update,
     },
     character: tx.character,
+    characterDraft: tx.characterDraft,
     characterAssociation: tx.characterAssociation,
     progressionEvent: tx.progressionEvent,
     skillOffer: tx.skillOffer,
@@ -667,6 +788,7 @@ export function createTestPrisma(): TestPrismaInstance {
       events,
       skillOffers,
       skillOfferOptions,
+      drafts,
       addCatalog(row) {
         const full: TestCatalogRow = {
           id: row.id,
@@ -704,6 +826,19 @@ export function createTestPrisma(): TestPrismaInstance {
         characters.set(full.id, full)
         return full
       },
+      addDraft(row) {
+        const id = row.id ?? `drf-${++draftCounter}`
+        const full: TestDraftRow = {
+          id,
+          userId: row.userId,
+          data: row.data ?? {},
+          version: row.version ?? 0,
+          createdAt: row.createdAt ?? new Date(),
+          updatedAt: row.updatedAt ?? new Date(),
+        }
+        drafts.set(id, full)
+        return { ...full }
+      },
       addAssociation(row) {
         const id = row.id ?? `asc-${++associationCounter}`
         const full: TestAssociationRow = {
@@ -724,11 +859,13 @@ export function createTestPrisma(): TestPrismaInstance {
         events.splice(0, events.length)
         skillOffers.splice(0, skillOffers.length)
         skillOfferOptions.splice(0, skillOfferOptions.length)
+        drafts.clear()
         idCounter = 0
         eventCounter = 0
         associationCounter = 0
         offerCounter = 0
         optionCounter = 0
+        draftCounter = 0
       },
     },
   }

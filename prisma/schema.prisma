@@ -61,6 +61,7 @@ model User {
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   characters Character[]
+  draft     CharacterDraft?
 
   @@map("users")
 }
@@ -84,6 +85,34 @@ model Asset {
 
   @@index([kind])
   @@map("assets")
+}
+
+// ------------------------------------------------------------------ //
+// Character creation drafts (resumable, per-user)
+// ------------------------------------------------------------------ //
+//
+// A draft is a resumable character-creation snapshot persisted per authenticated
+// user. It is NOT authoritative character state: the final Character row (and its
+// engine state) is created by the existing createCharacter flow, which is a
+// separate operation and, like every character mutation, runs in its own
+// transaction. A draft is at most one per user (`@@unique([userId])`), stores only
+// validated draft `data` (JSON, no uploaded binaries, no stat/award/effect
+// fields), and is optimistic-concurrency (CAS) versioned so a stale write never
+// silently overwrites a newer draft.
+
+model CharacterDraft {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Validated draft payload (see lib/server/draft-schema.ts). Never authoritative
+  // character state; the engine CharacterState is derived only when the draft is
+  // turned into a Character.
+  data      Json
+  version   Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("character_drafts")
 }
 
 // ------------------------------------------------------------------ //

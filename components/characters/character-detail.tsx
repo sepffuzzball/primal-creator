@@ -10,7 +10,11 @@ import {
   ArrowUpIcon,
   RotateCcwIcon,
   SparklesIcon,
+  Trash2Icon,
+  UploadIcon,
 } from "lucide-react"
+
+import { cn } from "cn"
 
 import {
   apiFetch,
@@ -30,13 +34,16 @@ import {
   type EvolveResponse,
   type Grade,
   type JournalDelta,
+  type PortraitResponse,
+  type PortraitView,
   type SkillResponse,
 } from "@/lib/api"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { Button, buttonVariants } from "@/components/ui/button"
 import { AppShell, useAppShell } from "@/components/app-shell"
 import { AllocationEditor } from "@/components/characters/allocation-editor"
 import { Alert } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -679,6 +686,9 @@ export function CharacterDetail() {
   const [grantOpen, setGrantOpen] = React.useState(false)
   const [grantSkillId, setGrantSkillId] = React.useState("")
   const [grantReason, setGrantReason] = React.useState("")
+  const [portrait, setPortrait] = React.useState<PortraitView | null>(null)
+  const [portraitBusy, setPortraitBusy] = React.useState(false)
+  const [removePortraitOpen, setRemovePortraitOpen] = React.useState(false)
 
   const reload = React.useCallback(async () => {
     if (!id) return
@@ -694,6 +704,102 @@ export function CharacterDetail() {
       setError(err instanceof Error ? err.message : "Failed to load character.")
     } finally {
       setLoading(false)
+    }
+  }, [id])
+
+  const loadPortrait = React.useCallback(async () => {
+    if (!id) return
+    try {
+      const res = await apiFetch<PortraitResponse>(
+        `/api/characters/${id}/portrait`
+      )
+      setPortrait(res.portrait)
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to load portrait."
+      )
+    }
+  }, [id])
+
+  const uploadPortrait = React.useCallback(
+    async (file: File) => {
+      if (!id) return
+      setPortraitBusy(true)
+      try {
+        const form = new FormData()
+        form.append("file", file)
+        await apiFetch<PortraitView>(`/api/characters/${id}/portrait`, {
+          method: "POST",
+          body: form,
+        })
+        toast.success("Portrait uploaded.")
+        // The upload bumped the character version, so reload the FULL character
+        // detail (not just the portrait) to keep `character.version` current for
+        // progression/actions, and refresh the portrait bytes too.
+        await Promise.all([reload(), loadPortrait()])
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Portrait upload failed."
+        )
+      } finally {
+        setPortraitBusy(false)
+      }
+    },
+    [id, loadPortrait, reload]
+  )
+
+  const removePortrait = React.useCallback(async () => {
+    if (!id) return
+    setRemovePortraitOpen(false)
+    setPortraitBusy(true)
+    try {
+      await apiFetch<PortraitView>(`/api/characters/${id}/portrait`, {
+        method: "DELETE",
+      })
+      toast.success("Portrait removed.")
+      // Removing a portrait bumps the version too, so reload the full detail as
+      // well as the (now empty) portrait to keep the version current.
+      await Promise.all([reload(), loadPortrait()])
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to remove portrait."
+      )
+    } finally {
+      setPortraitBusy(false)
+    }
+  }, [id, loadPortrait, reload])
+
+  function onPortraitFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (file.size > 4 * 1024 * 1024) {
+      toast.error("Portrait must be 4 MiB or smaller.")
+      return
+    }
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      toast.error("Portrait must be a PNG, JPEG or WebP image.")
+      return
+    }
+    void uploadPortrait(file)
+    event.target.value = ""
+  }
+
+  React.useEffect(() => {
+    if (!id) return
+    let active = true
+    apiFetch<PortraitResponse>(`/api/characters/${id}/portrait`)
+      .then((res) => {
+        if (active) setPortrait(res.portrait)
+      })
+      .catch((err) => {
+        if (active) {
+          toast.error(
+            err instanceof Error ? err.message : "Failed to load portrait."
+          )
+        }
+      })
+    return () => {
+      active = false
     }
   }, [id])
 
@@ -1150,35 +1256,85 @@ export function CharacterDetail() {
     <AppShell breadcrumbs={breadcrumbs}>
       <div className="flex flex-col gap-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h1 className="truncate font-heading text-lg font-medium">
-                {character.name}
-              </h1>
-              {character.archived ? <Badge>Archived</Badge> : null}
-              <Badge variant="outline" className="capitalize">
-                {character.origin}
-              </Badge>
-              <Badge variant="outline">
-                Grade {state.race.grade} (level {state.race.level})
-              </Badge>
-              <Badge variant="outline">v{character.version}</Badge>
+          <div className="flex min-w-0 items-start gap-3">
+            <div className="relative shrink-0">
+              <Avatar size="lg" className="size-12">
+                {portrait?.url ? (
+                  <AvatarImage
+                    src={portrait.url}
+                    alt={`${character.name} portrait`}
+                    className="size-12"
+                  />
+                ) : null}
+                <AvatarFallback className="text-sm">
+                  {character.name.charAt(0).toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
             </div>
-            <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
-              {[
-                character.raceName,
-                character.className,
-                character.professionName,
-              ]
-                .filter(Boolean)
-                .map((name, i) => (
-                  <React.Fragment key={name}>
-                    {i > 0 ? <ChevronRightIcon className="size-3" /> : null}
-                    <span>{name}</span>
-                  </React.Fragment>
-                ))}
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <h1 className="truncate font-heading text-lg font-medium">
+                  {character.name}
+                </h1>
+                {character.archived ? <Badge>Archived</Badge> : null}
+                <Badge variant="outline" className="capitalize">
+                  {character.origin}
+                </Badge>
+                <Badge variant="outline">
+                  Grade {state.race.grade} (level {state.race.level})
+                </Badge>
+                <Badge variant="outline">v{character.version}</Badge>
+              </div>
+              <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+                {[
+                  character.raceName,
+                  character.className,
+                  character.professionName,
+                ]
+                  .filter(Boolean)
+                  .map((name, i) => (
+                    <React.Fragment key={name}>
+                      {i > 0 ? <ChevronRightIcon className="size-3" /> : null}
+                      <span>{name}</span>
+                    </React.Fragment>
+                  ))}
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                {!character.archived ? (
+                  <label
+                    htmlFor="portrait-upload"
+                    className={cn(
+                      buttonVariants({ variant: "outline", size: "sm" }),
+                      "cursor-pointer"
+                    )}
+                  >
+                    <UploadIcon />
+                    Upload portrait
+                  </label>
+                ) : null}
+                {portrait ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-1"
+                    onClick={() => setRemovePortraitOpen(true)}
+                    disabled={portraitBusy}
+                  >
+                    <Trash2Icon />
+                    Remove
+                  </Button>
+                ) : null}
+              </div>
             </div>
           </div>
+          <input
+            id="portrait-upload"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="sr-only"
+            disabled={portraitBusy}
+            onChange={onPortraitFileChange}
+          />
           <div className="flex items-center gap-1">
             <Button
               variant="outline"
@@ -1441,9 +1597,9 @@ export function CharacterDetail() {
                           offer.options.every((o) => o.archived)
                         const selected = offer.selectedDefinitionId
                         const selectedName = selected
-                          ? offer.options.find(
+                          ? (offer.options.find(
                               (o) => o.definitionId === selected
-                            )?.nameSnapshot ?? null
+                            )?.nameSnapshot ?? null)
                           : null
                         return (
                           <div
@@ -1519,9 +1675,9 @@ export function CharacterDetail() {
                                 ))}
                                 {allArchived ? (
                                   <p className="text-xs text-muted-foreground">
-                                    Every offered choice is archived. An admin can
-                                    re-enable one in the catalog to unlock this
-                                    offer.
+                                    Every offered choice is archived. An admin
+                                    can re-enable one in the catalog to unlock
+                                    this offer.
                                   </p>
                                 ) : null}
                               </div>
@@ -1597,8 +1753,8 @@ export function CharacterDetail() {
                         </div>
                         <p className="text-xs text-muted-foreground">
                           Grants a skill immediately (provenance manual) with a
-                          required reason. Owners can only select offered options
-                          - they cannot grant.
+                          required reason. Owners can only select offered
+                          options - they cannot grant.
                         </p>
                       </div>
                     </>
@@ -1969,6 +2125,33 @@ export function CharacterDetail() {
           }}
         />
 
+        <Dialog open={removePortraitOpen} onOpenChange={setRemovePortraitOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Remove portrait</DialogTitle>
+              <DialogDescription>
+                Remove this character&apos;s portrait? This does not archive the
+                character and can be re-uploaded later.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setRemovePortraitOpen(false)}
+                disabled={portraitBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void removePortrait()}
+                disabled={portraitBusy}
+              >
+                {portraitBusy ? "Removing..." : "Remove"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         <Dialog
           open={!!consumeConfirm}
           onOpenChange={(open) => {
@@ -2016,7 +2199,8 @@ export function CharacterDetail() {
               <DialogDescription>
                 Link &quot;{selectConfirm?.name ?? ""}&quot; to this character?
                 Its effects are synthesized live from the current catalog;
-                archived options are unavailable until re-enabled in the catalog.
+                archived options are unavailable until re-enabled in the
+                catalog.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

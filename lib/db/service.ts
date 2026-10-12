@@ -691,6 +691,10 @@ export async function createCharacter(
     raceId: string
     classId: string
     professionId?: string
+    // Wizard draft-consume token. When supplied, the matching draft is deleted
+    // atomically with character creation; a stale/absent version 409s and rolls
+    // back the whole create + event. When absent, no draft is touched.
+    draftVersion?: number
   },
   user: SessionUser
 ): Promise<CharacterDetail> {
@@ -752,6 +756,24 @@ export async function createCharacter(
         } as Prisma.InputJsonValue,
       },
     })
+
+    // The wizard's final create step consumes the matching draft atomically: the
+    // draft delete is committed or rolled back with the character + event. A
+    // supplied `draftVersion` that does not match the current draft is a 409
+    // conflict (no second best-effort DELETE later, and no unvalidated state).
+    // When `draftVersion` is absent (a non-wizard API client) the draft is left
+    // untouched.
+    if (input.draftVersion != null) {
+      const draftResult = await tx.characterDraft.deleteMany({
+        where: { userId: user.id, version: input.draftVersion },
+      })
+      if (draftResult.count !== 1) {
+        throw conflict(
+          "draft_conflict",
+          `Draft version mismatch: expected ${input.draftVersion}`
+        )
+      }
+    }
 
     return toDetail(created, true)
   })

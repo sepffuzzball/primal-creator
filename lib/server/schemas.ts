@@ -190,6 +190,11 @@ export const characterCreateSchema = z.object({
   raceId: z.string().min(1),
   classId: z.string().min(1),
   professionId: z.string().optional(),
+  // When supplied (the wizard's final "create" step), the matching draft is
+  // consumed atomically with character creation: a stale/missing version 409s
+  // `draft_conflict` and rolls back the whole create. When absent (a non-wizard
+  // API client, or create-from-scratch), no draft is touched.
+  draftVersion: z.number().int().nonnegative().optional(),
 })
 
 export const characterUpdateSchema = z.object({

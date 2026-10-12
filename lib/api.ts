@@ -431,3 +431,74 @@ export interface ExportResponse {
   associations: ExportAssociation[]
   events: ProgressionEvent[]
 }
+
+// ------------------------------------------------------------------ //
+// Drafts (character-creation resumable snapshot)
+// ------------------------------------------------------------------ //
+
+/**
+ * Whitelisted draft payload for PUT /api/drafts. A draft is resumable creation
+ * state, NOT authoritative character state: the only fields stored are the ones
+ * the server whitelists (see lib/server/draft-schema.ts), so binaries and
+ * stat/award/effect fields never sneak in. All fields are optional and a strict
+ * object - anything not listed here is rejected with a 400.
+ */
+export interface DraftData {
+  /** The 0-based questionnaire step index. The client owns step progression. */
+  step?: number
+  name?: string
+  description?: string | null
+  origin?: "integrated" | "born"
+  raceId?: string
+  classId?: string
+  professionId?: string | null
+  /** "Has special abilities" informational flag - draft data only. */
+  special?: boolean
+  /** Selected catalog stableIds/ids for equipment - draft data only. */
+  equipment?: string[]
+  nickname?: string | null
+  pronouns?: string | null
+  ageDescription?: string | null
+  appearance?: string | null
+  biography?: string | null
+  notes?: string | null
+}
+
+export interface DraftView {
+  id: string
+  data: DraftData
+  version: number
+  updatedAt: string
+}
+
+export interface DraftResponse {
+  draft: DraftView | null
+}
+
+export interface SaveDraftRequest {
+  data: DraftData
+  /**
+   * CAS token. Omitting `version` only creates the draft (when none exists);
+   * updating an existing draft requires the exact current version.
+   */
+  version?: number
+}
+
+export interface DeleteDraftResponse {
+  deleted: boolean
+}
+
+// ------------------------------------------------------------------ //
+// Portraits (authenticated character avatar assets)
+// ------------------------------------------------------------------ //
+
+/** A portrait asset's public view. `url` is always `/api/assets/{id}`. */
+export interface PortraitView {
+  assetId: string
+  url: string
+}
+
+/** GET /api/characters/[id]/portrait - `portrait` is null when none uploaded. */
+export interface PortraitResponse {
+  portrait: PortraitView | null
+}

@@ -22,6 +22,41 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   questionnaire (name/description, origin, and race/class/profession picked from
   the catalog), advance class/profession, allocate attribute points, evolve the
   race grade, edit name/description, archive and restore.
+- **Resumable creation drafts**: the questionnaire is persisted per user as an
+  authenticated, owner-scoped draft (one per user) so work is never lost. A draft
+  stores only validated, whitelisted fields (`step`, name/description, origin,
+  race/class/profession, a special-abilities flag kept for backward
+  compatibility with legacy drafts (always `false` from the wizard - the feature
+  is deferred) and an equipment list, plus optional narrative fields), bounded
+  and capped at 20KB - no uploaded binaries and no
+  stat/award/effect fields. Drafts are optimistic-concurrency versioned (a stale
+  write 409s) and are **not authoritative character state**: final creation of a
+  `Character` (and its engine state) is a separate, still-transactional operation.
+  The wizard's final create step accepts an optional `draftVersion`; when supplied
+  the matching draft is deleted atomically inside the same transaction as the
+  character row and its `create` journal event, and a stale version 409s
+  `draft_conflict` and rolls back the whole create (no second best-effort DELETE).
+  When `draftVersion` is omitted (non-wizard clients) the draft is never touched.
+  The wizard only sends `name`, `description`, `origin`, `raceId`, `classId`,
+  `professionId` (and `draftVersion`) to create - the `special`/`equipment`
+  flags and the optional narrative fields are draft-only and never persisted to
+  the character as fake powers. The wizard always persists `special: false` (it
+  never submits `special: true`), so a legacy draft that carried the flag is
+  normalized rather than treated as character state. An optional portrait chosen
+  at creation is **not** part of this atomic create: it is uploaded after the
+  character exists,
+  so a failed upload never rolls back the character (the attachment is not
+  atomic). Other draft metadata (nickname, pronouns, age, appearance, biography,
+  notes) is preserved in the draft but not yet sent to the character.
+- **Character portraits**: an authenticated owner/admin can upload, view and
+  remove a character's portrait. Uploads are bounded to 4 MiB, validated
+  content-based (PNG/JPEG/WebP via sharp), re-encoded to WebP and stored as an
+  `Asset` binary under a private upload directory - never mounted on `/public`.
+  The binary is streamed back only through the authenticated, same-origin
+  `/api/assets/[id]` route (`Cache-Control: private, no-store`), so the server
+  filesystem path is never exposed. Portrait reads always succeed for
+  owner/admin (including archived characters); uploads are rejected for archived
+  characters, while removal remains allowed.
 - **Auditable attribute status**: the status endpoint returns each attribute's
   final value and the full phase-by-phase trace (base, race, track, equipment,
   consumables, caps, ...), so numbers are transparent rather than opaque.
@@ -62,11 +97,11 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
 
 The engine and schema already account for these, but they are not wired up:
 
-- **Special abilities calculation**: the creation form records a "has special
-  abilities" flag, but it is informational and does not change any numbers.
-- **Uploading portraits / user media**: assets are metadata-only (an `Asset`
-  model and the reserved `uploads` volume exist), but there is no upload endpoint
-  or UI.
+- **Special abilities calculation**: blessings, bloodlines and transcendents can
+  be defined in the encyclopedia/catalog, but they are not yet attached to a
+  character. The creation wizard does not record a "has special abilities" flag;
+  it shows the step as "Not assigned" and never treats the special category as
+  character state until that feature is wired up.
 - **Catalog import**: the catalog is populated by `db:seed`; there is no bulk
   import from the wiki, CSV or JSON.
 - **Character import**: characters can be exported but not re-imported.
@@ -185,7 +220,14 @@ See `.env.example` and `docs/deployment.md`.
 
 - **Database**: named volume `pgdata`.
 - **Uploads**: named volume `uploads`, mounted at `/app/data/uploads` in the app
-  container (reserved for Asset files; currently metadata-only in the schema).
+  container. It holds character portrait binaries (the bytes backing an `Asset`
+  row). The location is operator-controlled: set `UPLOAD_DIR` to override where
+  the app writes and reads portrait files (the default is `/app/data/uploads` in
+  production, or `<cwd>/data/uploads` outside production). Files here are private
+  by convention - never mounted under `/public` - and are only served through the
+  authenticated `/api/assets/[id]` route. Back up this volume together with the
+  database: the portrait metadata row lives in Postgres, but the bytes exist only
+  on this volume (see `docs/deployment.md`).
 
 ```bash
 # Dump the database (run on the host next to compose):

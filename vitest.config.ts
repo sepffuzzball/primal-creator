@@ -9,6 +9,9 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["**/*.test.ts", "**/*.test.mts"],
+    include: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.mts"],
+    // Build output (Next standalone) contains a stale copy of source test files;
+    // never collect tests from there.
+    exclude: ["**/node_modules/**", "**/.next/**", "**/.git/**"],
   },
 })

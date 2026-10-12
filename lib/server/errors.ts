@@ -46,6 +46,13 @@ export function conflict(code = "conflict", message = "Conflict"): ApiError {
   return new ApiError(409, code, message)
 }
 
+export function payloadTooLarge(
+  code = "payload_too_large",
+  message = "Payload too large"
+): ApiError {
+  return new ApiError(413, code, message)
+}
+
 export function errorBody(status: number, code: string, message: string) {
   return { error: { code, message } }
 }
