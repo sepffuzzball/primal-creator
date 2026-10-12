@@ -15,6 +15,7 @@ import {
   evolveCharacter,
   exportCharacter,
   getCharacter,
+  importCharacter,
   resolveTrackDefinition,
   serializeState,
   skillCharacter,
@@ -22,9 +23,17 @@ import {
   updateCharacter,
 } from "@/lib/db/service"
 import {
+  IMPORT_RULESET_VERSION,
+  IMPORT_SCHEMA,
+  type CharacterImportDocument,
+} from "@/lib/server/import-schema"
+import {
   createCharacterState,
   defaultRulesConfig,
   makeVector,
+  type Attribute,
+  type AttributeVector,
+  type CharacterState,
   type Grade,
   type TrackDefinition,
 } from "@/lib/rules"
@@ -45,9 +54,9 @@ vi.mock("@/lib/db/client", async () => {
 
 const user = { id: "user-1", email: "u@example.com", isAdmin: false }
 
-function allEqual(n: number) {
-  const out: Record<string, number> = {}
-  for (const a of [
+function allEqual(n: number): AttributeVector {
+  const out = {} as AttributeVector
+  const keys: Attribute[] = [
     "strength",
     "agility",
     "endurance",
@@ -57,7 +66,8 @@ function allEqual(n: number) {
     "intelligence",
     "perception",
     "willpower",
-  ]) {
+  ]
+  for (const a of keys) {
     out[a] = n
   }
   return out
@@ -1407,6 +1417,21 @@ describe("exportCharacter (associations / live state)", () => {
     })
   }
 
+  function seedSkill(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: extra.name ?? `Skill ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
   it("exports associations with a definition snapshot and the synthesized liveState", async () => {
     seedCharacterWithBase()
     seedTitle("title-1", { flat: { strength: 5 }, upgradeGroup: "hero" })
@@ -1427,7 +1452,15 @@ describe("exportCharacter (associations / live state)", () => {
       user
     )
     const portable = await exportCharacter("chr-1", user)
-    expect(portable.schema).toBe("primal-character/2")
+    expect(portable.schema).toBe("primal-character/3")
+    expect(portable.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
+    expect(portable.identity).toMatchObject({
+      name: "Test",
+      origin: "integrated",
+      race: { stableId: null },
+      class: { stableId: null },
+      profession: null,
+    })
     // Base state is untouched; the live state adds the synthesized pieces.
     expect((portable.state as { equipment: unknown[] }).equipment).toEqual([])
     expect(
@@ -1494,6 +1527,911 @@ describe("exportCharacter (associations / live state)", () => {
     expect(
       (portable.liveState as { activeEffects: unknown[] }).activeEffects
     ).toHaveLength(0)
+  })
+
+  it("exports a granted skill as kind 'skill' with its liveState effect, alongside title/equipment", async () => {
+    seedCharacterWithBase()
+    seedTitle("title-1", { flat: { strength: 5 }, upgradeGroup: "hero" })
+    seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
+    seedSkill("skill-1", {
+      effects: [{ phase: "flat", amount: { strength: 7 } }],
+    })
+    const admin = { ...user, isAdmin: true }
+    await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-1",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    await skillCharacter(
+      "chr-1",
+      {
+        operation: "grant",
+        definitionId: "skill-1",
+        version: 2,
+        reason: "story",
+      },
+      admin
+    )
+    const portable = await exportCharacter("chr-1", user)
+    const assoc = portable.associations as Array<{
+      kind: "title" | "equipment" | "skill"
+      definition: {
+        id: string
+        name: string
+        kind: string
+        config: Record<string, unknown>
+        provenance: string
+        archived: boolean
+        stableId: string
+        updatedAt: string
+      }
+    }>
+    expect(assoc).toHaveLength(3)
+    const skillAssoc = assoc.find((a) => a.kind === "skill")!
+    expect(skillAssoc.definition).toMatchObject({
+      id: "skill-1",
+      name: "Skill skill-1",
+      kind: "skills",
+      provenance: "house",
+      archived: false,
+      stableId: "skill-1",
+    })
+    expect(skillAssoc.definition.config.effects).toEqual([
+      { phase: "flat", amount: { strength: 7 } },
+    ])
+    // Titles and equipment are still labeled correctly; nothing leaks onto them.
+    expect(assoc.find((a) => a.kind === "title")!.definition.id).toBe("title-1")
+    expect(assoc.find((a) => a.kind === "equipment")!.definition.id).toBe(
+      "gear-1"
+    )
+    // The live state must synthesize the granted skill's flat effect.
+    const effects = (
+      portable.liveState as {
+        activeEffects: Array<{
+          source: string
+          amount: Record<string, number>
+        }>
+      }
+    ).activeEffects
+    expect(effects.find((e) => e.source === "Skill skill-1")).toMatchObject({
+      id: "skill-1:eff-0",
+      phase: "flat",
+      amount: { strength: 7 },
+    })
+  })
+
+  it("exports a selected skill offer as kind 'skill' with its liveState effect", async () => {
+    seedCharacterWithBase()
+    seedSkill("skill-1", {
+      effects: [{ phase: "flat", amount: { agility: 4 } }],
+    })
+    // Seed a pending skill offer whose single option is the skill definition.
+    dbMock.store.skillOffers.push({
+      id: "offer-1",
+      characterId: "chr-1",
+      track: "class",
+      level: 1,
+      choiceGroup: "standard",
+      selectedDefinitionId: null,
+      offeredAt: new Date(),
+      selectedAt: null,
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-1",
+      offerId: "offer-1",
+      definitionId: "skill-1",
+      nameSnapshot: "Skill skill-1",
+      configSnapshot: {},
+    })
+    const selected = await skillCharacter(
+      "chr-1",
+      {
+        operation: "select",
+        offerId: "offer-1",
+        definitionId: "skill-1",
+        version: 0,
+      },
+      user
+    )
+    expect(selected.character.associations[0].kind).toBe("skill")
+    const portable = await exportCharacter("chr-1", user)
+    const assoc = portable.associations as Array<{
+      kind: "title" | "equipment" | "skill"
+      definition: { id: string; kind: string; name: string }
+    }>
+    expect(assoc).toHaveLength(1)
+    expect(assoc[0].kind).toBe("skill")
+    expect(assoc[0].definition).toMatchObject({
+      id: "skill-1",
+      kind: "skills",
+      name: "Skill skill-1",
+    })
+    const effects = (
+      portable.liveState as {
+        activeEffects: Array<{
+          source: string
+          amount: Record<string, number>
+        }>
+      }
+    ).activeEffects
+    expect(effects).toHaveLength(1)
+    expect(effects[0]).toMatchObject({
+      id: "skill-1:eff-0",
+      phase: "flat",
+      amount: { agility: 4 },
+    })
+  })
+})
+
+describe("importCharacter (trusted backup v3)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function addImportCatalog(
+    kind: string,
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind,
+      stableId: id,
+      name: extra.name ?? id,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedRaceClass() {
+    addImportCatalog(
+      "races",
+      "human",
+      {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: allEqual(1), freePerLevel: 5 },
+        },
+      },
+      { name: "Human" }
+    )
+    addImportCatalog(
+      "classes",
+      "archer",
+      { grades: { G: { fixed: {}, free: 0 } } },
+      { name: "Archer" }
+    )
+  }
+
+  type ImportDocPartial = Omit<Partial<CharacterImportDocument>, "state"> & {
+    state?: CharacterState
+  }
+
+  function importDoc(partial: ImportDocPartial = {}): CharacterImportDocument {
+    const { state: rawState, ...rest } = partial
+    return {
+      schema: IMPORT_SCHEMA,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(
+        rawState ?? createInitialState("integrated", null, null)
+      ) as CharacterImportDocument["state"],
+      liveState: {},
+      status: {},
+      associations: [],
+      events: [],
+      skillOffers: [],
+      ...rest,
+    }
+  }
+
+  it("imports a valid v3 backup as a new imported character owned by the importer", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "professions",
+      "alchemist",
+      { grades: { G: { fixed: {}, free: 0 } } },
+      { name: "Alchemist" }
+    )
+    addImportCatalog(
+      "titles",
+      "title-1",
+      { upgradeGroup: "hero" },
+      { name: "Heroic" }
+    )
+    addImportCatalog("equipment", "gear-1", { slot: "head" }, { name: "Helm" })
+    addImportCatalog("skills", "skill-1", {}, { name: "Skill One" })
+
+    const state = createInitialState("integrated", null, null)
+    state.tracks.profession = { level: 0, quarter: 0, definitionId: "prof" }
+
+    const doc = importDoc({
+      identity: {
+        name: "Imported Hero",
+        description: "A backup",
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: { stableId: "alchemist" },
+      },
+      state,
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "title-1" } },
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "gear-1" },
+        },
+        { kind: "skill", definition: { kind: "skills", stableId: "skill-1" } },
+      ],
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          selectedStableId: "skill-1",
+          offeredAt: "2026-01-01T00:00:00.000Z",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      ],
+      events: [
+        { kind: "create", payload: { foo: 1 } },
+        { kind: "advance", payload: { level: 1 } },
+      ],
+    })
+
+    const result = await importCharacter(doc, user)
+    expect(result.imported).toBe(true)
+    expect(result.origin).toBe("integrated")
+    expect(result.raceName).toBe("Human")
+    expect(result.className).toBe("Archer")
+    expect(result.professionName).toBe("Alchemist")
+    expect(result.associations).toHaveLength(3)
+    expect(result.skillOffers).toHaveLength(1)
+    expect(result.skillOffers[0].selectedDefinitionId).toBe("skill-1")
+
+    const created = [...dbMock.store.characters.values()][0]
+    expect(created.ownerId).toBe(user.id)
+    expect(created.version).toBe(0)
+    expect(created.imported).toBe(true)
+    expect(created.raceId).toBe("human")
+    expect(created.classId).toBe("archer")
+    expect(created.professionId).toBe("alchemist")
+
+    const evs = dbMock.store.events.filter((e) => e.characterId === created.id)
+    expect(evs.map((e) => e.kind)).toEqual([
+      "import_history",
+      "import_history",
+      "import",
+    ])
+    expect((evs[0].payload as { sourceKind: string }).sourceKind).toBe("create")
+    expect((evs[2].payload as { rulesetVersion: string }).rulesetVersion).toBe(
+      IMPORT_RULESET_VERSION
+    )
+  })
+
+  it("rejects a backup whose race stableId is not in the catalog", async () => {
+    addImportCatalog("classes", "archer", {
+      grades: { G: { fixed: {}, free: 0 } },
+    })
+    await expect(importCharacter(importDoc(), user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_catalog_missing",
+    })
+  })
+
+  it("rejects an imported identity whose race definition is archived", async () => {
+    addImportCatalog("races", "human", {}, { archived: true })
+    addImportCatalog("classes", "archer", {
+      grades: { G: { fixed: {}, free: 0 } },
+    })
+    await expect(importCharacter(importDoc(), user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_catalog_archived",
+    })
+  })
+
+  it("rejects an association definition that is not in the catalog", async () => {
+    seedRaceClass()
+    const doc = importDoc({
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "ghost" } },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_missing",
+    })
+  })
+
+  it("rejects an association whose definition kind does not match the link kind", async () => {
+    seedRaceClass()
+    addImportCatalog("titles", "title-1", {})
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "titles", stableId: "title-1" },
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_kind_mismatch",
+    })
+  })
+
+  it("rejects the same catalog definition linked more than once", async () => {
+    seedRaceClass()
+    addImportCatalog("titles", "title-1", {})
+    const doc = importDoc({
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "title-1" } },
+        { kind: "title", definition: { kind: "titles", stableId: "title-1" } },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_duplicate_link",
+    })
+  })
+
+  it("rejects two active equipment links that occupy the same slot", async () => {
+    seedRaceClass()
+    addImportCatalog("equipment", "gear-1", { slot: "head" }, { name: "Helm" })
+    addImportCatalog("equipment", "gear-2", { slot: "head" }, { name: "Crown" })
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "gear-1" },
+        },
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "gear-2" },
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+  })
+
+  it("rejects two active title links sharing an upgrade group", async () => {
+    seedRaceClass()
+    addImportCatalog("titles", "title-1", { upgradeGroup: "hero" })
+    addImportCatalog("titles", "title-2", { upgradeGroup: "hero" })
+    const doc = importDoc({
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "title-1" } },
+        { kind: "title", definition: { kind: "titles", stableId: "title-2" } },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+  })
+
+  it("preserves an archived association inertly when its definition still exists", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "titles",
+      "title-1",
+      { upgradeGroup: "hero" },
+      { archived: true }
+    )
+    const doc = importDoc({
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "title-1" } },
+      ],
+    })
+    const result = await importCharacter(doc, user)
+    expect(result.associations).toHaveLength(1)
+    expect(result.associations[0].definitionArchived).toBe(true)
+  })
+
+  it("rejects a duplicate skill offer identity", async () => {
+    seedRaceClass()
+    addImportCatalog("skills", "skill-1", {})
+    addImportCatalog("skills", "skill-2", {})
+    const doc = importDoc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          options: [
+            { stableId: "skill-1", nameSnapshot: "x", configSnapshot: {} },
+          ],
+        },
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          options: [
+            { stableId: "skill-2", nameSnapshot: "y", configSnapshot: {} },
+          ],
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_duplicate_offer",
+    })
+  })
+
+  it("rejects a skill offer option not in the catalog", async () => {
+    seedRaceClass()
+    const doc = importDoc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          options: [
+            { stableId: "ghost-skill", nameSnapshot: "x", configSnapshot: {} },
+          ],
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_option_missing",
+    })
+  })
+
+  it("rejects a selected skill that is not one of the offer's options", async () => {
+    seedRaceClass()
+    addImportCatalog("skills", "skill-1", {})
+    addImportCatalog("skills", "other", {})
+    const doc = importDoc({
+      associations: [
+        { kind: "skill", definition: { kind: "skills", stableId: "skill-1" } },
+      ],
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          selectedStableId: "skill-1",
+          options: [
+            { stableId: "other", nameSnapshot: "x", configSnapshot: {} },
+          ],
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_selected_not_in_options",
+    })
+  })
+
+  it("accepts a selected skill offer whose skill was upgraded away (no longer linked)", async () => {
+    seedRaceClass()
+    addImportCatalog("skills", "skill-1", {}, { name: "Skill One" })
+    addImportCatalog("skills", "skill-2", {}, { name: "Skill Two" })
+    // An upgrade in the same group replaced skill-1's link with skill-2, but the
+    // historical offer still selects skill-1. The offer's selection must remain
+    // a faithful record even though skill-1 is no longer a current association.
+    const doc = importDoc({
+      associations: [
+        { kind: "skill", definition: { kind: "skills", stableId: "skill-2" } },
+      ],
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          selectedStableId: "skill-1",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      ],
+    })
+    const result = await importCharacter(doc, user)
+    expect(result.skillOffers).toHaveLength(1)
+    expect(result.skillOffers[0].selectedDefinitionId).toBe("skill-1")
+  })
+
+  it("rejects a state that over-allocates free points", async () => {
+    seedRaceClass()
+    const state = createInitialState("integrated", null, null)
+    state.allocations = [
+      { id: "a", source: "manual", at: 0, points: allEqual(1) },
+    ]
+    const doc = importDoc({ state })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects a non-integer allocation value", async () => {
+    seedRaceClass()
+    const state = createInitialState("integrated", null, null)
+    state.historicalLevelAwards = [
+      {
+        track: "class",
+        level: 1,
+        definitionId: "award",
+        fixed: allEqual(0),
+        free: 10,
+      },
+    ]
+    state.allocations = [
+      {
+        id: "a",
+        source: "manual",
+        at: 0,
+        points: { ...allEqual(0), strength: 0.5 },
+      },
+    ]
+    const doc = importDoc({ state })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects a backup whose identity.origin disagrees with state.race.origin", async () => {
+    seedRaceClass()
+    const doc = importDoc({
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "born",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects a derived-race backup whose race level is inconsistent with the tracks", async () => {
+    seedRaceClass()
+    const state = createInitialState("integrated", null, null)
+    state.race.level = 5
+    const doc = importDoc({ state })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("preserves historical award definitionIds verbatim and remaps current track definitionIds to local stableId references", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "professions",
+      "alchemist",
+      { grades: { G: { fixed: {}, free: 0 } } },
+      { name: "Alchemist" }
+    )
+    const state = createInitialState("integrated", null, null)
+    state.tracks.class.definitionId = "orig:class"
+    state.tracks.profession = {
+      level: 0,
+      quarter: 0,
+      definitionId: "orig:prof",
+    }
+    state.historicalLevelAwards = [
+      {
+        track: "class",
+        level: 1,
+        definitionId: "legacy:award",
+        fixed: allEqual(0),
+        free: 3,
+      },
+    ]
+    const doc = importDoc({
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: { stableId: "alchemist" },
+      },
+      state,
+    })
+    const result = await importCharacter(doc, user)
+    const stored = deserializeState(result.state)
+    expect(stored.tracks.class.definitionId).toBe("archer:G")
+    expect(stored.tracks.profession?.definitionId).toBe("alchemist:G")
+    expect(stored.historicalLevelAwards[0].definitionId).toBe("legacy:award")
+  })
+
+  it("preserves the historical selectedAt of a selected skill offer", async () => {
+    seedRaceClass()
+    addImportCatalog("skills", "skill-1", {}, { name: "Skill One" })
+    const selectedAt = new Date("2026-01-02T03:04:05.000Z")
+    const doc = importDoc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          selectedStableId: "skill-1",
+          selectedAt: selectedAt.toISOString(),
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      ],
+    })
+    await importCharacter(doc, user)
+    // The read API does not expose selectedAt; inspect the persisted offer row.
+    const storedOffer = dbMock.store.skillOffers.find(
+      (o) => o.selectedDefinitionId != null
+    )
+    expect(storedOffer?.selectedAt?.getTime()).toBe(selectedAt.getTime())
+  })
+
+  it("round-trips a selected skill offer whose skill was later upgraded away", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "skills",
+      "skill-1",
+      { upgradeGroup: "core" },
+      { name: "Skill One" }
+    )
+    addImportCatalog(
+      "skills",
+      "skill-2",
+      { upgradeGroup: "core" },
+      { name: "Skill Two" }
+    )
+
+    const src = await createCharacter(
+      {
+        name: "Upgrader",
+        origin: "integrated",
+        raceId: "human",
+        classId: "archer",
+      },
+      user
+    )
+
+    // Offer the level-1 pick and select skill-1.
+    dbMock.store.skillOffers.push({
+      id: "off-1",
+      characterId: src.id,
+      track: "class",
+      level: 1,
+      choiceGroup: "standard",
+      selectedDefinitionId: null,
+      offeredAt: new Date("2026-01-01T00:00:00.000Z"),
+      selectedAt: null,
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-1",
+      offerId: "off-1",
+      definitionId: "skill-1",
+      nameSnapshot: "Skill One",
+      configSnapshot: {},
+    })
+    await skillCharacter(
+      src.id,
+      {
+        operation: "select",
+        offerId: "off-1",
+        definitionId: "skill-1",
+        version: 0,
+      },
+      user
+    )
+
+    // Offer the level-2 pick and select skill-2 (same upgrade group). Selecting it
+    // replaces the skill-1 link, so only skill-2 remains as an association.
+    dbMock.store.skillOffers.push({
+      id: "off-2",
+      characterId: src.id,
+      track: "class",
+      level: 2,
+      choiceGroup: "standard",
+      selectedDefinitionId: null,
+      offeredAt: new Date("2026-01-02T00:00:00.000Z"),
+      selectedAt: null,
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-2",
+      offerId: "off-2",
+      definitionId: "skill-2",
+      nameSnapshot: "Skill Two",
+      configSnapshot: {},
+    })
+    await skillCharacter(
+      src.id,
+      {
+        operation: "select",
+        offerId: "off-2",
+        definitionId: "skill-2",
+        version: 1,
+      },
+      user
+    )
+
+    // The exported document carries only skill-2 as a live association, yet the
+    // historical level-1 offer still selects skill-1. Import must preserve it.
+    const doc = (await exportCharacter(
+      src.id,
+      user
+    )) as unknown as CharacterImportDocument
+    expect(doc.associations).toHaveLength(1)
+    expect(doc.associations[0].definition.stableId).toBe("skill-2")
+    const imported = await importCharacter(doc, user)
+    const levelOne = imported.skillOffers.find((o) => o.level === 1)
+    expect(levelOne?.selectedDefinitionId).toBe("skill-1")
+  })
+
+  it("rejects a state missing the required class track", async () => {
+    seedRaceClass()
+    const state = createInitialState("integrated", null, null)
+    delete state.tracks["class"]
+    const doc = importDoc({ state })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects a profession track present without a profession identity", async () => {
+    seedRaceClass()
+    const state = createInitialState("integrated", null, null)
+    state.tracks.profession = { level: 0, quarter: 0, definitionId: "" }
+    const doc = importDoc({ state })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects a profession identity declared without a profession track", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "professions",
+      "alchemist",
+      { grades: { G: { fixed: {}, free: 0 } } },
+      { name: "Alchemist" }
+    )
+    const doc = importDoc({
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: { stableId: "alchemist" },
+      },
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects an unknown track key in the imported state", async () => {
+    seedRaceClass()
+    const state = createInitialState("integrated", null, null)
+    state.tracks["extra"] = { level: 0, quarter: 0, definitionId: "" }
+    const doc = importDoc({ state })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("rejects a class catalog that defines no track level-up (not advanceable)", async () => {
+    addImportCatalog(
+      "races",
+      "human",
+      {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: allEqual(1), freePerLevel: 5 },
+        },
+      },
+      { name: "Human" }
+    )
+    addImportCatalog("classes", "archer", { grades: {} }, { name: "Archer" })
+    await expect(importCharacter(importDoc(), user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+  })
+
+  it("maps the track definitionId by the chosen-grade fallback and remains advanceable", async () => {
+    // The class catalog defines only grade F, but the imported character's race
+    // grade is G (integrated). The importer must store the FALLBACK definition
+    // (`archer:F`), not a naive `archer:G`, so advancing still works.
+    addImportCatalog(
+      "races",
+      "human",
+      {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: allEqual(1), freePerLevel: 5 },
+        },
+      },
+      { name: "Human" }
+    )
+    addImportCatalog(
+      "classes",
+      "archer",
+      { grades: { F: { fixed: {}, free: 0 } } },
+      { name: "Archer" }
+    )
+    const result = await importCharacter(importDoc(), user)
+    const stored = deserializeState(result.state)
+    expect(stored.tracks.class.definitionId).toBe("archer:F")
+    const advanced = await advanceCharacter(
+      result.id,
+      { track: "class", version: 0 },
+      user
+    )
+    expect(advanced.character.version).toBe(1)
+  })
+
+  it("rejects a malformed track level/quarter with invalid_import", async () => {
+    seedRaceClass()
+    const doc = importDoc()
+    const badState = {
+      ...(doc.state as Record<string, unknown>),
+      tracks: { class: { level: -1, quarter: 0, definitionId: "" } },
+    }
+    await expect(
+      importCharacter({ ...doc, state: badState as never }, user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_import" })
+  })
+
+  it("creates a new character and never overwrites an existing one", async () => {
+    seedRaceClass()
+    const existing = dbMock.store.addCharacter({
+      id: "chr-existing",
+      ownerId: user.id,
+      name: "Existing",
+      state: serializeState(createInitialState("integrated", null, null)),
+      version: 0,
+    })
+    const doc = importDoc()
+    const result = await importCharacter(doc, user)
+    expect(result.id).not.toBe(existing.id)
+    expect(dbMock.store.characters.size).toBe(2)
+    expect(dbMock.store.characters.get(existing.id)?.name).toBe("Existing")
   })
 })
 

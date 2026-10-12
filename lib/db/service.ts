@@ -14,19 +14,23 @@
  * they can be unit-tested without a database.
  */
 
+import { z } from "zod"
 import { Prisma } from "@prisma/client"
 import {
   advanceQuarter,
   allocatePoints,
+  allocatedPoints,
   applyPermanentConsumable,
   ATTRIBUTES,
   calculateStatus,
   consumableToEffect,
   defaultRulesConfig,
+  deriveRaceLevel,
   evolveGrade,
   gradeOrderIndex,
   makeVector,
   permanentConsumableCap,
+  totalFreePoints,
   zeroVector,
   type AttributeVector,
   type CharacterState,
@@ -47,6 +51,10 @@ import {
   isLegacyConsumableConfig,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
+import {
+  IMPORT_RULESET_VERSION,
+  type CharacterImportDocument,
+} from "@/lib/server/import-schema"
 import { badRequest, conflict, forbidden, notFound } from "@/lib/server/errors"
 import type { SessionUser } from "@/lib/auth/session"
 
@@ -119,6 +127,8 @@ export interface CharacterDetail {
   state: unknown
   version: number
   archived: boolean
+  /** True when the character was created from a user-supplied trusted-backup import. */
+  imported: boolean
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
@@ -143,6 +153,8 @@ export interface CharacterListItem {
   professionName: string | null
   updatedAt: string
   archived: boolean
+  /** True when the character was created from a user-supplied trusted-backup import. */
+  imported: boolean
   status?: StatusResult
 }
 
@@ -525,6 +537,26 @@ function permanentConsumableInfo(character: CharacterWithCatalog): {
   return { cap: toSparseVector(cap), remaining: toSparseVector(remaining) }
 }
 
+/**
+ * Map a persisted association kind to its public view kind, exhaustively. Every
+ * Prisma association kind is covered by the record, so a newly introduced kind is
+ * a compile-time error rather than a silent fallback that mislabels data.
+ */
+const associationViewKinds: Record<
+  CharacterWithCatalog["associations"][number]["kind"],
+  CharacterAssociationView["kind"]
+> = {
+  TITLE: "title",
+  EQUIPMENT: "equipment",
+  SKILL: "skill",
+}
+
+function associationViewKind(
+  kind: CharacterWithCatalog["associations"][number]["kind"]
+): CharacterAssociationView["kind"] {
+  return associationViewKinds[kind]
+}
+
 function associationView(
   link: CharacterWithCatalog["associations"][number]
 ): CharacterAssociationView {
@@ -532,12 +564,7 @@ function associationView(
     link.definition.kind,
     link.definition.config ?? {}
   )
-  const kind: CharacterAssociationView["kind"] =
-    link.kind === "TITLE"
-      ? "title"
-      : link.kind === "EQUIPMENT"
-        ? "equipment"
-        : "skill"
+  const kind = associationViewKind(link.kind)
   const view: CharacterAssociationView = {
     id: link.id,
     definitionId: link.definitionId,
@@ -602,6 +629,7 @@ function toDetail(
     state: character.state,
     version: character.version,
     archived: character.archived,
+    imported: character.imported,
     createdAt: character.createdAt.toISOString(),
     updatedAt: character.updatedAt.toISOString(),
     associations: character.associations.map(associationView),
@@ -626,6 +654,7 @@ function toListItem(
     professionName: character.profession?.name ?? null,
     updatedAt: character.updatedAt.toISOString(),
     archived: character.archived,
+    imported: character.imported,
     status: withStatus ? statusFor(character, config) : undefined,
   }
 }
@@ -1889,7 +1918,7 @@ export async function exportCharacter(
   const associations = row.associations.map((a) => ({
     id: a.id,
     definitionId: a.definitionId,
-    kind: a.kind === "TITLE" ? "title" : "equipment",
+    kind: associationViewKind(a.kind),
     createdAt: a.createdAt.toISOString(),
     definition: {
       id: a.definition.id,
@@ -1902,8 +1931,39 @@ export async function exportCharacter(
       updatedAt: a.definition.updatedAt.toISOString(),
     },
   }))
+  const identity = {
+    name: row.name,
+    description: row.description,
+    origin: row.origin,
+    race: { stableId: row.race?.stableId ?? null },
+    class: { stableId: row.class?.stableId ?? null },
+    profession: row.profession ? { stableId: row.profession.stableId } : null,
+  }
+  // Export skill offers with STABLE catalog identifiers so a re-import on another
+  // server instance can resolve each option/selection against its own catalog.
+  // `offeredAt` is emitted as an ISO string; the importer parses it back to a Date.
+  const skillOffers = row.skillOffers.map((offer) => {
+    const selectedOption = offer.options.find(
+      (o) => o.definitionId === offer.selectedDefinitionId
+    )
+    return {
+      track: offer.track,
+      level: offer.level,
+      choiceGroup: offer.choiceGroup,
+      offeredAt: offer.offeredAt.toISOString(),
+      selectedStableId: selectedOption?.definition?.stableId ?? null,
+      selectedAt: offer.selectedAt ? offer.selectedAt.toISOString() : null,
+      options: offer.options.map((o) => ({
+        stableId: o.definition?.stableId ?? "",
+        nameSnapshot: o.nameSnapshot,
+        configSnapshot: (o.configSnapshot ?? {}) as Record<string, unknown>,
+      })),
+    }
+  })
   return {
-    schema: "primal-character/2",
+    schema: "primal-character/3",
+    rulesetVersion: IMPORT_RULESET_VERSION,
+    identity,
     character: toListItem(row, true),
     state,
     liveState: live,
@@ -1914,7 +1974,606 @@ export async function exportCharacter(
       payload: e.payload,
       createdAt: e.createdAt.toISOString(),
     })),
+    skillOffers,
   }
+}
+
+// ------------------------------------------------------------------ //
+// Trusted-backup import (v3)
+// ------------------------------------------------------------------ //
+//
+// A v3 document is a *trusted backup*, not authoritative server-verified state.
+// Every catalog reference (identity race/class/profession, each association
+// definition, each skill-offer option/selection) is resolved by `kind` +
+// `stableId` to an EXISTING catalog definition; no catalog content is
+// auto-created, and a missing/mismatched/archived required definition is
+// rejected with an actionable 400. `liveState` / `status` in the document are
+// advisory and are ignored - status is recomputed from the imported state. The
+// imported history is stored as `import_history` events (source provenance, not
+// valid live IDs) and an `import` marker event is appended.
+
+type CatalogLookupRow = {
+  id: string
+  kind: string
+  stableId: string
+  name: string
+  config: unknown
+  archived: boolean
+  provenance: string
+}
+
+async function findCatalogByStableId(
+  db: DbClient,
+  kind: string,
+  stableId: string
+): Promise<CatalogLookupRow | null> {
+  const row = await db.catalogDefinition.findUnique({
+    where: { kind_stableId: { kind: kind as never, stableId } },
+  })
+  if (!row) return null
+  return row
+}
+
+async function resolveIdentityRef(
+  db: DbClient,
+  kind: string,
+  stableId: string | null,
+  label: string
+): Promise<CatalogLookupRow> {
+  const def = stableId ? await findCatalogByStableId(db, kind, stableId) : null
+  if (!def) {
+    throw badRequest(
+      "import_catalog_missing",
+      `Imported ${label} "${stableId ?? "(unset)"}" (kind "${kind}") is not in the catalog`
+    )
+  }
+  if (def.kind !== kind) {
+    throw badRequest(
+      "import_kind_mismatch",
+      `Imported ${label} stableId "${stableId}" is kind "${def.kind}", expected "${kind}"`
+    )
+  }
+  if (def.archived) {
+    throw badRequest(
+      "import_catalog_archived",
+      `Imported ${label} "${def.name}" (${def.stableId}) is archived; re-enable it in the catalog before importing`
+    )
+  }
+  return def
+}
+
+const ASSOC_KIND_TO_DB = {
+  title: "TITLE",
+  equipment: "EQUIPMENT",
+  skill: "SKILL",
+} as const
+
+const ASSOC_KIND_TO_DEF_KIND = {
+  title: "titles",
+  equipment: "equipment",
+  skill: "skills",
+} as const
+
+type ResolvedAssoc = {
+  sourceKind: "title" | "equipment" | "skill"
+  dbKind: "TITLE" | "EQUIPMENT" | "SKILL"
+  definitionId: string
+  definition: CatalogLookupRow
+}
+
+async function resolveAssociationRefs(
+  db: DbClient,
+  assocs: CharacterImportDocument["associations"]
+): Promise<ResolvedAssoc[]> {
+  const seen = new Set<string>()
+  const resolved: ResolvedAssoc[] = []
+  for (const a of assocs) {
+    const expectedDefKind = ASSOC_KIND_TO_DEF_KIND[a.kind]
+    if (a.definition.kind !== expectedDefKind) {
+      throw badRequest(
+        "import_kind_mismatch",
+        `Association "${a.definition.stableId}" has definition kind "${a.definition.kind}", but a "${a.kind}" association requires "${expectedDefKind}"`
+      )
+    }
+    const def = await findCatalogByStableId(
+      db,
+      a.definition.kind,
+      a.definition.stableId
+    )
+    if (!def) {
+      throw badRequest(
+        "import_link_missing",
+        `Association "${a.kind}" references catalog "${a.definition.stableId}" (${a.definition.kind}) which is not in the catalog`
+      )
+    }
+    if (seen.has(def.id)) {
+      throw badRequest(
+        "import_duplicate_link",
+        `Catalog "${def.name}" is linked more than once`
+      )
+    }
+    seen.add(def.id)
+    resolved.push({
+      sourceKind: a.kind,
+      dbKind: ASSOC_KIND_TO_DB[a.kind] as "TITLE" | "EQUIPMENT" | "SKILL",
+      definitionId: def.id,
+      definition: def,
+    })
+  }
+  return resolved
+}
+
+/**
+ * Reject a pair of active (unarchived) associations that would collide: two
+ * equipment links sharing a slot, or two title / skill links sharing an upgrade
+ * group. Archived definitions are inert and never collide. This mirrors the
+ * runtime invariant enforced by `associateCharacter` and `assertNoLinkCollision`.
+ */
+function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
+  const slots = new Map<string, string>()
+  const titleGroups = new Map<string, string>()
+  const skillGroups = new Map<string, string>()
+  for (const r of resolved) {
+    if (r.definition.archived) continue
+    const config = parseCatalogConfig(
+      r.definition.kind,
+      r.definition.config ?? {}
+    )
+    if (r.sourceKind === "equipment") {
+      const slot = slotForConfig(config)
+      if (slot) {
+        const existing = slots.get(slot)
+        if (existing) {
+          throw badRequest(
+            "import_link_collision",
+            `Equipment slot "${slot}" is occupied by both "${existing}" and "${r.definition.name}"`
+          )
+        }
+        slots.set(slot, r.definition.name)
+      }
+    } else if (r.sourceKind === "title") {
+      const group = upgradeGroupForConfig(config)
+      if (group) {
+        const existing = titleGroups.get(group)
+        if (existing) {
+          throw badRequest(
+            "import_link_collision",
+            `Title upgrade group "${group}" is occupied by both "${existing}" and "${r.definition.name}"`
+          )
+        }
+        titleGroups.set(group, r.definition.name)
+      }
+    } else {
+      const group = upgradeGroupForConfig(config)
+      if (group) {
+        const existing = skillGroups.get(group)
+        if (existing) {
+          throw badRequest(
+            "import_link_collision",
+            `Skill upgrade group "${group}" is occupied by both "${existing}" and "${r.definition.name}"`
+          )
+        }
+        skillGroups.set(group, r.definition.name)
+      }
+    }
+  }
+}
+
+type ResolvedOfferOption = {
+  definitionId: string
+  stableId: string
+  nameSnapshot: string
+  configSnapshot: Record<string, unknown>
+}
+
+type ResolvedOffer = {
+  track: string
+  level: number
+  choiceGroup: string
+  offeredAt: Date
+  selectedDefinitionId: string | null
+  selectedAt: Date | null
+  options: ResolvedOfferOption[]
+}
+
+function parseOfferDate(value: string | number | null | undefined): Date {
+  if (value == null) return new Date()
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed
+}
+
+async function resolveSkillOfferRefs(
+  db: DbClient,
+  offers: CharacterImportDocument["skillOffers"]
+): Promise<ResolvedOffer[]> {
+  const seen = new Set<string>()
+  const result: ResolvedOffer[] = []
+  for (const o of offers) {
+    const key = `${o.track}:${o.level}:${o.choiceGroup}`
+    if (seen.has(key)) {
+      throw badRequest(
+        "import_duplicate_offer",
+        `Duplicate skill offer for ${o.track} level ${o.level} choice group "${o.choiceGroup}"`
+      )
+    }
+    seen.add(key)
+
+    const options: ResolvedOfferOption[] = []
+    const optionStableIds = new Set<string>()
+    for (const opt of o.options) {
+      const def = await findCatalogByStableId(db, "skills", opt.stableId)
+      if (!def) {
+        throw badRequest(
+          "import_option_missing",
+          `Skill option "${opt.stableId}" is not in the catalog`
+        )
+      }
+      if (optionStableIds.has(def.stableId)) {
+        throw badRequest(
+          "import_duplicate_option",
+          `Skill "${def.name}" appears twice in the same offer`
+        )
+      }
+      optionStableIds.add(def.stableId)
+      options.push({
+        definitionId: def.id,
+        stableId: def.stableId,
+        nameSnapshot: opt.nameSnapshot,
+        configSnapshot: opt.configSnapshot ?? {},
+      })
+    }
+
+    let selectedDefinitionId: string | null = null
+    if (o.selectedStableId != null) {
+      if (!optionStableIds.has(o.selectedStableId)) {
+        throw badRequest(
+          "import_selected_not_in_options",
+          `Offer for ${o.track} level ${o.level} selects "${o.selectedStableId}", which is not one of its options`
+        )
+      }
+      // A selection only needs the selectedStableId to be among this offer's
+      // options and to resolve to a valid catalog definition. It need NOT also
+      // remain as a current skill association: a later upgrade in the same group
+      // removes the old link, but the historical answer is still a faithful
+      // record and must not block the import.
+      selectedDefinitionId = options.find(
+        (opt) => opt.stableId === o.selectedStableId
+      )!.definitionId
+    }
+
+    result.push({
+      track: o.track,
+      level: o.level,
+      choiceGroup: o.choiceGroup,
+      offeredAt: parseOfferDate(o.offeredAt),
+      selectedDefinitionId,
+      selectedAt: selectedDefinitionId ? parseOfferDate(o.selectedAt) : null,
+      options,
+    })
+  }
+  return result
+}
+
+/**
+ * Remap the imported state's engine-internal definitionIds to the LOCAL catalog
+ * forms so subsequent engine mutations resolve against this server's catalog:
+ *   - current class/profession track definitionId -> the id selected by
+ *     `resolveTrackDefinition` for the imported state (which applies the same
+ *     chosen-grade fallback the advance flow uses, NOT a naive
+ *     `${stableId}:${raceGrade}`), or 400 if the catalog row defines no track.
+ *   - current race definitionId -> the local per-grade `raceDefinitions[grade].id`.
+ * Historical level awards are preserved verbatim (they are source snapshots). No
+ * other state is altered.
+ */
+function normalizeImportedState(
+  state: CharacterState,
+  identity: CharacterImportDocument["identity"],
+  raceRow: CatalogLookupRow,
+  classRow: CatalogLookupRow,
+  profRow: CatalogLookupRow | null
+): CharacterState {
+  const grade = state.race.grade
+  // Normalize the race part first so the track definitions below are resolved
+  // against the same state (and grade) the advance flow will use; the grade is
+  // unchanged by normalization but the resolution must be identical.
+  const raceState: CharacterState["race"] = {
+    ...state.race,
+    origin: identity.origin,
+  }
+  const resolvedState: CharacterState = { ...state, race: raceState }
+
+  const tracks: CharacterState["tracks"] = { ...state.tracks }
+  if (tracks["class"]) {
+    const def = resolveTrackDefinition(classRow, resolvedState)
+    if (!def) {
+      throw badRequest(
+        "invalid_import",
+        `Class "${classRow.name}" (${classRow.stableId}) defines no track level-up; advancing class would fail`
+      )
+    }
+    tracks["class"] = { ...tracks["class"], definitionId: def.id }
+  }
+  if (profRow && tracks["profession"]) {
+    const def = resolveTrackDefinition(profRow, resolvedState)
+    if (!def) {
+      throw badRequest(
+        "invalid_import",
+        `Profession "${profRow.name}" (${profRow.stableId}) defines no track level-up; advancing profession would fail`
+      )
+    }
+    tracks["profession"] = { ...tracks["profession"], definitionId: def.id }
+  }
+
+  const parsedRace = parseCatalogConfig(raceRow.kind, raceRow.config ?? {})
+  const defs = parsedRace.raceDefinitions as
+    Partial<Record<Grade, { id: string }>> | undefined
+  const raceDefId = defs?.[grade]?.id
+  if (raceDefId) raceState.definitionId = raceDefId
+  else delete raceState.definitionId
+  return { ...state, race: raceState, tracks }
+}
+
+/**
+ * Validate the imported state's self-consistency before persisting. Rejects a
+ * backup that (after Zod shape validation) has the wrong track set, out-of-range
+ * track levels/quarters, disagrees on origin, carries negative or non-integer
+ * attribute/allocation values, over-allocates free points, or (for a derived
+ * race) declares a race level inconsistent with the track levels. Every failure
+ * is a 400 `invalid_import` raised BEFORE any DB write. No automatic
+ * user-provided effects are added beyond the validated state.
+ */
+function assertImportState(
+  state: CharacterState,
+  identity: CharacterImportDocument["identity"],
+  config: RulesConfig
+): void {
+  // Exactly the class track must be present; the profession track must be present
+  // iff a profession identity is declared, and no other track key is allowed.
+  const allowedTracks = new Set(["class", "profession"])
+  for (const key of Object.keys(state.tracks)) {
+    if (!allowedTracks.has(key)) {
+      throw badRequest(
+        "invalid_import",
+        `Imported state declares unknown track "${key}"`
+      )
+    }
+  }
+  if (!state.tracks["class"]) {
+    throw badRequest(
+      "invalid_import",
+      "Imported state is missing the required class track"
+    )
+  }
+  const hasProfessionIdentity = identity.profession != null
+  const hasProfessionTrack = state.tracks["profession"] != null
+  if (hasProfessionTrack !== hasProfessionIdentity) {
+    throw badRequest(
+      "invalid_import",
+      hasProfessionIdentity
+        ? "Imported state is missing the profession track for the declared profession"
+        : "Imported state has a profession track but no profession identity"
+    )
+  }
+
+  // Track levels are nonnegative integers; quarters are 0..3. The document Zod
+  // schema already constrains these, but re-checking here prevents a direct
+  // service call from persisting an un-advanceable track.
+  for (const [track, t] of Object.entries(state.tracks)) {
+    if (!Number.isInteger(t.level) || t.level < 0) {
+      throw badRequest(
+        "invalid_import",
+        `Imported track "${track}" level ${String(t.level)} must be a nonnegative integer`
+      )
+    }
+    if (!Number.isInteger(t.quarter) || t.quarter < 0 || t.quarter > 3) {
+      throw badRequest(
+        "invalid_import",
+        `Imported track "${track}" quarter ${String(t.quarter)} must be an integer in 0..3`
+      )
+    }
+  }
+
+  if (state.race.origin != null && state.race.origin !== identity.origin) {
+    throw badRequest(
+      "invalid_import",
+      `identity.origin "${identity.origin}" disagrees with state.race.origin "${state.race.origin}"`
+    )
+  }
+  for (const [attr, v] of Object.entries(state.baseAttributes)) {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw badRequest(
+        "invalid_import",
+        `baseAttributes.${attr} must be a nonnegative number (got ${String(v)})`
+      )
+    }
+  }
+  for (const entry of state.allocations) {
+    for (const [attr, v] of Object.entries(entry.points)) {
+      if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+        throw badRequest(
+          "invalid_import",
+          `allocation "${entry.id}" (${entry.source}) ${attr} must be a nonnegative integer (got ${String(v)})`
+        )
+      }
+    }
+  }
+  const totalFree = totalFreePoints(state)
+  const allocated = allocatedPoints(state)
+  if (allocated > totalFree) {
+    throw badRequest(
+      "invalid_import",
+      `allocated points ${allocated} exceed total free points ${totalFree}`
+    )
+  }
+  if (state.race.mode === "derived") {
+    const derived = deriveRaceLevel(state, config)
+    if (state.race.level !== derived) {
+      throw badRequest(
+        "invalid_import",
+        `race level ${state.race.level} is inconsistent with the derived level ${derived}`
+      )
+    }
+  }
+}
+
+/**
+ * Import a trusted-backup v3 document as a NEW character owned by `user`. Never
+ * overwrites an existing character and never mutates the catalog. All writes
+ * (character row, association links, skill offers/options, imported history and
+ * the import marker) are transactional: any resolution/validation failure 400s
+ * and rolls the whole import back.
+ */
+export async function importCharacter(
+  input: CharacterImportDocument,
+  user: SessionUser
+): Promise<CharacterDetail> {
+  return prisma.$transaction(async (tx) => {
+    const race = await resolveIdentityRef(
+      tx,
+      "races",
+      input.identity.race.stableId,
+      "race"
+    )
+    const cls = await resolveIdentityRef(
+      tx,
+      "classes",
+      input.identity.class.stableId,
+      "class"
+    )
+    const prof = input.identity.profession
+      ? await resolveIdentityRef(
+          tx,
+          "professions",
+          input.identity.profession.stableId,
+          "profession"
+        )
+      : null
+
+    // Deserialize with a hard rejection: a state that violates the engine schema
+    // (including track levels/quarters) must 400 `invalid_import` before any DB
+    // write, even when the route's Zod check was bypassed by a direct caller.
+    let rawState: CharacterState
+    try {
+      rawState = deserializeState(input.state)
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        const issues = err.issues
+          .slice(0, 3)
+          .map(
+            (i) =>
+              `${i.path.length ? i.path.join(".") : "(root)"}: ${i.message}`
+          )
+          .join("; ")
+        throw badRequest(
+          "invalid_import",
+          `Imported state is malformed - ${issues}`
+        )
+      }
+      throw err
+    }
+    const config = buildRulesConfig(race)
+    // Validate the RAW document state before normalizing: `normalizeImportedState`
+    // rewrites the origin to identity.origin, which would otherwise mask a
+    // backup whose state.race.origin disagrees with identity.origin.
+    assertImportState(rawState, input.identity, config)
+    const state = normalizeImportedState(
+      rawState,
+      input.identity,
+      race,
+      cls,
+      prof
+    )
+
+    const resolvedAssocs = await resolveAssociationRefs(tx, input.associations)
+    assertAssocCollisions(resolvedAssocs)
+    const resolvedOffers = await resolveSkillOfferRefs(tx, input.skillOffers)
+
+    const serialized = serializeState(state)
+    const created = await tx.character.create({
+      data: {
+        ownerId: user.id,
+        name: input.identity.name,
+        description: input.identity.description ?? null,
+        origin: input.identity.origin,
+        raceId: race.id,
+        classId: cls.id,
+        professionId: prof?.id ?? null,
+        state: serialized as Prisma.InputJsonValue,
+        version: 0,
+        imported: true,
+      },
+      include: characterInclude,
+    })
+
+    for (const a of resolvedAssocs) {
+      await tx.characterAssociation.create({
+        data: {
+          characterId: created.id,
+          definitionId: a.definitionId,
+          kind: a.dbKind as never,
+        },
+      })
+    }
+
+    for (const o of resolvedOffers) {
+      await tx.skillOffer.create({
+        data: {
+          characterId: created.id,
+          track: o.track,
+          level: o.level,
+          choiceGroup: o.choiceGroup,
+          offeredAt: o.offeredAt,
+          selectedDefinitionId: o.selectedDefinitionId,
+          selectedAt: o.selectedAt,
+          options: {
+            create: o.options.map((opt) => ({
+              definitionId: opt.definitionId,
+              nameSnapshot: opt.nameSnapshot,
+              configSnapshot: opt.configSnapshot as Prisma.InputJsonValue,
+            })),
+          },
+        },
+      })
+    }
+
+    for (const event of input.events) {
+      await tx.progressionEvent.create({
+        data: {
+          characterId: created.id,
+          kind: "import_history",
+          payload: {
+            sourceKind: event.kind ?? "unknown",
+            sourceCreatedAt: event.createdAt ?? new Date().toISOString(),
+            sourcePayload: event.payload ?? {},
+          } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
+    await tx.progressionEvent.create({
+      data: {
+        characterId: created.id,
+        kind: "import",
+        payload: {
+          origin: input.identity.origin,
+          raceStableId: race.stableId,
+          classStableId: cls.stableId,
+          professionStableId: prof?.stableId ?? null,
+          rulesetVersion: IMPORT_RULESET_VERSION,
+          sourceEvents: input.events.length,
+        } as Prisma.InputJsonValue,
+      },
+    })
+
+    // Re-fetch so the returned detail includes the associations and skill offers
+    // created above (the `character.create` snapshot has empty relation arrays).
+    const refetched = (await tx.character.findUnique({
+      where: { id: created.id },
+      include: characterInclude,
+    }))!
+
+    return toDetail(refetched, true)
+  })
 }
 
 // ------------------------------------------------------------------ //

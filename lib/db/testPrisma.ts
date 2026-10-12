@@ -81,6 +81,7 @@ export interface TestCharacterRow {
   state: unknown
   version: number
   archived: boolean
+  imported: boolean
   createdAt: Date
   updatedAt: Date
   // Relations, only set on the object returned by findUnique/create.
@@ -152,7 +153,10 @@ export interface TestPrismaInstance {
     }
     catalogDefinition: {
       findUnique: (args: {
-        where: { id: string }
+        where: {
+          id?: string
+          kind_stableId?: { kind: string; stableId: string }
+        }
       }) => Promise<TestCatalogRow | null>
       findMany: (args: {
         where?: { kind?: string; archived?: boolean }
@@ -311,7 +315,7 @@ interface Transaction {
   }
   catalogDefinition: {
     findUnique: (args: {
-      where: { id: string }
+      where: { id?: string; kind_stableId?: { kind: string; stableId: string } }
     }) => Promise<TestCatalogRow | null>
     findMany: (args: {
       where?: { kind?: string; archived?: boolean }
@@ -459,6 +463,20 @@ export function createTestPrisma(): TestPrismaInstance {
     return skillOffers.find((o) => o.id === where.id)
   }
 
+  function findCatalog(where: {
+    id?: string
+    kind_stableId?: { kind: string; stableId: string }
+  }): TestCatalogRow | undefined {
+    if (where.id != null) return catalog.get(where.id)
+    const key = where.kind_stableId
+    if (key) {
+      return [...catalog.values()].find(
+        (r) => r.kind === key.kind && r.stableId === key.stableId
+      )
+    }
+    return undefined
+  }
+
   const tx: Transaction = {
     user: {
       findUnique: async ({ where }) => {
@@ -518,6 +536,7 @@ export function createTestPrisma(): TestPrismaInstance {
           state: data.state,
           version: (data.version as number) ?? 0,
           archived: (data.archived as boolean) ?? false,
+          imported: (data.imported as boolean) ?? false,
           createdAt: now,
           updatedAt: now,
         }
@@ -616,8 +635,14 @@ export function createTestPrisma(): TestPrismaInstance {
       },
     },
     catalogDefinition: {
-      findUnique: async ({ where }: { where: { id: string } }) =>
-        catalog.get(where.id) ?? null,
+      findUnique: async ({
+        where,
+      }: {
+        where: {
+          id?: string
+          kind_stableId?: { kind: string; stableId: string }
+        }
+      }) => findCatalog(where) ?? null,
       findMany: async ({
         where,
       }: {
@@ -736,9 +761,10 @@ export function createTestPrisma(): TestPrismaInstance {
           track: data.track as string,
           level: data.level as number,
           choiceGroup: data.choiceGroup as string,
-          selectedDefinitionId: null,
-          offeredAt: now,
-          selectedAt: null,
+          selectedDefinitionId:
+            (data.selectedDefinitionId as string | null) ?? null,
+          offeredAt: (data.offeredAt as Date | undefined) ?? now,
+          selectedAt: (data.selectedAt as Date | null) ?? null,
         }
         skillOffers.push(offer)
         const nestedOptions = (
@@ -870,8 +896,14 @@ export function createTestPrisma(): TestPrismaInstance {
       return run
     },
     catalogDefinition: {
-      findUnique: async ({ where }: { where: { id: string } }) =>
-        catalog.get(where.id) ?? null,
+      findUnique: async ({
+        where,
+      }: {
+        where: {
+          id?: string
+          kind_stableId?: { kind: string; stableId: string }
+        }
+      }) => findCatalog(where) ?? null,
       findMany: tx.catalogDefinition.findMany,
       update: tx.catalogDefinition.update,
     },
@@ -1011,6 +1043,7 @@ export function createTestPrisma(): TestPrismaInstance {
           state: row.state ?? {},
           version: row.version ?? 0,
           archived: row.archived ?? false,
+          imported: row.imported ?? false,
           createdAt: row.createdAt ?? new Date(),
           updatedAt: row.updatedAt ?? new Date(),
         }

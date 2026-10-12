@@ -197,6 +197,44 @@ deliberately **not** authoritative character state. The contract is:
   non-wizard API client, or create-from-scratch), the draft is left untouched and
   the create proceeds as before.
 
+## Trusted-backup character export / import (contract)
+
+A saved character can be exported as a **trusted backup** JSON document (schema
+`primal-character/3`) and re-imported into any instance of the app. The document
+is a backup, **not** authoritative server-verified state: the contract is:
+
+- **Stable identifiers, not internal ids.** The document carries `identity`
+  (name, description, origin, race/class/profession) and every association /
+  skill-offer option reference by catalog `kind` + `stableId` (never the
+  runtime-internal definition id). The raw engine `state` is exported verbatim
+  (it keeps its engine-internal `definitionId` values), and on import those
+  current track/race definition ids are remapped to the local catalog forms
+  (via the same `resolveTrackDefinition` fallback the advancement flow uses - the
+  id for the character's grade if defined, otherwise the lowest defined grade -
+  for tracks, and the local per-grade `raceDefinitions[grade].id` for the race).
+  Historical level awards are preserved verbatim as source snapshots.
+- **No catalog is auto-created and no overwrite.** Every identity / association /
+  offer-option reference must resolve to an EXISTING catalog definition; a
+  missing, wrong-kind, or (for required race/class/profession) archived definition
+  rejects the whole import with an actionable 400. Archived associations or offer
+  options may be preserved as inert links only when the definition exists. Import
+  always creates a NEW character (owned by the current user) - it never mutates an
+  existing row.
+- **History is provenance, not live ids.** Imported progression events are stored
+  as `kind: 'import_history'` events with a `sourceKind` / `sourceCreatedAt` /
+  `sourcePayload` provenance, so the source ids are clearly not valid live ids. A
+  current-time `kind: 'import'` event is appended.
+- **State is self-consistent or rejected.** The `state` is validated against the
+  engine `CharacterState` schema, then semantically checked: identity origin must
+  agree with any `state.race.origin`, allocations must be nonnegative integers,
+  `allocatedPoints` must not exceed `totalFreePoints`, and a derived race level
+  must be consistent with the class/profession track levels (per the server-held
+  rules config). `liveState` / `status` in the document are advisory and are
+  ignored - the server recomputes status from the imported state.
+- **Marked as imported.** The created character carries `imported = true`, shown
+  in the UI as "Imported - unverified backup", distinguishing untrusted
+  user-supplied history from server-verified progression.
+
 ## Decisions still needed (escalate if blocking)
 
 - Whether the engine should expose a single entry point that takes a full input

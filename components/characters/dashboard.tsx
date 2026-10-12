@@ -7,6 +7,7 @@ import {
   DownloadIcon,
   PlusIcon,
   SearchIcon,
+  UploadIcon,
   UserIcon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -100,6 +101,34 @@ export function CharactersDashboard() {
   const [pendingArchive, setPendingArchive] =
     React.useState<CharacterListItem | null>(null)
   const [archiving, setArchiving] = React.useState(false)
+  const [importing, setImporting] = React.useState(false)
+  const [importConfirm, setImportConfirm] = React.useState<{
+    fileName: string
+    document: unknown
+  } | null>(null)
+  const importFileRef = React.useRef<HTMLInputElement | null>(null)
+
+  const importFileChange = React.useCallback((file: File | undefined) => {
+    if (!file) return
+    const MB_BYTES = 1024 * 1024
+    if (file.size > 2 * MB_BYTES) {
+      toast.error(`"${file.name}" is larger than the 2MiB import limit.`)
+      return
+    }
+    file
+      .text()
+      .then((text) => {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(text)
+        } catch {
+          toast.error(`"${file.name}" is not valid JSON.`)
+          return
+        }
+        setImportConfirm({ fileName: file.name, document: parsed })
+      })
+      .catch(() => toast.error(`Could not read "${file.name}".`))
+  }, [])
 
   const load = React.useCallback(async () => {
     try {
@@ -116,6 +145,23 @@ export function CharactersDashboard() {
       setLoading(false)
     }
   }, [])
+
+  const confirmImport = React.useCallback(async () => {
+    if (!importConfirm) return
+    setImporting(true)
+    try {
+      await apiFetch<CharacterResponse>("/api/characters/import", {
+        ...jsonInit("POST", { document: importConfirm.document }),
+      })
+      toast.success("Character imported as an unverified backup.")
+      setImportConfirm(null)
+      await load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Import failed.")
+    } finally {
+      setImporting(false)
+    }
+  }, [importConfirm, load])
 
   React.useEffect(() => {
     let active = true
@@ -329,6 +375,26 @@ export function CharactersDashboard() {
             <span className="text-xs">Create a character</span>
           </Link>
 
+          <button
+            type="button"
+            onClick={() => importFileRef.current?.click()}
+            className="flex min-h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
+          >
+            <UploadIcon className="size-6" />
+            <span className="text-xs">Import from backup</span>
+          </button>
+
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="application/json,.json"
+            className="sr-only"
+            onChange={(e) => {
+              importFileChange(e.target.files?.[0])
+              e.target.value = ""
+            }}
+          />
+
           {visible.map((item) => {
             return (
               <Card key={item.id}>
@@ -428,6 +494,51 @@ export function CharactersDashboard() {
               disabled={archiving}
             >
               {archiving ? "Archiving..." : "Archive"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!importConfirm}
+        onOpenChange={(open) => !open && setImportConfirm(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Import backup</DialogTitle>
+            <DialogDescription>
+              Importing &quot;{importConfirm?.fileName ?? ""}&quot; as a new
+              character owned by you.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2 text-xs/relaxed text-muted-foreground">
+            <p>
+              This backup is <span className="font-medium">unverified</span>:
+              imported history is kept as source provenance, and the live status
+              is recomputed from the current catalog.
+            </p>
+            <p>
+              Any catalog definition the backup references (race, class,
+              profession, titles, equipment or skills) that is missing,
+              archived, or the wrong kind is{" "}
+              <span className="font-medium">rejected</span>, and nothing is
+              imported.
+            </p>
+            <p>
+              The import never overwrites an existing character; it always
+              creates a new one.
+            </p>
+          </div>
+          <DialogFooter showCloseButton>
+            <Button
+              variant="outline"
+              onClick={() => setImportConfirm(null)}
+              disabled={importing}
+            >
+              Cancel
+            </Button>
+            <Button onClick={confirmImport} disabled={importing}>
+              {importing ? "Importing..." : "Import"}
             </Button>
           </DialogFooter>
         </DialogContent>

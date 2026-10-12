@@ -1288,6 +1288,9 @@ export function CharacterDetail({
                 {character.name}
               </h1>
               {character.archived ? <Badge>Archived</Badge> : null}
+              {character.imported ? (
+                <Badge variant="outline">Imported - unverified backup</Badge>
+              ) : null}
               <Badge variant="outline" className="capitalize">
                 {character.origin}
               </Badge>

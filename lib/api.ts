@@ -264,6 +264,8 @@ export interface CharacterListItem {
   professionName: string | null
   updatedAt: string
   archived: boolean
+  /** True when the character was created from a user-supplied trusted-backup import. */
+  imported: boolean
   status?: StatusResult
 }
 
@@ -316,6 +318,8 @@ export interface CharacterDetail {
   state: CharacterState
   version: number
   archived: boolean
+  /** True when the character was created from a user-supplied trusted-backup import. */
+  imported: boolean
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
@@ -449,26 +453,56 @@ export interface ExportDefinitionSnapshot {
 export interface ExportAssociation {
   id: string
   definitionId: string
-  kind: "title" | "equipment"
+  kind: "title" | "equipment" | "skill"
   createdAt: string
   definition: ExportDefinitionSnapshot
 }
 
+/** The v3 trusted-backup identity block, using stable catalog identifiers. */
+export interface CharacterIdentityExport {
+  name: string
+  description: string | null
+  origin: "integrated" | "born"
+  race: { stableId: string | null }
+  class: { stableId: string | null }
+  profession: { stableId: string } | null
+}
+
+/** A read-only snapshotted skill option in an exported offer. */
+export interface SkillOfferOptionExport {
+  stableId: string
+  nameSnapshot: string
+  configSnapshot: Record<string, unknown>
+}
+
+/** An exported skill offer (milestone choice), keyed by stable identifiers. */
+export interface SkillOfferExport {
+  track: string
+  level: number
+  choiceGroup: string
+  offeredAt: string
+  selectedStableId: string | null
+  options: SkillOfferOptionExport[]
+}
+
 export interface ExportResponse {
-  /** Bumped to "primal-character/2" when associations/liveState were added. */
+  /** "primal-character/3" - the current trusted-backup schema. */
   schema: string
+  rulesetVersion: string
+  identity: CharacterIdentityExport
   character: CharacterListItem
   /** The immutable, stored base state (no synthesized effects/equipment). */
   state: CharacterState
   /**
    * The synthesized live state used by `status` (stored state merged with the
-   * effects/equipment from currently linked, unarchived definitions). An importer
-   * can reproduce the exact `status` from this without re-resolving links.
+   * effects/equipment from currently linked, unarchived definitions). Advisory
+   * on import - status is recomputed server-side.
    */
   liveState: CharacterState
   status: StatusResult
   associations: ExportAssociation[]
   events: ProgressionEvent[]
+  skillOffers: SkillOfferExport[]
 }
 
 // ------------------------------------------------------------------ //

@@ -60,9 +60,17 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
 - **Auditable attribute status**: the status endpoint returns each attribute's
   final value and the full phase-by-phase trace (base, race, track, equipment,
   consumables, caps, ...), so numbers are transparent rather than opaque.
-- **Immutable history & export**: every progression event is written to an
-  append-only journal, and a character (state + status + journal) can be exported
-  as JSON. No sample characters are created.
+- **Immutable history & trusted-backup export/import**: every progression event is
+  written to an append-only journal, and a character (state + live status + skill
+  offers + journal) can be exported as a `primal-character/3` JSON backup keyed by
+  stable catalog identifiers. A backup can be re-imported (`POST
+  /api/characters/import`) as a NEW character owned by the current user; it is a
+  trusted-but-unverified backup, so it is marked `imported` in the UI and its
+  history is stored as source provenance (`import_history` events) rather than
+  treated as server-verified. The live status is recomputed from the current
+  catalog, catalog references are resolved by `kind` + `stableId` (no catalog
+  content is auto-created), and any required definition that is missing, archived,
+  or the wrong kind rejects the whole import. No sample characters are created.
 - **Admin-managed catalog**: a polymorphic catalog for all of the kinds above.
   Admins can create and edit entries, set a `verified` / `inferred` / `house`
   provenance, attach a source URL, and store per-kind `config`. With
@@ -121,8 +129,8 @@ The engine and schema already account for these, but they are not wired up:
   it shows the step as "Not assigned" and never treats the special category as
   character state until that feature is wired up.
 - **Catalog import**: the catalog is populated by `db:seed`; there is no bulk
-  import from the wiki, CSV or JSON.
-- **Character import**: characters can be exported but not re-imported.
+  import from the wiki, CSV or JSON (character backups are imported, but catalog
+  content is resolved against existing entries, never auto-created).
 
 ## Fan project disclaimer & attribution
 
