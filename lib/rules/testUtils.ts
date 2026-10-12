@@ -32,6 +32,7 @@ export type CharacterOptions = {
   raceMode?: RaceMode
   raceLevel?: number
   raceGrade?: Grade
+  raceOrigin?: "born" | "integrated"
   intLevel?: number
   dexLevel?: number
   base?: PartialVector
@@ -52,6 +53,7 @@ export function character(opts: CharacterOptions = {}): CharacterState {
       : (opts.raceLevel ?? 10)
   const raceLevel = opts.raceLevel ?? computedRace
   const raceGrade = opts.raceGrade ?? "F"
+  const raceOrigin = opts.raceOrigin ?? "integrated"
   const base = opts.base ?? {}
 
   const baseAttributes = makeVector(base) || allZero()
@@ -70,7 +72,12 @@ export function character(opts: CharacterOptions = {}): CharacterState {
         definitionId: "prof-def",
       },
     },
-    race: { level: raceLevel, grade: raceGrade, mode: raceMode },
+    race: {
+      level: raceLevel,
+      grade: raceGrade,
+      mode: raceMode,
+      origin: raceOrigin,
+    },
   })
 
   if (opts.intLevel != null) baseAttributes.intelligence = opts.intLevel

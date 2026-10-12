@@ -114,6 +114,9 @@ export type AttributeKey = (typeof ATTRIBUTE_KEYS)[number]
 
 export type AttributeVector = Record<AttributeKey, number>
 
+/** A sparse attribute patch; unspecified keys default to zero. */
+export type PartialVector = Partial<Record<AttributeKey, number>>
+
 export interface PhaseTrace {
   phase: string
   value: number
@@ -197,6 +200,7 @@ export interface RaceState {
   grade: Grade
   mode: string
   definitionId?: string
+  origin?: "integrated" | "born"
 }
 
 export interface CharacterState {
@@ -253,6 +257,13 @@ export interface CharacterDetail {
   updatedAt: string
   associations: CharacterAssociationView[]
   status?: StatusResult
+  /**
+   * Server-computed permanent-consumable capacity per attribute. Authoritative -
+   * the UI must not recompute this.
+   */
+  permanentConsumableCap?: PartialVector
+  /** Server-computed remaining permanent-consumable capacity per attribute. */
+  permanentConsumableRemaining?: PartialVector
 }
 
 export interface CharactersResponse {
@@ -303,6 +314,17 @@ export interface EvolveResponse {
 export interface AllocateResponse {
   character: CharacterDetail
   status: StatusResult
+}
+
+export interface ConsumeRequest {
+  definitionId: string
+  version: number
+}
+
+export interface ConsumeResponse {
+  character: CharacterDetail
+  status: StatusResult
+  event: { kind: string; payload: unknown }
 }
 
 export interface AssociationRequest {

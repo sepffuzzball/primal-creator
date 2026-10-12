@@ -13,7 +13,7 @@
  *   + flat effects
  *   ~ percent effects (integer basis points, floors each application)
  *   + equipment (capped: per-attribute aggregate + overall sum)
- *   + temporary effects (consumables capped by grade rate)
+ *   + temporary effects (consumables use only effect duration; no grade-rate cap)
  *
  * Percent effects are stored and applied as integer basis points; each
  * documented phase floors the result.
@@ -155,7 +155,9 @@ export interface PermanentResolution {
  * level caps. A `raceLevel` gain carries a `grade` and a `count` of levels.
  * When a grade band's cumulative `count` exceeds `config.permanentRaceGradeCaps`,
  * the excess gains are rejected whole (later insertion-order gains rejected
- * first). Non-race gains always apply.
+ * first). Non-race gains always apply; `buff` and `consumable` gains are
+ * permanent and applied verbatim (a `consumable` gain was already capped at
+ * application time and is never re-capped by later config changes).
  */
 export function resolvePermanentGains(
   state: CharacterState,

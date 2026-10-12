@@ -7,11 +7,14 @@ import {
   applyEvolve,
   associateCharacter,
   buildRulesConfig,
+  consumeCharacter,
+  createCatalogItem,
   createCharacter,
   createInitialState,
   deserializeState,
   evolveCharacter,
   exportCharacter,
+  getCharacter,
   resolveTrackDefinition,
   serializeState,
   updateCatalogItem,
@@ -21,6 +24,7 @@ import {
   createCharacterState,
   defaultRulesConfig,
   makeVector,
+  type Grade,
   type TrackDefinition,
 } from "@/lib/rules"
 
@@ -1298,5 +1302,371 @@ describe("exportCharacter (associations / live state)", () => {
     expect(
       (portable.liveState as { activeEffects: unknown[] }).activeEffects
     ).toHaveLength(0)
+  })
+})
+
+describe("consumeCharacter (consumables)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function bornFState(raceLevel: number, grade: string = "F"): unknown {
+    const state = createInitialState("born", null, null)
+    state.race = { ...state.race, level: raceLevel, grade: grade as Grade }
+    return serializeState(state)
+  }
+
+  function seedConsumable(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "consumables",
+      stableId: id,
+      name: extra.name ?? `Consumable ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedChar(
+    state: unknown,
+    version = 0,
+    archived = false,
+    origin: "integrated" | "born" = "integrated"
+  ): unknown {
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state,
+      version,
+      archived,
+      origin,
+    })
+  }
+
+  function stripOrigin(state: unknown): unknown {
+    delete (state as { race: { origin?: string } }).race.origin
+    return state
+  }
+
+  it("applies a permanent gain and logs a consume event with a definition snapshot", async () => {
+    seedChar(bornFState(10), 0, false, "born")
+    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-1", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    // Applied as a verbatim permanent gain (baseAttributes 0 + gain 3).
+    expect(res.status.attributes.strength).toBe(3)
+    // Authoritative server fields: remaining capacity is now 27 of 30.
+    expect(res.character.permanentConsumableCap).toMatchObject({ strength: 30 })
+    expect(res.character.permanentConsumableRemaining).toMatchObject({
+      strength: 27,
+      agility: 30,
+    })
+    const gains = (
+      res.character.state as {
+        permanentGains: Array<{ kind: string; vector: Record<string, number> }>
+      }
+    ).permanentGains
+    expect(gains).toHaveLength(1)
+    expect(gains[0]).toMatchObject({
+      kind: "consumable",
+      vector: { strength: 3 },
+    })
+
+    expect(dbMock.store.events).toHaveLength(1)
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("consume")
+    expect(event.payload).toMatchObject({
+      definitionId: "perm-1",
+      type: "permanent",
+      applied: { strength: 3 },
+      requested: { strength: 3 },
+      capRemainingAfter: { strength: 27 },
+    })
+    const payload = event.payload as {
+      definition: { name: string }
+      appliedAt: string
+    }
+    expect(payload.definition.name).toBe("Consumable perm-1")
+    expect(typeof payload.appliedAt).toBe("string")
+  })
+
+  it("rejects a permanent gain above the cumulative cap (400) and writes no event", async () => {
+    seedChar(bornFState(10), 0, false, "born")
+    seedConsumable("perm-1", { type: "permanent", amount: { strength: 31 } })
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-1", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
+    // No mutation, no event, ledger untouched.
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("adds a unique temporary active effect that expires by duration quarters", async () => {
+    seedChar(bornFState(5), 0, false, "born")
+    seedConsumable("temp-1", {
+      type: "temporary",
+      amount: { strength: 4 },
+      durationQuarters: 3,
+    })
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "temp-1", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    const effects = (
+      res.character.state as {
+        activeEffects: Array<{
+          id: string
+          phase: string
+          source: string
+          expiresAt?: number
+          amount: Record<string, number>
+        }>
+      }
+    ).activeEffects
+    expect(effects).toHaveLength(1)
+    const effect = effects[0]
+    expect(effect.phase).toBe("temporary")
+    expect(effect.source).toBe("consumable")
+    expect(effect.amount.strength).toBe(4)
+    // state.turn is 0, so the effect expires 3 quarters later.
+    expect(effect.expiresAt).toBe(3)
+    // Temporary effects are uncapped: requested === applied, no capUsage.
+    expect(res.status.consumables.applied.strength).toBe(4)
+    expect(res.status.attributes.strength).toBe(4)
+    expect(res.status.consumables.capUsage).toEqual([])
+    // Unique per-application effect id is deterministic but distinct per consumption.
+    expect(effect.id).toContain("temp-1:cons-0-")
+
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("consume")
+    expect(event.payload).toMatchObject({
+      definitionId: "temp-1",
+      type: "temporary",
+      applied: { strength: 4 },
+      durationQuarters: 3,
+      expiresAt: 3,
+      capRemainingAfter: {},
+    })
+  })
+
+  it("supports repeated permanent applications", async () => {
+    seedChar(bornFState(10), 0, false, "born")
+    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
+    const first = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-1", version: 0 },
+      user
+    )
+    const second = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-1", version: 1 },
+      user
+    )
+    expect(first.character.version).toBe(1)
+    expect(second.character.version).toBe(2)
+    const gains = (
+      second.character.state as {
+        permanentGains: Array<{ kind: string }>
+      }
+    ).permanentGains
+    expect(gains).toHaveLength(2)
+    expect(second.status.attributes.strength).toBe(6)
+    expect(dbMock.store.events).toHaveLength(2)
+  })
+
+  it("rejects a wrong-kind, an archived definition, and an archived character", async () => {
+    seedChar(bornFState(1), 0, false, "born")
+    // Wrong kind: an equipment entry requested as a consumable.
+    dbMock.store.addCatalog({
+      id: "gear-1",
+      kind: "equipment",
+      stableId: "gear-1",
+      name: "Gear",
+      config: { slot: "head", bonus: { strength: 5 } },
+    })
+    // Archived consumable.
+    seedConsumable(
+      "perm-arch",
+      { type: "permanent", amount: { strength: 1 } },
+      {
+        archived: true,
+      }
+    )
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "gear-1", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "wrong_kind" })
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-arch", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+    // A missing definition 404s.
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "missing", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 404 })
+
+    // An archived character is inert.
+    seedChar(bornFState(1), 0, true, "born")
+    seedConsumable("perm-ok", { type: "permanent", amount: { strength: 1 } })
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-ok", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "character_archived" })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a stale version (409) and never writes a stale event", async () => {
+    seedChar(bornFState(10), 0, false, "born")
+    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
+    const first = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-1", version: 0 },
+      user
+    )
+    expect(first.character.version).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-1", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.version).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("rejects a positive permanent gain when the grade has zero capacity", async () => {
+    // An integrated G-origin character in the G band (levels 1..9) has a 0 rate by
+    // default (G is an unknown/unconfigured grade). The cumulative capacity is 0,
+    // so any positive permanent gain is rejected.
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, level: 5, grade: "G" }
+    seedChar(serializeState(state))
+    seedConsumable("perm-g", { type: "permanent", amount: { strength: 1 } })
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-g", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("reconstructs a missing state origin from Character.origin (born) and persists it", async () => {
+    // A legacy state predating origin tracking: race.origin absent, but the
+    // authoritative Character.origin column says "born".
+    seedChar(stripOrigin(bornFState(10)), 0, false, "born")
+    seedConsumable("perm-born", { type: "permanent", amount: { strength: 4 } })
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-born", version: 0 },
+      user
+    )
+    // born F level 10 capacity is 30, so the +4 applies in full, not capped to 3.
+    expect(res.status.attributes.strength).toBe(4)
+    expect(res.character.permanentConsumableCap).toMatchObject({ strength: 30 })
+    // The mutation wrote the reconstructed origin into the persisted state.
+    const persisted = res.character.state as { race: { origin?: string } }
+    expect(persisted.race.origin).toBe("born")
+  })
+
+  it("treats a legacy integrated state as conservative integrated (no over-cap grant)", async () => {
+    // Legacy state without race.origin, integrated row, F level 10. The engine
+    // must NOT infer born from the non-G grade: conservative integrated capacity
+    // is 3, so a +4 permanent gain is rejected rather than silently accepted.
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, level: 10, grade: "F" as Grade }
+    seedChar(serializeState(state))
+    seedConsumable("perm-int", { type: "permanent", amount: { strength: 4 } })
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-int", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("derives detail capacity from Character.origin, not grade inference (integrated 3 vs born 30)", async () => {
+    // Integrated row, legacy state without origin: F level 10 -> cap 3.
+    let state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, level: 10, grade: "F" as Grade }
+    seedChar(serializeState(state))
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.permanentConsumableCap).toMatchObject({ strength: 3 })
+
+    dbMock.store.reset()
+    // Born row, legacy state without origin: F level 10 -> cap 30.
+    state = createInitialState("born", null, null)
+    state.race = { ...state.race, level: 10, grade: "F" as Grade }
+    seedChar(serializeState(state), 0, false, "born")
+    const bornDetail = await getCharacter("chr-1", user)
+    expect(bornDetail.permanentConsumableCap).toMatchObject({ strength: 30 })
+  })
+
+  it("rejects a legacy consumable config with an actionable 400, not a 500", async () => {
+    seedChar(bornFState(10), 0, false, "born")
+    // A legacy config lacking type/amount must remain visible and reject on
+    // consume with an explicit code, never crash as a 500 or fake a default.
+    seedConsumable("legacy-1", { grade: "F" })
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "legacy-1", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "legacy_consumable_config" })
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+})
+
+describe("catalog consumable config legacy handling", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("allows a metadata-only PATCH on a legacy consumable entry (config unchanged)", async () => {
+    dbMock.store.addCatalog({
+      id: "legacy-c",
+      kind: "consumables",
+      stableId: "legacy-c",
+      name: "Old Potion",
+      config: { grade: "F" },
+    })
+    const item = await updateCatalogItem("consumables", "legacy-c", {
+      name: "Renamed Potion",
+    })
+    expect(item.name).toBe("Renamed Potion")
+    // The legacy config is preserved untouched, and no default amount is invented.
+    expect((item.config as Record<string, unknown>).grade).toBe("F")
+    expect((item.config as Record<string, unknown>).amount).toBeUndefined()
+  })
+
+  it("requires the modern full shape when a consumable config is changed", async () => {
+    dbMock.store.addCatalog({
+      id: "legacy-c",
+      kind: "consumables",
+      stableId: "legacy-c",
+      name: "Old Potion",
+      config: { grade: "F" },
+    })
+    await expect(
+      updateCatalogItem("consumables", "legacy-c", { config: { grade: "F" } })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The update never applied - the catalog row is unchanged.
+    expect(
+      (dbMock.store.catalog.get("legacy-c")!.config as Record<string, unknown>)
+        .grade
+    ).toBe("F")
+  })
+
+  it("requires the modern full shape when creating a consumable", async () => {
+    await expect(
+      createCatalogItem("consumables", {
+        name: "New Potion",
+        config: { grade: "F" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
   })
 })

@@ -25,6 +25,7 @@ import {
   type AdvanceResponse,
   type AllocateResponse,
   type AssociationResponse,
+  type ConsumeResponse,
   type ExportResponse,
   type EvolveResponse,
   type Grade,
@@ -204,6 +205,21 @@ function upgradeGroupFor(item: CatalogItem): string | undefined {
   return typeof group === "string" && group.length > 0 ? group : undefined
 }
 
+function consumableTypeFor(item: CatalogItem): "permanent" | "temporary" {
+  return item.config?.type === "temporary" ? "temporary" : "permanent"
+}
+
+function consumableAmountFor(item: CatalogItem): string {
+  return formatVector(
+    item.config?.amount as Partial<Record<AttributeKey, number>> | undefined
+  )
+}
+
+function consumableDurationFor(item: CatalogItem): number | undefined {
+  const d = item.config?.durationQuarters
+  return typeof d === "number" && Number.isFinite(d) ? d : undefined
+}
+
 /**
  * Right-hand panel for attaching/removing titles and equipment. It lists the
  * real catalog entries and calls the associations endpoint with the current
@@ -218,20 +234,26 @@ function AssociationSheet({
   character,
   titles,
   equipment,
+  consumables,
   loading,
   busy,
+  consumeBusy,
   onAdd,
   onRemove,
+  onConsume,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   character: CharacterDetail
   titles: CatalogItem[]
   equipment: CatalogItem[]
+  consumables: CatalogItem[]
   loading: boolean
   busy: boolean
+  consumeBusy: boolean
   onAdd: (kind: "title" | "equipment", definitionId: string) => void
   onRemove: (kind: "title" | "equipment", definitionId: string) => void
+  onConsume: (definitionId: string) => void
 }) {
   const linked = new Map(character.associations.map((a) => [a.definitionId, a]))
   const equipmentStatusById = new Map(
@@ -384,15 +406,91 @@ function AssociationSheet({
     )
   }
 
+  function consumableRow(item: CatalogItem) {
+    const permanent = consumableTypeFor(item) === "permanent"
+    return (
+      <div
+        key={item.id}
+        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+      >
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate font-medium">{item.name}</span>
+            <Badge variant={permanent ? "default" : "outline"}>
+              {permanent ? "Permanent" : "Temporary"}
+            </Badge>
+          </div>
+          <div className="text-[0.6875rem] text-muted-foreground">
+            Amount: {consumableAmountFor(item) || "0"}
+            {permanent
+              ? null
+              : ` - Duration: ${consumableDurationFor(item) ?? "?"} quarter(s)`}
+          </div>
+          <div className="text-[0.6875rem] text-muted-foreground">
+            Provenance: {item.provenance}
+          </div>
+          {permanent &&
+          character.permanentConsumableCap &&
+          character.permanentConsumableRemaining ? (
+            <div className="text-[0.6875rem] text-muted-foreground">
+              Cap: {formatVector(character.permanentConsumableCap)} - Remaining:{" "}
+              {formatVector(character.permanentConsumableRemaining)}
+            </div>
+          ) : null}
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={consumeBusy}
+          onClick={() => onConsume(item.id)}
+        >
+          Consume
+        </Button>
+      </div>
+    )
+  }
+
+  const permanentHistory = (character.state.permanentGains ?? []).filter(
+    (g) => (g as { kind?: string }).kind === "consumable"
+  ) as Array<{
+    id: string
+    source: string
+    vector?: Partial<Record<AttributeKey, number>>
+    requested?: Partial<Record<AttributeKey, number>>
+    capRemainingAfter?: Partial<Record<AttributeKey, number>>
+    gradeAtApplication?: string
+    raceLevelAtApplication?: number
+    appliedAt?: string | number
+  }>
+
+  // Only show temporary consumable effects that are still active: an effect with
+  // a recorded `expiresAt` is active while it is strictly greater than the
+  // current turn; effects without an expiry stay active indefinitely.
+  const currentTurn = character.state.turn
+  const activeTempEffects = (character.state.activeEffects ?? []).filter(
+    (e) =>
+      (e as { phase?: string }).phase === "temporary" &&
+      (e as { source?: string }).source === "consumable" &&
+      ((e as { expiresAt?: number }).expiresAt == null ||
+        (e as { expiresAt?: number }).expiresAt! > currentTurn)
+  ) as Array<{
+    id: string
+    source: string
+    provenance: string
+    expiresAt?: number
+    amount?: Partial<Record<AttributeKey, number>>
+  }>
+
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="flex flex-col gap-4">
         <SheetHeader>
-          <SheetTitle>Titles & equipment</SheetTitle>
+          <SheetTitle>Titles, equipment & consumables</SheetTitle>
           <SheetDescription>
-            Attach titles and equip equipment directly onto this character. This
-            is direct equip, not an inventory ownership claim - an inventory
-            system is deferred. Notes are written to the journal.
+            Attach titles, equip equipment, and consume consumables directly
+            onto this character. This is direct application, not an inventory
+            ownership claim - an inventory system is deferred. Actions are
+            written to the journal.
           </SheetDescription>
         </SheetHeader>
 
@@ -400,6 +498,7 @@ function AssociationSheet({
           <TabsList variant="line">
             <TabsTrigger value="titles">Titles</TabsTrigger>
             <TabsTrigger value="equipment">Equipment</TabsTrigger>
+            <TabsTrigger value="consumables">Consumables</TabsTrigger>
           </TabsList>
 
           <TabsContent value="titles" className="pt-3">
@@ -440,6 +539,80 @@ function AssociationSheet({
               are what these caps reject.
             </p>
           </TabsContent>
+
+          <TabsContent value="consumables" className="pt-3">
+            {loading ? (
+              <p className="text-xs text-muted-foreground">
+                Loading consumables...
+              </p>
+            ) : consumables.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No consumables in the catalog yet.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {consumables.map(consumableRow)}
+              </div>
+            )}
+
+            <Separator className="my-3" />
+
+            <div className="flex flex-col gap-2">
+              <h4 className="text-xs font-medium">Active temporary effects</h4>
+              {activeTempEffects.length === 0 ? (
+                <p className="text-[0.6875rem] text-muted-foreground">
+                  No active temporary consumable effects.
+                </p>
+              ) : (
+                activeTempEffects.map((effect) => (
+                  <div
+                    key={effect.id}
+                    className="rounded-lg border bg-input/20 p-2 text-xs/relaxed"
+                  >
+                    <div className="font-medium">
+                      {formatVector(effect.amount) || "0"}
+                    </div>
+                    <div className="text-[0.6875rem] text-muted-foreground">
+                      Expires at turn {effect.expiresAt ?? "?"} (
+                      {effect.provenance})
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="mt-3 flex flex-col gap-2">
+              <h4 className="text-xs font-medium">Permanent gains applied</h4>
+              {permanentHistory.length === 0 ? (
+                <p className="text-[0.6875rem] text-muted-foreground">
+                  No permanent consumable gains recorded yet.
+                </p>
+              ) : (
+                permanentHistory.map((gain) => (
+                  <div
+                    key={gain.id}
+                    className="rounded-lg border bg-input/20 p-2 text-xs/relaxed"
+                  >
+                    <div className="font-medium">{gain.source}</div>
+                    <div className="text-[0.6875rem] text-muted-foreground">
+                      Applied: {formatVector(gain.vector)} - Requested:{" "}
+                      {formatVector(gain.requested)}
+                      {gain.gradeAtApplication
+                        ? ` - Grade at application: ${gain.gradeAtApplication}`
+                        : ""}
+                      {typeof gain.raceLevelAtApplication === "number"
+                        ? ` - Race level: ${gain.raceLevelAtApplication}`
+                        : ""}
+                    </div>
+                    <div className="text-[0.6875rem] text-muted-foreground">
+                      Cap remaining after:{" "}
+                      {formatVector(gain.capRemainingAfter)}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </TabsContent>
         </Tabs>
       </SheetContent>
     </Sheet>
@@ -476,8 +649,14 @@ export function CharacterDetail() {
   const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
     []
   )
+  const [consumablesCatalog, setConsumablesCatalog] = React.useState<
+    CatalogItem[]
+  >([])
   const [catalogLoading, setCatalogLoading] = React.useState(false)
   const [assocBusy, setAssocBusy] = React.useState(false)
+  const [consumeBusy, setConsumeBusy] = React.useState(false)
+  const [consumeConfirm, setConsumeConfirm] =
+    React.useState<CatalogItem | null>(null)
 
   const reload = React.useCallback(async () => {
     if (!id) return
@@ -691,12 +870,13 @@ export function CharacterDetail() {
   }, [character])
 
   const loadCatalog = React.useCallback(
-    async (kind: "titles" | "equipment") => {
+    async (kind: "titles" | "equipment" | "consumables") => {
       setCatalogLoading(true)
       try {
         const res = await apiFetch<CatalogListResponse>(`/api/catalog/${kind}`)
         if (kind === "titles") setTitlesCatalog(res.items)
-        else setEquipmentCatalog(res.items)
+        else if (kind === "equipment") setEquipmentCatalog(res.items)
+        else setConsumablesCatalog(res.items)
       } catch (err) {
         toast.error(
           err instanceof Error ? err.message : "Failed to load catalog."
@@ -712,7 +892,13 @@ export function CharacterDetail() {
     setAssociationsOpen(true)
     if (titlesCatalog.length === 0) void loadCatalog("titles")
     if (equipmentCatalog.length === 0) void loadCatalog("equipment")
-  }, [titlesCatalog.length, equipmentCatalog.length, loadCatalog])
+    if (consumablesCatalog.length === 0) void loadCatalog("consumables")
+  }, [
+    titlesCatalog.length,
+    equipmentCatalog.length,
+    consumablesCatalog.length,
+    loadCatalog,
+  ])
 
   const addAssociation = React.useCallback(
     async (kind: "title" | "equipment", definitionId: string) => {
@@ -767,6 +953,52 @@ export function CharacterDetail() {
     },
     [character, reload]
   )
+
+  const doConsume = React.useCallback(
+    async (definitionId: string, name?: string) => {
+      if (!character) return
+      setConsumeBusy(true)
+      setError(null)
+      try {
+        await apiFetch<ConsumeResponse>(
+          `/api/characters/${character.id}/consume`,
+          {
+            ...jsonInit("POST", {
+              definitionId,
+              version: character.version,
+            }),
+          }
+        )
+        toast.success(`Consumed "${name ?? "consumable"}".`)
+        await reload()
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Consume failed.")
+      } finally {
+        setConsumeBusy(false)
+      }
+    },
+    [character, reload]
+  )
+
+  const requestConsume = React.useCallback(
+    (item: CatalogItem) => {
+      // Temporary effects are immediate; permanent gains cannot be undone, so
+      // they first require confirmation.
+      if (consumableTypeFor(item) === "permanent") {
+        setConsumeConfirm(item)
+      } else {
+        void doConsume(item.id, item.name)
+      }
+    },
+    [doConsume]
+  )
+
+  const confirmConsume = React.useCallback(async () => {
+    if (!consumeConfirm) return
+    const item = consumeConfirm
+    setConsumeConfirm(null)
+    await doConsume(item.id, item.name)
+  }, [consumeConfirm, doConsume])
 
   if (loading && !character) {
     return (
@@ -943,6 +1175,7 @@ export function CharacterDetail() {
             <TabsTrigger value="skills">Skills</TabsTrigger>
             <TabsTrigger value="titles">Titles</TabsTrigger>
             <TabsTrigger value="equipment">Equipment</TabsTrigger>
+            <TabsTrigger value="consumables">Consumables</TabsTrigger>
             <TabsTrigger value="history">History</TabsTrigger>
             <TabsTrigger value="notes">Notes</TabsTrigger>
           </TabsList>
@@ -1226,6 +1459,66 @@ export function CharacterDetail() {
             ) : null}
           </TabsContent>
 
+          <TabsContent value="consumables" className="pt-3">
+            <div className="flex items-start justify-between gap-3">
+              <p className="text-xs text-muted-foreground">
+                Consumables grant either a permanent stat gain (capped by the
+                grade-based race-level capacity) or a temporary effect that
+                expires after a number of quarters. Permanent gains are recorded
+                in the immutable journal and cannot be undone.
+              </p>
+              <Button variant="outline" size="sm" onClick={openAssociations}>
+                Manage consumables
+              </Button>
+            </div>
+
+            {status && status.consumables ? (
+              <div className="mt-3 overflow-x-auto rounded-lg border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Requested</TableHead>
+                      <TableHead>Applied</TableHead>
+                      <TableHead>Suppressed</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    <TableRow>
+                      <TableCell className="tabular-nums">
+                        {formatVector(status.consumables.requested)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatVector(status.consumables.applied)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatVector(status.consumables.suppressed)}
+                      </TableCell>
+                    </TableRow>
+                  </TableBody>
+                </Table>
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-muted-foreground">
+                No active temporary consumable effects.
+              </p>
+            )}
+
+            <div className="mt-4 flex flex-col gap-2">
+              <div className="flex items-center gap-1.5">
+                <Badge variant="outline">Cap</Badge>
+                <span className="text-xs tabular-nums">
+                  {formatVector(character.permanentConsumableCap)}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Badge variant="outline">Remaining</Badge>
+                <span className="text-xs tabular-nums">
+                  {formatVector(character.permanentConsumableRemaining)}
+                </span>
+              </div>
+            </div>
+          </TabsContent>
+
           <TabsContent value="history" className="pt-3">
             {events ? (
               <div className="flex flex-col gap-2">
@@ -1374,15 +1667,56 @@ export function CharacterDetail() {
           character={character}
           titles={titlesCatalog}
           equipment={equipmentCatalog}
+          consumables={consumablesCatalog}
           loading={catalogLoading}
           busy={assocBusy}
+          consumeBusy={consumeBusy}
           onAdd={(kind, definitionId) =>
             void addAssociation(kind, definitionId)
           }
           onRemove={(kind, definitionId) =>
             void removeAssociation(kind, definitionId)
           }
+          onConsume={(definitionId) => {
+            const item = consumablesCatalog.find((c) => c.id === definitionId)
+            if (item) requestConsume(item)
+          }}
         />
+
+        <Dialog
+          open={!!consumeConfirm}
+          onOpenChange={(open) => {
+            if (!open) setConsumeConfirm(null)
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Consume permanent consumable</DialogTitle>
+              <DialogDescription>
+                Applying &quot;{consumeConfirm?.name ?? ""}&quot; grants a
+                permanent attribute gain that cannot be undone by simply
+                unequipping. It is capped by the grade-based
+                permanent-consumable capacity (a house assumption,
+                F3/E5/D15/C45).
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setConsumeConfirm(null)}
+                disabled={consumeBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void confirmConsume()}
+                disabled={consumeBusy}
+              >
+                {consumeBusy ? "Consuming..." : "Consume"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </AppShell>
   )

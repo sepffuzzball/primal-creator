@@ -107,8 +107,7 @@ D-grade 100 / ~84; profession E-grade 22 / 27, D-grade 80 / ~66, C-grade 240).
 If the summed per-level bonus from all attributes would exceed the cap, the engine
 distributes the cap **proportionally** to the source values:
 
-- Suppose a class would grant raw bonuses summing to 40 at a grade where the cap is
-  34. Each attribute's bonus is scaled by 34/40 = 0.85.
+- Suppose a class would grant raw bonuses summing to 40 at a grade where the cap is 34. Each attribute's bonus is scaled by 34/40 = 0.85.
 - Implication: the engine never silently exceeds the cap; it scales the whole line
   down, which changes attribute ratios. This is a project choice (proportional
   distribution), not a source rule.
@@ -135,6 +134,15 @@ The equipment (20% individual / 15% combined) and consumable (F3 / E5 / D15 / C4
 rates are **assumptions**; changing them changes roll outcomes but never changes a
 sourced value. The engine must treat them as configuration, and the output
 provenance must tag them as assumptions so they are never mistaken for canon.
+
+The consumable grade rates are **per-level** rates on **permanent external stat
+gains** acquired from consumables, not a cap on temporary potions. A character's
+permanent consumable capacity for an attribute is the cumulative sum of the
+per-level rate across every race level attained through the grade bands (including
+the born-F vs integrated-G handling of the overlapping G/F bands). This capacity is
+enforced at application time, and a recorded gain is never re-capped by later
+config changes - historical facts are immutable. Temporary potion effects are
+bounded only by their effect duration.
 
 ## Verification status of inputs
 

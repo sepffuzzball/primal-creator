@@ -204,6 +204,17 @@ export interface RaceState {
   grade: Grade
   mode: RaceMode
   definitionId?: string
+  /**
+   * Provenance of the starting grade, recorded at character creation: `born`
+   * races enter at F-grade, `integrated` races at G-grade. Used to resolve the
+   * G/F overlapping band when applying the permanent consumable cap (a born
+   * race counts levels 1..9 at the F rate, not the G rate). Optional for
+   * backward compatibility with states created before this was tracked; when
+   * absent the engine defaults conservatively to `integrated` (never infers
+   * `born` from a non-G grade), and the DB service reconstructs the
+   * authoritative value from `Character.origin` on reads and before application.
+   */
+  origin?: "born" | "integrated"
 }
 
 export type RaceDerivationStrategy = "floorHalfAvg" | "maxOf" | "sum" | "none"
@@ -233,7 +244,7 @@ export interface AllocationEntry {
 }
 
 /** What a permanent gain modifies, used for race-level cap accounting. */
-export type PermanentKind = "raceLevel" | "buff"
+export type PermanentKind = "raceLevel" | "buff" | "consumable"
 
 export interface PermanentGain {
   id: string
@@ -243,7 +254,29 @@ export interface PermanentGain {
   grade?: Grade
   /** Number of race levels this gain represents (for cumulative caps). */
   count?: number
+  /**
+   * Applied attribute vector. For `consumable` gains this is the accepted amount
+   * (immutable once recorded); it is only ever less than `requested` when a cap
+   * enforces rejection in whole, and accepted entries therefore always equal it.
+   */
   vector: PartialVector
+  /**
+   * Requested attribute vector at the moment of application. Present (strictly)
+   * on new `consumable` entries so the pre-cap request is preserved as history;
+   * optional for backward compatibility with existing `raceLevel`/`buff` entries.
+   */
+  requested?: PartialVector
+  /** The character's grade when this gain was applied (consumable provenance). */
+  gradeAtApplication?: Grade
+  /** The character's race level when this gain was applied (consumable cap). */
+  raceLevelAtApplication?: number
+  /**
+   * Vector of remaining permanent-consumable capacity after this gain was
+   * applied, snapshotted so later config changes never re-cap historical facts.
+   */
+  capRemainingAfter?: PartialVector
+  /** ISO date string or numeric timestamp at which the gain was applied. */
+  appliedAt?: string | number
 }
 
 export interface EquipmentBonus {
@@ -341,12 +374,21 @@ export interface RulesConfig {
   equipmentCombinedCapPercent: number
 
   /**
-   * Consumable cumulative grade rates (assumption F3 / E5 / D15 / C45). A grade
-   * not present in the map falls back to `consumableFallbackRate`.
+   * Permanent consumable cumulative grade rates (assumption F3 / E5 / D15 / C45).
+   * These are PER-LEVEL rates on permanent external stat gains acquired from
+   * consumables, summed cumulatively across every race level attained through the
+   * grade bands. They do NOT cap temporary potions (which use only their effect
+   * duration). A grade not present in the map falls back to
+   * `consumableFallbackRate`; an unknown grade with no rate behaves as rate 0
+   * (a positive gain is then rejected against zero capacity).
    */
   consumableGradeRates: Partial<Record<Grade, number>>
 
-  /** Fallback rate when a character's grade has no consumable grade rate. */
+  /**
+   * Fallback rate for a grade with no configured consumable grade rate. Default 0,
+   * so unknown grades (B/A/S and G unless configured) reject positive permanent
+   * consumable gains rather than inventing a canonical multiplier.
+   */
   consumableFallbackRate: number
 
   /**

@@ -18,12 +18,17 @@ import { Prisma } from "@prisma/client"
 import {
   advanceQuarter,
   allocatePoints,
+  applyPermanentConsumable,
+  ATTRIBUTES,
   calculateStatus,
+  consumableToEffect,
   defaultRulesConfig,
   evolveGrade,
   gradeOrderIndex,
   makeVector,
+  permanentConsumableCap,
   zeroVector,
+  type AttributeVector,
   type CharacterState,
   type Grade,
   type PartialVector,
@@ -34,7 +39,11 @@ import {
   type TrackId,
 } from "@/lib/rules"
 import { prisma } from "@/lib/db/client"
-import { characterStateSchema, parseCatalogConfig } from "@/lib/server/schemas"
+import {
+  characterStateSchema,
+  isLegacyConsumableConfig,
+  parseCatalogConfig,
+} from "@/lib/server/schemas"
 import { badRequest, conflict, forbidden, notFound } from "@/lib/server/errors"
 import type { SessionUser } from "@/lib/auth/session"
 
@@ -84,6 +93,13 @@ export interface CharacterDetail {
   updatedAt: string
   associations: CharacterAssociationView[]
   status?: StatusResult
+  /**
+   * Server-computed permanent-consumable capacity per attribute (authoritative;
+   * the UI must not recompute this). Populated on every character detail read.
+   */
+  permanentConsumableCap?: PartialVector
+  /** Server-computed remaining permanent-consumable capacity per attribute. */
+  permanentConsumableRemaining?: PartialVector
 }
 
 export interface CharacterListItem {
@@ -258,6 +274,7 @@ export function createInitialState(
       level: 0,
       grade: origin === "born" ? "F" : "G",
       mode: "derived",
+      origin,
     },
     historicalLevelAwards: [],
     allocations: [],
@@ -392,6 +409,49 @@ function configFor(character: CharacterWithCatalog): RulesConfig {
   return buildRulesConfig(character.race)
 }
 
+/** Encode a full vector as a sparse `PartialVector` with only non-zero entries. */
+function toSparseVector(vec: AttributeVector): PartialVector {
+  const out: PartialVector = {}
+  for (const attr of ATTRIBUTES) {
+    if (vec[attr] !== 0) out[attr] = vec[attr]
+  }
+  return out
+}
+
+/**
+ * Server-computed, authoritative permanent-consumable capacity and remaining
+ * capacity per attribute. The UI must not recompute the grade-band cap, so it is
+ * derived here from the character's race level, origin and the server-held rules
+ * config (F3/E5/D15/C45). Used by the detail read so the Consumables sheet can
+ * show "current cap and remaining" without re-deriving the cap.
+ */
+function permanentConsumableInfo(character: CharacterWithCatalog): {
+  cap: PartialVector
+  remaining: PartialVector
+} {
+  const state = deserializeState(character.state)
+  const config = configFor(character)
+  // Capacity is always derived from the authoritative Character.origin column,
+  // never inferred from the grade. A legacy state that predates origin tracking
+  // is resolved against the DB row, so a born character is never mis-capped as
+  // integrated (or vice versa) just because `state.race.origin` is absent.
+  const origin: "born" | "integrated" = character.origin
+  const cap = permanentConsumableCap(state.race.level, config, { origin })
+  const used = zeroVector()
+  for (const g of state.permanentGains) {
+    if (g.kind !== "consumable") continue
+    for (const attr of ATTRIBUTES) {
+      const v = g.vector[attr]
+      if (typeof v === "number" && Number.isFinite(v)) used[attr] += v
+    }
+  }
+  const remaining = zeroVector()
+  for (const attr of ATTRIBUTES) {
+    remaining[attr] = Math.max(0, cap[attr] - used[attr])
+  }
+  return { cap: toSparseVector(cap), remaining: toSparseVector(remaining) }
+}
+
 function associationView(
   link: CharacterWithCatalog["associations"][number]
 ): CharacterAssociationView {
@@ -423,6 +483,7 @@ function toDetail(
   withStatus: boolean
 ): CharacterDetail {
   const config = configFor(character)
+  const consumableInfo = permanentConsumableInfo(character)
   return {
     id: character.id,
     name: character.name,
@@ -441,6 +502,8 @@ function toDetail(
     updatedAt: character.updatedAt.toISOString(),
     associations: character.associations.map(associationView),
     status: withStatus ? statusFor(character, config) : undefined,
+    permanentConsumableCap: consumableInfo.cap,
+    permanentConsumableRemaining: consumableInfo.remaining,
   }
 }
 
@@ -834,6 +897,205 @@ export async function evolveCharacter(
   })
 }
 
+/**
+ * Consume a catalog consumable onto a character.
+ *
+ * The consumer must be the owner or an admin, the target catalog entry must be
+ * an unarchived `consumables` definition, and the character must not be archived.
+ * Two kinds are supported, mirroring the consumable engine:
+ *   - `permanent`: `applyPermanentConsumable()` rejects the request in whole when
+ *     any attribute exceeds the cumulative per-attribute capacity (the grade-based
+ *     race-level cap). A recorded gain is immutable.
+ *   - `temporary`: `consumableToEffect()` produces a temporary effect with a unique
+ *     id and an `expiresAt` of `state.turn + durationQuarters`; it is NOT capped by
+ *     the grade rates. Expiry is automatic on quarter advancement (the engine drops
+ *     effects whose `expiresAt <= state.turn`).
+ *
+ * The mutation runs in a transaction that CASes the client-supplied `version`
+ * (a stale value 409s and rolls back the state write and the journal entry), then
+ * persists the new state, logs a `consume` progression event carrying a definition
+ * snapshot plus applied/requested/capRemainingAfter and a timestamp, and returns
+ * the updated character, its live status, and the event.
+ */
+export async function consumeCharacter(
+  id: string,
+  body: { definitionId: string; version: number },
+  user: SessionUser
+): Promise<{
+  character: CharacterDetail
+  status: StatusResult
+  event: unknown
+}> {
+  return prisma.$transaction(async (tx) => {
+    const row = await assertOwner(tx, id, user)
+    // A consumed item mutates the character, so an archived character is inert.
+    if (row.archived) {
+      throw badRequest(
+        "character_archived",
+        "Archived character cannot consume a consumable"
+      )
+    }
+
+    const definition = await tx.catalogDefinition.findUnique({
+      where: { id: body.definitionId },
+    })
+    if (!definition) {
+      throw notFound("catalog_not_found", "Catalog entry not found")
+    }
+    if (definition.kind !== "consumables") {
+      throw badRequest(
+        "wrong_kind",
+        `Catalog entry has wrong kind (expected "consumables")`
+      )
+    }
+    if (definition.archived) {
+      throw badRequest(
+        "catalog_archived",
+        "Catalog entry is archived and cannot be consumed"
+      )
+    }
+
+    const config = parseCatalogConfig(definition.kind, definition.config ?? {})
+    const state = deserializeState(row.state)
+    const rulesConfig = configFor(row)
+
+    // The engine never guesses provenance from the grade: origin is always
+    // reconstructed from the authoritative Character.origin column before any
+    // apply, and the mutation persists it so the ledger state becomes
+    // self-describing. This both fixes legacy states that predate origin
+    // tracking and guards against any drift between the state and the row.
+    const stateWithOrigin: CharacterState = {
+      ...state,
+      race: { ...state.race, origin: row.origin },
+    }
+
+    // A legacy catalog consumable config carries no usable type/amount and is
+    // metadata-only. It stays editable but must be rejected here with an
+    // actionable 400 rather than silently granted a fabricated default amount
+    // (an empty vector would otherwise be misreported as an over-cap error) or
+    // blow up as a 500 during config parsing.
+    if (definition.kind === "consumables" && isLegacyConsumableConfig(config)) {
+      throw badRequest(
+        "legacy_consumable_config",
+        `Consumable "${definition.name}" has no usable "type"/"amount" in its catalog config; add both to consume it`
+      )
+    }
+
+    const type = config.type === "temporary" ? "temporary" : "permanent"
+    const amount = (config.amount ?? {}) as PartialVector
+    const snapshot = {
+      id: definition.id,
+      name: definition.name,
+      stableId: definition.stableId,
+      kind: definition.kind,
+      config: (definition.config ?? {}) as Record<string, unknown>,
+      provenance: definition.provenance,
+      grade: definition.grade,
+      archived: definition.archived,
+    }
+
+    let nextState: CharacterState
+    let eventPayload: Record<string, unknown>
+
+    if (type === "permanent") {
+      const result = applyPermanentConsumable(
+        stateWithOrigin,
+        definition.name,
+        amount,
+        rulesConfig
+      )
+      if (!result.ok || !result.entry) {
+        throw badRequest(
+          "consumable_cap_exceeded",
+          result.errors.join("; ") || "Permanent consumable exceeds its cap"
+        )
+      }
+      nextState = result.state
+      eventPayload = {
+        definitionId: definition.id,
+        definition: snapshot,
+        type: "permanent",
+        amount,
+        applied: result.entry.vector,
+        requested: result.entry.requested ?? result.entry.vector,
+        capRemainingAfter: result.entry.capRemainingAfter ?? {},
+        appliedAt: new Date().toISOString(),
+      }
+    } else {
+      const durationQuarters = config.durationQuarters as number | undefined
+      if (durationQuarters == null) {
+        throw badRequest(
+          "validation",
+          "Temporary consumable requires durationQuarters"
+        )
+      }
+      // A unique effect id per consumption so repeated applications never collide.
+      const effectId = `${definition.id}:cons-${stateWithOrigin.turn}-${stateWithOrigin.activeEffects.length}`
+      const effect = consumableToEffect(
+        {
+          id: effectId,
+          name: definition.name,
+          group: (config.group as string | undefined) ?? "",
+          amount,
+          durationQuarters,
+          ...(definition.grade ? { grade: definition.grade as Grade } : {}),
+        },
+        stateWithOrigin
+      )
+      nextState = {
+        ...stateWithOrigin,
+        activeEffects: [...stateWithOrigin.activeEffects, effect],
+      }
+      eventPayload = {
+        definitionId: definition.id,
+        definition: snapshot,
+        type: "temporary",
+        amount,
+        applied: amount,
+        requested: amount,
+        effectId,
+        durationQuarters,
+        expiresAt: effect.expiresAt,
+        capRemainingAfter: {},
+        appliedAt: new Date().toISOString(),
+      }
+    }
+
+    const serialized = serializeState(nextState)
+    const updatedMany = await tx.character.updateMany({
+      where: { id, version: body.version },
+      data: {
+        state: serialized as Prisma.InputJsonValue,
+        version: { increment: 1 },
+      },
+    })
+    if (updatedMany.count !== 1) {
+      throw conflict(
+        "version_conflict",
+        `Version mismatch: expected ${body.version}, got a newer version`
+      )
+    }
+
+    await tx.progressionEvent.create({
+      data: {
+        characterId: id,
+        kind: "consume",
+        payload: eventPayload as Prisma.InputJsonValue,
+      },
+    })
+
+    const updated = (await tx.character.findUnique({
+      where: { id },
+      include: characterInclude,
+    }))!
+    return {
+      character: toDetail(updated, true),
+      status: statusFor(updated, rulesConfig),
+      event: { kind: "consume", payload: eventPayload },
+    }
+  })
+}
+
 /** Decode the equipment slot from a catalog definition's parsed config. */
 function definitionSlot(def: {
   kind: string
@@ -1180,6 +1442,14 @@ export async function createCatalogItem(
   }
 ): Promise<CatalogItem> {
   const config = parseConfigOr400(kind, input.config ?? {})
+  // A new consumable requires the modern full shape; legacy metadata-only configs
+  // are accepted only for existing entries whose config is not being changed.
+  if (kind === "consumables" && isLegacyConsumableConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Consumable config is missing required "type" and "amount" fields'
+    )
+  }
   let stableId = input.stableId
   if (!stableId) {
     stableId =
@@ -1303,8 +1573,19 @@ export async function updateCatalogItem(
   if (!existing || existing.kind !== kind) {
     throw notFound("catalog_not_found", "Catalog entry not found")
   }
-  const config =
-    patch.config != null ? parseConfigOr400(kind, patch.config) : undefined
+  // Legacy consumable configs remain editable for metadata-only PATCHes (no
+  // `config` in the payload): the existing config is re-parsed permissively. A
+  // config-changing PATCH, like a new POST, requires the modern full shape.
+  let config: Record<string, unknown> | undefined
+  if (patch.config != null) {
+    config = parseConfigOr400(kind, patch.config)
+    if (kind === "consumables" && isLegacyConsumableConfig(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Consumable config is missing required "type" and "amount" fields'
+      )
+    }
+  }
   const finalConfig = config ?? parseCatalogConfig(kind, existing.config ?? {})
   const finalArchived =
     patch.archived != null ? patch.archived : existing.archived

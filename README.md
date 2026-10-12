@@ -38,6 +38,13 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   `Character.state` and the event journal stay immutable, so editing a catalog
   entry recalculates status without rewriting history. This is direct equip, not
   an inventory claim (an inventory system is deferred).
+- **Consumables on a character**: a character can consume real catalog
+  consumables directly (direct consumption, not an inventory claim - an inventory
+  system is deferred). Permanent consumables grant a permanent external stat gain
+  capped by the grade-based race-level capacity (F3/E5/D15/C45, a **house**
+  assumption pending verification); temporary potions produce a temporary effect
+  that expires after a number of quarters. Every consumption mutates the stored
+  state and writes an immutable `consume` progression event to the journal.
 - **Auth & sessions**: email/password login with a JWT session cookie and an
   admin role. No real credentials are committed.
 
@@ -48,8 +55,6 @@ The engine and schema already account for these, but they are not wired up:
 - **Skill selection on a character**: skills exist in the catalog and the rules,
   but a character does not store skill references, so the Skills tab is a
   placeholder.
-- **Consumables on a character**: the engine computes consumable status, but
-  there is no way to attach or show them.
 - **Special abilities calculation**: the creation form records a "has special
   abilities" flag, but it is informational and does not change any numbers.
 - **Uploading portraits / user media**: assets are metadata-only (an `Asset`

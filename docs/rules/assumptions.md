@@ -35,7 +35,18 @@ No `Consumables` page; no published drop/craft rates (see
 - **Key:** `consumable.rates.D` - **Default: 15**
 - **Key:** `consumable.rates.C` - **Default: 45**
 
-Meaning: a base weight/rate mapped to each grade band (F, E, D, C).
+Meaning: a base per-level rate/weight mapped to each grade band (F, E, D, C),
+applied **cumulatively to permanent external stat gains per race level**. A
+character's permanent consumable capacity for an attribute is the sum of the
+per-level rate across every race level attained through those bands. Temporary
+potion effects are **not** capped by these rates - they use only their effect
+duration.
+
+- **G-grade and unknown grades: rate 0** by default (`consumable.rates.G` unset).
+  A **born** race counts levels 1..9 at the **F rate** because it enters the
+  system at F-grade; an **integrated** race counts levels 1..9 at the **G rate**
+  (0 unless configured). The overlapping G/F bands are resolved by provenance, so
+  we do not invent a canonical G multiplier.
 
 ## 3. Race-level rounding and missing track
 
@@ -110,6 +121,7 @@ invisible threshold" (see `docs/rules/transcendents.md`). House choice:
 
 Evolution blocks further experience gains until completed, and a multi-track
 participant may defer one track (see `docs/rules/evolution.md`). House choice:
+
 - **Key:** `evolution.blockExpWhilePending` - **Default: `true`** (matches source).
 - **Key:** `evolution.allowDeferTrack` - **Default: `true`** (matches source).
 

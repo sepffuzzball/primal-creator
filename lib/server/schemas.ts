@@ -79,6 +79,7 @@ const raceStateSchema = z.object({
   grade: gradeSchema,
   mode: z.enum(["derived", "independent"]),
   definitionId: z.string().optional(),
+  origin: z.enum(["integrated", "born"]).optional(),
 })
 
 const levelAwardSchema = z.object({
@@ -99,10 +100,15 @@ const allocationEntrySchema = z.object({
 const permanentGainSchema = z.object({
   id: z.string(),
   source: z.string(),
-  kind: z.enum(["raceLevel", "buff"]),
+  kind: z.enum(["raceLevel", "buff", "consumable"]),
   grade: gradeSchema.optional(),
   count: z.number().int().optional(),
   vector: partialVectorSchema,
+  requested: partialVectorSchema.optional(),
+  gradeAtApplication: gradeSchema.optional(),
+  raceLevelAtApplication: z.number().int().nonnegative().optional(),
+  capRemainingAfter: partialVectorSchema.optional(),
+  appliedAt: z.union([z.string(), z.number()]).optional(),
 })
 
 const effectConditionSchema = z.union([
@@ -201,6 +207,11 @@ export const advanceSchema = z.object({
 
 export const allocateSchema = z.object({
   allocation: partialVectorSchema,
+  version: z.number().int().nonnegative(),
+})
+
+export const consumeSchema = z.object({
+  definitionId: z.string().min(1),
   version: z.number().int().nonnegative(),
 })
 
@@ -323,14 +334,81 @@ export const bloodlineConfigSchema = z
   })
   .passthrough()
 
+/**
+ * Catalog config for a `consumables` entry.
+ *
+ * A consumable is exactly one of two kinds:
+ *   - `permanent`: grants a permanent external stat gain, capped by the grade-based
+ *     race-level capacity (F3/E5/D15/C45). It must NOT carry `durationQuarters`.
+ *   - `temporary`: produces a temporary effect that lasts `durationQuarters` quarters
+ *     and is NOT capped by the grade rates. It MUST carry a positive `durationQuarters`.
+ *
+ * `amount` is a non-negative integer partial vector that must request at least one
+ * positive attribute (an all-zero amount is rejected as empty).
+ *
+ * Legacy entries created before the `type`/`amount` shape was hardened may omit
+ * either field. Such a config is accepted here (metadata-only, so the catalog
+ * stays readable/editable) and is rejected only at consume time with an
+ * actionable `legacy_consumable_config` error - never granted a fabricated
+ * default amount. New POSTs and config-changing PATCHes are required by the
+ * service layer to carry the modern full shape (see `isLegacyConsumableConfig`).
+ */
 export const consumableConfigSchema = z
   .object({
+    type: z.enum(["permanent", "temporary"]).optional(),
+    amount: nonnegativePartialVectorSchema.optional(),
+    durationQuarters: z.number().int().positive().optional(),
     group: z.string().optional(),
-    amount: partialVectorSchema.optional(),
-    durationQuarters: z.number().int().nonnegative().optional(),
     grade: gradeSchema.optional(),
   })
   .passthrough()
+  .superRefine((config, ctx) => {
+    const { type, amount, durationQuarters } = config
+    // A legacy consumable config (missing `type` or `amount`) is metadata-only
+    // and is skipped here; consume rejects it explicitly rather than inventing a
+    // default amount.
+    if (type == null || amount == null) return
+    const hasPositive = Object.values(amount).some(
+      (v) => typeof v === "number" && Number.isFinite(v) && v > 0
+    )
+    if (!hasPositive) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "consumable amount must request at least one positive attribute",
+        path: ["amount"],
+      })
+    }
+    if (type === "temporary" && durationQuarters == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "temporary consumable requires durationQuarters (a positive integer)",
+        path: ["durationQuarters"],
+      })
+    }
+    if (type === "permanent" && durationQuarters != null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "permanent consumable forbids durationQuarters",
+        path: ["durationQuarters"],
+      })
+    }
+  })
+
+/**
+ * Detect a `consumables` config that lacks the modern `type`/`amount` shape.
+ * Such a config is permitted for reads and metadata-only PATCHes (see
+ * `consumableConfigSchema`), but the service layer requires the modern full
+ * shape whenever a consumable is created or its config is changed, and rejects
+ * it with an actionable error at consume time. This avoids accepting a
+ * fabricated default amount.
+ */
+export function isLegacyConsumableConfig(
+  config: Record<string, unknown>
+): boolean {
+  return config.type == null || config.amount == null
+}
 
 export const evolutionConfigSchema = z
   .object({
