@@ -159,7 +159,7 @@ without a source citation.
 - **Next.js 16.4** (App Router, `output: "standalone"`), React 19
 - **Prisma 6.19** + PostgreSQL (client + migration tooling)
 - **pnpm 12** (see `packageManager`/lockfile)
-- TypeScript, ESLint, Vitest, Prettier (Tailwind plugin)
+- TypeScript, ESLint, Vitest, Prettier (Tailwind plugin), Playwright (browser E2E)
 
 ## Local development
 
@@ -186,6 +186,70 @@ pnpm typecheck
 pnpm test
 pnpm build
 ```
+
+### Browser E2E (Playwright)
+
+The authenticated character lifecycle is covered by a Playwright Chromium E2E
+test (`e2e/character-flow.spec.ts`). It logs in through the UI, asserts the
+dashboard starts empty, walks the eight-step questionnaire (born / Human /
+Archer / no profession), creates a uniquely-named character, advances the class
+track four quarters, allocates one attribute point, and archives the character.
+
+The E2E is designed to run against a **fresh, isolated test database** with a
+**dedicated test-only admin account** - never against your real user data. The
+seed creates no characters and no draft, so a freshly migrated and seeded test
+database starts empty, and the test asserts that up front (it fails loudly
+rather than cleaning up) before creating anything. The only character it ever
+changes is the one it creates, which it archives at the end and never restores.
+Repeated runs against the same test database are fine: prior runs leave that
+character archived, and the dashboard excludes archived characters by default,
+so leftovers never reappear as active and are never touched.
+
+These tests are **gated**: an ordinary `pnpm test:e2e` refuses to run unless both
+hold, so your dev database is never accidentally mutated:
+
+- `RUN_BROWSER_TESTS=1` is set, and
+- the effective `DATABASE_URL` names an isolated **test** database (the name
+  must contain `_test` or `test_`, e.g. `primal_creator_test`).
+
+The test database must start with **no active characters and no resumable
+draft**; if it does, the test fails with a clear message telling you to
+drop/reseed. Do not point it at a database that already holds real characters.
+
+To run them locally against a scratch database (Chromium is installed on first
+run; Linux may need `pnpm exec playwright install --with-deps chromium`):
+
+```bash
+# 1. Create a fresh, isolated test database (name contains `_test`).
+createdb primal_creator_test
+
+# 2. Migrate and seed it with test-only admin credentials. The seed creates no
+#    characters and no draft, so the database starts empty.
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public" \
+ADMIN_EMAIL="admin@primal.local" \
+ADMIN_PASSWORD="PrimalE2eStrongPass-9713" \
+  pnpm db:migrate
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public" \
+ADMIN_EMAIL="admin@primal.local" \
+ADMIN_PASSWORD="PrimalE2eStrongPass-9713" \
+  pnpm db:seed
+
+# 3. Run the browser tests with the SAME dedicated test account. The credentials
+#    must match the seeded admin exactly, and this account is the only one the
+#    tests log in as - user data is never touched.
+RUN_BROWSER_TESTS=1 \
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public" \
+E2E_ADMIN_EMAIL="admin@primal.local" \
+E2E_ADMIN_PASSWORD="PrimalE2eStrongPass-9713" \
+  pnpm test:e2e
+```
+
+Playwright starts the app itself on `127.0.0.1:3101` via the `webServer` block
+(`pnpm dev -p 3101`), so you do not need to run `pnpm dev` first. It always
+starts its own server (`reuseExistingServer: false`): if something is already
+listening on that port (for example a dev server pointed at a different
+database), the run fails on the port conflict instead of silently reusing the
+wrong server. Passwords are test-only placeholders and are never committed.
 
 ## Docker / Compose
 
@@ -266,12 +330,14 @@ See `docs/deployment.md` for the full deployment, operation and restore guide.
 ## CI / CD
 
 - **CI (`ci.yml`)**: on pull requests only - lint, formatting, typecheck, unit
-  tests, build, plus a Postgres-backed migration + seed + smoke job. Never
+  tests, build, plus a Postgres-backed migration + seed + smoke job and an
+  isolated `primal_creator_test` Playwright browser-checks job (Chromium). Never
   publishes.
 - **Docker (`docker.yml`)**: on push to `main` and version tags - prerequisite
-  checks, then a multi-arch (`linux/amd64`, `linux/arm64`) Buildx build with
-  GHCR caching, using a scoped `GITHUB_TOKEN`, pushed to
-  `ghcr.io/sepffuzzball/primal-creator`.
+  checks, DB integration checks, and a Playwright browser-checks job (Chromium)
+  against an isolated `primal_creator_test` database; only then a multi-arch
+  (`linux/amd64`, `linux/arm64`) Buildx build with GHCR caching, using a scoped
+  `GITHUB_TOKEN`, pushed to `ghcr.io/sepffuzzball/primal-creator`.
 
 ## License
 

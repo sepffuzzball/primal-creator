@@ -46,7 +46,11 @@ async function seedUser(): Promise<void> {
   })
 }
 
-function expectCode(res: Response, status: number, code: string): Promise<void> {
+function expectCode(
+  res: Response,
+  status: number,
+  code: string
+): Promise<void> {
   expect(res.status).toBe(status)
   return res.json().then((body: { error: { code: string } }) => {
     expect(body.error.code).toBe(code)

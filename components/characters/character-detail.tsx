@@ -40,7 +40,7 @@ import {
 } from "@/lib/api"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Button, buttonVariants } from "@/components/ui/button"
-import { AppShell, useAppShell } from "@/components/app-shell"
+import { useAppShell } from "@/components/app-shell"
 import { AllocationEditor } from "@/components/characters/allocation-editor"
 import { Alert } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -636,7 +636,11 @@ function AssociationSheet({
   )
 }
 
-export function CharacterDetail() {
+export function CharacterDetail({
+  onNameChange,
+}: {
+  onNameChange?: (name: string) => void
+}) {
   const params = useParams<{ id: string }>()
   const id = params.id
   const { user } = useAppShell()
@@ -689,6 +693,11 @@ export function CharacterDetail() {
   const [portrait, setPortrait] = React.useState<PortraitView | null>(null)
   const [portraitBusy, setPortraitBusy] = React.useState(false)
   const [removePortraitOpen, setRemovePortraitOpen] = React.useState(false)
+
+  // Last character name reported upstream to the breadcrumb. Used to fire
+  // onNameChange only when the successfully fetched name actually changes,
+  // never on every render.
+  const lastReportedName = React.useRef<string | null>(null)
 
   const reload = React.useCallback(async () => {
     if (!id) return
@@ -829,6 +838,18 @@ export function CharacterDetail() {
       active = false
     }
   }, [id])
+
+  // Report the character name upstream (to the breadcrumb) only when the
+  // successfully fetched name changes, not on every render. The ref guard
+  // keeps onNameChange from firing again for the same name (e.g. Strict Mode's
+  // double-invoked effects, or a reload that returns an unchanged name).
+  React.useEffect(() => {
+    const name = character?.name ?? null
+    if (name === null) return
+    if (lastReportedName.current === name) return
+    lastReportedName.current = name
+    onNameChange?.(name)
+  }, [character?.name, onNameChange])
 
   // Load the immutable journal when the History tab is first opened.
   React.useEffect(() => {
@@ -1205,25 +1226,21 @@ export function CharacterDetail() {
 
   if (loading && !character) {
     return (
-      <AppShell breadcrumbs={[{ label: "Character" }]}>
-        <div className="flex flex-col gap-4">
-          <div className="h-6 w-1/3 animate-pulse rounded bg-muted" />
-          <div className="h-32 animate-pulse rounded-lg bg-muted" />
-        </div>
-      </AppShell>
+      <div className="flex flex-col gap-4">
+        <div className="h-6 w-1/3 animate-pulse rounded bg-muted" />
+        <div className="h-32 animate-pulse rounded-lg bg-muted" />
+      </div>
     )
   }
 
   if (error && !character) {
     return (
-      <AppShell breadcrumbs={[{ label: "Character" }]}>
-        <Alert variant="destructive">
-          {error}{" "}
-          <Button variant="outline" className="ml-2" onClick={reload}>
-            Retry
-          </Button>
-        </Alert>
-      </AppShell>
+      <Alert variant="destructive">
+        {error}{" "}
+        <Button variant="outline" className="ml-2" onClick={reload}>
+          Retry
+        </Button>
+      </Alert>
     )
   }
 
@@ -1247,1054 +1264,1027 @@ export function CharacterDetail() {
     (a) => a.kind === "skill"
   )
 
-  const breadcrumbs = [
-    { label: "Characters", href: "/" },
-    { label: character.name },
-  ]
-
   return (
-    <AppShell breadcrumbs={breadcrumbs}>
-      <div className="flex flex-col gap-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="flex min-w-0 items-start gap-3">
-            <div className="relative shrink-0">
-              <Avatar size="lg" className="size-12">
-                {portrait?.url ? (
-                  <AvatarImage
-                    src={portrait.url}
-                    alt={`${character.name} portrait`}
-                    className="size-12"
-                  />
-                ) : null}
-                <AvatarFallback className="text-sm">
-                  {character.name.charAt(0).toUpperCase()}
-                </AvatarFallback>
-              </Avatar>
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h1 className="truncate font-heading text-lg font-medium">
-                  {character.name}
-                </h1>
-                {character.archived ? <Badge>Archived</Badge> : null}
-                <Badge variant="outline" className="capitalize">
-                  {character.origin}
-                </Badge>
-                <Badge variant="outline">
-                  Grade {state.race.grade} (level {state.race.level})
-                </Badge>
-                <Badge variant="outline">v{character.version}</Badge>
-              </div>
-              <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
-                {[
-                  character.raceName,
-                  character.className,
-                  character.professionName,
-                ]
-                  .filter(Boolean)
-                  .map((name, i) => (
-                    <React.Fragment key={name}>
-                      {i > 0 ? <ChevronRightIcon className="size-3" /> : null}
-                      <span>{name}</span>
-                    </React.Fragment>
-                  ))}
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                {!character.archived ? (
-                  <label
-                    htmlFor="portrait-upload"
-                    className={cn(
-                      buttonVariants({ variant: "outline", size: "sm" }),
-                      "cursor-pointer"
-                    )}
-                  >
-                    <UploadIcon />
-                    Upload portrait
-                  </label>
-                ) : null}
-                {portrait ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="gap-1"
-                    onClick={() => setRemovePortraitOpen(true)}
-                    disabled={portraitBusy}
-                  >
-                    <Trash2Icon />
-                    Remove
-                  </Button>
-                ) : null}
-              </div>
-            </div>
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <div className="relative shrink-0">
+            <Avatar size="lg" className="size-12">
+              {portrait?.url ? (
+                <AvatarImage
+                  src={portrait.url}
+                  alt={`${character.name} portrait`}
+                  className="size-12"
+                />
+              ) : null}
+              <AvatarFallback className="text-sm">
+                {character.name.charAt(0).toUpperCase()}
+              </AvatarFallback>
+            </Avatar>
           </div>
-          <input
-            id="portrait-upload"
-            type="file"
-            accept="image/png,image/jpeg,image/webp"
-            className="sr-only"
-            disabled={portraitBusy}
-            onChange={onPortraitFileChange}
-          />
-          <div className="flex items-center gap-1">
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1"
-              onClick={exportCharacter}
-            >
-              <DownloadIcon />
-              Export
-            </Button>
-            {character.archived ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1"
-                onClick={restore}
-                disabled={busy}
-              >
-                <RotateCcwIcon />
-                Restore
-              </Button>
-            ) : (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1"
-                onClick={archive}
-                disabled={busy}
-              >
-                <ArchiveIcon />
-                Archive
-              </Button>
-            )}
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <h1 className="truncate font-heading text-lg font-medium">
+                {character.name}
+              </h1>
+              {character.archived ? <Badge>Archived</Badge> : null}
+              <Badge variant="outline" className="capitalize">
+                {character.origin}
+              </Badge>
+              <Badge variant="outline">
+                Grade {state.race.grade} (level {state.race.level})
+              </Badge>
+              <Badge variant="outline">v{character.version}</Badge>
+            </div>
+            <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+              {[
+                character.raceName,
+                character.className,
+                character.professionName,
+              ]
+                .filter(Boolean)
+                .map((name, i) => (
+                  <React.Fragment key={name}>
+                    {i > 0 ? <ChevronRightIcon className="size-3" /> : null}
+                    <span>{name}</span>
+                  </React.Fragment>
+                ))}
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              {!character.archived ? (
+                <label
+                  htmlFor="portrait-upload"
+                  className={cn(
+                    buttonVariants({ variant: "outline", size: "sm" }),
+                    "cursor-pointer"
+                  )}
+                >
+                  <UploadIcon />
+                  Upload portrait
+                </label>
+              ) : null}
+              {portrait ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1"
+                  onClick={() => setRemovePortraitOpen(true)}
+                  disabled={portraitBusy}
+                >
+                  <Trash2Icon />
+                  Remove
+                </Button>
+              ) : null}
+            </div>
           </div>
         </div>
-
-        {error ? <Alert variant="destructive">{error}</Alert> : null}
-
-        <div className="flex flex-wrap items-center gap-2">
+        <input
+          id="portrait-upload"
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          className="sr-only"
+          disabled={portraitBusy}
+          onChange={onPortraitFileChange}
+        />
+        <div className="flex items-center gap-1">
           <Button
             variant="outline"
             size="sm"
             className="gap-1"
-            onClick={() => advance("class")}
-            disabled={busy || !classTrack}
+            onClick={exportCharacter}
           >
-            <ArrowUpIcon />
-            Advance class
-            {classTrack ? ` (L${classTrack.level} Q${classTrack.quarter})` : ""}
+            <DownloadIcon />
+            Export
           </Button>
-          {professionTrack ? (
+          {character.archived ? (
             <Button
               variant="outline"
               size="sm"
               className="gap-1"
-              onClick={() => advance("profession")}
+              onClick={restore}
               disabled={busy}
             >
-              <ArrowUpIcon />
-              Advance profession (L{professionTrack.level} Q
-              {professionTrack.quarter})
+              <RotateCcwIcon />
+              Restore
             </Button>
-          ) : null}
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={archive}
+              disabled={busy}
+            >
+              <ArchiveIcon />
+              Archive
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {error ? <Alert variant="destructive">{error}</Alert> : null}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="gap-1"
+          onClick={() => advance("class")}
+          disabled={busy || !classTrack}
+        >
+          <ArrowUpIcon />
+          Advance class
+          {classTrack ? ` (L${classTrack.level} Q${classTrack.quarter})` : ""}
+        </Button>
+        {professionTrack ? (
           <Button
             variant="outline"
             size="sm"
             className="gap-1"
-            onClick={() => {
-              setEvolveError(null)
-              setEvolveOpen(true)
-            }}
-            disabled={busy || evolveBusy || !evolveTarget}
-            title={
-              evolveTarget
-                ? `Evolve race grade to ${evolveTarget}`
-                : "No higher race grade reached at this level yet"
-            }
-            aria-label={
-              evolveTarget
-                ? `Evolve race grade to ${evolveTarget}`
-                : "Evolve race grade"
-            }
+            onClick={() => advance("profession")}
+            disabled={busy}
           >
-            <SparklesIcon />
-            Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
+            <ArrowUpIcon />
+            Advance profession (L{professionTrack.level} Q
+            {professionTrack.quarter})
           </Button>
-        </div>
+        ) : null}
+        <Button
+          variant="outline"
+          size="sm"
+          className="gap-1"
+          onClick={() => {
+            setEvolveError(null)
+            setEvolveOpen(true)
+          }}
+          disabled={busy || evolveBusy || !evolveTarget}
+          title={
+            evolveTarget
+              ? `Evolve race grade to ${evolveTarget}`
+              : "No higher race grade reached at this level yet"
+          }
+          aria-label={
+            evolveTarget
+              ? `Evolve race grade to ${evolveTarget}`
+              : "Evolve race grade"
+          }
+        >
+          <SparklesIcon />
+          Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
+        </Button>
+      </div>
 
-        <Tabs value={activeTab} onValueChange={(v) => v && setActiveTab(v)}>
-          <TabsList variant="line">
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="attributes">Attributes</TabsTrigger>
-            <TabsTrigger value="identity">
-              Race / Class / Profession
-            </TabsTrigger>
-            <TabsTrigger value="skills">Skills</TabsTrigger>
-            <TabsTrigger value="titles">Titles</TabsTrigger>
-            <TabsTrigger value="equipment">Equipment</TabsTrigger>
-            <TabsTrigger value="consumables">Consumables</TabsTrigger>
-            <TabsTrigger value="history">History</TabsTrigger>
-            <TabsTrigger value="notes">Notes</TabsTrigger>
-          </TabsList>
+      <Tabs value={activeTab} onValueChange={(v) => v && setActiveTab(v)}>
+        <TabsList variant="line">
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="attributes">Attributes</TabsTrigger>
+          <TabsTrigger value="identity">Race / Class / Profession</TabsTrigger>
+          <TabsTrigger value="skills">Skills</TabsTrigger>
+          <TabsTrigger value="titles">Titles</TabsTrigger>
+          <TabsTrigger value="equipment">Equipment</TabsTrigger>
+          <TabsTrigger value="consumables">Consumables</TabsTrigger>
+          <TabsTrigger value="history">History</TabsTrigger>
+          <TabsTrigger value="notes">Notes</TabsTrigger>
+        </TabsList>
 
-          <TabsContent value="overview" className="pt-3">
-            <Card>
-              <CardContent>
-                <div className="flex flex-col gap-1">
-                  <MetaRow label="Description">
-                    {character.description?.trim() || "No description"}
-                  </MetaRow>
-                  <MetaRow label="Origin">{character.origin}</MetaRow>
-                  <MetaRow label="Race">
-                    {character.raceName ?? "Not set"}
-                  </MetaRow>
-                  <MetaRow label="Class">
-                    {character.className ?? "Not set"}
-                  </MetaRow>
-                  <MetaRow label="Profession">
-                    {character.professionName ?? "None"}
-                  </MetaRow>
-                  <MetaRow label="Updated">{character.updatedAt}</MetaRow>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="attributes" className="pt-3">
-            {status ? (
-              <div className="flex flex-col gap-4">
-                <div className="flex flex-wrap gap-1.5">
-                  <Badge variant="outline">
-                    Available points: {status.availablePoints}
-                  </Badge>
-                  <Badge variant="outline">
-                    Total free: {status.totalFreePoints}
-                  </Badge>
-                  <Badge variant="outline">
-                    Allocated: {status.allocatedPoints}
-                  </Badge>
-                </div>
-
-                <div className="overflow-x-auto rounded-lg border">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Attribute</TableHead>
-                        <TableHead className="text-right">Value</TableHead>
-                        <TableHead>Trace</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {status.traces.map((trace) => (
-                        <TableRow key={trace.attribute}>
-                          <TableCell className="capitalize">
-                            {trace.attribute}
-                          </TableCell>
-                          <TableCell className="text-right tabular-nums">
-                            {trace.final}
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex flex-col gap-0.5">
-                              {trace.phases.map((phase) => (
-                                <span
-                                  key={phase.phase}
-                                  className="flex justify-between text-[0.6875rem] text-muted-foreground"
-                                >
-                                  <span>{phase.phase}</span>
-                                  <span className="tabular-nums">
-                                    {phase.value}
-                                    {phase.delta >= 0 ? " (+" : " ("}
-                                    {phase.delta}){" "}
-                                  </span>
-                                </span>
-                              ))}
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-
-                <Card>
-                  <CardContent>
-                    <h3 className="mb-2 font-heading text-sm font-medium">
-                      Allocate points
-                    </h3>
-                    <AllocationEditor
-                      status={status}
-                      onAllocate={allocate}
-                      busy={busy}
-                    />
-                  </CardContent>
-                </Card>
+        <TabsContent value="overview" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex flex-col gap-1">
+                <MetaRow label="Description">
+                  {character.description?.trim() || "No description"}
+                </MetaRow>
+                <MetaRow label="Origin">{character.origin}</MetaRow>
+                <MetaRow label="Race">
+                  {character.raceName ?? "Not set"}
+                </MetaRow>
+                <MetaRow label="Class">
+                  {character.className ?? "Not set"}
+                </MetaRow>
+                <MetaRow label="Profession">
+                  {character.professionName ?? "None"}
+                </MetaRow>
+                <MetaRow label="Updated">{character.updatedAt}</MetaRow>
               </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                Status is not available.
-              </p>
-            )}
-          </TabsContent>
+            </CardContent>
+          </Card>
+        </TabsContent>
 
-          <TabsContent value="identity" className="pt-3">
-            <Card>
-              <CardContent>
-                <div className="flex flex-col gap-1">
-                  <MetaRow label="Race">
-                    {character.raceName ?? "Not set"}
-                  </MetaRow>
-                  <MetaRow label="Class">
-                    {character.className ?? "Not set"}
-                  </MetaRow>
-                  <MetaRow label="Profession">
-                    {character.professionName ?? "None"}
-                  </MetaRow>
-                  <MetaRow label="Race grade">
-                    {state.race.grade} (mode {state.race.mode})
-                  </MetaRow>
-                  <MetaRow label="Race level">{state.race.level}</MetaRow>
-                  <MetaRow label="Class level">
-                    {classTrack
-                      ? `${classTrack.level} (quarter ${classTrack.quarter})`
-                      : "None"}
-                  </MetaRow>
-                  <MetaRow label="Profession level">
-                    {professionTrack
-                      ? `${professionTrack.level} (quarter ${professionTrack.quarter})`
-                      : "None"}
-                  </MetaRow>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
+        <TabsContent value="attributes" className="pt-3">
+          {status ? (
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-wrap gap-1.5">
+                <Badge variant="outline">
+                  Available points: {status.availablePoints}
+                </Badge>
+                <Badge variant="outline">
+                  Total free: {status.totalFreePoints}
+                </Badge>
+                <Badge variant="outline">
+                  Allocated: {status.allocatedPoints}
+                </Badge>
+              </div>
 
-          <TabsContent value="skills" className="pt-3">
-            <Card>
-              <CardContent>
-                <div className="flex flex-col gap-4">
-                  <div>
-                    <h3 className="font-heading text-sm font-medium">
-                      Skill offers
-                    </h3>
-                    <p className="text-xs text-muted-foreground">
-                      Skills are offered at class/profession milestones - never
-                      auto-awarded. Choose one option from a pending offer, or
-                      re-open the catalog to edit what is offered.
-                    </p>
-                  </div>
-
-                  {character.skillOffers.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No skill offers yet. Advance a class or profession to its
-                      milestone to be offered skills.
-                    </p>
-                  ) : (
-                    <div className="flex flex-col gap-2">
-                      {character.skillOffers.map((offer) => {
-                        const allArchived =
-                          offer.options.length > 0 &&
-                          offer.options.every((o) => o.archived)
-                        const selected = offer.selectedDefinitionId
-                        const selectedName = selected
-                          ? (offer.options.find(
-                              (o) => o.definitionId === selected
-                            )?.nameSnapshot ?? null)
-                          : null
-                        return (
-                          <div
-                            key={offer.id}
-                            className="rounded-lg border bg-input/20 p-2"
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="font-medium">
-                                {offer.track === "class"
-                                  ? "Class"
-                                  : "Profession"}{" "}
-                                level {offer.level} - {offer.choiceGroup}
-                              </span>
-                              {selected ? (
-                                <Badge variant="outline">Selected</Badge>
-                              ) : allArchived ? (
-                                <Badge variant="outline">Blocked</Badge>
-                              ) : (
-                                <Badge variant="outline">Pending</Badge>
-                              )}
-                            </div>
-                            {selected ? (
-                              <div className="text-xs text-muted-foreground">
-                                Selected: {selectedName ?? "?"}
-                              </div>
-                            ) : (
-                              <div className="mt-1 flex flex-col gap-1.5">
-                                {offer.options.map((opt) => (
-                                  <div
-                                    key={opt.definitionId}
-                                    className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-1.5"
-                                  >
-                                    <div className="min-w-0">
-                                      <div className="flex flex-wrap items-center gap-1.5">
-                                        <span className="truncate font-medium">
-                                          {opt.nameSnapshot}
-                                        </span>
-                                        {opt.grade ? (
-                                          <Badge variant="outline">
-                                            {opt.grade}
-                                          </Badge>
-                                        ) : null}
-                                        {opt.archived ? (
-                                          <Badge variant="outline">
-                                            Archived
-                                          </Badge>
-                                        ) : null}
-                                      </div>
-                                      <div className="text-[0.6875rem] text-muted-foreground">
-                                        Provenance: {opt.provenance ?? "house"}
-                                        {opt.archived
-                                          ? " - unavailable until re-enabled in the catalog"
-                                          : ""}
-                                      </div>
-                                    </div>
-                                    {opt.archived ? null : (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={skillBusy}
-                                        onClick={() =>
-                                          setSelectConfirm({
-                                            offerId: offer.id,
-                                            definitionId: opt.definitionId,
-                                            name: opt.nameSnapshot,
-                                          })
-                                        }
-                                      >
-                                        Select
-                                      </Button>
-                                    )}
-                                  </div>
-                                ))}
-                                {allArchived ? (
-                                  <p className="text-xs text-muted-foreground">
-                                    Every offered choice is archived. An admin
-                                    can re-enable one in the catalog to unlock
-                                    this offer.
-                                  </p>
-                                ) : null}
-                              </div>
-                            )}
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )}
-
-                  <Separator />
-
-                  <div>
-                    <h3 className="font-heading text-sm font-medium">
-                      Acquired skills
-                    </h3>
-                    <p className="text-xs text-muted-foreground">
-                      Effects are synthesized live from the current catalog; the
-                      stored history is unchanged. Archived skills no longer
-                      contribute.
-                    </p>
-                  </div>
-                  {skillAssociations.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No skills acquired yet.
-                    </p>
-                  ) : (
-                    <div className="flex flex-col gap-2">
-                      {skillAssociations.map((a) => (
-                        <div
-                          key={a.id}
-                          className="rounded-lg border bg-input/20 p-2"
-                        >
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="font-medium">{a.name}</span>
-                            {a.definitionArchived ? (
-                              <Badge variant="outline">Archived</Badge>
-                            ) : null}
-                            {a.grade ? (
-                              <Badge variant="outline">{a.grade}</Badge>
-                            ) : null}
-                          </div>
-                          <div className="text-[0.6875rem] text-muted-foreground">
-                            Provenance: {a.provenance ?? "house"}
-                            {a.upgradeGroup
-                              ? ` - Upgrade group: ${a.upgradeGroup}`
-                              : ""}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {isAdmin ? (
-                    <>
-                      <Separator />
-                      <div className="flex flex-col gap-2">
-                        <div className="flex items-center justify-between gap-3">
-                          <h3 className="font-heading text-sm font-medium">
-                            Admin: manually grant a skill
-                          </h3>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => {
-                              setGrantSkillId("")
-                              setGrantReason("")
-                              setGrantOpen(true)
-                            }}
-                          >
-                            Grant skill
-                          </Button>
-                        </div>
-                        <p className="text-xs text-muted-foreground">
-                          Grants a skill immediately (provenance manual) with a
-                          required reason. Owners can only select offered
-                          options - they cannot grant.
-                        </p>
-                      </div>
-                    </>
-                  ) : null}
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="titles" className="pt-3">
-            <Card>
-              <CardContent>
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h3 className="font-heading text-sm font-medium">Titles</h3>
-                    <p className="text-xs text-muted-foreground">
-                      Titles attached to this character. Their effects are
-                      synthesized live from the current catalog; the stored
-                      history is unchanged.
-                    </p>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={openAssociations}
-                  >
-                    Manage titles & equipment
-                  </Button>
-                </div>
-                {character.associations.filter((a) => a.kind === "title")
-                  .length === 0 ? (
-                  <p className="mt-3 text-xs text-muted-foreground">
-                    No titles attached yet.
-                  </p>
-                ) : (
-                  <div className="mt-3 flex flex-col gap-2">
-                    {character.associations
-                      .filter((a) => a.kind === "title")
-                      .map((a) => (
-                        <div
-                          key={a.id}
-                          className="flex items-center justify-between rounded-lg border bg-input/20 p-2"
-                        >
-                          <div>
-                            <div className="flex items-center gap-1.5">
-                              <span className="font-medium">{a.name}</span>
-                              {a.definitionArchived ? (
-                                <Badge variant="outline">Archived</Badge>
-                              ) : null}
-                            </div>
-                            {a.upgradeGroup ? (
-                              <div className="text-[0.6875rem] text-muted-foreground">
-                                Upgrade group: {a.upgradeGroup}
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-                      ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="equipment" className="pt-3">
-            <div className="flex items-start justify-between gap-3">
-              <p className="text-xs text-muted-foreground">
-                Equipment is equipped directly onto this character - not an
-                inventory ownership claim (an inventory system is deferred).
-                Bonuses are capped by the house assumption of 20% per attribute
-                (aggregate) and 15% overall.
-              </p>
-              <Button variant="outline" size="sm" onClick={openAssociations}>
-                Manage titles & equipment
-              </Button>
-            </div>
-            {status && status.equipment.items.length > 0 ? (
-              <div className="mt-3 overflow-x-auto rounded-lg border">
+              <div className="overflow-x-auto rounded-lg border">
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Item</TableHead>
-                      <TableHead>Requested</TableHead>
-                      <TableHead>Applied</TableHead>
-                      <TableHead>Suppressed</TableHead>
+                      <TableHead>Attribute</TableHead>
+                      <TableHead className="text-right">Value</TableHead>
+                      <TableHead>Trace</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {status.equipment.items.map((item) => (
-                      <TableRow key={item.id}>
-                        <TableCell>{item.name}</TableCell>
-                        <TableCell className="tabular-nums">
-                          {ATTRIBUTE_KEYS.filter((a) => item.requested[a] !== 0)
-                            .map((a) => `${a}:${item.requested[a]}`)
-                            .join(", ") || "0"}
+                    {status.traces.map((trace) => (
+                      <TableRow key={trace.attribute}>
+                        <TableCell className="capitalize">
+                          {trace.attribute}
                         </TableCell>
-                        <TableCell className="tabular-nums">
-                          {ATTRIBUTE_KEYS.filter((a) => item.applied[a] !== 0)
-                            .map((a) => `${a}:${item.applied[a]}`)
-                            .join(", ") || "0"}
+                        <TableCell className="text-right tabular-nums">
+                          {trace.final}
                         </TableCell>
-                        <TableCell className="tabular-nums">
-                          {ATTRIBUTE_KEYS.filter(
-                            (a) => item.suppressed[a] !== 0
-                          )
-                            .map((a) => `${a}:${item.suppressed[a]}`)
-                            .join(", ") || "0"}
+                        <TableCell>
+                          <div className="flex flex-col gap-0.5">
+                            {trace.phases.map((phase) => (
+                              <span
+                                key={phase.phase}
+                                className="flex justify-between text-[0.6875rem] text-muted-foreground"
+                              >
+                                <span>{phase.phase}</span>
+                                <span className="tabular-nums">
+                                  {phase.value}
+                                  {phase.delta >= 0 ? " (+" : " ("}
+                                  {phase.delta}){" "}
+                                </span>
+                              </span>
+                            ))}
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
                 </Table>
               </div>
-            ) : (
-              <Card className="mt-3">
+
+              <Card>
                 <CardContent>
-                  <p className="text-xs text-muted-foreground">
-                    {archivedEquipmentLinks.length > 0
-                      ? "No active equipment is contributing, but archived links remain."
-                      : "No equipment is attached to this character yet. Equip items from the catalog to see their bonuses."}
-                  </p>
+                  <h3 className="mb-2 font-heading text-sm font-medium">
+                    Allocate points
+                  </h3>
+                  <AllocationEditor
+                    status={status}
+                    onAllocate={allocate}
+                    busy={busy}
+                  />
                 </CardContent>
               </Card>
-            )}
-            {archivedEquipmentLinks.length > 0 ? (
-              <div className="mt-3 flex flex-col gap-2">
-                {archivedEquipmentLinks.map((a) => (
-                  <div
-                    key={a.id}
-                    className="flex items-center justify-between rounded-lg border bg-input/20 p-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate font-medium">{a.name}</span>
-                        <Badge variant="outline">Archived</Badge>
-                      </div>
-                      <div className="text-[0.6875rem] text-muted-foreground">
-                        Linked but archived - no longer contributing.
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </TabsContent>
-
-          <TabsContent value="consumables" className="pt-3">
-            <div className="flex items-start justify-between gap-3">
-              <p className="text-xs text-muted-foreground">
-                Consumables grant either a permanent stat gain (capped by the
-                grade-based race-level capacity) or a temporary effect that
-                expires after a number of quarters. Permanent gains are recorded
-                in the immutable journal and cannot be undone.
-              </p>
-              <Button variant="outline" size="sm" onClick={openAssociations}>
-                Manage consumables
-              </Button>
             </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Status is not available.
+            </p>
+          )}
+        </TabsContent>
 
-            {status && status.consumables ? (
-              <div className="mt-3 overflow-x-auto rounded-lg border">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Requested</TableHead>
-                      <TableHead>Applied</TableHead>
-                      <TableHead>Suppressed</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    <TableRow>
-                      <TableCell className="tabular-nums">
-                        {formatVector(status.consumables.requested)}
-                      </TableCell>
-                      <TableCell className="tabular-nums">
-                        {formatVector(status.consumables.applied)}
-                      </TableCell>
-                      <TableCell className="tabular-nums">
-                        {formatVector(status.consumables.suppressed)}
-                      </TableCell>
-                    </TableRow>
-                  </TableBody>
-                </Table>
+        <TabsContent value="identity" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex flex-col gap-1">
+                <MetaRow label="Race">
+                  {character.raceName ?? "Not set"}
+                </MetaRow>
+                <MetaRow label="Class">
+                  {character.className ?? "Not set"}
+                </MetaRow>
+                <MetaRow label="Profession">
+                  {character.professionName ?? "None"}
+                </MetaRow>
+                <MetaRow label="Race grade">
+                  {state.race.grade} (mode {state.race.mode})
+                </MetaRow>
+                <MetaRow label="Race level">{state.race.level}</MetaRow>
+                <MetaRow label="Class level">
+                  {classTrack
+                    ? `${classTrack.level} (quarter ${classTrack.quarter})`
+                    : "None"}
+                </MetaRow>
+                <MetaRow label="Profession level">
+                  {professionTrack
+                    ? `${professionTrack.level} (quarter ${professionTrack.quarter})`
+                    : "None"}
+                </MetaRow>
               </div>
-            ) : (
-              <p className="mt-3 text-xs text-muted-foreground">
-                No active temporary consumable effects.
-              </p>
-            )}
+            </CardContent>
+          </Card>
+        </TabsContent>
 
-            <div className="mt-4 flex flex-col gap-2">
-              <div className="flex items-center gap-1.5">
-                <Badge variant="outline">Cap</Badge>
-                <span className="text-xs tabular-nums">
-                  {formatVector(character.permanentConsumableCap)}
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <Badge variant="outline">Remaining</Badge>
-                <span className="text-xs tabular-nums">
-                  {formatVector(character.permanentConsumableRemaining)}
-                </span>
-              </div>
-            </div>
-          </TabsContent>
-
-          <TabsContent value="history" className="pt-3">
-            {events ? (
-              <div className="flex flex-col gap-2">
-                {events.length === 0 ? (
+        <TabsContent value="skills" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex flex-col gap-4">
+                <div>
+                  <h3 className="font-heading text-sm font-medium">
+                    Skill offers
+                  </h3>
                   <p className="text-xs text-muted-foreground">
-                    No progression events recorded yet.
-                  </p>
-                ) : (
-                  events.map((event, i) => (
-                    <div
-                      key={i}
-                      className="flex flex-col gap-1 rounded-lg border bg-input/20 p-2 text-xs/relaxed"
-                    >
-                      <div className="flex items-center justify-between">
-                        <Badge variant="outline" className="capitalize">
-                          {event.kind}
-                        </Badge>
-                        <span className="text-[0.6875rem] text-muted-foreground">
-                          {event.createdAt}
-                        </span>
-                      </div>
-                      <pre className="whitespace-pre-wrap text-muted-foreground">
-                        {JSON.stringify(event.payload, null, 2)}
-                      </pre>
-                    </div>
-                  ))
-                )}
-              </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                Loading history...
-              </p>
-            )}
-          </TabsContent>
-
-          <TabsContent value="notes" className="pt-3">
-            <Card>
-              <CardContent>
-                <div className="flex flex-col gap-3">
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor="note-name">Name</Label>
-                    <Input
-                      id="note-name"
-                      value={notes.name}
-                      onChange={(e) =>
-                        setNotes((n) => ({ ...n, name: e.target.value }))
-                      }
-                    />
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor="note-description">
-                      Notes / description
-                    </Label>
-                    <textarea
-                      id="note-description"
-                      value={notes.description}
-                      onChange={(e) =>
-                        setNotes((n) => ({ ...n, description: e.target.value }))
-                      }
-                      className="min-h-28 w-full rounded-md border border-input bg-input/20 px-2 py-1.5 text-xs/relaxed outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
-                    />
-                  </div>
-                  <div>
-                    <Button
-                      onClick={saveNotes}
-                      disabled={savingNotes || notes.name.trim().length === 0}
-                    >
-                      {savingNotes ? "Saving..." : "Save"}
-                    </Button>
-                  </div>
-                  <p className="text-[0.6875rem] text-muted-foreground">
-                    Saving sends the current version to detect conflicts with
-                    other changes.
+                    Skills are offered at class/profession milestones - never
+                    auto-awarded. Choose one option from a pending offer, or
+                    re-open the catalog to edit what is offered.
                   </p>
                 </div>
+
+                {character.skillOffers.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No skill offers yet. Advance a class or profession to its
+                    milestone to be offered skills.
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {character.skillOffers.map((offer) => {
+                      const allArchived =
+                        offer.options.length > 0 &&
+                        offer.options.every((o) => o.archived)
+                      const selected = offer.selectedDefinitionId
+                      const selectedName = selected
+                        ? (offer.options.find(
+                            (o) => o.definitionId === selected
+                          )?.nameSnapshot ?? null)
+                        : null
+                      return (
+                        <div
+                          key={offer.id}
+                          className="rounded-lg border bg-input/20 p-2"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-medium">
+                              {offer.track === "class" ? "Class" : "Profession"}{" "}
+                              level {offer.level} - {offer.choiceGroup}
+                            </span>
+                            {selected ? (
+                              <Badge variant="outline">Selected</Badge>
+                            ) : allArchived ? (
+                              <Badge variant="outline">Blocked</Badge>
+                            ) : (
+                              <Badge variant="outline">Pending</Badge>
+                            )}
+                          </div>
+                          {selected ? (
+                            <div className="text-xs text-muted-foreground">
+                              Selected: {selectedName ?? "?"}
+                            </div>
+                          ) : (
+                            <div className="mt-1 flex flex-col gap-1.5">
+                              {offer.options.map((opt) => (
+                                <div
+                                  key={opt.definitionId}
+                                  className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-1.5"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span className="truncate font-medium">
+                                        {opt.nameSnapshot}
+                                      </span>
+                                      {opt.grade ? (
+                                        <Badge variant="outline">
+                                          {opt.grade}
+                                        </Badge>
+                                      ) : null}
+                                      {opt.archived ? (
+                                        <Badge variant="outline">
+                                          Archived
+                                        </Badge>
+                                      ) : null}
+                                    </div>
+                                    <div className="text-[0.6875rem] text-muted-foreground">
+                                      Provenance: {opt.provenance ?? "house"}
+                                      {opt.archived
+                                        ? " - unavailable until re-enabled in the catalog"
+                                        : ""}
+                                    </div>
+                                  </div>
+                                  {opt.archived ? null : (
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={skillBusy}
+                                      onClick={() =>
+                                        setSelectConfirm({
+                                          offerId: offer.id,
+                                          definitionId: opt.definitionId,
+                                          name: opt.nameSnapshot,
+                                        })
+                                      }
+                                    >
+                                      Select
+                                    </Button>
+                                  )}
+                                </div>
+                              ))}
+                              {allArchived ? (
+                                <p className="text-xs text-muted-foreground">
+                                  Every offered choice is archived. An admin can
+                                  re-enable one in the catalog to unlock this
+                                  offer.
+                                </p>
+                              ) : null}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+
+                <Separator />
+
+                <div>
+                  <h3 className="font-heading text-sm font-medium">
+                    Acquired skills
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Effects are synthesized live from the current catalog; the
+                    stored history is unchanged. Archived skills no longer
+                    contribute.
+                  </p>
+                </div>
+                {skillAssociations.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No skills acquired yet.
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {skillAssociations.map((a) => (
+                      <div
+                        key={a.id}
+                        className="rounded-lg border bg-input/20 p-2"
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-medium">{a.name}</span>
+                          {a.definitionArchived ? (
+                            <Badge variant="outline">Archived</Badge>
+                          ) : null}
+                          {a.grade ? (
+                            <Badge variant="outline">{a.grade}</Badge>
+                          ) : null}
+                        </div>
+                        <div className="text-[0.6875rem] text-muted-foreground">
+                          Provenance: {a.provenance ?? "house"}
+                          {a.upgradeGroup
+                            ? ` - Upgrade group: ${a.upgradeGroup}`
+                            : ""}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {isAdmin ? (
+                  <>
+                    <Separator />
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <h3 className="font-heading text-sm font-medium">
+                          Admin: manually grant a skill
+                        </h3>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setGrantSkillId("")
+                            setGrantReason("")
+                            setGrantOpen(true)
+                          }}
+                        >
+                          Grant skill
+                        </Button>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Grants a skill immediately (provenance manual) with a
+                        required reason. Owners can only select offered options
+                        - they cannot grant.
+                      </p>
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="titles" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="font-heading text-sm font-medium">Titles</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Titles attached to this character. Their effects are
+                    synthesized live from the current catalog; the stored
+                    history is unchanged.
+                  </p>
+                </div>
+                <Button variant="outline" size="sm" onClick={openAssociations}>
+                  Manage titles & equipment
+                </Button>
+              </div>
+              {character.associations.filter((a) => a.kind === "title")
+                .length === 0 ? (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  No titles attached yet.
+                </p>
+              ) : (
+                <div className="mt-3 flex flex-col gap-2">
+                  {character.associations
+                    .filter((a) => a.kind === "title")
+                    .map((a) => (
+                      <div
+                        key={a.id}
+                        className="flex items-center justify-between rounded-lg border bg-input/20 p-2"
+                      >
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-medium">{a.name}</span>
+                            {a.definitionArchived ? (
+                              <Badge variant="outline">Archived</Badge>
+                            ) : null}
+                          </div>
+                          {a.upgradeGroup ? (
+                            <div className="text-[0.6875rem] text-muted-foreground">
+                              Upgrade group: {a.upgradeGroup}
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="equipment" className="pt-3">
+          <div className="flex items-start justify-between gap-3">
+            <p className="text-xs text-muted-foreground">
+              Equipment is equipped directly onto this character - not an
+              inventory ownership claim (an inventory system is deferred).
+              Bonuses are capped by the house assumption of 20% per attribute
+              (aggregate) and 15% overall.
+            </p>
+            <Button variant="outline" size="sm" onClick={openAssociations}>
+              Manage titles & equipment
+            </Button>
+          </div>
+          {status && status.equipment.items.length > 0 ? (
+            <div className="mt-3 overflow-x-auto rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Item</TableHead>
+                    <TableHead>Requested</TableHead>
+                    <TableHead>Applied</TableHead>
+                    <TableHead>Suppressed</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {status.equipment.items.map((item) => (
+                    <TableRow key={item.id}>
+                      <TableCell>{item.name}</TableCell>
+                      <TableCell className="tabular-nums">
+                        {ATTRIBUTE_KEYS.filter((a) => item.requested[a] !== 0)
+                          .map((a) => `${a}:${item.requested[a]}`)
+                          .join(", ") || "0"}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {ATTRIBUTE_KEYS.filter((a) => item.applied[a] !== 0)
+                          .map((a) => `${a}:${item.applied[a]}`)
+                          .join(", ") || "0"}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {ATTRIBUTE_KEYS.filter((a) => item.suppressed[a] !== 0)
+                          .map((a) => `${a}:${item.suppressed[a]}`)
+                          .join(", ") || "0"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <Card className="mt-3">
+              <CardContent>
+                <p className="text-xs text-muted-foreground">
+                  {archivedEquipmentLinks.length > 0
+                    ? "No active equipment is contributing, but archived links remain."
+                    : "No equipment is attached to this character yet. Equip items from the catalog to see their bonuses."}
+                </p>
               </CardContent>
             </Card>
-          </TabsContent>
-        </Tabs>
-
-        <Separator />
-
-        <Dialog open={journalOpen} onOpenChange={setJournalOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Progression journal</DialogTitle>
-              <DialogDescription>
-                What the last advancement produced.
-              </DialogDescription>
-            </DialogHeader>
-            {journal ? <JournalPanel journal={journal} /> : null}
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={evolveOpen} onOpenChange={setEvolveOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Evolve race grade</DialogTitle>
-              <DialogDescription>
-                This progresses race grade only - from {raceGrade} to{" "}
-                {evolveTarget ?? ""}. Class/profession evolution is not selected
-                yet, so the system will not auto-choose an option for you.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="flex flex-col gap-1 text-xs/relaxed text-muted-foreground">
-              <span>
-                Current grade: <span className="font-medium">{raceGrade}</span>
-              </span>
-              <span>
-                Target grade:{" "}
-                <span className="font-medium">{evolveTarget ?? "-"}</span>
-              </span>
-              <span>
-                Race level:{" "}
-                <span className="font-medium">{state.race.level}</span>
-              </span>
-            </div>
-            {evolveError ? (
-              <p role="alert" className="text-xs/relaxed text-destructive">
-                {evolveError}
-              </p>
-            ) : null}
-            <DialogFooter>
-              <Button
-                variant="outline"
-                onClick={() => setEvolveOpen(false)}
-                disabled={evolveBusy}
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={() => evolveTarget && evolve(evolveTarget)}
-                disabled={evolveBusy || !evolveTarget}
-              >
-                {evolveBusy
-                  ? "Evolving..."
-                  : `Evolve to ${evolveTarget ?? "-"}`}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <AssociationSheet
-          open={associationsOpen}
-          onOpenChange={setAssociationsOpen}
-          character={character}
-          titles={titlesCatalog}
-          equipment={equipmentCatalog}
-          consumables={consumablesCatalog}
-          loading={catalogLoading}
-          busy={assocBusy}
-          consumeBusy={consumeBusy}
-          onAdd={(kind, definitionId) =>
-            void addAssociation(kind, definitionId)
-          }
-          onRemove={(kind, definitionId) =>
-            void removeAssociation(kind, definitionId)
-          }
-          onConsume={(definitionId) => {
-            const item = consumablesCatalog.find((c) => c.id === definitionId)
-            if (item) requestConsume(item)
-          }}
-        />
-
-        <Dialog open={removePortraitOpen} onOpenChange={setRemovePortraitOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Remove portrait</DialogTitle>
-              <DialogDescription>
-                Remove this character&apos;s portrait? This does not archive the
-                character and can be re-uploaded later.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                onClick={() => setRemovePortraitOpen(false)}
-                disabled={portraitBusy}
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={() => void removePortrait()}
-                disabled={portraitBusy}
-              >
-                {portraitBusy ? "Removing..." : "Remove"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog
-          open={!!consumeConfirm}
-          onOpenChange={(open) => {
-            if (!open) setConsumeConfirm(null)
-          }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Consume permanent consumable</DialogTitle>
-              <DialogDescription>
-                Applying &quot;{consumeConfirm?.name ?? ""}&quot; grants a
-                permanent attribute gain that cannot be undone by simply
-                unequipping. It is capped by the grade-based
-                permanent-consumable capacity (a house assumption,
-                F3/E5/D15/C45).
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                onClick={() => setConsumeConfirm(null)}
-                disabled={consumeBusy}
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={() => void confirmConsume()}
-                disabled={consumeBusy}
-              >
-                {consumeBusy ? "Consuming..." : "Consume"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog
-          open={!!selectConfirm}
-          onOpenChange={(open) => {
-            if (!open) setSelectConfirm(null)
-          }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Select skill</DialogTitle>
-              <DialogDescription>
-                Link &quot;{selectConfirm?.name ?? ""}&quot; to this character?
-                Its effects are synthesized live from the current catalog;
-                archived options are unavailable until re-enabled in the
-                catalog.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                onClick={() => setSelectConfirm(null)}
-                disabled={skillBusy}
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={() =>
-                  selectConfirm &&
-                  void selectSkill(
-                    selectConfirm.offerId,
-                    selectConfirm.definitionId
-                  )
-                }
-                disabled={skillBusy}
-              >
-                {skillBusy ? "Selecting..." : "Select"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={grantOpen} onOpenChange={setGrantOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Grant a skill</DialogTitle>
-              <DialogDescription>
-                Grants a skill immediately with provenance &quot;manual&quot;
-                and a required reason. Owners can only select offered options -
-                they cannot grant.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="grant-skill">Skill</Label>
-                <Select
-                  value={grantSkillId}
-                  onValueChange={(value) => setGrantSkillId(value ?? "")}
+          )}
+          {archivedEquipmentLinks.length > 0 ? (
+            <div className="mt-3 flex flex-col gap-2">
+              {archivedEquipmentLinks.map((a) => (
+                <div
+                  key={a.id}
+                  className="flex items-center justify-between rounded-lg border bg-input/20 p-2"
                 >
-                  <SelectTrigger id="grant-skill" className="w-full">
-                    <SelectValue placeholder="Choose a skill" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {skillsCatalog.length === 0 ? (
-                      <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                        No skills in the catalog.
-                      </div>
-                    ) : (
-                      skillsCatalog.map((skill) => (
-                        <SelectItem key={skill.id} value={skill.id}>
-                          {skill.name}
-                          {skill.grade ? ` (${skill.grade})` : ""}
-                        </SelectItem>
-                      ))
-                    )}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="grant-reason">Reason (required)</Label>
-                <Input
-                  id="grant-reason"
-                  value={grantReason}
-                  onChange={(e) => setGrantReason(e.target.value)}
-                  placeholder="Why is this granted?"
-                />
-              </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate font-medium">{a.name}</span>
+                      <Badge variant="outline">Archived</Badge>
+                    </div>
+                    <div className="text-[0.6875rem] text-muted-foreground">
+                      Linked but archived - no longer contributing.
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setGrantOpen(false)
-                  setGrantSkillId("")
-                  setGrantReason("")
-                }}
-                disabled={skillBusy}
+          ) : null}
+        </TabsContent>
+
+        <TabsContent value="consumables" className="pt-3">
+          <div className="flex items-start justify-between gap-3">
+            <p className="text-xs text-muted-foreground">
+              Consumables grant either a permanent stat gain (capped by the
+              grade-based race-level capacity) or a temporary effect that
+              expires after a number of quarters. Permanent gains are recorded
+              in the immutable journal and cannot be undone.
+            </p>
+            <Button variant="outline" size="sm" onClick={openAssociations}>
+              Manage consumables
+            </Button>
+          </div>
+
+          {status && status.consumables ? (
+            <div className="mt-3 overflow-x-auto rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Requested</TableHead>
+                    <TableHead>Applied</TableHead>
+                    <TableHead>Suppressed</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <TableRow>
+                    <TableCell className="tabular-nums">
+                      {formatVector(status.consumables.requested)}
+                    </TableCell>
+                    <TableCell className="tabular-nums">
+                      {formatVector(status.consumables.applied)}
+                    </TableCell>
+                    <TableCell className="tabular-nums">
+                      {formatVector(status.consumables.suppressed)}
+                    </TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <p className="mt-3 text-xs text-muted-foreground">
+              No active temporary consumable effects.
+            </p>
+          )}
+
+          <div className="mt-4 flex flex-col gap-2">
+            <div className="flex items-center gap-1.5">
+              <Badge variant="outline">Cap</Badge>
+              <span className="text-xs tabular-nums">
+                {formatVector(character.permanentConsumableCap)}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Badge variant="outline">Remaining</Badge>
+              <span className="text-xs tabular-nums">
+                {formatVector(character.permanentConsumableRemaining)}
+              </span>
+            </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="history" className="pt-3">
+          {events ? (
+            <div className="flex flex-col gap-2">
+              {events.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No progression events recorded yet.
+                </p>
+              ) : (
+                events.map((event, i) => (
+                  <div
+                    key={i}
+                    className="flex flex-col gap-1 rounded-lg border bg-input/20 p-2 text-xs/relaxed"
+                  >
+                    <div className="flex items-center justify-between">
+                      <Badge variant="outline" className="capitalize">
+                        {event.kind}
+                      </Badge>
+                      <span className="text-[0.6875rem] text-muted-foreground">
+                        {event.createdAt}
+                      </span>
+                    </div>
+                    <pre className="whitespace-pre-wrap text-muted-foreground">
+                      {JSON.stringify(event.payload, null, 2)}
+                    </pre>
+                  </div>
+                ))
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Loading history...</p>
+          )}
+        </TabsContent>
+
+        <TabsContent value="notes" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="note-name">Name</Label>
+                  <Input
+                    id="note-name"
+                    value={notes.name}
+                    onChange={(e) =>
+                      setNotes((n) => ({ ...n, name: e.target.value }))
+                    }
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="note-description">Notes / description</Label>
+                  <textarea
+                    id="note-description"
+                    value={notes.description}
+                    onChange={(e) =>
+                      setNotes((n) => ({ ...n, description: e.target.value }))
+                    }
+                    className="min-h-28 w-full rounded-md border border-input bg-input/20 px-2 py-1.5 text-xs/relaxed outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+                  />
+                </div>
+                <div>
+                  <Button
+                    onClick={saveNotes}
+                    disabled={savingNotes || notes.name.trim().length === 0}
+                  >
+                    {savingNotes ? "Saving..." : "Save"}
+                  </Button>
+                </div>
+                <p className="text-[0.6875rem] text-muted-foreground">
+                  Saving sends the current version to detect conflicts with
+                  other changes.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+
+      <Separator />
+
+      <Dialog open={journalOpen} onOpenChange={setJournalOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Progression journal</DialogTitle>
+            <DialogDescription>
+              What the last advancement produced.
+            </DialogDescription>
+          </DialogHeader>
+          {journal ? <JournalPanel journal={journal} /> : null}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={evolveOpen} onOpenChange={setEvolveOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Evolve race grade</DialogTitle>
+            <DialogDescription>
+              This progresses race grade only - from {raceGrade} to{" "}
+              {evolveTarget ?? ""}. Class/profession evolution is not selected
+              yet, so the system will not auto-choose an option for you.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-1 text-xs/relaxed text-muted-foreground">
+            <span>
+              Current grade: <span className="font-medium">{raceGrade}</span>
+            </span>
+            <span>
+              Target grade:{" "}
+              <span className="font-medium">{evolveTarget ?? "-"}</span>
+            </span>
+            <span>
+              Race level:{" "}
+              <span className="font-medium">{state.race.level}</span>
+            </span>
+          </div>
+          {evolveError ? (
+            <p role="alert" className="text-xs/relaxed text-destructive">
+              {evolveError}
+            </p>
+          ) : null}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setEvolveOpen(false)}
+              disabled={evolveBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => evolveTarget && evolve(evolveTarget)}
+              disabled={evolveBusy || !evolveTarget}
+            >
+              {evolveBusy ? "Evolving..." : `Evolve to ${evolveTarget ?? "-"}`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AssociationSheet
+        open={associationsOpen}
+        onOpenChange={setAssociationsOpen}
+        character={character}
+        titles={titlesCatalog}
+        equipment={equipmentCatalog}
+        consumables={consumablesCatalog}
+        loading={catalogLoading}
+        busy={assocBusy}
+        consumeBusy={consumeBusy}
+        onAdd={(kind, definitionId) => void addAssociation(kind, definitionId)}
+        onRemove={(kind, definitionId) =>
+          void removeAssociation(kind, definitionId)
+        }
+        onConsume={(definitionId) => {
+          const item = consumablesCatalog.find((c) => c.id === definitionId)
+          if (item) requestConsume(item)
+        }}
+      />
+
+      <Dialog open={removePortraitOpen} onOpenChange={setRemovePortraitOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove portrait</DialogTitle>
+            <DialogDescription>
+              Remove this character&apos;s portrait? This does not archive the
+              character and can be re-uploaded later.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setRemovePortraitOpen(false)}
+              disabled={portraitBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void removePortrait()}
+              disabled={portraitBusy}
+            >
+              {portraitBusy ? "Removing..." : "Remove"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!consumeConfirm}
+        onOpenChange={(open) => {
+          if (!open) setConsumeConfirm(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Consume permanent consumable</DialogTitle>
+            <DialogDescription>
+              Applying &quot;{consumeConfirm?.name ?? ""}&quot; grants a
+              permanent attribute gain that cannot be undone by simply
+              unequipping. It is capped by the grade-based permanent-consumable
+              capacity (a house assumption, F3/E5/D15/C45).
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setConsumeConfirm(null)}
+              disabled={consumeBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void confirmConsume()}
+              disabled={consumeBusy}
+            >
+              {consumeBusy ? "Consuming..." : "Consume"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!selectConfirm}
+        onOpenChange={(open) => {
+          if (!open) setSelectConfirm(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Select skill</DialogTitle>
+            <DialogDescription>
+              Link &quot;{selectConfirm?.name ?? ""}&quot; to this character?
+              Its effects are synthesized live from the current catalog;
+              archived options are unavailable until re-enabled in the catalog.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setSelectConfirm(null)}
+              disabled={skillBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                selectConfirm &&
+                void selectSkill(
+                  selectConfirm.offerId,
+                  selectConfirm.definitionId
+                )
+              }
+              disabled={skillBusy}
+            >
+              {skillBusy ? "Selecting..." : "Select"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={grantOpen} onOpenChange={setGrantOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Grant a skill</DialogTitle>
+            <DialogDescription>
+              Grants a skill immediately with provenance &quot;manual&quot; and
+              a required reason. Owners can only select offered options - they
+              cannot grant.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="grant-skill">Skill</Label>
+              <Select
+                value={grantSkillId}
+                onValueChange={(value) => setGrantSkillId(value ?? "")}
               >
-                Cancel
-              </Button>
-              <Button
-                onClick={() => void grantSkill()}
-                disabled={skillBusy || !grantSkillId || !grantReason.trim()}
-              >
-                {skillBusy ? "Granting..." : "Grant"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      </div>
-    </AppShell>
+                <SelectTrigger id="grant-skill" className="w-full">
+                  <SelectValue placeholder="Choose a skill" />
+                </SelectTrigger>
+                <SelectContent>
+                  {skillsCatalog.length === 0 ? (
+                    <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                      No skills in the catalog.
+                    </div>
+                  ) : (
+                    skillsCatalog.map((skill) => (
+                      <SelectItem key={skill.id} value={skill.id}>
+                        {skill.name}
+                        {skill.grade ? ` (${skill.grade})` : ""}
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="grant-reason">Reason (required)</Label>
+              <Input
+                id="grant-reason"
+                value={grantReason}
+                onChange={(e) => setGrantReason(e.target.value)}
+                placeholder="Why is this granted?"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setGrantOpen(false)
+                setGrantSkillId("")
+                setGrantReason("")
+              }}
+              disabled={skillBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void grantSkill()}
+              disabled={skillBusy || !grantSkillId || !grantReason.trim()}
+            >
+              {skillBusy ? "Granting..." : "Grant"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   )
 }

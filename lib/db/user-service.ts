@@ -167,7 +167,10 @@ export async function createUser(input: {
     return toView(created)
   } catch (err) {
     if (isUniqueViolation(err)) {
-      throw conflict("email_taken", `A user with email "${email}" already exists`)
+      throw conflict(
+        "email_taken",
+        `A user with email "${email}" already exists`
+      )
     }
     throw err
   }
@@ -225,11 +228,7 @@ export async function updateUser(
 
           // Self-demotion: the acting admin cannot remove their own admin role (or
           // disable themselves), even if another admin exists.
-          if (
-            actor.id === id &&
-            wasEnabledAdmin &&
-            !willBeEnabledAdmin
-          ) {
+          if (actor.id === id && wasEnabledAdmin && !willBeEnabledAdmin) {
             throw conflict(
               "self_demotion",
               "You cannot demote or disable your own admin account"
@@ -260,10 +259,7 @@ export async function updateUser(
   } catch (err) {
     if (isSerializationFailure(err)) {
       // A concurrent last-admin demotion lost the race: surface as a 409.
-      throw conflict(
-        "conflict",
-        "Concurrent user update; retry the change"
-      )
+      throw conflict("conflict", "Concurrent user update; retry the change")
     }
     throw err
   }

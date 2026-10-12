@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import bcrypt from "bcryptjs"
-import { changeOwnPassword, createUser, listUsers, updateUser } from "@/lib/db/user-service"
+import {
+  changeOwnPassword,
+  createUser,
+  listUsers,
+  updateUser,
+} from "@/lib/db/user-service"
 
 type TestStore = import("./testPrisma").TestPrismaInstance["store"]
 type TestPrisma = import("./testPrisma").TestPrismaInstance["prisma"]
@@ -18,7 +23,11 @@ vi.mock("@/lib/db/client", async () => {
   return { prisma: instance.prisma, default: instance.prisma }
 })
 
-const actorRegular = { id: "actor-1", email: "actor@example.com", isAdmin: false }
+const actorRegular = {
+  id: "actor-1",
+  email: "actor@example.com",
+  isAdmin: false,
+}
 const actorAdmin = { id: "admin-1", email: "admin@example.com", isAdmin: true }
 
 function seedUser(row: {
@@ -74,7 +83,9 @@ describe("createUser", () => {
     const stored = [...dbMock.store.users.values()][0]
     expect(stored.email).toBe("new.user@example.com")
     expect(stored.password).not.toBe("a-strong-password")
-    expect(await bcrypt.compare("a-strong-password", stored.password)).toBe(true)
+    expect(await bcrypt.compare("a-strong-password", stored.password)).toBe(
+      true
+    )
   })
 
   it("honors isAdmin and rejects a duplicate email with 409", async () => {
@@ -152,7 +163,11 @@ describe("updateUser", () => {
   it("allows demoting an admin when another enabled admin exists", async () => {
     seedUser({ id: "admin-1", email: "a@example.com", isAdmin: true })
     seedUser({ id: "admin-2", email: "b@example.com", isAdmin: true })
-    const updated = await updateUser("admin-1", { isAdmin: false }, actorRegular)
+    const updated = await updateUser(
+      "admin-1",
+      { isAdmin: false },
+      actorRegular
+    )
     expect(updated.isAdmin).toBe(false)
   })
 

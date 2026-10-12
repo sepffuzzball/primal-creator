@@ -308,9 +308,7 @@ describe("write/read/delete file helpers", () => {
   })
 
   it("deleting a nonexistent file is not an error", async () => {
-    await expect(
-      deletePortraitFile(validName("d"))
-    ).resolves.toBeUndefined()
+    await expect(deletePortraitFile(validName("d"))).resolves.toBeUndefined()
   })
 
   it("deleting a null/empty name is a no-op", async () => {

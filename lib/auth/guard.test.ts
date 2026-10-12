@@ -1,9 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import {
-  assertOrigin,
-  requireAdmin,
-  requireUser,
-} from "@/lib/auth/guard"
+import { assertOrigin, requireAdmin, requireUser } from "@/lib/auth/guard"
 import { createSessionToken } from "@/lib/auth/session"
 
 type TestStore = import("../db/testPrisma").TestPrismaInstance["store"]
@@ -40,11 +36,7 @@ function req(
   return new Request(url, { method, headers })
 }
 
-function expectSyncError(
-  fn: () => void,
-  status: number,
-  code: string
-): void {
+function expectSyncError(fn: () => void, status: number, code: string): void {
   let caught: unknown
   try {
     fn()
@@ -60,11 +52,7 @@ describe("assertOrigin", () => {
   })
 
   it("rejects a missing Origin on an unsafe method with 403 bad_origin", () => {
-    expectSyncError(
-      () => assertOrigin(req("POST", null)),
-      403,
-      "bad_origin"
-    )
+    expectSyncError(() => assertOrigin(req("POST", null)), 403, "bad_origin")
   })
 
   it("rejects a cross-origin mismatch with 403 bad_origin", () => {
@@ -144,7 +132,12 @@ describe("requireUser / requireAdmin (origin is enforced before session lookup)"
       { id, email: "u@example.com", isAdmin: false },
       0
     )
-    const r = req("POST", "http://localhost", BASE_URL, `primal_session=${token}`)
+    const r = req(
+      "POST",
+      "http://localhost",
+      BASE_URL,
+      `primal_session=${token}`
+    )
     const user = await requireUser(r)
     expect(user).toMatchObject({ id, email: "u@example.com", isAdmin: false })
   })
@@ -156,7 +149,12 @@ describe("requireUser / requireAdmin (origin is enforced before session lookup)"
       { id, email: "admin@example.com", isAdmin: true },
       0
     )
-    const r = req("POST", "http://localhost", BASE_URL, `primal_session=${token}`)
+    const r = req(
+      "POST",
+      "http://localhost",
+      BASE_URL,
+      `primal_session=${token}`
+    )
     const user = await requireAdmin(r)
     expect(user).toMatchObject({ id, isAdmin: true })
   })

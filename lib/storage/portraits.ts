@@ -149,10 +149,7 @@ export function portraitAssetUrl(assetId: string): string {
  */
 export function assertPortraitFileName(fileName: string): void {
   if (!PORTRAIT_FILE_NAME_PATTERN.test(fileName)) {
-    throw badRequest(
-      "invalid_path",
-      `Invalid portrait file name "${fileName}"`
-    )
+    throw badRequest("invalid_path", `Invalid portrait file name "${fileName}"`)
   }
 }
 

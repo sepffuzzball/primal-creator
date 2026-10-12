@@ -159,7 +159,9 @@ function ChangePasswordCard() {
         await refreshUser()
       } catch (err) {
         toast.error(
-          err instanceof ApiError ? err.message : "Could not change the password."
+          err instanceof ApiError
+            ? err.message
+            : "Could not change the password."
         )
       } finally {
         setSubmitting(false)
@@ -303,7 +305,9 @@ function AdminUsersCard() {
         setNewIsAdmin(false)
         await reload()
       } catch (err) {
-        toast.error(err instanceof ApiError ? err.message : "Could not create user.")
+        toast.error(
+          err instanceof ApiError ? err.message : "Could not create user."
+        )
       } finally {
         setCreating(false)
       }
@@ -387,7 +391,10 @@ function AdminUsersCard() {
                 />
                 Grant admin role
               </label>
-              <Button type="submit" disabled={creating || !newEmail || !newPassword}>
+              <Button
+                type="submit"
+                disabled={creating || !newEmail || !newPassword}
+              >
                 <UserPlusIcon />
                 {creating ? "Creating..." : "Create"}
               </Button>
@@ -395,7 +402,9 @@ function AdminUsersCard() {
           </form>
 
           {loading ? (
-            <div className="text-xs text-muted-foreground">Loading users...</div>
+            <div className="text-xs text-muted-foreground">
+              Loading users...
+            </div>
           ) : (
             <ul className="flex flex-col gap-2">
               {users.map((u) => (
@@ -506,8 +515,8 @@ function AdminUsersCard() {
             <DialogHeader>
               <DialogTitle>Reset password</DialogTitle>
               <DialogDescription>
-                Set a new password for &quot;{resetTarget.email}&quot;. This signs out all
-                of their existing sessions immediately.
+                Set a new password for &quot;{resetTarget.email}&quot;. This
+                signs out all of their existing sessions immediately.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={onReset} className="flex flex-col gap-4">

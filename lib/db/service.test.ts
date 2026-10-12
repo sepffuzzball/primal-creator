@@ -490,7 +490,12 @@ describe("optimistic concurrency (CAS)", () => {
       version: 5,
     })
     const detail = await createCharacter(
-      { name: "Kael", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+      },
       user
     )
     expect(detail.id).toBeTruthy()

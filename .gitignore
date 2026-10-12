@@ -11,6 +11,11 @@
 # testing
 /coverage
 
+# Playwright browser-test artifacts (screenshots/videos/traces on failure)
+/test-results/
+/playwright-report/
+/blob-report/
+
 # next.js
 /.next/
 /out/

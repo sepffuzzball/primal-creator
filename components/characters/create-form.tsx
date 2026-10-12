@@ -1129,6 +1129,17 @@ export function CreateCharacterForm() {
                 Not assigned. Configure when the feature is available.
               </p>
             )}
+            {/* The questionnaire only advances past an item that reports an
+                answer. This step has nothing to record, so a default-checked
+                continuation choice registers the step as answered and lets the
+                wizard move on (and lets the final submit validate). It is
+                visually hidden so the step still renders as a plain
+                informational panel. */}
+            <QuestionnaireChoices className="hidden">
+              <QuestionnaireChoice value="none" defaultChecked>
+                Continue
+              </QuestionnaireChoice>
+            </QuestionnaireChoices>
           </QuestionnaireItem>
 
           <QuestionnaireItem name="equipment">
@@ -1140,6 +1151,14 @@ export function CreateCharacterForm() {
             <p className="text-xs text-muted-foreground">
               Assign equipment on the character page after creation.
             </p>
+            {/* Same as the special-abilities step: nothing to record, so a
+                default-checked continuation choice registers the step as
+                answered and permits advancing and final submission. */}
+            <QuestionnaireChoices className="hidden">
+              <QuestionnaireChoice value="none" defaultChecked>
+                Continue
+              </QuestionnaireChoice>
+            </QuestionnaireChoices>
           </QuestionnaireItem>
 
           <QuestionnaireItem name="review">

@@ -70,7 +70,11 @@ describe.skipIf(!gate.run)("user access (real PG)", () => {
   it("revokes a session when a user is disabled, and re-admits after re-enable", async () => {
     const { id, email } = await makeUser({})
     const token = await createSessionToken({ id, email, isAdmin: false }, 0)
-    expect(await verifySessionToken(token)).toMatchObject({ id, email, isAdmin: false })
+    expect(await verifySessionToken(token)).toMatchObject({
+      id,
+      email,
+      isAdmin: false,
+    })
 
     await prisma.user.update({ where: { id }, data: { disabled: true } })
     expect(await verifySessionToken(token)).toBeNull()
@@ -137,7 +141,9 @@ describe.skipIf(!gate.run)("user access (real PG)", () => {
   })
 
   it("a password change invalidates previously issued tokens but keeps the current session", async () => {
-    const { id, email, password } = await makeUser({ password: "old-password-123" })
+    const { id, email, password } = await makeUser({
+      password: "old-password-123",
+    })
     const oldToken = await createSessionToken({ id, email, isAdmin: false }, 0)
     expect(await verifySessionToken(oldToken)).toMatchObject({ id })
 

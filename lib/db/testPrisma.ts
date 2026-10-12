@@ -138,9 +138,7 @@ export interface TestPrismaInstance {
         }
         orderBy?: unknown
       }) => Promise<TestUserRow[]>
-      create: (args: {
-        data: Record<string, unknown>
-      }) => Promise<TestUserRow>
+      create: (args: { data: Record<string, unknown> }) => Promise<TestUserRow>
       update: (args: {
         where: { id: string }
         data: Record<string, unknown>
@@ -148,7 +146,9 @@ export interface TestPrismaInstance {
       count: (args: {
         where?: { id?: { not?: string }; isAdmin?: boolean; disabled?: boolean }
       }) => Promise<number>
-      deleteMany: (args: { where?: { id?: string } }) => Promise<{ count: number }>
+      deleteMany: (args: {
+        where?: { id?: string }
+      }) => Promise<{ count: number }>
     }
     catalogDefinition: {
       findUnique: (args: {
@@ -463,9 +463,14 @@ export function createTestPrisma(): TestPrismaInstance {
     user: {
       findUnique: async ({ where }) => {
         const key =
-          "id" in where ? (where as { id: string }).id : (where as { email: string }).email
+          "id" in where
+            ? (where as { id: string }).id
+            : (where as { email: string }).email
         for (const u of users.values()) {
-          if (("id" in where && u.id === key) || ("email" in where && u.email === key)) {
+          if (
+            ("id" in where && u.id === key) ||
+            ("email" in where && u.email === key)
+          ) {
             return { ...u }
           }
         }
@@ -474,7 +479,8 @@ export function createTestPrisma(): TestPrismaInstance {
       update: async ({ where, data }) => {
         const u = users.get(where.id)
         if (!u) throw new Error(`User ${where.id} not found`)
-        const versionOp = data.sessionVersion as { increment?: number } | undefined
+        const versionOp = data.sessionVersion as
+          { increment?: number } | undefined
         if (versionOp && typeof versionOp.increment === "number") {
           u.sessionVersion += versionOp.increment
         }
@@ -876,9 +882,14 @@ export function createTestPrisma(): TestPrismaInstance {
         where: { id: string } | { email: string }
       }) => {
         const key =
-          "id" in where ? (where as { id: string }).id : (where as { email: string }).email
+          "id" in where
+            ? (where as { id: string }).id
+            : (where as { email: string }).email
         for (const u of users.values()) {
-          if (("id" in where && u.id === key) || ("email" in where && u.email === key)) {
+          if (
+            ("id" in where && u.id === key) ||
+            ("email" in where && u.email === key)
+          ) {
             return { ...u }
           }
         }
@@ -941,11 +952,7 @@ export function createTestPrisma(): TestPrismaInstance {
       },
       update: tx.user.update,
       count: tx.user.count,
-      deleteMany: async ({
-        where,
-      }: {
-        where?: { id?: string }
-      }) => {
+      deleteMany: async ({ where }: { where?: { id?: string } }) => {
         let removed = 0
         for (const [id, u] of [...users]) {
           if (where?.id != null && u.id !== where.id) continue

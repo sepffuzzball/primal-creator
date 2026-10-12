@@ -100,9 +100,69 @@ jobs:
       - name: Run unit suite with DB integration tests enabled
         run: pnpm test
 
+  browser-checks:
+    name: Playwright browser checks (chromium)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: primal_creator_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d primal_creator_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Opt in to browser E2E and point the server at an isolated test database
+      # (name contains `_test`) so the run can never touch the dev `primal_creator`
+      # database.
+      RUN_BROWSER_TESTS: "1"
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public
+      AUTH_SECRET: ci-only-auth-secret-for-primal-creator-dockerbrowser-123
+      # Test-only admin credentials (strong, non-placeholder). E2E_ADMIN_* mirror
+      # the seeded ADMIN_* so the UI login uses them.
+      ADMIN_EMAIL: admin@primal.local
+      ADMIN_PASSWORD: PrimalE2eStrongPass-9713
+      E2E_ADMIN_EMAIL: admin@primal.local
+      E2E_ADMIN_PASSWORD: PrimalE2eStrongPass-9713
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma generate
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Apply migrations (test DB, no auto-migration in requests)
+        run: pnpm db:migrate
+
+      - name: Seed database (test-only admin + catalog, no sample characters)
+        run: pnpm db:seed
+
+      - name: Run Playwright browser checks
+        run: pnpm test:e2e
+
   publish:
     name: Build & push multi-arch image
-    needs: [checks, db-checks]
+    needs: [checks, db-checks, browser-checks]
     runs-on: ubuntu-latest
     permissions:
       contents: read

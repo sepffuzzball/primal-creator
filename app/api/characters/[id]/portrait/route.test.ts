@@ -79,24 +79,18 @@ describe.skipIf(!gate.run)(
         new Blob([bytes as unknown as BlobPart], { type: "image/png" }),
         filename
       )
-      return new Request(
-        `http://localhost/api/characters/${charId}/portrait`,
-        {
-          method: "POST",
-          body: form,
-          headers: { cookie: `primal_session=${token}`, origin: ORIGIN },
-        }
-      )
+      return new Request(`http://localhost/api/characters/${charId}/portrait`, {
+        method: "POST",
+        body: form,
+        headers: { cookie: `primal_session=${token}`, origin: ORIGIN },
+      })
     }
 
     function deleteReq(): Request {
-      return new Request(
-        `http://localhost/api/characters/${charId}/portrait`,
-        {
-          method: "DELETE",
-          headers: { cookie: `primal_session=${token}`, origin: ORIGIN },
-        }
-      )
+      return new Request(`http://localhost/api/characters/${charId}/portrait`, {
+        method: "DELETE",
+        headers: { cookie: `primal_session=${token}`, origin: ORIGIN },
+      })
     }
 
     it("two simultaneous uploads leave exactly one asset and one on-disk file", async () => {

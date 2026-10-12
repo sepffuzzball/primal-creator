@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto"
 import { requireUser, assertCharacterAccess } from "@/lib/auth/guard"
-import { badRequest, notFound, payloadTooLarge, respond } from "@/lib/server/errors"
+import {
+  badRequest,
+  notFound,
+  payloadTooLarge,
+  respond,
+} from "@/lib/server/errors"
 import { prisma } from "@/lib/db/client"
 import {
   MAX_PORTRAIT_BYTES,

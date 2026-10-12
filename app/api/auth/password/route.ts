@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server"
 
 import { requireUser } from "@/lib/auth/guard"
-import { SESSION_COOKIE, cookieOptions, createSessionToken } from "@/lib/auth/session"
+import {
+  SESSION_COOKIE,
+  cookieOptions,
+  createSessionToken,
+} from "@/lib/auth/session"
 import { changeOwnPassword } from "@/lib/db/user-service"
 import { badRequest, respond } from "@/lib/server/errors"
 import { passwordChangeSchema } from "@/lib/server/schemas"
@@ -31,10 +35,7 @@ export async function POST(req: Request) {
     }
 
     const result = await changeOwnPassword(session, parsed.data)
-    const token = await createSessionToken(
-      result.user,
-      result.sessionVersion
-    )
+    const token = await createSessionToken(result.user, result.sessionVersion)
 
     const res = NextResponse.json({
       user: {
