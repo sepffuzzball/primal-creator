@@ -1,0 +1,35 @@
+# Dependencies (installed inside the image)
+node_modules
+
+# Build output
+.next
+out
+build
+
+# Graph/knowledge graph artifacts
+graphify-out
+
+# opencode OpenChamber screenshots
+.openchamber
+
+# Test coverage
+coverage
+
+# Local env files: never bake secrets into an image; compose/CI supply them.
+.env
+.env.*
+!.env.example
+
+# VCS / tooling
+.git
+.gitignore
+AGENTS.md
+CLAUDE.md
+*.tsbuildinfo
+next-env.d.ts
+
+# Misc
+.DS_Store
+*.pem
+npm-debug.log*
+pnpm-debug.log*

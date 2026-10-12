@@ -1,0 +1,93 @@
+name: primal-creator
+
+# Production-oriented Compose stack.
+#
+# The app container does NOT run migrations or seed on boot. Apply them
+# explicitly (this is the "explicit migration + seed" contract; there is no
+# unsafe auto-migration in request handling):
+#
+#   docker compose run --rm app pnpm db:migrate
+#   docker compose run --rm app pnpm db:seed
+#
+# Then start the stack:
+#
+#   docker compose up -d --build
+#
+# Required before first `up`: set AUTH_SECRET (>= 32 chars), ADMIN_PASSWORD
+# (>= 12 chars, not a placeholder), and POSTGRES_PASSWORD. The default Postgres
+# password is a DEV-only value (`postgres`); it must be changed on any service
+# exposed to the network. See .env.example.
+
+services:
+  app:
+    image: ghcr.io/sepffuzzball/primal-creator:${DOCKER_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: "production"
+      HOSTNAME: "0.0.0.0"
+      PORT: "3000"
+      # Always points at the compose `postgres` service, regardless of any
+      # local-dev DATABASE_URL in a repo-root `.env`. POSTGRES_PASSWORD is
+      # required (no fallback) - the dev-only default `postgres` must be
+      # overridden on any network-facing Postgres.
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set a real Postgres password}@postgres:5432/${POSTGRES_DB:-primal_creator}?schema=public"
+      # No hardcoded secret: compose fails fast if it is missing. Generate with:
+      #   openssl rand -base64 48
+      AUTH_SECRET: "${AUTH_SECRET:?AUTH_SECRET is required (openssl rand -base64 48)}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL:-admin@primal.local}"
+      # No fallback: seeding a production admin with a guessable password is a
+      # deploy mistake, so compose fails fast if ADMIN_PASSWORD is unset. The
+      # seed additionally rejects weak/placeholder and <12 char values.
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Set a strong admin password}"
+      CATALOG_PUBLIC: "${CATALOG_PUBLIC:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/data/uploads
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      # No fallback: the known default `postgres` is a DEV-only value and must be
+      # replaced on any exposed/production Postgres. Compose fails fast if unset.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set a real Postgres password}"
+      POSTGRES_DB: "${POSTGRES_DB:-primal_creator}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Local dev convenience; production usually keeps Postgres behind the reverse
+    # proxy or a managed service, so the port is optional. Uncomment to expose:
+    # ports:
+    #   - "5432:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-primal_creator}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata: {}
+  uploads: {}

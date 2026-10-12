@@ -1,0 +1,169 @@
+// Prisma schema for primal-creator.
+//
+// Persistence for the deterministic progression engine. The engine itself is a
+// pure TypeScript module (lib/rules) and stores its full CharacterState as a
+// JSON blob on Character.state. This schema adds identity, ownership, optimistic
+// concurrency, an immutable event journal, and a polymorphic catalog.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------------ //
+// Enums
+// ------------------------------------------------------------------ //
+
+enum Origin {
+  integrated
+  born
+}
+
+enum CatalogKind {
+  races
+  classes
+  professions
+  titles
+  equipment
+  skills
+  blessings
+  bloodlines
+  consumables
+  evolutions
+}
+
+enum Provenance {
+  verified
+  inferred
+  house
+}
+
+// ------------------------------------------------------------------ //
+// Users
+// ------------------------------------------------------------------ //
+
+model User {
+  id        String      @id @default(cuid())
+  email     String      @unique
+  // bcrypt hash; never plaintext. Seeded from ADMIN_EMAIL / ADMIN_PASSWORD.
+  password  String
+  isAdmin   Boolean     @default(false)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  characters Character[]
+
+  @@map("users")
+}
+
+// ------------------------------------------------------------------ //
+// Assets (metadata only; the binary is stored elsewhere)
+// ------------------------------------------------------------------ //
+
+model Asset {
+  id         String    @id @default(cuid())
+  // e.g. "character-avatar", "catalog-image", "journal-attachment".
+  kind       String
+  fileName   String?
+  mimeType   String?
+  sizeBytes  Int?
+  url        String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  character  Character? @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  characterId String?
+
+  @@index([kind])
+  @@map("assets")
+}
+
+// ------------------------------------------------------------------ //
+// Characters
+// ------------------------------------------------------------------ //
+
+model Character {
+  id            String   @id @default(cuid())
+  ownerId       String
+  owner         User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name          String
+  description   String?
+  origin        Origin   @default(integrated)
+  // Optional relations to catalog definitions. Null means "not yet chosen".
+  raceId        String?
+  classId       String?
+  professionId  String?
+  race          CatalogDefinition? @relation("CharacterRace", fields: [raceId], references: [id])
+  class         CatalogDefinition? @relation("CharacterClass", fields: [classId], references: [id])
+  profession    CatalogDefinition? @relation("CharacterProfession", fields: [professionId], references: [id])
+
+  // Full engine state, serialized as JSON. Represents `CharacterState`.
+  state         Json
+  // Optimistic concurrency token. Every mutation must present the current value
+  // via the `version` field; a mismatch is a 409 conflict.
+  version       Int      @default(0)
+  archived      Boolean  @default(false)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  events        ProgressionEvent[]
+  assets        Asset[]
+
+  @@index([ownerId])
+  @@index([archived])
+  @@index([ownerId, archived])
+  @@map("characters")
+}
+
+// Immutable journal of progression events. Append-only: a row is never updated
+// or deleted. Every state mutation persists one of these.
+model ProgressionEvent {
+  id          String    @id @default(cuid())
+  characterId String
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  // "create" | "update" | "advance" | "allocate" | "evolve" | "archive" | ...
+  kind        String
+  // Immutable payload; never mutated after insert.
+  payload     Json
+  createdAt   DateTime  @default(now())
+
+  @@index([characterId, createdAt])
+  @@map("progression_events")
+}
+
+// ------------------------------------------------------------------ //
+// Polymorphic catalog
+// ------------------------------------------------------------------ //
+//
+// A single table holds every kind of catalog entry keyed by `kind` + `stableId`.
+// `config` carries kind-specific validated JSON (per-kind Zod schema on the
+// server). `grade` is the grade band the entry belongs to (G/F/E/D/C/B/A/S);
+// arbitrary entries may leave it null. `provenance` distinguishes verified wiki
+// facts from inferred/house placeholders so nothing is presented as canon.
+
+model CatalogDefinition {
+  id          String      @id @default(cuid())
+  kind        CatalogKind
+  stableId    String
+  name        String
+  description String?
+  grade       String?
+  provenance  Provenance  @default(house)
+  sourceUrl   String?
+  archived    Boolean     @default(false)
+  config      Json        @default("{}")
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  raceCharacters      Character[] @relation("CharacterRace")
+  classCharacters     Character[] @relation("CharacterClass")
+  professionCharacters Character[] @relation("CharacterProfession")
+
+  @@unique([kind, stableId])
+  @@index([kind])
+  @@index([kind, archived])
+  @@map("catalog_definitions")
+}
