@@ -302,3 +302,36 @@ model SkillOfferOption {
   @@index([definitionId])
   @@map("skill_offer_options")
 }
+
+// ------------------------------------------------------------------ //
+// Server-wide house rules (singleton, admin-editable)
+// ------------------------------------------------------------------ //
+//
+// A SINGLE row (`id = 'active'`) holds the validated, admin-editable house-rule
+// defaults for the calculation engine: the equipment cap percentages and the
+// consumable grade rates. It is layered on top of the engine defaults by
+// `buildRulesConfig` (lib/db/service.ts) - it never rewrites historical awards.
+//
+// The row is seeded DURING the migration (0007_house_rules), never by the seed
+// script, so the app never silently falls back to an in-memory default. `config`
+// is validated server-side by `houseRulesConfigSchema` (lib/db/ruleset.ts);
+// `version` is the optimistic-concurrency token for the admin Settings form
+// (a stale PATCH is a 409). The `updatedAt` is surfaced to the admin so they know
+// whether they are editing a fresh snapshot.
+//
+// PATCH semantics: updateMany({ where: { id: 'active', version } }) with
+// `version: { increment: 1 }`. A missing row is an explicit 503, never a silent
+// default.
+
+model HouseRules {
+  id        String   @id
+  version   Int      @default(0)
+  // Validated shape from `houseRulesConfigSchema`:
+  // { equipmentIndividualCapPercent, equipmentCombinedCapPercent,
+  //   consumableGradeRates: { F, E, D, C } }.
+  config    Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("house_rules")
+}

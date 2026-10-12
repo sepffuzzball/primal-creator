@@ -144,6 +144,19 @@ enforced at application time, and a recorded gain is never re-capped by later
 config changes - historical facts are immutable. Temporary potion effects are
 bounded only by their effect duration.
 
+These rates are NOT hard-coded. They live in a single server-wide `house_rules` row
+(`id = 'active'`, migration `0007_house_rules`) that an admin edits from the
+Settings page via `GET`/`PATCH /api/admin/rules`. The engine receives the current
+validated config ONCE per request and passes it down through the service layer;
+helpers never issue their own hidden DB lookup. Because live status is re-derived
+from the current config on every read or mutation, an admin edit is effective
+immediately, while the persisted `Character.state`, the append-only journal and
+every historical level award stay untouched. A lowered equipment cap clamps only the
+currently-synthesized bonus (the surplus becomes `suppressed`), and a recorded
+permanent-consumable gain is never re-capped (`remaining = max(0, newer cap - used)`).
+The current house-rules version is surfaced as `rulesetVersion` on character details
+and list items when the row exists.
+
 ## Verification status of inputs
 
 - **Verified:** grade/level bands; race-level = average of class/profession;

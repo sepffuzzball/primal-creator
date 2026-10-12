@@ -31,7 +31,7 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   `POST /api/characters/[id]/evolve`. The legacy grade-only house evolution is
   retained as a fallback and is accepted only when NO valid catalog path to the
   requested grade exists (otherwise the server returns `409
-  evolution_choice_required`).
+evolution_choice_required`).
 - **Resumable creation drafts**: the questionnaire is persisted per user as an
   authenticated, owner-scoped draft (one per user) so work is never lost. A draft
   stores only validated, whitelisted fields (`step`, name/description, origin,
@@ -74,7 +74,7 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   written to an append-only journal, and a character (state + live status + skill
   offers + journal) can be exported as a `primal-character/3` JSON backup keyed by
   stable catalog identifiers. A backup can be re-imported (`POST
-  /api/characters/import`) as a NEW character owned by the current user; it is a
+/api/characters/import`) as a NEW character owned by the current user; it is a
   trusted-but-unverified backup, so it is marked `imported` in the UI and its
   history is stored as source provenance (`import_history` events) rather than
   treated as server-verified. The live status is recomputed from the current
@@ -98,6 +98,15 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   assumption pending verification); temporary potions produce a temporary effect
   that expires after a number of quarters. Every consumption mutates the stored
   state and writes an immutable `consume` progression event to the journal.
+- **Admin-editable house rules**: the equipment (20% individual / 15% combined)
+  and consumable (F3/E5/D15/C45) defaults are NOT hard-coded. They are served from
+  a single server-wide `house_rules` row and edited by an admin from the Settings
+  page (`GET`/`PATCH /api/admin/rules`, optimistic-concurrency versioned - a stale
+  write 409s and never silently clobbers a concurrent edit). A change takes effect
+  on the next read or mutation (live status is always re-derived from the current
+  config) and never rewrites historically awarded stats or the persisted state;
+  the current version is exposed as `rulesetVersion` on character reads. Non-admin
+  users see no editor.
 - **Skill milestone offers & selection**: skills are **offered, never
   auto-awarded**. The milestone schedule and rarity ladder are data-driven
   (per-skill catalog config), not hard-coded formulas. When a character levels up

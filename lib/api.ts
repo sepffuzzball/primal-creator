@@ -110,6 +110,38 @@ export interface PasswordChangeResponse {
 }
 
 // ------------------------------------------------------------------ //
+// House rules (admin-only)
+// ------------------------------------------------------------------ //
+
+/**
+ * The validated, server-wide house-rules config. EXACT shape - the admin Settings
+ * form edits exactly these fields; anything else is rejected.
+ */
+export interface AdminHouseRulesConfig {
+  equipmentIndividualCapPercent: number
+  equipmentCombinedCapPercent: number
+  consumableGradeRates: {
+    F: number
+    E: number
+    D: number
+    C: number
+  }
+}
+
+/** GET /api/admin/rules - current validated house rules plus the CAS version. */
+export interface AdminHouseRulesResponse {
+  version: number
+  config: AdminHouseRulesConfig
+  updatedAt: string
+}
+
+/** PATCH /api/admin/rules - full-shape optimistic-concurrency update. */
+export interface HouseRulesPatchRequest {
+  version: number
+  config: AdminHouseRulesConfig
+}
+
+// ------------------------------------------------------------------ //
 // Catalog
 // ------------------------------------------------------------------ //
 
@@ -267,6 +299,11 @@ export interface CharacterListItem {
   /** True when the character was created from a user-supplied trusted-backup import. */
   imported: boolean
   status?: StatusResult
+  /**
+   * The version of the server-wide house-rules config this list item was derived
+   * from. Present when the singleton house-rules row exists; omitted otherwise.
+   */
+  rulesetVersion?: number
 }
 
 export interface CharacterAssociationView {
@@ -333,6 +370,11 @@ export interface CharacterDetail {
   permanentConsumableCap?: PartialVector
   /** Server-computed remaining permanent-consumable capacity per attribute. */
   permanentConsumableRemaining?: PartialVector
+  /**
+   * The version of the server-wide house-rules config this detail was derived
+   * from. Present when the singleton house-rules row exists; omitted otherwise.
+   */
+  rulesetVersion?: number
 }
 
 export interface CharactersResponse {

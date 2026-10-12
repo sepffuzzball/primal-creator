@@ -46,6 +46,11 @@ import {
 } from "@/lib/rules"
 import { prisma } from "@/lib/db/client"
 import {
+  loadHouseRules,
+  type HouseRulesConfig,
+  type HouseRulesRow,
+} from "@/lib/db/ruleset"
+import {
   characterStateSchema,
   hasInvalidSkillTrack,
   isIncompleteSkillConfig,
@@ -144,6 +149,13 @@ export interface CharacterDetail {
   permanentConsumableCap?: PartialVector
   /** Server-computed remaining permanent-consumable capacity per attribute. */
   permanentConsumableRemaining?: PartialVector
+  /**
+   * The version of the server-wide house-rules config this detail was derived
+   * from. Always present - the singleton house-rules row is required (a missing
+   * row yields a 503 `ruleset_unavailable`, never a silent default). Lets the UI
+   * detect that a rule edit has bumped the config.
+   */
+  rulesetVersion?: number
 }
 
 export interface CharacterListItem {
@@ -158,6 +170,12 @@ export interface CharacterListItem {
   /** True when the character was created from a user-supplied trusted-backup import. */
   imported: boolean
   status?: StatusResult
+  /**
+   * The version of the server-wide house-rules config this list item was derived
+   * from. Always present - the singleton house-rules row is required (a missing
+   * row yields a 503 `ruleset_unavailable`, never a silent default).
+   */
+  rulesetVersion?: number
 }
 
 export interface CatalogItem {
@@ -226,16 +244,36 @@ function raceDefinitionsFrom(
  * Build the engine RulesConfig for a single character from its catalog rows.
  * Everything not sourced from a catalog row keeps the engine default (which is
  * itself a documented house assumption), so no canon formula is invented.
+ *
+ * `houseRules` is the validated, admin-editable singleton house config
+ * (`HouseRulesConfig` from lib/db/ruleset.ts). When supplied it OVERRIDES the
+ * engine defaults for the three editable knobs (equipment caps + consumable grade
+ * rates); everything else (grade table, race derivation strategy, open grade
+ * gates, permanent race caps, unresolved resources) stays at the engine default.
+ * It never rewrites historical awards - it only changes how future/live values
+ * are derived.
  */
-export function buildRulesConfig(raceRow: CatalogRow | null): RulesConfig {
+export function buildRulesConfig(
+  raceRow: CatalogRow | null,
+  houseRules?: HouseRulesConfig
+): RulesConfig {
   const config = defaultRulesConfig()
   if (raceRow) {
     const parsed = parseCatalogConfig(raceRow.kind, raceRow.config ?? {})
     const defs = raceDefinitionsFrom(parsed)
     if (Object.keys(defs).length > 0) config.raceDefinitions = defs
   }
+  if (houseRules) {
+    config.equipmentIndividualCapPercent =
+      houseRules.equipmentIndividualCapPercent
+    config.equipmentCombinedCapPercent = houseRules.equipmentCombinedCapPercent
+    config.consumableGradeRates = {
+      ...config.consumableGradeRates,
+      ...houseRules.consumableGradeRates,
+    }
+  }
   // resourceMultipliers stay null (derived resources unresolved -> max null).
-  // consumable rates and equipment caps stay at engine defaults.
+  // consumable grades not individually overridden keep the engine assumptions.
   // gradeGates stay open ({}).
   return config
 }
@@ -492,8 +530,11 @@ function statusFor(
   return calculateStatus(liveState(character), config)
 }
 
-function configFor(character: CharacterWithCatalog): RulesConfig {
-  return buildRulesConfig(character.race)
+function configFor(
+  character: CharacterWithCatalog,
+  houseRules: HouseRulesConfig
+): RulesConfig {
+  return buildRulesConfig(character.race, houseRules)
 }
 
 /** Encode a full vector as a sparse `PartialVector` with only non-zero entries. */
@@ -512,12 +553,14 @@ function toSparseVector(vec: AttributeVector): PartialVector {
  * config (F3/E5/D15/C45). Used by the detail read so the Consumables sheet can
  * show "current cap and remaining" without re-deriving the cap.
  */
-function permanentConsumableInfo(character: CharacterWithCatalog): {
+function permanentConsumableInfo(
+  character: CharacterWithCatalog,
+  config: RulesConfig
+): {
   cap: PartialVector
   remaining: PartialVector
 } {
   const state = deserializeState(character.state)
-  const config = configFor(character)
   // Capacity is always derived from the authoritative Character.origin column,
   // never inferred from the grade. A legacy state that predates origin tracking
   // is resolved against the DB row, so a born character is never mis-capped as
@@ -613,10 +656,11 @@ function skillOfferView(
 
 function toDetail(
   character: CharacterWithCatalog,
-  withStatus: boolean
+  withStatus: boolean,
+  config: RulesConfig,
+  rulesetVersion?: number
 ): CharacterDetail {
-  const config = configFor(character)
-  const consumableInfo = permanentConsumableInfo(character)
+  const consumableInfo = permanentConsumableInfo(character, config)
   return {
     id: character.id,
     name: character.name,
@@ -639,14 +683,16 @@ function toDetail(
     status: withStatus ? statusFor(character, config) : undefined,
     permanentConsumableCap: consumableInfo.cap,
     permanentConsumableRemaining: consumableInfo.remaining,
+    ...(rulesetVersion != null ? { rulesetVersion } : {}),
   }
 }
 
 function toListItem(
   character: CharacterWithCatalog,
-  withStatus: boolean
+  withStatus: boolean,
+  config: RulesConfig,
+  rulesetVersion?: number
 ): CharacterListItem {
-  const config = configFor(character)
   return {
     id: character.id,
     name: character.name,
@@ -658,7 +704,34 @@ function toListItem(
     archived: character.archived,
     imported: character.imported,
     status: withStatus ? statusFor(character, config) : undefined,
+    ...(rulesetVersion != null ? { rulesetVersion } : {}),
   }
+}
+
+/**
+ * Build a full character detail from a loaded row AND a single in-request
+ * house-rules row, deriving the rules config ONCE and passing it through the
+ * status / consumable-cap helpers (no hidden DB lookups inside).
+ */
+function detailFor(
+  character: CharacterWithCatalog,
+  houseRules: HouseRulesRow
+): CharacterDetail {
+  const config = buildRulesConfig(character.race, houseRules.config)
+  return toDetail(character, true, config, houseRules.version)
+}
+
+/**
+ * Build a character list item from a loaded row AND a single in-request
+ * house-rules row, deriving the config once and passing it through the helpers.
+ */
+function listItemFor(
+  character: CharacterWithCatalog,
+  houseRules: HouseRulesRow,
+  withStatus: boolean
+): CharacterListItem {
+  const config = buildRulesConfig(character.race, houseRules.config)
+  return toListItem(character, withStatus, config, houseRules.version)
 }
 
 // ------------------------------------------------------------------ //
@@ -681,12 +754,16 @@ export async function listCharacters(
     ...ownedWhere(user),
     ...(opts?.includeArchived ? {} : { archived: false }),
   }
+  // Load the house rules ONCE for the whole request (read path, no transaction).
+  const houseRules = await loadHouseRules(prisma)
   const rows = await prisma.character.findMany({
     where,
     include: characterInclude,
     orderBy: { updatedAt: "desc" },
   })
-  return rows.map((row) => toListItem(row, opts?.withStatus ?? false))
+  return rows.map((row) =>
+    listItemFor(row, houseRules, opts?.withStatus ?? false)
+  )
 }
 
 async function assertOwner(
@@ -711,7 +788,9 @@ export async function getCharacter(
   opts?: { withStatus?: boolean }
 ): Promise<CharacterDetail> {
   const row = await assertOwner(prisma, id, user)
-  return toDetail(row, opts?.withStatus ?? true)
+  const houseRules = await loadHouseRules(prisma)
+  const config = buildRulesConfig(row.race, houseRules.config)
+  return toDetail(row, opts?.withStatus ?? true, config, houseRules.version)
 }
 
 export async function createCharacter(
@@ -760,6 +839,8 @@ export async function createCharacter(
   // Create the character and append the "create" progression event atomically: a
   // character row must never exist without its corresponding journal entry.
   return prisma.$transaction(async (tx) => {
+    // Load the house rules ONCE for this mutation, through the SAME tx client.
+    const houseRules = await loadHouseRules(tx)
     const created = await tx.character.create({
       data: {
         ownerId: user.id,
@@ -806,7 +887,7 @@ export async function createCharacter(
       }
     }
 
-    return toDetail(created, true)
+    return detailFor(created, houseRules)
   })
 }
 
@@ -823,6 +904,8 @@ export async function updateCharacter(
 ): Promise<CharacterDetail> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    // Load the house rules once for this mutation, through the same tx client.
+    const houseRules = await loadHouseRules(tx)
     // CAS token: prefer the client-supplied version (validate-and-write), but
     // when the client omits it (e.g. a PATCH that only flips `archived`) fall
     // back to the version read from the DB inside this transaction. Either way
@@ -882,7 +965,7 @@ export async function updateCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return toDetail(updated, true)
+    return detailFor(updated, houseRules)
   })
 }
 
@@ -892,6 +975,7 @@ export async function archiveCharacter(
 ): Promise<CharacterDetail> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
     const result = await tx.character.updateMany({
       where: { id, version: row.version },
       data: { archived: true, version: { increment: 1 } },
@@ -913,7 +997,7 @@ export async function archiveCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return toDetail(updated, true)
+    return detailFor(updated, houseRules)
   })
 }
 
@@ -1033,8 +1117,9 @@ export async function advanceCharacter(
 ): Promise<{ character: CharacterDetail; journal: unknown }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
     const state = deserializeState(row.state)
-    const config = configFor(row)
+    const config = configFor(row, houseRules.config)
     const trackRow = body.track === "class" ? row.class : row.profession
     const definition = resolveTrackDefinition(trackRow, state)
     if (!definition) {
@@ -1105,7 +1190,7 @@ export async function advanceCharacter(
       include: characterInclude,
     }))!
     return {
-      character: toDetail(updated, true),
+      character: toDetail(updated, true, config, houseRules.version),
       journal: advanceJournal,
     }
   })
@@ -1189,6 +1274,7 @@ export async function skillCharacter(
 ): Promise<{ character: CharacterDetail }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
 
     if (input.operation === "select") {
       const offer = await tx.skillOffer.findUnique({
@@ -1298,7 +1384,7 @@ export async function skillCharacter(
         where: { id },
         include: characterInclude,
       }))!
-      return { character: toDetail(updated, true) }
+      return { character: detailFor(updated, houseRules) }
     }
 
     // GRANT (admin only)
@@ -1401,7 +1487,7 @@ export async function skillCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return { character: toDetail(updated, true) }
+    return { character: detailFor(updated, houseRules) }
   })
 }
 
@@ -1412,8 +1498,9 @@ export async function allocateCharacter(
 ): Promise<{ character: CharacterDetail; status: StatusResult }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
     const state = deserializeState(row.state)
-    const config = configFor(row)
+    const config = configFor(row, houseRules.config)
     const nextState = applyAllocate(state, body.allocation)
     const serialized = serializeState(nextState)
     const updatedMany = await tx.character.updateMany({
@@ -1441,7 +1528,7 @@ export async function allocateCharacter(
       include: characterInclude,
     }))!
     return {
-      character: toDetail(updated, true),
+      character: toDetail(updated, true, config, houseRules.version),
       status: statusFor(updated, config),
     }
   })
@@ -1697,6 +1784,7 @@ export async function evolveCharacter(
 ): Promise<{ character: CharacterDetail; journal: unknown }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
     const state = deserializeState(row.state)
     const currentGrade = state.race.grade
     const currentRaceStableId = row.race?.stableId ?? null
@@ -1728,7 +1816,7 @@ export async function evolveCharacter(
           `Catalog defines race evolution path(s) to grade ${targetGrade}; submit an optionId choice`
         )
       }
-      const config = configFor(row)
+      const config = configFor(row, houseRules.config)
       const result = applyEvolve(state, body.grade, config)
       const serialized = serializeState(result.state)
       const updatedMany = await tx.character.updateMany({
@@ -1758,7 +1846,10 @@ export async function evolveCharacter(
         where: { id },
         include: characterInclude,
       }))!
-      return { character: toDetail(updated, true), journal: result.journal }
+      return {
+        character: toDetail(updated, true, config, houseRules.version),
+        journal: result.journal,
+      }
     }
 
     // ---- Catalog race path choice ---------------------------------------- //
@@ -1872,7 +1963,7 @@ export async function evolveCharacter(
     // after validating both current and destination. No rewards/skills are
     // invented: class/profession tracks, historical awards and allocations are
     // preserved.
-    const destRulesConfig = buildRulesConfig(destRace)
+    const destRulesConfig = buildRulesConfig(destRace, houseRules.config)
     const result = applyEvolve(state, path.toGrade, destRulesConfig)
     const serialized = serializeState(result.state)
     const updatedMany = await tx.character.updateMany({
@@ -1931,7 +2022,11 @@ export async function evolveCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return { character: toDetail(updated, true), journal }
+    const updatedConfig = buildRulesConfig(updated.race, houseRules.config)
+    return {
+      character: toDetail(updated, true, updatedConfig, houseRules.version),
+      journal,
+    }
   })
 }
 
@@ -1966,6 +2061,7 @@ export async function consumeCharacter(
 }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
     // A consumed item mutates the character, so an archived character is inert.
     if (row.archived) {
       throw badRequest(
@@ -1995,7 +2091,7 @@ export async function consumeCharacter(
 
     const config = parseCatalogConfig(definition.kind, definition.config ?? {})
     const state = deserializeState(row.state)
-    const rulesConfig = configFor(row)
+    const rulesConfig = configFor(row, houseRules.config)
 
     // The engine never guesses provenance from the grade: origin is always
     // reconstructed from the authoritative Character.origin column before any
@@ -2127,7 +2223,7 @@ export async function consumeCharacter(
       include: characterInclude,
     }))!
     return {
-      character: toDetail(updated, true),
+      character: toDetail(updated, true, rulesConfig, houseRules.version),
       status: statusFor(updated, rulesConfig),
       event: { kind: "consume", payload: eventPayload },
     }
@@ -2164,6 +2260,7 @@ export async function associateCharacter(
 ): Promise<{ character: CharacterDetail }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
+    const houseRules = await loadHouseRules(tx)
 
     const definition = await tx.catalogDefinition.findUnique({
       where: { id: body.definitionId },
@@ -2342,7 +2439,7 @@ export async function associateCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return { character: toDetail(updated, true) }
+    return { character: detailFor(updated, houseRules) }
   })
 }
 
@@ -2351,7 +2448,8 @@ export async function exportCharacter(
   user: SessionUser
 ): Promise<Record<string, unknown>> {
   const row = await assertOwner(prisma, id, user)
-  const config = configFor(row)
+  const houseRules = await loadHouseRules(prisma)
+  const config = configFor(row, houseRules.config)
   const state = deserializeState(row.state)
   // The live state is what `status` is computed from. It merges the immutable
   // stored state with effects/equipment synthesized from the currently linked,
@@ -2412,7 +2510,7 @@ export async function exportCharacter(
     schema: "primal-character/3",
     rulesetVersion: IMPORT_RULESET_VERSION,
     identity,
-    character: toListItem(row, true),
+    character: listItemFor(row, houseRules, true),
     state,
     liveState: live,
     status: statusFor(row, config),
@@ -2876,6 +2974,7 @@ export async function importCharacter(
   user: SessionUser
 ): Promise<CharacterDetail> {
   return prisma.$transaction(async (tx) => {
+    const houseRules = await loadHouseRules(tx)
     const race = await resolveIdentityRef(
       tx,
       "races",
@@ -2919,7 +3018,7 @@ export async function importCharacter(
       }
       throw err
     }
-    const config = buildRulesConfig(race)
+    const config = buildRulesConfig(race, houseRules.config)
     // Validate the RAW document state before normalizing: `normalizeImportedState`
     // rewrites the origin to identity.origin, which would otherwise mask a
     // backup whose state.race.origin disagrees with identity.origin.
@@ -3020,7 +3119,7 @@ export async function importCharacter(
       include: characterInclude,
     }))!
 
-    return toDetail(refetched, true)
+    return detailFor(refetched, houseRules)
   })
 }
 

@@ -20,6 +20,8 @@
  * characters, and to assert on the resulting rows/events.
  */
 
+import { DEFAULT_HOUSE_RULES_CONFIG, HOUSE_RULES_ID } from "./ruleset"
+
 export interface TestCatalogRow {
   id: string
   kind: string
@@ -116,6 +118,14 @@ export interface TestUserRow {
   isAdmin: boolean
   disabled: boolean
   sessionVersion: number
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface TestHouseRulesRow {
+  id: string
+  version: number
+  config: unknown
   createdAt: Date
   updatedAt: Date
 }
@@ -243,6 +253,15 @@ export interface TestPrismaInstance {
         data: Record<string, unknown>
       }) => Promise<TestSkillOfferRow>
     }
+    houseRules: {
+      findUnique: (args: {
+        where: { id: string }
+      }) => Promise<TestHouseRulesRow | null>
+      updateMany: (args: {
+        where: { id: string; version?: number }
+        data: Record<string, unknown>
+      }) => Promise<{ count: number }>
+    }
   }
   store: {
     characters: Map<string, TestCharacterRow>
@@ -253,12 +272,16 @@ export interface TestPrismaInstance {
     skillOfferOptions: TestSkillOfferOptionRow[]
     drafts: Map<string, TestDraftRow>
     users: Map<string, TestUserRow>
+    houseRules: Map<string, TestHouseRulesRow>
     addCatalog(row: Partial<TestCatalogRow> & { id: string }): TestCatalogRow
     addCharacter(
       row: Partial<TestCharacterRow> & { id: string }
     ): TestCharacterRow
     addDraft(row: Partial<TestDraftRow> & { userId: string }): TestDraftRow
     addUser(row: Partial<TestUserRow> & { id: string }): TestUserRow
+    addHouseRules(
+      row: Partial<TestHouseRulesRow> & { id: string }
+    ): TestHouseRulesRow
     addAssociation(
       row: Partial<TestAssociationRow> & {
         characterId: string
@@ -375,6 +398,33 @@ interface Transaction {
       data: Record<string, unknown>
     }) => Promise<TestSkillOfferRow>
   }
+  houseRules: {
+    findUnique: (args: {
+      where: { id: string }
+    }) => Promise<TestHouseRulesRow | null>
+    updateMany: (args: {
+      where: { id: string; version?: number }
+      data: Record<string, unknown>
+    }) => Promise<{ count: number }>
+  }
+}
+
+/**
+ * The singleton house-rules row that the service layer ALWAYS requires. Seeded by
+ * `createTestPrisma` and re-seeded by `store.reset()` so that service tests that
+ * call a read/mutation/import/export never hit the 503 `ruleset_unavailable`
+ * path by accident. A test that specifically exercises the missing-row 503 must
+ * clear `store.houseRules` first.
+ */
+function defaultHouseRulesRow(): TestHouseRulesRow {
+  const now = new Date()
+  return {
+    id: HOUSE_RULES_ID,
+    version: 0,
+    config: DEFAULT_HOUSE_RULES_CONFIG,
+    createdAt: now,
+    updatedAt: now,
+  }
 }
 
 export function createTestPrisma(): TestPrismaInstance {
@@ -386,6 +436,8 @@ export function createTestPrisma(): TestPrismaInstance {
   const skillOfferOptions: TestSkillOfferOptionRow[] = []
   const drafts = new Map<string, TestDraftRow>()
   const users = new Map<string, TestUserRow>()
+  const houseRules = new Map<string, TestHouseRulesRow>()
+  houseRules.set(HOUSE_RULES_ID, defaultHouseRulesRow())
   let idCounter = 0
   let eventCounter = 0
   let associationCounter = 0
@@ -809,6 +861,33 @@ export function createTestPrisma(): TestPrismaInstance {
         return attachOffer(offer)
       },
     },
+    houseRules: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const row = houseRules.get(where.id)
+        return row ? { ...row } : null
+      },
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: { id: string; version?: number }
+        data: Record<string, unknown>
+      }) => {
+        // CAS semantics: a stale `version` matches 0 rows; a missing row too.
+        const row = houseRules.get(where.id)
+        if (!row) return { count: 0 }
+        if (where.version != null && row.version !== where.version) {
+          return { count: 0 }
+        }
+        if (data.config !== undefined) row.config = data.config
+        const versionOp = data.version as { increment?: number } | undefined
+        if (versionOp && typeof versionOp.increment === "number") {
+          row.version += versionOp.increment
+        }
+        row.updatedAt = new Date()
+        return { count: 1 }
+      },
+    },
   }
 
   function attachOffer(o: TestSkillOfferRow): TestSkillOfferRow {
@@ -844,6 +923,9 @@ export function createTestPrisma(): TestPrismaInstance {
     const charSnapshot = new Map([...characters].map(([k, v]) => [k, { ...v }]))
     const draftSnapshot = new Map([...drafts].map(([k, v]) => [k, { ...v }]))
     const userSnapshot = new Map([...users].map(([k, v]) => [k, { ...v }]))
+    const houseRulesSnapshot = new Map(
+      [...houseRules].map(([k, v]) => [k, { ...v }])
+    )
     return {
       assocSnapshot,
       eventSnapshot,
@@ -852,6 +934,7 @@ export function createTestPrisma(): TestPrismaInstance {
       charSnapshot,
       draftSnapshot,
       userSnapshot,
+      houseRulesSnapshot,
     }
   }
 
@@ -870,6 +953,8 @@ export function createTestPrisma(): TestPrismaInstance {
     for (const [k, v] of snap.draftSnapshot) drafts.set(k, v)
     users.clear()
     for (const [k, v] of snap.userSnapshot) users.set(k, v)
+    houseRules.clear()
+    for (const [k, v] of snap.houseRulesSnapshot) houseRules.set(k, v)
   }
 
   const prisma = {
@@ -1000,6 +1085,7 @@ export function createTestPrisma(): TestPrismaInstance {
     characterAssociation: tx.characterAssociation,
     progressionEvent: tx.progressionEvent,
     skillOffer: tx.skillOffer,
+    houseRules: tx.houseRules,
   }
 
   return {
@@ -1013,6 +1099,7 @@ export function createTestPrisma(): TestPrismaInstance {
       skillOfferOptions,
       drafts,
       users,
+      houseRules,
       addCatalog(row) {
         const full: TestCatalogRow = {
           id: row.id,
@@ -1079,6 +1166,18 @@ export function createTestPrisma(): TestPrismaInstance {
         users.set(id, full)
         return { ...full }
       },
+      addHouseRules(row) {
+        const id = row.id ?? HOUSE_RULES_ID
+        const full: TestHouseRulesRow = {
+          id,
+          version: row.version ?? 0,
+          config: row.config ?? {},
+          createdAt: row.createdAt ?? new Date(),
+          updatedAt: row.updatedAt ?? new Date(),
+        }
+        houseRules.set(id, full)
+        return { ...full }
+      },
       addAssociation(row) {
         const id = row.id ?? `asc-${++associationCounter}`
         const full: TestAssociationRow = {
@@ -1101,6 +1200,8 @@ export function createTestPrisma(): TestPrismaInstance {
         skillOfferOptions.splice(0, skillOfferOptions.length)
         drafts.clear()
         users.clear()
+        houseRules.clear()
+        houseRules.set(HOUSE_RULES_ID, defaultHouseRulesRow())
         idCounter = 0
         eventCounter = 0
         associationCounter = 0

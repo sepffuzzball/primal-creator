@@ -10,6 +10,8 @@ import {
   RefreshCwIcon,
   ShieldIcon,
   ShieldPlusIcon,
+  SlidersHorizontalIcon,
+  TriangleAlertIcon,
   UserIcon,
   UserPlusIcon,
 } from "lucide-react"
@@ -19,9 +21,12 @@ import {
   apiFetch,
   ApiError,
   jsonInit,
+  type AdminHouseRulesConfig,
+  type AdminHouseRulesResponse,
   type AdminUser,
   type AdminUserResponse,
   type AdminUsersResponse,
+  type HouseRulesPatchRequest,
   type PasswordChangeResponse,
 } from "@/lib/api"
 import { AppShell, useAppShell } from "@/components/app-shell"
@@ -73,6 +78,8 @@ function SettingsContent() {
       <ChangePasswordCard />
 
       {user.isAdmin ? <AdminUsersCard /> : null}
+
+      {user.isAdmin ? <HouseRulesCard /> : null}
 
       <Card className="max-w-lg">
         <CardHeader>
@@ -552,5 +559,244 @@ function AdminUsersCard() {
         ) : null}
       </Dialog>
     </Card>
+  )
+}
+
+/**
+ * Admin-only house-rules editor for the single server-wide `house_rules` row.
+ * GET/PATCH with an explicit CAS version: a stale PATCH is a 409 and the card
+ * reloads the latest values (never silently clobbers an admin's concurrent edit).
+ * Non-admin users never render this card at all.
+ */
+function HouseRulesCard() {
+  const [config, setConfig] = React.useState<AdminHouseRulesConfig | null>(null)
+  const [version, setVersion] = React.useState<number>(0)
+  const [loading, setLoading] = React.useState(true)
+  const [saving, setSaving] = React.useState(false)
+
+  const applyResponse = React.useCallback((res: AdminHouseRulesResponse) => {
+    setConfig(res.config)
+    setVersion(res.version)
+  }, [])
+
+  const reload = React.useCallback(async () => {
+    try {
+      const res = await apiFetch<AdminHouseRulesResponse>("/api/admin/rules")
+      applyResponse(res)
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.message : "Could not load house rules."
+      )
+    }
+  }, [applyResponse])
+
+  // Initial load. Deferred setState happens only inside the promise callbacks so
+  // a synchronous setState never runs in the effect body.
+  React.useEffect(() => {
+    let active = true
+    apiFetch<AdminHouseRulesResponse>("/api/admin/rules")
+      .then((res) => {
+        if (active) applyResponse(res)
+      })
+      .catch((err) => {
+        if (active) {
+          toast.error(
+            err instanceof ApiError
+              ? err.message
+              : "Could not load house rules."
+          )
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [applyResponse])
+
+  const setPercent =
+    (key: "equipmentIndividualCapPercent" | "equipmentCombinedCapPercent") =>
+    (value: number) => {
+      setConfig((prev) => (prev ? { ...prev, [key]: value } : prev))
+    }
+
+  const setGradeRate = (grade: "F" | "E" | "D" | "C") => (value: number) => {
+    setConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            consumableGradeRates: {
+              ...prev.consumableGradeRates,
+              [grade]: value,
+            },
+          }
+        : prev
+    )
+  }
+
+  const onSave = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!config) return
+    setSaving(true)
+    try {
+      const body: HouseRulesPatchRequest = { version, config }
+      const res = await apiFetch<AdminHouseRulesResponse>(
+        "/api/admin/rules",
+        jsonInit("PATCH", body)
+      )
+      applyResponse(res)
+      toast.success("House rules updated and live.")
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        toast.error(
+          "House rules changed elsewhere. Reloading the latest values."
+        )
+        await reload()
+      } else {
+        toast.error(
+          err instanceof ApiError
+            ? err.message
+            : "Could not update house rules."
+        )
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card className="max-w-2xl">
+      <CardHeader>
+        <CardTitle>House rules</CardTitle>
+        <CardDescription>
+          Admin-editable server-wide defaults for the calculation engine.
+          Changes take effect immediately on live status; they never rewrite
+          historically awarded stats or the permanent consumable ledge.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <div className="text-xs text-muted-foreground">
+            Loading house rules...
+          </div>
+        ) : config ? (
+          <form onSubmit={onSave} className="flex flex-col gap-4">
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
+              <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
+              <span>
+                These are <span className="font-medium">house</span> defaults -
+                the store&apos;s own rulings. They apply server-wide on every
+                read/mutation below, so live status always reflects the current
+                values. Lowering an equipment cap never recaps an already-earned
+                bonus: the surplus is simply clamped to the new ceiling.
+              </span>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <HouseRuleInput
+                label="Individual equipment cap (%)"
+                value={config.equipmentIndividualCapPercent}
+                onChange={setPercent("equipmentIndividualCapPercent")}
+                min={0}
+                max={100}
+                hint="Per-item bonus cap as a percentage of the base attribute (default 20)."
+              />
+              <HouseRuleInput
+                label="Combined equipment cap (%)"
+                value={config.equipmentCombinedCapPercent}
+                onChange={setPercent("equipmentCombinedCapPercent")}
+                min={0}
+                max={100}
+                hint="Total bonus cap from all equipment on an attribute (default 15)."
+              />
+            </div>
+
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">
+                Consumable grade rates
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <HouseRuleInput
+                  label="F grade rate"
+                  value={config.consumableGradeRates.F}
+                  onChange={setGradeRate("F")}
+                  min={0}
+                  max={100000}
+                />
+                <HouseRuleInput
+                  label="E grade rate"
+                  value={config.consumableGradeRates.E}
+                  onChange={setGradeRate("E")}
+                  min={0}
+                  max={100000}
+                />
+                <HouseRuleInput
+                  label="D grade rate"
+                  value={config.consumableGradeRates.D}
+                  onChange={setGradeRate("D")}
+                  min={0}
+                  max={100000}
+                />
+                <HouseRuleInput
+                  label="C grade rate"
+                  value={config.consumableGradeRates.C}
+                  onChange={setGradeRate("C")}
+                  min={0}
+                  max={100000}
+                />
+              </div>
+              <div className="mt-1.5 text-xs text-muted-foreground">
+                Permanent-consumable capacity gained per grade of consumable
+                (default F=3, E=5, D=15, C=45).
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs text-muted-foreground">
+                Ruleset version: <span className="font-mono">{version}</span>
+              </div>
+              <Button type="submit" disabled={saving}>
+                <SlidersHorizontalIcon />
+                {saving ? "Saving..." : "Save house rules"}
+              </Button>
+            </div>
+          </form>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function HouseRuleInput({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+  hint,
+}: {
+  label: string
+  value: number
+  onChange: (value: number) => void
+  min: number
+  max: number
+  hint?: string
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Label>{label}</Label>
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        step={1}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      {hint ? (
+        <div className="text-xs text-muted-foreground">{hint}</div>
+      ) : null}
+    </div>
   )
 }

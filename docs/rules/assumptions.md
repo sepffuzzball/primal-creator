@@ -13,6 +13,22 @@ else lives here.
 - Nothing here may be presented as canon in the UI or in documentation prose
   without a source citation.
 
+## Admin-editable house rules
+
+The defaults in sections 1 (equipment) and 2 (consumables) are NOT hard-coded. They
+are served from a single server-wide `house_rules` row (`id = 'active'`, created and
+seeded by migration `0007_house_rules`, never by the seed script) and edited by an
+admin from the Settings page (`GET`/`PATCH /api/admin/rules`). The app-facing config
+keys are `equipmentIndividualCapPercent`, `equipmentCombinedCapPercent` and
+`consumableGradeRates.{F,E,D,C}`.
+
+An admin edit takes effect on the NEXT read or mutation - live status is always
+re-derived from the current validated config, and helpers never issue their own
+hidden lookup. It never rewrites historically awarded stats or the persisted
+`Character.state`; a recorded permanent-consumable gain is never re-capped. The
+current house-rules version is surfaced as `rulesetVersion` on character reads when
+the row exists.
+
 ## 1. Equipment grade rates
 
 The source has no `Equipment` page and publishes no drop/quality distribution (see
@@ -20,6 +36,10 @@ The source has no `Equipment` page and publishes no drop/quality distribution (s
 
 - **Key:** `equipment.rate.individual` - **Default: 0.20** (20%)
 - **Key:** `equipment.rate.combined` - **Default: 0.15** (15%)
+
+In the app config these correspond to the admin-editable
+`equipmentIndividualCapPercent` (20) and `equipmentCombinedCapPercent` (15) house
+rules (see "Admin-editable house rules" above).
 
 Meaning: the probability that an individual piece of equipment is treated as
 belonging to a given grade band is 20%; when equipment is combined/rolled together
@@ -34,6 +54,10 @@ No `Consumables` page; no published drop/craft rates (see
 - **Key:** `consumable.rates.E` - **Default: 5**
 - **Key:** `consumable.rates.D` - **Default: 15**
 - **Key:** `consumable.rates.C` - **Default: 45**
+
+These four rates are admin-editable server-wide defaults; in the app config they
+are `consumableGradeRates.F` / `.E` / `.D` / `.C` (see "Admin-editable house rules"
+above).
 
 Meaning: a base per-level rate/weight mapped to each grade band (F, E, D, C),
 applied **cumulatively to permanent external stat gains per race level**. A

@@ -28,6 +28,7 @@ import {
   IMPORT_SCHEMA,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
+import { DEFAULT_HOUSE_RULES_CONFIG } from "./ruleset"
 import {
   createCharacterState,
   defaultRulesConfig,
@@ -3942,5 +3943,198 @@ describe("skill catalog config (legacy track + validation)", () => {
     )!
     const flat = strengthTrace.phases.find((p) => p.phase === "flat")!
     expect(flat.delta).toBe(3)
+  })
+})
+
+describe("house rules threading (admin-editable defaults)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedDefaultRules() {
+    dbMock.store.addHouseRules({
+      id: "active",
+      version: 0,
+      config: DEFAULT_HOUSE_RULES_CONFIG,
+    })
+  }
+
+  function seedClassCatalog() {
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  function integratedState(): unknown {
+    return serializeState(createInitialState("integrated", null, null))
+  }
+
+  function seedCharacter(overrides: Record<string, unknown> = {}): unknown {
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      classId: "cls-1",
+      state: integratedState(),
+      version: 0,
+      ...(overrides as Record<string, unknown>),
+    })
+  }
+
+  it("equipment applied/suppressed reflects a lowered individual cap after a rule edit", async () => {
+    seedDefaultRules()
+    const state = createInitialState("integrated", null, null)
+    state.baseAttributes.strength = 100
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+    dbMock.store.addCatalog({
+      id: "gear-1",
+      kind: "equipment",
+      stableId: "gear-1",
+      name: "Gear",
+      config: { slot: "head", bonus: { strength: 10 } },
+    })
+    const before = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-1",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const beforeItem = before.character.status!.equipment.items[0]
+    expect(before.character.rulesetVersion).toBe(0)
+    expect(beforeItem.applied.strength).toBe(10)
+    expect(beforeItem.suppressed.strength).toBe(0)
+
+    // The service reloads house rules per request, so a lowered individual cap is
+    // reflected on the NEXT read with no re-association - live status is derived
+    // from the current config.
+    dbMock.store.addHouseRules({
+      id: "active",
+      version: 1,
+      config: {
+        ...DEFAULT_HOUSE_RULES_CONFIG,
+        equipmentIndividualCapPercent: 5,
+      },
+    })
+    const after = await getCharacter("chr-1", user)
+    const afterItem = after.status!.equipment.items[0]
+    expect(after.rulesetVersion).toBe(1)
+    expect(afterItem.applied.strength).toBe(5)
+    expect(afterItem.suppressed.strength).toBe(5)
+    // The stored state is never rewritten by a rule change.
+    expect(
+      (after.state as { baseAttributes: { strength: number } }).baseAttributes
+        .strength
+    ).toBe(100)
+    expect(after.associations.map((a) => a.definitionId)).toEqual(["gear-1"])
+  })
+
+  it("lowers permanent-consumable remaining when the grade rate drops", async () => {
+    seedDefaultRules()
+    const state = createInitialState("born", null, null)
+    state.race = { ...state.race, level: 10, grade: "F" as Grade }
+    state.permanentGains.push({
+      id: "cons-0",
+      source: "consumable",
+      kind: "consumable",
+      vector: { strength: 10 },
+      requested: { strength: 10 },
+      gradeAtApplication: "F",
+      raceLevelAtApplication: 10,
+      capRemainingAfter: { strength: 20 },
+      appliedAt: 0,
+    })
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+      origin: "born",
+    })
+
+    const before = await getCharacter("chr-1", user)
+    expect(before.permanentConsumableCap).toMatchObject({ strength: 30 })
+    expect(before.permanentConsumableRemaining).toMatchObject({ strength: 20 })
+
+    // Lower the F rate from 3 to 2: capacity is re-derived, the already-earned
+    // immutable gain stays, and the remaining capacity clamps to the new ceiling.
+    dbMock.store.addHouseRules({
+      id: "active",
+      version: 1,
+      config: {
+        ...DEFAULT_HOUSE_RULES_CONFIG,
+        consumableGradeRates: {
+          ...DEFAULT_HOUSE_RULES_CONFIG.consumableGradeRates,
+          F: 2,
+        },
+      },
+    })
+    const after = await getCharacter("chr-1", user)
+    expect(after.permanentConsumableCap).toMatchObject({ strength: 20 })
+    expect(after.permanentConsumableRemaining).toMatchObject({ strength: 10 })
+  })
+
+  it("never rewrites historical awards when the house rules change", async () => {
+    seedDefaultRules()
+    seedClassCatalog()
+    seedCharacter()
+    // Advance the class track four quarters to snapshot one historical award.
+    let detail = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    for (let v = 1; v < 4; v++) {
+      detail = await advanceCharacter(
+        "chr-1",
+        { track: "class", version: v },
+        user
+      )
+    }
+    const beforeState = detail.character.state
+    const beforeAwards = (
+      beforeState as {
+        historicalLevelAwards: Array<{ track: string; free: number }>
+      }
+    ).historicalLevelAwards
+    expect(beforeAwards.length).toBe(1)
+
+    // Changing both house-rule knobs must not touch the stored, snapshotted awards.
+    dbMock.store.addHouseRules({
+      id: "active",
+      version: 1,
+      config: {
+        ...DEFAULT_HOUSE_RULES_CONFIG,
+        equipmentIndividualCapPercent: 5,
+        consumableGradeRates: {
+          ...DEFAULT_HOUSE_RULES_CONFIG.consumableGradeRates,
+          F: 2,
+        },
+      },
+    })
+    const after = await getCharacter("chr-1", user)
+    expect(after.version).toBe(detail.character.version)
+    expect(after.state).toEqual(beforeState)
+    const afterAwards = (
+      after.state as {
+        historicalLevelAwards: Array<{ track: string; free: number }>
+      }
+    ).historicalLevelAwards
+    expect(afterAwards).toEqual(beforeAwards)
+    expect(afterAwards[0]).toMatchObject({ track: "class" })
   })
 })
