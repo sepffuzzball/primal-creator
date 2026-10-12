@@ -62,3 +62,58 @@ Evolution must be modeled as a **phase gate** in the engine:
 
 The engine does **not** invent an evolution XP formula; the block is modeled as
 data. See `docs/architecture/calculation-engine.md`.
+
+## Race evolution paths (catalog-driven)
+
+Race evolution in the app is not hard-coded to a single house formula. The
+catalog `evolutions` kind defines contextual RACE evolution paths, and the
+service exposes them as a choice the owner/admin must resolve before the grade
+changes.
+
+### Config shape
+
+An **active race path** carries a full, validated config:
+`track: "race"`, `fromRaceStableId`, `toRaceStableId`, `fromGrade`, `toGrade`,
+plus the optional `minRaceLevel`, `requiredTitleStableIds`,
+`requiredSkillStableIds` and `manualRequirementsText`. Any entry missing a
+required field is not a usable path.
+
+A **legacy metadata-only** config (the old `{from, to, titleId}` shape) stays
+readable and editable, but is not selectable as a path. The service rejects a
+NEW or CONFIG-CHANGED `evolutions` entry that is not a valid full race path,
+mirroring the consumables/skills hardening.
+
+### GET /api/characters/[id]/evolutions (owner/admin)
+
+Returns `{ options, legacyAvailable }` where each option describes one path that
+matches the character's **current race stableId, current grade, and the NEXT
+grade** (evolution is one step at a time per the engine's grade-ceiling gate).
+Archived entries, malformed configs, wrong-race / wrong-grade / non-next-grade
+entries, and paths whose destination race is missing, archived, or has no
+`raceDefinitions[toGrade]` are ignored.
+
+Each option exposes `eligible` (the mechanical requirements are met) and
+`blockers` (the unmet requirements) computed from the race/grade match,
+`minRaceLevel`, and the required title/skill associations (linked, unarchived
+definitions). `manualReview` is true when the path carries a
+`manualRequirementsText` narrative gate. `legacyAvailable` is true **only when
+no valid catalog path matches** - the client then falls back to the legacy
+grade-only house evolution.
+
+### POST /api/characters/[id]/evolve
+
+- **Path choice** (`{optionId, version, reason?}`): the server re-evaluates the
+  path eligibility inside the transaction. The destination race must exist, be
+  enabled, and define `raceDefinitions[toGrade]`, otherwise the request is
+  rejected. The engine evolution runs against the TARGET race's rules config
+  only (no invented rewards/skills); the character's `raceId`, race grade and
+  race `definitionId` are updated, while class/profession tracks,
+  `historicalLevelAwards` and `allocations` are preserved. The journal records
+  the option id, the prerequisites, and any (user or admin) reason.
+- **Manual gate:** a user reason never bypasses a mechanical blocker. A
+  `manualRequirementsText` gate is bypassed only by a **nonempty admin reason**.
+- **Legacy grade-only** (`{grade, version}`): if ANY valid catalog path to the
+  requested grade exists (even when every such path is currently blocked), the
+  request is rejected with `409 evolution_choice_required` so the client must
+  submit an `optionId`. Only when no valid path exists does the legacy grade-only
+  house fallback run as before.

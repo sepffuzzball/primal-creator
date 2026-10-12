@@ -29,6 +29,7 @@ import {
   evolveGrade,
   gradeOrderIndex,
   makeVector,
+  nextGrade,
   permanentConsumableCap,
   totalFreePoints,
   zeroVector,
@@ -49,6 +50,7 @@ import {
   hasInvalidSkillTrack,
   isIncompleteSkillConfig,
   isLegacyConsumableConfig,
+  isValidRaceEvolutionConfig,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
 import {
@@ -1445,20 +1447,438 @@ export async function allocateCharacter(
   })
 }
 
+export type EvolveCharacterInput =
+  | { optionId: string; version: number; reason?: string }
+  | { grade: Grade; version: number }
+
+export interface EvolutionOptionView {
+  id: string
+  name: string
+  description: string | null
+  fromGrade: Grade
+  toGrade: Grade
+  toRaceName: string
+  provenance: string
+  sourceUrl: string | null
+  eligible: boolean
+  blockers: string[]
+  manualReview: boolean
+}
+
+export interface EvolutionOptionsResult {
+  options: EvolutionOptionView[]
+  legacyAvailable: boolean
+}
+
+/**
+ * A parsed, validated race evolution path from an `evolutions` catalog row's
+ * config. Only set when `isValidRaceEvolutionConfig` passes; a legacy
+ * metadata-only config yields null (readable but not a usable path).
+ */
+interface RaceEvolutionPath {
+  id: string
+  name: string
+  description: string | null
+  provenance: string
+  sourceUrl: string | null
+  fromRaceStableId: string
+  toRaceStableId: string
+  fromGrade: Grade
+  toGrade: Grade
+  minRaceLevel: number | undefined
+  requiredTitleStableIds: string[]
+  requiredSkillStableIds: string[]
+  manualRequirementsText: string | undefined
+}
+
+function parseRaceEvolutionPath(row: {
+  id: string
+  name: string
+  description: string | null
+  provenance: string
+  sourceUrl: string | null
+  config: unknown
+}): RaceEvolutionPath | null {
+  const config = parseCatalogConfig("evolutions", row.config ?? {})
+  if (!isValidRaceEvolutionConfig(config)) return null
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    provenance: row.provenance,
+    sourceUrl: row.sourceUrl,
+    fromRaceStableId: config.fromRaceStableId as string,
+    toRaceStableId: config.toRaceStableId as string,
+    fromGrade: config.fromGrade as Grade,
+    toGrade: config.toGrade as Grade,
+    minRaceLevel:
+      typeof config.minRaceLevel === "number"
+        ? (config.minRaceLevel as number)
+        : undefined,
+    requiredTitleStableIds: Array.isArray(config.requiredTitleStableIds)
+      ? (config.requiredTitleStableIds as string[])
+      : [],
+    requiredSkillStableIds: Array.isArray(config.requiredSkillStableIds)
+      ? (config.requiredSkillStableIds as string[])
+      : [],
+    manualRequirementsText:
+      typeof config.manualRequirementsText === "string"
+        ? (config.manualRequirementsText as string)
+        : undefined,
+  }
+}
+
+interface EvolutionEligibilityContext {
+  currentRaceStableId: string | null
+  currentGrade: Grade
+  raceLevel: number
+  linkedTitleStableIds: Set<string>
+  linkedSkillStableIds: Set<string>
+}
+
+/**
+ * Evaluate the mechanical (hard) requirements of a race path. Only race/grade
+ * match, the minimum race level and the explicitly required title/skill
+ * associations (linked, unarchived definitions) count here; the narrative
+ * `manualRequirementsText` gate is tracked separately via `manualReview`.
+ */
+function evaluateRacePathEligibility(
+  path: RaceEvolutionPath,
+  ctx: EvolutionEligibilityContext
+): { eligible: boolean; blockers: string[] } {
+  const blockers: string[] = []
+  if (
+    ctx.currentRaceStableId == null ||
+    path.fromRaceStableId !== ctx.currentRaceStableId
+  ) {
+    blockers.push(`Requires race "${path.fromRaceStableId}"`)
+  }
+  if (path.fromGrade !== ctx.currentGrade) {
+    blockers.push(`Requires current grade ${path.fromGrade}`)
+  }
+  if (path.minRaceLevel != null && ctx.raceLevel < path.minRaceLevel) {
+    blockers.push(
+      `Requires race level ${path.minRaceLevel} or higher (currently ${ctx.raceLevel})`
+    )
+  }
+  for (const stableId of path.requiredTitleStableIds) {
+    if (!ctx.linkedTitleStableIds.has(stableId)) {
+      blockers.push(`Requires title "${stableId}"`)
+    }
+  }
+  for (const stableId of path.requiredSkillStableIds) {
+    if (!ctx.linkedSkillStableIds.has(stableId)) {
+      blockers.push(`Requires skill "${stableId}"`)
+    }
+  }
+  return { eligible: blockers.length === 0, blockers }
+}
+
+interface ValidRacePath {
+  path: RaceEvolutionPath
+  destRace: CatalogLookupRow
+}
+
+/**
+ * Collect the UNARCHIVED `evolutions` catalog entries whose config is a valid
+ * full race path matching the character's current race stableId and grade AND
+ * targeting `targetGrade`, where the destination race exists, is enabled and
+ * defines a `raceDefinitions[targetGrade]`. A malformed, archived, wrong-race,
+ * wrong-grade, non-target-grade or missing-destination entry is ignored. The
+ * returned paths are the authoritative set used both to build the choice list and
+ * to decide whether a legacy grade-only request must be rejected.
+ */
+async function collectValidRacePathsForTarget(
+  db: DbClient,
+  currentRaceStableId: string | null,
+  currentGrade: Grade,
+  targetGrade: Grade
+): Promise<ValidRacePath[]> {
+  const rows = await db.catalogDefinition.findMany({
+    where: { kind: "evolutions", archived: false },
+  })
+  const out: ValidRacePath[] = []
+  for (const row of rows) {
+    const path = parseRaceEvolutionPath(row)
+    if (!path) continue
+    if (path.fromRaceStableId !== currentRaceStableId) continue
+    if (path.fromGrade !== currentGrade) continue
+    if (path.toGrade !== targetGrade) continue
+    const destRace = await findCatalogByStableId(
+      db,
+      "races",
+      path.toRaceStableId
+    )
+    if (!destRace || destRace.archived) continue
+    const destConfig = parseCatalogConfig("races", destRace.config ?? {})
+    const defs = (destConfig.raceDefinitions ?? {}) as Record<string, unknown>
+    if (!(path.toGrade in defs)) continue
+    out.push({ path, destRace })
+  }
+  return out
+}
+
+function linkedStableIds(
+  row: CharacterWithCatalog,
+  kind: "TITLE" | "SKILL"
+): Set<string> {
+  const set = new Set<string>()
+  for (const link of row.associations) {
+    const def = link.definition
+    if (!def || def.archived) continue
+    if (link.kind === kind) set.add(def.stableId)
+  }
+  return set
+}
+
+/**
+ * GET /api/characters/[id]/evolutions (owner/admin). Returns the contextual race
+ * evolution options for the character's current race/grade/level derived from
+ * the editable `evolutions` catalog, plus whether the legacy grade-only house
+ * fallback is available (true only when NO valid catalog path matches).
+ */
+export async function getEvolutionOptions(
+  id: string,
+  user: SessionUser
+): Promise<EvolutionOptionsResult> {
+  const row = await assertOwner(prisma, id, user)
+  const state = deserializeState(row.state)
+  const currentGrade = state.race.grade
+  const currentRaceStableId = row.race?.stableId ?? null
+  const targetGrade = nextGrade(currentGrade)
+
+  const linkedTitleStableIds = linkedStableIds(row, "TITLE")
+  const linkedSkillStableIds = linkedStableIds(row, "SKILL")
+
+  const valid =
+    targetGrade == null
+      ? []
+      : await collectValidRacePathsForTarget(
+          prisma,
+          currentRaceStableId,
+          currentGrade,
+          targetGrade
+        )
+
+  const options: EvolutionOptionView[] = []
+  for (const { path, destRace } of valid) {
+    const { eligible, blockers } = evaluateRacePathEligibility(path, {
+      currentRaceStableId,
+      currentGrade,
+      raceLevel: state.race.level,
+      linkedTitleStableIds,
+      linkedSkillStableIds,
+    })
+    options.push({
+      id: path.id,
+      name: path.name,
+      description: path.description,
+      fromGrade: path.fromGrade,
+      toGrade: path.toGrade,
+      toRaceName: destRace.name,
+      provenance: path.provenance,
+      sourceUrl: path.sourceUrl,
+      eligible,
+      blockers,
+      manualReview: path.manualRequirementsText != null,
+    })
+  }
+
+  return {
+    options,
+    legacyAvailable: targetGrade != null && valid.length === 0,
+  }
+}
+
 export async function evolveCharacter(
   id: string,
-  body: { grade: Grade; version: number },
+  body: EvolveCharacterInput,
   user: SessionUser
 ): Promise<{ character: CharacterDetail; journal: unknown }> {
   return prisma.$transaction(async (tx) => {
     const row = await assertOwner(tx, id, user)
     const state = deserializeState(row.state)
-    const config = configFor(row)
-    const result = applyEvolve(state, body.grade, config)
+    const currentGrade = state.race.grade
+    const currentRaceStableId = row.race?.stableId ?? null
+
+    // ---- Legacy grade-only path (house fallback) ------------------------- //
+    if ("grade" in body) {
+      // Only the NEXT grade may be evolved into. A skip grade (e.g. G->E while
+      // the race level already falls in E's published band) is rejected up front
+      // here, before any option/path gating, even though the engine's level check
+      // alone would accept it - the character must never jump a grade.
+      const targetGrade = nextGrade(currentGrade)
+      if (body.grade !== targetGrade) {
+        throw badRequest(
+          "invalid_evolution_grade",
+          `Character is grade ${currentGrade}; can only evolve to the next grade ${targetGrade ?? "(none)"}, got ${body.grade}`
+        )
+      }
+      // If ANY valid, unarchived catalog path to the NEXT grade exists (even when
+      // every such path is currently blocked), the client must choose a path.
+      const valid = await collectValidRacePathsForTarget(
+        tx,
+        currentRaceStableId,
+        currentGrade,
+        targetGrade
+      )
+      if (valid.length > 0) {
+        throw conflict(
+          "evolution_choice_required",
+          `Catalog defines race evolution path(s) to grade ${targetGrade}; submit an optionId choice`
+        )
+      }
+      const config = configFor(row)
+      const result = applyEvolve(state, body.grade, config)
+      const serialized = serializeState(result.state)
+      const updatedMany = await tx.character.updateMany({
+        where: { id, version: body.version },
+        data: {
+          state: serialized as Prisma.InputJsonValue,
+          version: { increment: 1 },
+        },
+      })
+      if (updatedMany.count !== 1) {
+        throw conflict(
+          "version_conflict",
+          `Version mismatch: expected ${body.version}, got a newer version`
+        )
+      }
+      await tx.progressionEvent.create({
+        data: {
+          characterId: id,
+          kind: "evolve",
+          payload: {
+            grade: body.grade,
+            journal: result.journal,
+          } as Prisma.InputJsonValue,
+        },
+      })
+      const updated = (await tx.character.findUnique({
+        where: { id },
+        include: characterInclude,
+      }))!
+      return { character: toDetail(updated, true), journal: result.journal }
+    }
+
+    // ---- Catalog race path choice ---------------------------------------- //
+    const optionId = body.optionId
+    const evo = await tx.catalogDefinition.findUnique({
+      where: { id: optionId },
+    })
+    if (!evo || evo.kind !== "evolutions") {
+      throw notFound("evolution_not_found", "Evolution path not found")
+    }
+    if (evo.archived) {
+      throw badRequest(
+        "catalog_archived",
+        `Evolution path "${evo.name}" is archived`
+      )
+    }
+    const path = parseRaceEvolutionPath(evo)
+    if (!path) {
+      throw badRequest(
+        "evolution_invalid_config",
+        `Evolution path "${evo.name}" has no usable race config`
+      )
+    }
+    if (
+      currentRaceStableId == null ||
+      path.fromRaceStableId !== currentRaceStableId
+    ) {
+      throw badRequest(
+        "evolution_race_mismatch",
+        `Path requires race "${path.fromRaceStableId}", character is "${currentRaceStableId ?? "(none)"}"`
+      )
+    }
+    if (path.fromGrade !== currentGrade) {
+      throw badRequest(
+        "evolution_grade_mismatch",
+        `Path requires current grade ${path.fromGrade}, character is ${currentGrade}`
+      )
+    }
+
+    // Only the NEXT grade may be targeted. A skip-grade path (e.g. G->E while the
+    // race level already falls in E's published band) is rejected up front, before
+    // destination resolution and eligibility gating, even though every other gate
+    // would pass - the character must never jump a grade.
+    const targetGrade = nextGrade(currentGrade)
+    if (path.toGrade !== targetGrade) {
+      throw badRequest(
+        "invalid_evolution_grade",
+        `Path evolves to grade ${path.toGrade}; character is grade ${currentGrade} and can only evolve to the next grade ${targetGrade ?? "(none)"}`
+      )
+    }
+
+    // Destination race must exist, be enabled, and define the target grade.
+    const destRace = await findCatalogByStableId(
+      tx,
+      "races",
+      path.toRaceStableId
+    )
+    if (!destRace) {
+      throw badRequest(
+        "evolution_destination_missing",
+        `Destination race "${path.toRaceStableId}" is not in the catalog`
+      )
+    }
+    if (destRace.archived) {
+      throw badRequest(
+        "evolution_destination_archived",
+        `Destination race "${destRace.name}" is archived`
+      )
+    }
+    const destConfigParsed = parseCatalogConfig("races", destRace.config ?? {})
+    const defs = (destConfigParsed.raceDefinitions ?? {}) as Record<
+      string,
+      unknown
+    >
+    if (!(path.toGrade in defs)) {
+      throw badRequest(
+        "evolution_destination_definition_missing",
+        `Destination race "${destRace.name}" has no ${path.toGrade}-grade race definition`
+      )
+    }
+
+    // Re-evaluate eligibility INSIDE the transaction. A user or admin reason can
+    // never bypass a mechanical blocker; manualRequirementsText can be overridden
+    // only by a nonempty admin reason.
+    const { eligible, blockers } = evaluateRacePathEligibility(path, {
+      currentRaceStableId,
+      currentGrade,
+      raceLevel: state.race.level,
+      linkedTitleStableIds: linkedStableIds(row, "TITLE"),
+      linkedSkillStableIds: linkedStableIds(row, "SKILL"),
+    })
+    if (!eligible) {
+      throw badRequest("evolution_prerequisites", blockers.join("; "))
+    }
+    if (path.manualRequirementsText != null) {
+      const canBypass =
+        user.isAdmin &&
+        typeof body.reason === "string" &&
+        body.reason.trim().length > 0
+      if (!canBypass) {
+        throw badRequest(
+          "evolution_manual_required",
+          user.isAdmin
+            ? `A reason is required to override manual requirements: ${path.manualRequirementsText}`
+            : `Requires manual (admin) review: ${path.manualRequirementsText}`
+        )
+      }
+    }
+
+    // Run the pure engine (evolveGrade) with the TARGET race's rules config, only
+    // after validating both current and destination. No rewards/skills are
+    // invented: class/profession tracks, historical awards and allocations are
+    // preserved.
+    const destRulesConfig = buildRulesConfig(destRace)
+    const result = applyEvolve(state, path.toGrade, destRulesConfig)
     const serialized = serializeState(result.state)
     const updatedMany = await tx.character.updateMany({
       where: { id, version: body.version },
       data: {
+        raceId: destRace.id,
         state: serialized as Prisma.InputJsonValue,
         version: { increment: 1 },
       },
@@ -1469,13 +1889,41 @@ export async function evolveCharacter(
         `Version mismatch: expected ${body.version}, got a newer version`
       )
     }
+
+    const reason =
+      typeof body.reason === "string" && body.reason.trim().length > 0
+        ? body.reason.trim()
+        : null
+    const journal: Record<string, unknown> = {
+      ...result.journal,
+      source: "catalog",
+      optionId: evo.id,
+      option: { id: evo.id, name: evo.name, stableId: evo.stableId },
+      prerequisites: {
+        fromRaceStableId: path.fromRaceStableId,
+        toRaceStableId: path.toRaceStableId,
+        fromGrade: path.fromGrade,
+        toGrade: path.toGrade,
+        minRaceLevel: path.minRaceLevel ?? null,
+        requiredTitleStableIds: path.requiredTitleStableIds,
+        requiredSkillStableIds: path.requiredSkillStableIds,
+      },
+      destinationRace: {
+        id: destRace.id,
+        stableId: destRace.stableId,
+        name: destRace.name,
+      },
+      reason,
+    }
+
     await tx.progressionEvent.create({
       data: {
         characterId: id,
         kind: "evolve",
         payload: {
-          grade: body.grade,
-          journal: result.journal,
+          optionId: evo.id,
+          journal,
+          reason,
         } as Prisma.InputJsonValue,
       },
     })
@@ -1483,7 +1931,7 @@ export async function evolveCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return { character: toDetail(updated, true), journal: result.journal }
+    return { character: toDetail(updated, true), journal }
   })
 }
 
@@ -2682,6 +3130,14 @@ export async function createCatalogItem(
       'Skill config has an invalid "track": expected "class" or "profession"'
     )
   }
+  // A NEW evolutions entry must be a valid full race path; a legacy
+  // metadata-only config cannot be used as an optionId choice.
+  if (kind === "evolutions" && !isValidRaceEvolutionConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Evolution config is not a valid race path: it requires track "race", fromRaceStableId, toRaceStableId, fromGrade and toGrade'
+    )
+  }
   let stableId = input.stableId
   if (!stableId) {
     stableId =
@@ -2831,6 +3287,12 @@ export async function updateCatalogItem(
       throw badRequest(
         "invalid_config",
         'Skill config has an invalid "track": expected "class" or "profession"'
+      )
+    }
+    if (kind === "evolutions" && !isValidRaceEvolutionConfig(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Evolution config is not a valid race path: it requires track "race", fromRaceStableId, toRaceStableId, fromGrade and toGrade'
       )
     }
   }

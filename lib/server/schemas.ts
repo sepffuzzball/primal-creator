@@ -265,10 +265,30 @@ export const consumeSchema = z.object({
   version: z.number().int().nonnegative(),
 })
 
-export const evolveSchema = z.object({
+/**
+ * A RACE evolution path choice. The client must supply the id of an unarchived
+ * `evolutions` catalog entry that declares a valid race path config. `reason` is
+ * optional and is only ever recorded (or, for an admin, used to override the
+ * narrative `manualRequirementsText` hard gate). A user-provided reason never
+ * bypasses a mechanical requirement.
+ */
+export const evolvePathSchema = z.object({
+  optionId: z.string().min(1),
+  version: z.number().int().nonnegative(),
+  reason: z.string().optional(),
+})
+
+/**
+ * Legacy grade-only evolution. Retained as the house fallback that is only
+ * accepted when NO valid catalog race path to the requested grade exists; when a
+ * path exists the server 409s `evolution_choice_required`.
+ */
+export const evolveGradeSchema = z.object({
   grade: gradeSchema,
   version: z.number().int().nonnegative(),
 })
+
+export const evolveSchema = z.union([evolvePathSchema, evolveGradeSchema])
 
 export const associationSchema = z.object({
   kind: z.enum(["title", "equipment"]),
@@ -557,13 +577,100 @@ export function isLegacyConsumableConfig(
   return config.type == null || config.amount == null
 }
 
+function isGradeValue(value: unknown): boolean {
+  return gradeSchema.safeParse(value).success
+}
+
+/**
+ * Catalog config for an `evolutions` entry.
+ *
+ * Two shapes are supported:
+ *   - A **legacy metadata-only** config (`{from, to, titleId}`) remains readable
+ *     and editable (metadata PATCH) but is NOT a usable race evolution path.
+ *   - An **active race evolution path**: `track: "race"` plus the required
+ *     `fromRaceStableId`, `toRaceStableId`, `fromGrade`, `toGrade`, and optional
+ *     `minRaceLevel`, `requiredTitleStableIds`, `requiredSkillStableIds` and
+ *     `manualRequirementsText`. Only this shape can be selected by
+ *     `POST /api/characters/[id]/evolve` with `optionId`.
+ *
+ * The schema reads permissively (passthrough) so a legacy or partial config never
+ * breaks a catalog read; the service layer rejects a NEW or CONFIG-CHANGED
+ * evolutions entry whose config is not a valid full race path (see
+ * `isValidRaceEvolutionConfig`), mirroring the consumables/skills hardening.
+ */
 export const evolutionConfigSchema = z
   .object({
     from: gradeSchema.optional(),
     to: gradeSchema.optional(),
     titleId: z.string().optional(),
+    track: z.string().optional(),
+    fromRaceStableId: z.string().optional(),
+    toRaceStableId: z.string().optional(),
+    fromGrade: gradeSchema.optional(),
+    toGrade: gradeSchema.optional(),
+    minRaceLevel: z.number().int().nonnegative().optional(),
+    requiredTitleStableIds: z.array(z.string()).optional(),
+    requiredSkillStableIds: z.array(z.string()).optional(),
+    manualRequirementsText: z.string().optional(),
   })
   .passthrough()
+
+/**
+ * Whether an `evolutions` config is a fully-formed, active race evolution path.
+ *
+ * A legacy metadata-only config (the old `{from,to,titleId}` shape) is readable
+ * and editable, but is NOT a full path, so this returns false and it can never be
+ * used as an `optionId` choice. The service layer rejects NEW or CONFIG-CHANGED
+ * evolutions entries whose config fails this check, same as consumables/skills.
+ */
+export function isValidRaceEvolutionConfig(
+  config: Record<string, unknown>
+): boolean {
+  if (config.track !== "race") return false
+  if (
+    typeof config.fromRaceStableId !== "string" ||
+    config.fromRaceStableId.length === 0
+  ) {
+    return false
+  }
+  if (
+    typeof config.toRaceStableId !== "string" ||
+    config.toRaceStableId.length === 0
+  ) {
+    return false
+  }
+  if (!isGradeValue(config.fromGrade)) return false
+  if (!isGradeValue(config.toGrade)) return false
+  if (
+    config.minRaceLevel != null &&
+    (typeof config.minRaceLevel !== "number" ||
+      !Number.isInteger(config.minRaceLevel) ||
+      config.minRaceLevel < 0)
+  ) {
+    return false
+  }
+  if (
+    config.requiredTitleStableIds != null &&
+    (!Array.isArray(config.requiredTitleStableIds) ||
+      config.requiredTitleStableIds.some((s) => typeof s !== "string"))
+  ) {
+    return false
+  }
+  if (
+    config.requiredSkillStableIds != null &&
+    (!Array.isArray(config.requiredSkillStableIds) ||
+      config.requiredSkillStableIds.some((s) => typeof s !== "string"))
+  ) {
+    return false
+  }
+  if (
+    config.manualRequirementsText != null &&
+    typeof config.manualRequirementsText !== "string"
+  ) {
+    return false
+  }
+  return true
+}
 
 const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   races: raceConfigSchema,

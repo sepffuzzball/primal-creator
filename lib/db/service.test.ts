@@ -15,6 +15,7 @@ import {
   evolveCharacter,
   exportCharacter,
   getCharacter,
+  getEvolutionOptions,
   importCharacter,
   resolveTrackDefinition,
   serializeState,
@@ -1670,6 +1671,467 @@ describe("exportCharacter (associations / live state)", () => {
       phase: "flat",
       amount: { agility: 4 },
     })
+  })
+})
+
+describe("race evolution path choices", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  const validPathConfig = {
+    track: "race",
+    fromRaceStableId: "human",
+    toRaceStableId: "elf",
+    fromGrade: "G",
+    toGrade: "F",
+  }
+
+  function seedHumanRace() {
+    dbMock.store.addCatalog({
+      id: "race-human",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedElfRace() {
+    dbMock.store.addCatalog({
+      id: "race-elf",
+      kind: "races",
+      stableId: "elf",
+      name: "Elf",
+      config: {
+        raceDefinitions: {
+          F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+        },
+      },
+    })
+  }
+
+  function seedEvolution(
+    id: string,
+    name: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ archived: boolean }> = {}
+  ) {
+    dbMock.store.addCatalog({
+      id,
+      kind: "evolutions",
+      stableId: id,
+      name,
+      config,
+      ...extra,
+    })
+  }
+
+  function seedTitle(id: string, stableId: string) {
+    dbMock.store.addCatalog({
+      id,
+      kind: "titles",
+      stableId,
+      name: `Title ${id}`,
+      config: { flat: { strength: 1 } },
+    })
+  }
+
+  function seedSkill(id: string, stableId: string) {
+    dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId,
+      name: `Skill ${id}`,
+      config: { effects: [{ phase: "flat", amount: { strength: 1 } }] },
+    })
+  }
+
+  function seedCharacter(overrides: Record<string, unknown> = {}) {
+    const state = createInitialState("integrated", null, null)
+    state.race = {
+      level: 10,
+      grade: "G",
+      mode: "derived",
+      origin: "integrated",
+    }
+    state.tracks.class = { level: 20, quarter: 0, definitionId: "" }
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      raceId: "race-human",
+      classId: "cls-1",
+      state: serializeState(state),
+      version: 0,
+      ...(overrides as Record<string, unknown>),
+    })
+  }
+
+  it("builds options from a valid unarchived race path matching current race/grade and the next grade", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+    seedCharacter()
+
+    const res = await getEvolutionOptions("chr-1", user)
+    expect(res.options).toHaveLength(1)
+    expect(res.options[0]).toMatchObject({
+      id: "evo-1",
+      name: "Human to Elf",
+      fromGrade: "G",
+      toGrade: "F",
+      toRaceName: "Elf",
+      provenance: "house",
+      sourceUrl: null,
+      eligible: true,
+      blockers: [],
+      manualReview: false,
+    })
+    expect(res.legacyAvailable).toBe(false)
+  })
+
+  it("marks an option blocked by minRaceLevel and required title/skill, then clears once met", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedTitle("title-1", "hero")
+    seedSkill("skill-1", "arcane")
+    seedEvolution("evo-1", "Ascension", {
+      ...validPathConfig,
+      minRaceLevel: 12,
+      requiredTitleStableIds: ["hero"],
+      requiredSkillStableIds: ["arcane"],
+    })
+    seedCharacter()
+
+    let res = await getEvolutionOptions("chr-1", user)
+    expect(res.options).toHaveLength(1)
+    expect(res.options[0].eligible).toBe(false)
+    expect(res.options[0].blockers).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("race level 12"),
+        expect.stringContaining('title "hero"'),
+        expect.stringContaining('skill "arcane"'),
+      ])
+    )
+
+    // Meet every requirement: link the title/skill and raise the race level.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "skill-1",
+      kind: "SKILL",
+    })
+    const stored = dbMock.store.characters.get("chr-1")!
+    const state = deserializeState(stored.state)
+    stored.state = serializeState({
+      ...state,
+      race: { ...state.race, level: 12 },
+    })
+
+    res = await getEvolutionOptions("chr-1", user)
+    expect(res.options[0].eligible).toBe(true)
+    expect(res.options[0].blockers).toEqual([])
+  })
+
+  it("ignores malformed, archived, wrong-race/grade and missing-destination paths for fallback", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-malformed", "Malformed", {
+      track: "race",
+      fromRaceStableId: "human",
+      toRaceStableId: "elf",
+      fromGrade: "G",
+    })
+    seedEvolution("evo-archived", "Archived", validPathConfig, {
+      archived: true,
+    })
+    seedEvolution("evo-wrong-grade", "WrongGrade", {
+      ...validPathConfig,
+      fromGrade: "E",
+    })
+    seedEvolution("evo-wrong-race", "WrongRace", {
+      ...validPathConfig,
+      fromRaceStableId: "orc",
+    })
+    seedEvolution("evo-bad-dest", "BadDest", {
+      ...validPathConfig,
+      toRaceStableId: "dragon",
+    })
+    seedEvolution("evo-non-next", "NonNext", {
+      ...validPathConfig,
+      toGrade: "E",
+    })
+    seedCharacter()
+
+    const res = await getEvolutionOptions("chr-1", user)
+    expect(res.options).toHaveLength(0)
+    expect(res.legacyAvailable).toBe(true)
+  })
+
+  it("rejects a legacy grade-only POST with evolution_choice_required even when the path is blocked", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Ascension", {
+      ...validPathConfig,
+      minRaceLevel: 50, // character race level (10) is below this, so blocked
+    })
+    seedCharacter()
+
+    await expect(
+      evolveCharacter("chr-1", { grade: "F", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 409, code: "evolution_choice_required" })
+
+    // No evolve event was written; the character is untouched.
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("evolves along a chosen catalog path to the destination race and grade", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+
+    const base = createInitialState("integrated", null, null)
+    base.race = { level: 10, grade: "G", mode: "derived", origin: "integrated" }
+    base.tracks.class = { level: 20, quarter: 0, definitionId: "" }
+    base.historicalLevelAwards.push({
+      track: "class",
+      level: 1,
+      definitionId: "archer:F",
+      fixed: makeVector({ agility: 2 }),
+      free: 1,
+    })
+    base.allocations.push({
+      id: "alloc-0",
+      source: "available-points",
+      at: 0,
+      points: makeVector({ agility: 1 }),
+    })
+    seedCharacter({ state: serializeState(base) })
+
+    const res = await evolveCharacter(
+      "chr-1",
+      { optionId: "evo-1", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    expect(res.character.raceId).toBe("race-elf")
+    expect(res.character.raceName).toBe("Elf")
+    const state = deserializeState(res.character.state)
+    expect(state.race.grade).toBe("F")
+    expect(state.race.definitionId).toBe("elf:F")
+    // Class track, historical awards and allocations are preserved unchanged.
+    expect(state.tracks.class.level).toBe(20)
+    expect(state.historicalLevelAwards).toHaveLength(1)
+    expect(state.historicalLevelAwards[0]).toMatchObject({ track: "class" })
+    expect(state.allocations).toHaveLength(1)
+    expect(res.journal).toMatchObject({
+      from: "G",
+      to: "F",
+      optionId: "evo-1",
+      source: "catalog",
+    })
+  })
+
+  it("uses the destination race definitions for future race awards", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+
+    const state = createInitialState("integrated", null, null)
+    state.race = {
+      level: 19,
+      grade: "G",
+      mode: "derived",
+      origin: "integrated",
+    }
+    state.tracks.class = { level: 20, quarter: 3, definitionId: "" }
+    state.tracks.profession = { level: 19, quarter: 0, definitionId: "" }
+    seedCharacter({ state: serializeState(state) })
+
+    const evolved = await evolveCharacter(
+      "chr-1",
+      { optionId: "evo-1", version: 0 },
+      user
+    )
+    expect(evolved.character.raceId).toBe("race-elf")
+
+    // A class level-up bumps the derived race level from 19 to 20 and snapshots
+    // the award against the destination race's definition (elf:F).
+    const advanced = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 1 },
+      user
+    )
+    const newState = deserializeState(advanced.character.state)
+    const raceAwards = newState.historicalLevelAwards.filter(
+      (a) => a.track === "race"
+    )
+    expect(raceAwards.length).toBeGreaterThan(0)
+    expect(raceAwards.at(-1)!.definitionId).toBe("elf:F")
+  })
+
+  it("does not let a reason bypass a required title/skill", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedTitle("title-1", "hero")
+    seedEvolution("evo-1", "Ascension", {
+      ...validPathConfig,
+      requiredTitleStableIds: ["hero"],
+    })
+    seedCharacter()
+
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { optionId: "evo-1", version: 0, reason: "story" },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "evolution_prerequisites" })
+  })
+
+  it("bypasses manualRequirementsText only for a nonempty admin reason", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Ascension", {
+      ...validPathConfig,
+      manualRequirementsText: "Requires the blessing of the moon",
+    })
+    seedCharacter()
+    const admin = { ...user, isAdmin: true }
+
+    // Owner reason does not bypass the narrative gate.
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { optionId: "evo-1", version: 0, reason: "narrative" },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "evolution_manual_required" })
+
+    // Admin with no reason does not bypass either.
+    await expect(
+      evolveCharacter("chr-1", { optionId: "evo-1", version: 0 }, admin)
+    ).rejects.toMatchObject({ status: 400, code: "evolution_manual_required" })
+
+    // Admin with a nonempty reason bypasses.
+    const res = await evolveCharacter(
+      "chr-1",
+      { optionId: "evo-1", version: 0, reason: "approved by council" },
+      admin
+    )
+    expect(res.character.raceId).toBe("race-elf")
+    expect(res.journal).toMatchObject({ reason: "approved by council" })
+  })
+
+  it("rolls back a path evolution on a stale version with no event", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Ascension", validPathConfig)
+    seedCharacter({ version: 2 })
+
+    // An unrelated mutation bumps the version to 3.
+    await updateCharacter("chr-1", { name: "Renamed", version: 2 }, user)
+
+    await expect(
+      evolveCharacter("chr-1", { optionId: "evo-1", version: 2 }, user)
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.raceId).toBe("race-human")
+    expect(fresh.version).toBe(3)
+    // Only the update event was written; the path evolve never committed.
+    expect(dbMock.store.events).toHaveLength(1)
+    expect(dbMock.store.events[0].kind).toBe("update")
+  })
+
+  it("rejects a legacy grade-only evolution to a skip grade even when the race level falls in a higher grade band", async () => {
+    seedHumanRace()
+    // G grade at level 25, which falls in E's published band (entry 25). The only
+    // legitimate target is the NEXT grade (F), so grade-only E must be rejected up
+    // front - the character must never jump a grade.
+    const state = createInitialState("integrated", null, null)
+    state.race = {
+      level: 25,
+      grade: "G",
+      mode: "derived",
+      origin: "integrated",
+    }
+    seedCharacter({ state: serializeState(state) })
+
+    await expect(
+      evolveCharacter("chr-1", { grade: "E", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_evolution_grade" })
+
+    // No evolve event was written; the character is untouched.
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("rejects a catalog path that skips the next grade even when the race level falls in a higher grade band", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-skip", "Human to Elf (skip E)", {
+      ...validPathConfig,
+      toGrade: "E",
+    })
+    const state = createInitialState("integrated", null, null)
+    state.race = {
+      level: 25,
+      grade: "G",
+      mode: "derived",
+      origin: "integrated",
+    }
+    seedCharacter({ state: serializeState(state) })
+
+    await expect(
+      evolveCharacter("chr-1", { optionId: "evo-skip", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_evolution_grade" })
+
+    // No evolve event was written; the character is untouched.
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("still evolves along a path to the NEXT grade when the race level falls in a higher grade band", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+    // Level 20 keeps the target (F) within its grade band (entry 10, max 24), so
+    // the next-grade path must not be rejected by the new skip-grade guard.
+    const state = createInitialState("integrated", null, null)
+    state.race = {
+      level: 20,
+      grade: "G",
+      mode: "derived",
+      origin: "integrated",
+    }
+    state.tracks.class = { level: 20, quarter: 0, definitionId: "" }
+    seedCharacter({ state: serializeState(state) })
+
+    const res = await evolveCharacter(
+      "chr-1",
+      { optionId: "evo-1", version: 0 },
+      user
+    )
+    expect(res.character.raceId).toBe("race-elf")
+    expect(deserializeState(res.character.state).race.grade).toBe("F")
   })
 })
 

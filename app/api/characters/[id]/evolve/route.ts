@@ -2,6 +2,7 @@ import { requireUser } from "@/lib/auth/guard"
 import { badRequest, respond } from "@/lib/server/errors"
 import { evolveSchema } from "@/lib/server/schemas"
 import { evolveCharacter } from "@/lib/db/service"
+import type { EvolveCharacterInput } from "@/lib/db/service"
 
 export const runtime = "nodejs"
 
@@ -16,7 +17,11 @@ export async function POST(req: Request, ctx: Ctx) {
     if (!parsed.success) {
       throw badRequest("validation", "Invalid evolution payload")
     }
-    const { character, journal } = await evolveCharacter(id, parsed.data, user)
+    const { character, journal } = await evolveCharacter(
+      id,
+      parsed.data as EvolveCharacterInput,
+      user
+    )
     return Response.json({ character, journal })
   })
 }

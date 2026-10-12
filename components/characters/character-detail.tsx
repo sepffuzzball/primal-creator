@@ -32,6 +32,7 @@ import {
   type ConsumeResponse,
   type ExportResponse,
   type EvolveResponse,
+  type EvolutionOptionsResult,
   type Grade,
   type JournalDelta,
   type PortraitResponse,
@@ -667,6 +668,14 @@ export function CharacterDetail({
   const [evolveOpen, setEvolveOpen] = React.useState(false)
   const [evolveBusy, setEvolveBusy] = React.useState(false)
   const [evolveError, setEvolveError] = React.useState<string | null>(null)
+  const [evolutionOptions, setEvolutionOptions] =
+    React.useState<EvolutionOptionsResult | null>(null)
+  const [evolutionLoading, setEvolutionLoading] = React.useState(false)
+  const [selectedOptionId, setSelectedOptionId] = React.useState("")
+  const [evolutionOptionMode, setEvolutionOptionMode] = React.useState<
+    "option" | "legacy"
+  >("option")
+  const [evolveReason, setEvolveReason] = React.useState("")
   const [associationsOpen, setAssociationsOpen] = React.useState(false)
   const [titlesCatalog, setTitlesCatalog] = React.useState<CatalogItem[]>([])
   const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
@@ -913,32 +922,85 @@ export function CharacterDetail({
     [character, reload]
   )
 
-  const evolve = React.useCallback(
-    async (target: Grade) => {
-      if (!character) return
-      setEvolveBusy(true)
-      setEvolveError(null)
-      try {
-        const res = await apiFetch<EvolveResponse>(
-          `/api/characters/${character.id}/evolve`,
-          {
-            ...jsonInit("POST", {
-              grade: target,
-              version: character.version,
-            }),
-          }
-        )
-        setEvolveOpen(false)
-        toast.success(`Evolved race grade to ${res.journal.to}.`)
-        await reload()
-      } catch (err) {
-        setEvolveError(err instanceof Error ? err.message : "Evolution failed.")
-      } finally {
-        setEvolveBusy(false)
+  const loadEvolutionOptions = React.useCallback(async () => {
+    if (!character) return
+    setEvolutionLoading(true)
+    setEvolveError(null)
+    try {
+      const res = await apiFetch<EvolutionOptionsResult>(
+        `/api/characters/${character.id}/evolutions`
+      )
+      setEvolutionOptions(res)
+      // Default to the first option a user could take (no manual review gate);
+      // otherwise prefer the first mechanically-eligible option. The client can
+      // still change the selection; the server re-validates on submit.
+      const firstSelectable = res.options.find(
+        (o) => o.eligible && (isAdmin ? true : !o.manualReview)
+      )
+      if (firstSelectable) {
+        setSelectedOptionId(firstSelectable.id)
+        setEvolutionOptionMode("option")
+      } else if (res.legacyAvailable) {
+        setEvolutionOptionMode("legacy")
+      } else {
+        setSelectedOptionId(res.options[0]?.id ?? "")
+        setEvolutionOptionMode("option")
       }
-    },
-    [character, reload]
-  )
+    } catch (err) {
+      setEvolveError(
+        err instanceof Error ? err.message : "Failed to load evolution options."
+      )
+      // Leave options UNKNOWN (null) rather than claiming a legacy fallback is
+      // available: on a failed fetch no option list is trustworthy, so the UI
+      // must not show the grade-only fallback or enable the action.
+      setEvolutionOptions(null)
+    } finally {
+      setEvolutionLoading(false)
+    }
+  }, [character, isAdmin])
+
+  const submitEvolution = React.useCallback(async () => {
+    if (!character) return
+    setEvolveBusy(true)
+    setEvolveError(null)
+    try {
+      let body: {
+        version: number
+        grade?: Grade
+        optionId?: string
+        reason?: string
+      }
+      if (evolutionOptionMode === "legacy") {
+        const fallbackGrade = evolutionTarget(
+          character.state.race.level,
+          character.state.race.grade
+        )
+        if (!fallbackGrade) {
+          setEvolveError("No higher race grade reached at this level yet.")
+          setEvolveBusy(false)
+          return
+        }
+        body = { grade: fallbackGrade, version: character.version }
+      } else {
+        body = {
+          optionId: selectedOptionId,
+          version: character.version,
+          ...(evolveReason.trim() ? { reason: evolveReason.trim() } : {}),
+        }
+      }
+      const res = await apiFetch<EvolveResponse>(
+        `/api/characters/${character.id}/evolve`,
+        { ...jsonInit("POST", body) }
+      )
+      setEvolveOpen(false)
+      toast.success(`Evolved race grade to ${res.journal.to}.`)
+      await reload()
+    } catch (err) {
+      setEvolveError(err instanceof Error ? err.message : "Evolution failed.")
+    } finally {
+      setEvolveBusy(false)
+    }
+  }, [character, evolutionOptionMode, selectedOptionId, evolveReason, reload])
 
   const archive = React.useCallback(async () => {
     if (!character) return
@@ -1264,6 +1326,18 @@ export function CharacterDetail({
     (a) => a.kind === "skill"
   )
 
+  const evolutionOptionList = evolutionOptions?.options ?? []
+  const legacyAvailable = evolutionOptions?.legacyAvailable ?? false
+  const selectedOption = evolutionOptionList.find(
+    (o) => o.id === selectedOptionId
+  )
+  const canConfirm =
+    evolutionOptionMode === "legacy"
+      ? legacyAvailable && evolveTarget != null
+      : selectedOption?.eligible === true &&
+        (!selectedOption.manualReview ||
+          (isAdmin && evolveReason.trim().length > 0))
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1418,7 +1492,11 @@ export function CharacterDetail({
           className="gap-1"
           onClick={() => {
             setEvolveError(null)
+            setSelectedOptionId("")
+            setEvolutionOptionMode("option")
+            setEvolveReason("")
             setEvolveOpen(true)
+            void loadEvolutionOptions()
           }}
           disabled={busy || evolveBusy || !evolveTarget}
           title={
@@ -2060,9 +2138,8 @@ export function CharacterDetail({
           <DialogHeader>
             <DialogTitle>Evolve race grade</DialogTitle>
             <DialogDescription>
-              This progresses race grade only - from {raceGrade} to{" "}
-              {evolveTarget ?? ""}. Class/profession evolution is not selected
-              yet, so the system will not auto-choose an option for you.
+              This progresses race grade only. Class/profession evolution is not
+              selected yet, so the system will not auto-choose a path for you.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-1 text-xs/relaxed text-muted-foreground">
@@ -2078,6 +2155,143 @@ export function CharacterDetail({
               <span className="font-medium">{state.race.level}</span>
             </span>
           </div>
+
+          {evolutionLoading ? (
+            <p className="text-xs text-muted-foreground">
+              Loading evolution options...
+            </p>
+          ) : evolutionOptions == null ? (
+            <div className="flex flex-col gap-2">
+              <p className="text-xs text-muted-foreground">
+                Could not load evolution options.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void loadEvolutionOptions()}
+              >
+                Retry
+              </Button>
+            </div>
+          ) : evolutionOptions && evolutionOptionList.length > 0 ? (
+            <div className="flex flex-col gap-2">
+              {evolutionOptionList.map((option) => {
+                const selected = option.id === selectedOptionId
+                const selectable = option.eligible
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => {
+                      if (!selectable) return
+                      setSelectedOptionId(option.id)
+                      setEvolutionOptionMode("option")
+                    }}
+                    disabled={!selectable}
+                    className={cn(
+                      "flex w-full flex-col gap-1 rounded-lg border p-2 text-left text-xs/relaxed",
+                      selected ? "border-ring bg-input/20" : "border",
+                      !selectable ? "cursor-not-allowed opacity-70" : ""
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-medium">{option.name}</span>
+                      <Badge variant="outline">
+                        {option.fromGrade} {"->"} {option.toGrade}
+                      </Badge>
+                      <Badge variant="outline">Race: {option.toRaceName}</Badge>
+                      {option.manualReview ? (
+                        <Badge variant="outline">Manual review</Badge>
+                      ) : null}
+                      {!selectable ? (
+                        <Badge variant="outline">Blocked</Badge>
+                      ) : null}
+                    </div>
+                    {option.description ? (
+                      <span className="text-muted-foreground">
+                        {option.description}
+                      </span>
+                    ) : null}
+                    <span className="text-muted-foreground">
+                      Provenance: {option.provenance}
+                      {option.sourceUrl ? ` - ${option.sourceUrl}` : ""}
+                    </span>
+                    {option.blockers.length > 0 ? (
+                      <ul className="list-disc pl-5 text-muted-foreground">
+                        {option.blockers.map((blocker, i) => (
+                          <li key={i}>{blocker}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {option.manualReview && !isAdmin ? (
+                      <span className="text-muted-foreground">
+                        An admin must provide a reason to override the manual
+                        requirements for this path.
+                      </span>
+                    ) : null}
+                  </button>
+                )
+              })}
+              {legacyAvailable ? (
+                <button
+                  type="button"
+                  onClick={() => setEvolutionOptionMode("legacy")}
+                  className={cn(
+                    "flex w-full flex-col gap-1 rounded-lg border p-2 text-left text-xs/relaxed",
+                    evolutionOptionMode === "legacy"
+                      ? "border-ring bg-input/20"
+                      : "border"
+                  )}
+                >
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-medium">
+                      Grade-only ({evolveTarget ?? "-"})
+                    </span>
+                    <Badge variant="outline">House fallback</Badge>
+                  </div>
+                  <span className="text-muted-foreground">
+                    No contextual race path targets this grade, so the same-race
+                    grade evolution is offered.
+                  </span>
+                </button>
+              ) : null}
+            </div>
+          ) : evolutionOptions && evolutionOptions.legacyAvailable ? (
+            <p className="text-xs text-muted-foreground">
+              No contextual race evolution path is configured for this grade.
+              The system applies the grade-only house fallback to{" "}
+              {evolveTarget ?? "-"}.
+            </p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No evolution options are available yet.
+            </p>
+          )}
+
+          {evolutionOptionMode === "option" &&
+          selectedOption?.manualReview &&
+          isAdmin ? (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="evolve-reason">
+                Reason (required to override manual requirements)
+              </Label>
+              <Input
+                id="evolve-reason"
+                value={evolveReason}
+                onChange={(e) => setEvolveReason(e.target.value)}
+              />
+            </div>
+          ) : evolutionOptionMode === "legacy" && isAdmin ? (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="evolve-reason">Reason (optional)</Label>
+              <Input
+                id="evolve-reason"
+                value={evolveReason}
+                onChange={(e) => setEvolveReason(e.target.value)}
+              />
+            </div>
+          ) : null}
+
           {evolveError ? (
             <p role="alert" className="text-xs/relaxed text-destructive">
               {evolveError}
@@ -2092,8 +2306,8 @@ export function CharacterDetail({
               Cancel
             </Button>
             <Button
-              onClick={() => evolveTarget && evolve(evolveTarget)}
-              disabled={evolveBusy || !evolveTarget}
+              onClick={() => void submitEvolution()}
+              disabled={!canConfirm || evolveBusy}
             >
               {evolveBusy ? "Evolving..." : `Evolve to ${evolveTarget ?? "-"}`}
             </Button>

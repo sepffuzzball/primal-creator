@@ -558,6 +558,7 @@ export function createTestPrisma(): TestPrismaInstance {
           c.description = data.description as string | null
         }
         if (data.archived != null) c.archived = data.archived as boolean
+        if (data.raceId !== undefined) c.raceId = data.raceId as string | null
         if (data.state !== undefined) c.state = data.state
         c.updatedAt = new Date()
         return { count: 1 }

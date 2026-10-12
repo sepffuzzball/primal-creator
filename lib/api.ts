@@ -377,11 +377,55 @@ export interface EvolveJournal {
   from: Grade
   to: Grade
   level: number
+  /** Present when the evolution came from a catalog race path choice. */
+  source?: "catalog"
+  /** Catalog id of the chosen evolution path (present for path evolutions). */
+  optionId?: string
+  option?: { id: string; name: string; stableId: string }
+  prerequisites?: {
+    fromRaceStableId: string
+    toRaceStableId: string
+    fromGrade: Grade
+    toGrade: Grade
+    minRaceLevel: number | null
+    requiredTitleStableIds: string[]
+    requiredSkillStableIds: string[]
+  }
+  destinationRace?: { id: string; stableId: string; name: string }
+  /** Admin narrative reason recorded for the evolution (null when none). */
+  reason?: string | null
 }
 
 export interface EvolveResponse {
   character: CharacterDetail
   journal: EvolveJournal
+}
+
+/** A contextual race evolution option derived from an `evolutions` catalog entry. */
+export interface EvolutionOptionView {
+  id: string
+  name: string
+  description: string | null
+  fromGrade: Grade
+  toGrade: Grade
+  toRaceName: string
+  provenance: string
+  sourceUrl: string | null
+  /** Whether all mechanical (hard) requirements are met. */
+  eligible: boolean
+  /** Human-readable unmet mechanical requirements (empty when eligible). */
+  blockers: string[]
+  /** Whether the path declares a narrative `manualRequirementsText` hard gate. */
+  manualReview: boolean
+}
+
+export interface EvolutionOptionsResult {
+  options: EvolutionOptionView[]
+  /**
+   * True only when NO valid catalog race path targets the character's next grade,
+   * i.e. the legacy grade-only house fallback is offered.
+   */
+  legacyAvailable: boolean
 }
 
 export interface AllocateResponse {

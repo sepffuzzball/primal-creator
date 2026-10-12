@@ -22,6 +22,16 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   questionnaire (name/description, origin, and race/class/profession picked from
   the catalog), advance class/profession, allocate attribute points, evolve the
   race grade, edit name/description, archive and restore.
+- **Contextual race evolution paths**: race evolution is not a single hard-coded
+  house formula. The `evolutions` catalog kind defines editable race paths
+  (`track: "race"` with `fromRaceStableId`/`toRaceStableId`/`fromGrade`/`toGrade`
+  and optional `minRaceLevel`, required title/skill stableIds, and a
+  `manualRequirementsText` gate). The client fetches the contextual options via
+  `GET /api/characters/[id]/evolutions` and submits a chosen `optionId` to
+  `POST /api/characters/[id]/evolve`. The legacy grade-only house evolution is
+  retained as a fallback and is accepted only when NO valid catalog path to the
+  requested grade exists (otherwise the server returns `409
+  evolution_choice_required`).
 - **Resumable creation drafts**: the questionnaire is persisted per user as an
   authenticated, owner-scoped draft (one per user) so work is never lost. A draft
   stores only validated, whitelisted fields (`step`, name/description, origin,
