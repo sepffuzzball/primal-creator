@@ -26,6 +26,7 @@ import {
   zeroVector,
   type CharacterState,
   type Grade,
+  type PartialVector,
   type RaceDefinition,
   type RulesConfig,
   type StatusResult,
@@ -45,6 +46,7 @@ const characterInclude = {
   race: true,
   class: true,
   profession: true,
+  associations: { include: { definition: true } },
 } as const
 
 type CharacterWithCatalog = Prisma.CharacterGetPayload<{
@@ -52,6 +54,17 @@ type CharacterWithCatalog = Prisma.CharacterGetPayload<{
 }>
 
 type DbClient = Prisma.TransactionClient | typeof prisma
+
+export interface CharacterAssociationView {
+  id: string
+  definitionId: string
+  kind: "title" | "equipment"
+  name: string
+  slot?: string
+  upgradeGroup?: string
+  /** Whether the linked catalog definition is currently archived. */
+  definitionArchived: boolean
+}
 
 export interface CharacterDetail {
   id: string
@@ -69,6 +82,7 @@ export interface CharacterDetail {
   archived: boolean
   createdAt: string
   updatedAt: string
+  associations: CharacterAssociationView[]
   status?: StatusResult
 }
 
@@ -313,16 +327,95 @@ export function applyEvolve(
 // DTO helpers
 // ------------------------------------------------------------------ //
 
+/**
+ * Build a read-time "live" CharacterState by merging the immutable stored state
+ * with equipment and effects synthesized from the character's currently linked,
+ * unarchived catalog definitions. The stored `state` is never mutated, so
+ * history stays immutable; catalog edits recalculate live effects without
+ * rewriting historical awards. Existing stored effects/equipment are respected
+ * (they are never overwritten, only appended).
+ */
+function liveState(character: CharacterWithCatalog): CharacterState {
+  const state = deserializeState(character.state)
+  const equipment = [...state.equipment]
+  const activeEffects = [...state.activeEffects]
+  for (const link of character.associations) {
+    const def = link.definition
+    if (!def || def.archived) continue
+    const config = parseCatalogConfig(def.kind, def.config ?? {})
+    if (def.kind === "equipment") {
+      const slot = config.slot as string | undefined
+      if (!slot) continue
+      equipment.push({
+        id: def.id,
+        name: def.name,
+        slot,
+        source: def.name,
+        bonus: makeVector((config.bonus ?? {}) as PartialVector),
+      })
+    } else if (def.kind === "titles") {
+      const flat = config.flat as PartialVector | undefined
+      if (flat) {
+        activeEffects.push({
+          id: `${def.id}:flat`,
+          source: def.name,
+          provenance: def.provenance,
+          phase: "flat",
+          amount: makeVector(flat),
+          stacking: "stack",
+        })
+      }
+      const pct = config.percentBasisPoints as PartialVector | undefined
+      if (pct) {
+        activeEffects.push({
+          id: `${def.id}:percent`,
+          source: def.name,
+          provenance: def.provenance,
+          phase: "percent",
+          basisPoints: makeVector(pct),
+          stacking: "stack",
+        })
+      }
+    }
+  }
+  return { ...state, equipment, activeEffects }
+}
+
 function statusFor(
   character: CharacterWithCatalog,
   config: RulesConfig
 ): StatusResult {
-  const state = deserializeState(character.state)
-  return calculateStatus(state, config)
+  return calculateStatus(liveState(character), config)
 }
 
 function configFor(character: CharacterWithCatalog): RulesConfig {
   return buildRulesConfig(character.race)
+}
+
+function associationView(
+  link: CharacterWithCatalog["associations"][number]
+): CharacterAssociationView {
+  const config = parseCatalogConfig(
+    link.definition.kind,
+    link.definition.config ?? {}
+  )
+  const kind = link.kind === "TITLE" ? "title" : "equipment"
+  const view: CharacterAssociationView = {
+    id: link.id,
+    definitionId: link.definitionId,
+    kind,
+    name: link.definition.name,
+    definitionArchived: link.definition.archived,
+  }
+  if (kind === "equipment") {
+    const slot = config.slot as string | undefined
+    if (slot) view.slot = slot
+  }
+  if (kind === "title") {
+    const upgradeGroup = config.upgradeGroup as string | undefined
+    if (upgradeGroup) view.upgradeGroup = upgradeGroup
+  }
+  return view
 }
 
 function toDetail(
@@ -346,6 +439,7 @@ function toDetail(
     archived: character.archived,
     createdAt: character.createdAt.toISOString(),
     updatedAt: character.updatedAt.toISOString(),
+    associations: character.associations.map(associationView),
     status: withStatus ? statusFor(character, config) : undefined,
   }
 }
@@ -740,6 +834,218 @@ export async function evolveCharacter(
   })
 }
 
+/** Decode the equipment slot from a catalog definition's parsed config. */
+function definitionSlot(def: {
+  kind: string
+  config?: unknown
+}): string | undefined {
+  const slot = parseCatalogConfig(def.kind, def.config ?? {}).slot
+  return typeof slot === "string" && slot.length > 0 ? slot : undefined
+}
+
+/** Decode the title upgrade group from a catalog definition's parsed config. */
+function definitionUpgradeGroup(def: {
+  kind: string
+  config?: unknown
+}): string | undefined {
+  const group = parseCatalogConfig(def.kind, def.config ?? {}).upgradeGroup
+  return typeof group === "string" && group.length > 0 ? group : undefined
+}
+
+export async function associateCharacter(
+  id: string,
+  body: {
+    kind: "title" | "equipment"
+    definitionId: string
+    operation: "add" | "remove"
+    version: number
+  },
+  user: SessionUser
+): Promise<{ character: CharacterDetail }> {
+  return prisma.$transaction(async (tx) => {
+    const row = await assertOwner(tx, id, user)
+
+    const definition = await tx.catalogDefinition.findUnique({
+      where: { id: body.definitionId },
+    })
+    if (!definition) {
+      throw notFound("catalog_not_found", "Catalog entry not found")
+    }
+    const expectedKind = body.kind === "title" ? "titles" : "equipment"
+    if (definition.kind !== expectedKind) {
+      throw badRequest(
+        "wrong_kind",
+        `Catalog entry has wrong kind (expected "${expectedKind}")`
+      )
+    }
+
+    const assocKind = body.kind === "title" ? "TITLE" : "EQUIPMENT"
+    const existing = row.associations
+    const existingLink = existing.find(
+      (l) =>
+        l.definitionId === body.definitionId &&
+        (body.kind === "title" ? l.kind === "TITLE" : l.kind === "EQUIPMENT")
+    )
+
+    // Links the operation displaces: for an add, every existing link that shares
+    // the equipment slot / title upgrade group; for a remove, the single link
+    // being removed (an archived linked entry is always removable).
+    const displaced: Array<{ id: string; definitionId: string; name: string }> =
+      []
+
+    if (body.operation === "add") {
+      // An archived catalog entry cannot be newly attached.
+      if (definition.archived) {
+        throw badRequest(
+          "catalog_archived",
+          "Catalog entry is archived and cannot be attached"
+        )
+      }
+      if (existingLink) {
+        throw badRequest(
+          "duplicate",
+          `This ${body.kind === "title" ? "title" : "equipment piece"} is already attached`
+        )
+      }
+
+      const config = parseCatalogConfig(
+        definition.kind,
+        definition.config ?? {}
+      )
+
+      // Equipment add replaces whatever currently occupies the SAME slot. Remove
+      // every such link atomically - never leave a second effective item in a
+      // slot.
+      if (body.kind === "equipment") {
+        const slot = config.slot as string | undefined
+        if (slot) {
+          const sameSlotLinks = existing.filter(
+            (l) =>
+              l.kind === "EQUIPMENT" && definitionSlot(l.definition) === slot
+          )
+          for (const link of sameSlotLinks) {
+            displaced.push({
+              id: link.id,
+              definitionId: link.definitionId,
+              name: link.definition.name,
+            })
+            await tx.characterAssociation.deleteMany({
+              where: {
+                characterId: id,
+                definitionId: link.definitionId,
+              },
+            })
+          }
+        }
+      }
+
+      // Title add never stacks superseded tiers: it removes every title that
+      // currently occupies the same upgrade group.
+      if (body.kind === "title") {
+        const upgradeGroup = config.upgradeGroup as string | undefined
+        if (upgradeGroup) {
+          const sameGroupLinks = existing.filter(
+            (l) =>
+              l.kind === "TITLE" &&
+              definitionUpgradeGroup(l.definition) === upgradeGroup
+          )
+          for (const link of sameGroupLinks) {
+            displaced.push({
+              id: link.id,
+              definitionId: link.definitionId,
+              name: link.definition.name,
+            })
+            await tx.characterAssociation.deleteMany({
+              where: {
+                characterId: id,
+                definitionId: link.definitionId,
+              },
+            })
+          }
+        }
+      }
+
+      await tx.characterAssociation.create({
+        data: {
+          characterId: id,
+          definitionId: definition.id,
+          kind: assocKind as never,
+        },
+      })
+    } else {
+      if (!existingLink) {
+        throw badRequest(
+          "not_linked",
+          `This ${body.kind === "title" ? "title" : "equipment piece"} is not attached to the character`
+        )
+      }
+      displaced.push({
+        id: existingLink.id,
+        definitionId: existingLink.definitionId,
+        name: existingLink.definition.name,
+      })
+      await tx.characterAssociation.deleteMany({
+        where: {
+          characterId: id,
+          definitionId: existingLink.definitionId,
+        },
+      })
+    }
+
+    // CAS: the character version must match the expected value. A mismatch
+    // returns 409 and rolls back the link create/delete and the event.
+    const updatedMany = await tx.character.updateMany({
+      where: { id, version: body.version },
+      data: { version: { increment: 1 } },
+    })
+    if (updatedMany.count !== 1) {
+      throw conflict(
+        "version_conflict",
+        `Version mismatch: expected ${body.version}, got a newer version`
+      )
+    }
+
+    const config = parseCatalogConfig(definition.kind, definition.config ?? {})
+    await tx.progressionEvent.create({
+      data: {
+        characterId: id,
+        kind: "associate",
+        payload: {
+          operation: body.operation,
+          kind: body.kind,
+          definitionId: definition.id,
+          definition: {
+            id: definition.id,
+            name: definition.name,
+            ...(body.kind === "equipment"
+              ? {
+                  slot: (config.slot as string | undefined) ?? null,
+                }
+              : {}),
+            ...(body.kind === "title"
+              ? {
+                  upgradeGroup:
+                    (config.upgradeGroup as string | undefined) ?? null,
+                }
+              : {}),
+          },
+          added:
+            body.operation === "add"
+              ? { id: definition.id, name: definition.name }
+              : null,
+          removed: displaced,
+        } as Prisma.InputJsonValue,
+      },
+    })
+
+    const updated = (await tx.character.findUnique({
+      where: { id },
+      include: characterInclude,
+    }))!
+    return { character: toDetail(updated, true) }
+  })
+}
+
 export async function exportCharacter(
   id: string,
   user: SessionUser
@@ -747,15 +1053,39 @@ export async function exportCharacter(
   const row = await assertOwner(prisma, id, user)
   const config = configFor(row)
   const state = deserializeState(row.state)
+  // The live state is what `status` is computed from. It merges the immutable
+  // stored state with effects/equipment synthesized from the currently linked,
+  // unarchived catalog definitions. Exporting it (rather than only the stale
+  // `state`) lets an importer reproduce the exact status without re-running the
+  // association resolution.
+  const live = liveState(row)
   const events = await prisma.progressionEvent.findMany({
     where: { characterId: id },
     orderBy: { createdAt: "asc" },
   })
+  const associations = row.associations.map((a) => ({
+    id: a.id,
+    definitionId: a.definitionId,
+    kind: a.kind === "TITLE" ? "title" : "equipment",
+    createdAt: a.createdAt.toISOString(),
+    definition: {
+      id: a.definition.id,
+      name: a.definition.name,
+      kind: a.definition.kind,
+      config: (a.definition.config ?? {}) as Record<string, unknown>,
+      provenance: a.definition.provenance,
+      archived: a.definition.archived,
+      stableId: a.definition.stableId,
+      updatedAt: a.definition.updatedAt.toISOString(),
+    },
+  }))
   return {
-    schema: "primal-character/1",
+    schema: "primal-character/2",
     character: toListItem(row, true),
     state,
-    status: calculateStatus(state, config),
+    liveState: live,
+    status: statusFor(row, config),
+    associations,
     events: events.map((e) => ({
       kind: e.kind,
       payload: e.payload,
@@ -884,6 +1214,77 @@ export async function createCatalogItem(
   }
 }
 
+/**
+ * Reject a catalog update that would make an equipment `slot` or a title
+ * `upgradeGroup` collide on an EXISTING character link. The rule is that a
+ * character can never have two effective (non-archived) effects in the same
+ * group/slot, so a config edit that introduces such a collision is rejected with
+ * 409 and the whole update is rolled back. Archived definitions are inert and
+ * never collide. The check runs inside the same transaction as the update.
+ */
+async function assertNoLinkCollision(
+  tx: DbClient,
+  kind: string,
+  definitionId: string,
+  finalConfig: Record<string, unknown>,
+  finalArchived: boolean
+): Promise<void> {
+  // Only slots (equipment) and upgrade groups (titles) can collide; archived
+  // definitions synthesise no effect so they cannot conflict.
+  if (kind !== "equipment" && kind !== "titles") return
+  if (finalArchived) return
+
+  const slot = kind === "equipment" ? slotForConfig(finalConfig) : undefined
+  const group =
+    kind === "titles" ? upgradeGroupForConfig(finalConfig) : undefined
+  const value = slot ?? group
+  if (!value) return
+
+  const expectedAssocKind = kind === "equipment" ? "EQUIPMENT" : "TITLE"
+  const links = await tx.characterAssociation.findMany({
+    where: { definitionId },
+    include: {
+      character: {
+        include: { associations: { include: { definition: true } } },
+      },
+    },
+  })
+
+  for (const link of links) {
+    const character = link.character
+    if (!character) continue
+    for (const other of character.associations ?? []) {
+      if (other.definitionId === definitionId) continue
+      if (other.kind !== expectedAssocKind) continue
+      const def = other.definition
+      if (!def || def.archived) continue
+      const otherConfig = parseCatalogConfig(def.kind, def.config ?? {})
+      const otherValue =
+        kind === "equipment"
+          ? slotForConfig(otherConfig)
+          : upgradeGroupForConfig(otherConfig)
+      if (otherValue === value) {
+        throw conflict(
+          "link_collision",
+          `Catalog edit would put "${character.name}" in conflict: "${def.name}" already occupies the same ${kind === "equipment" ? "slot" : "upgrade group"}`
+        )
+      }
+    }
+  }
+}
+
+function slotForConfig(config: Record<string, unknown>): string | undefined {
+  const slot = config.slot
+  return typeof slot === "string" && slot.length > 0 ? slot : undefined
+}
+
+function upgradeGroupForConfig(
+  config: Record<string, unknown>
+): string | undefined {
+  const group = config.upgradeGroup
+  return typeof group === "string" && group.length > 0 ? group : undefined
+}
+
 export async function updateCatalogItem(
   kind: string,
   id: string,
@@ -904,30 +1305,38 @@ export async function updateCatalogItem(
   }
   const config =
     patch.config != null ? parseConfigOr400(kind, patch.config) : undefined
-  try {
-    const row = await prisma.catalogDefinition.update({
-      where: { id },
-      data: {
-        ...(patch.stableId != null ? { stableId: patch.stableId } : {}),
-        ...(patch.name != null ? { name: patch.name } : {}),
-        ...(patch.description != null
-          ? { description: patch.description }
-          : {}),
-        ...(patch.grade != null ? { grade: patch.grade } : {}),
-        ...(patch.provenance != null ? { provenance: patch.provenance } : {}),
-        ...(patch.sourceUrl != null ? { sourceUrl: patch.sourceUrl } : {}),
-        ...(patch.archived != null ? { archived: patch.archived } : {}),
-        ...(config != null ? { config: config as Prisma.InputJsonValue } : {}),
-      },
-    })
-    return catalogItem(row)
-  } catch (err) {
-    if (isUniqueViolation(err)) {
-      throw conflict(
-        "catalog_stable_id_conflict",
-        `Catalog entry with stableId "${patch.stableId}" already exists`
-      )
+  const finalConfig = config ?? parseCatalogConfig(kind, existing.config ?? {})
+  const finalArchived =
+    patch.archived != null ? patch.archived : existing.archived
+  return prisma.$transaction(async (tx) => {
+    await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
+    try {
+      const row = await tx.catalogDefinition.update({
+        where: { id },
+        data: {
+          ...(patch.stableId != null ? { stableId: patch.stableId } : {}),
+          ...(patch.name != null ? { name: patch.name } : {}),
+          ...(patch.description != null
+            ? { description: patch.description }
+            : {}),
+          ...(patch.grade != null ? { grade: patch.grade } : {}),
+          ...(patch.provenance != null ? { provenance: patch.provenance } : {}),
+          ...(patch.sourceUrl != null ? { sourceUrl: patch.sourceUrl } : {}),
+          ...(patch.archived != null ? { archived: patch.archived } : {}),
+          ...(config != null
+            ? { config: config as Prisma.InputJsonValue }
+            : {}),
+        },
+      })
+      return catalogItem(row)
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw conflict(
+          "catalog_stable_id_conflict",
+          `Catalog entry with stableId "${patch.stableId}" already exists`
+        )
+      }
+      throw err
     }
-    throw err
-  }
+  })
 }

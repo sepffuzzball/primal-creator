@@ -42,6 +42,11 @@ enum Provenance {
   house
 }
 
+enum AssociationKind {
+  TITLE
+  EQUIPMENT
+}
+
 // ------------------------------------------------------------------ //
 // Users
 // ------------------------------------------------------------------ //
@@ -111,6 +116,7 @@ model Character {
 
   events        ProgressionEvent[]
   assets        Asset[]
+  associations  CharacterAssociation[]
 
   @@index([ownerId])
   @@index([archived])
@@ -161,9 +167,40 @@ model CatalogDefinition {
   raceCharacters      Character[] @relation("CharacterRace")
   classCharacters     Character[] @relation("CharacterClass")
   professionCharacters Character[] @relation("CharacterProfession")
+  characterAssociations CharacterAssociation[] @relation("AssociationDefinition")
 
   @@unique([kind, stableId])
   @@index([kind])
   @@index([kind, archived])
   @@map("catalog_definitions")
+}
+
+// ------------------------------------------------------------------ //
+// Character associations (titles / equipment)
+// ------------------------------------------------------------------ //
+//
+// A link between a saved character and a catalog definition. Titles and
+// equipment are NOT stored in Character.state; they are referenced here and
+// synthesized into the live status at read time from the current (unedited)
+// catalog config. History (Character.state and the event journal) stays
+// immutable, so catalog edits recalculate live effects without rewriting
+// historical awards.
+//
+// - `kind` TITLE or EQUIPMENT. Only one link per (character, definition).
+// - Deleting a character cascades to its links. Deleting a catalog definition
+//   that is referenced is RESTRICTed (a referenced definition is never removed).
+
+model CharacterAssociation {
+  id           String          @id @default(cuid())
+  characterId  String
+  character    Character       @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  definitionId String
+  definition   CatalogDefinition @relation("AssociationDefinition", fields: [definitionId], references: [id], onDelete: Restrict)
+  kind         AssociationKind
+  createdAt    DateTime        @default(now())
+
+  @@unique([characterId, definitionId])
+  @@index([characterId])
+  @@index([kind])
+  @@map("character_associations")
 }

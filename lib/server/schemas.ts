@@ -46,6 +46,24 @@ export const partialVectorSchema = z.object({
   willpower: z.number().optional(),
 })
 
+/**
+ * Sparse attribute patch whose values are nonnegative integers. Used for the
+ * catalog-level bonuses that the engine consumes (title flat / percent basis
+ * points, equipment bonus). These are bounded by the engine's caps, never
+ * negative, and always whole numbers.
+ */
+export const nonnegativePartialVectorSchema = z.object({
+  strength: z.number().int().nonnegative().optional(),
+  agility: z.number().int().nonnegative().optional(),
+  endurance: z.number().int().nonnegative().optional(),
+  vitality: z.number().int().nonnegative().optional(),
+  toughness: z.number().int().nonnegative().optional(),
+  wisdom: z.number().int().nonnegative().optional(),
+  intelligence: z.number().int().nonnegative().optional(),
+  perception: z.number().int().nonnegative().optional(),
+  willpower: z.number().int().nonnegative().optional(),
+})
+
 // ------------------------------------------------------------------ //
 // Engine CharacterState (mirrors lib/rules/types.ts)
 // ------------------------------------------------------------------ //
@@ -191,6 +209,13 @@ export const evolveSchema = z.object({
   version: z.number().int().nonnegative(),
 })
 
+export const associationSchema = z.object({
+  kind: z.enum(["title", "equipment"]),
+  definitionId: z.string().min(1),
+  operation: z.enum(["add", "remove"]),
+  version: z.number().int().nonnegative(),
+})
+
 // ------------------------------------------------------------------ //
 // Catalog
 // ------------------------------------------------------------------ //
@@ -262,8 +287,8 @@ export const trackConfigSchema = z
 
 export const equipmentConfigSchema = z
   .object({
-    slot: z.string().optional(),
-    bonus: partialVectorSchema.optional(),
+    slot: z.string().min(1).optional(),
+    bonus: nonnegativePartialVectorSchema.optional(),
   })
   .passthrough()
 
@@ -278,6 +303,9 @@ export const titleConfigSchema = z
   .object({
     grade: gradeSchema.optional(),
     grants: z.record(z.string(), z.number()).optional(),
+    flat: nonnegativePartialVectorSchema.optional(),
+    percentBasisPoints: nonnegativePartialVectorSchema.optional(),
+    upgradeGroup: z.string().optional(),
   })
   .passthrough()
 

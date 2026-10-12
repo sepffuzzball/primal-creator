@@ -45,3 +45,28 @@ The engine should model titles as effects that may carry configurable bonuses bu
 should not assume every title has a numeric effect. Where a bonus is sourced
 (e.g. blessing titles raise stats, via `Blessings`), it is used; otherwise the
 effect is an unresolved placeholder.
+
+## Character attachment (catalog config)
+
+Titles are attached to a saved character through a `CharacterAssociation` link
+(`kind = TITLE`). The link references a catalog `titles` entry and is validated
+against the **current, unarchived** catalog config at read time, so editing a
+title's config recalculates a character's live status without rewriting any
+historical award (the journal and `Character.state` are immutable).
+
+The `config` for a `titles` catalog entry accepts the following fields, in
+addition to the legacy `grade` / `grants` (which are preserved):
+
+- `flat?: PartialVector` - nonnegative-integer flat attribute bonuses. Synthesized
+  as a flat engine effect.
+- `percentBasisPoints?: PartialVector` - nonnegative-integer integer basis points.
+  Synthesized as a percent engine effect.
+- `upgradeGroup?: string` - when set, a title attached to a character **replaces**
+  any title already attached in the same upgrade group. Superseded tiers never
+  stack; the journal records the old/new pair when a replacement happens.
+
+Title bonuses are **not** silently auto-granted: only titles a user explicitly
+attaches produce effects. Effects synthesized from a title carry the catalog
+entry's `provenance` (`verified` / `inferred` / `house`) so nothing is presented
+as canon. A title with no numeric `flat` / `percentBasisPoints` contributes no
+effect (an unresolved placeholder), matching the wiki-uncertain note above.

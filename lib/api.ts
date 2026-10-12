@@ -224,6 +224,17 @@ export interface CharacterListItem {
   status?: StatusResult
 }
 
+export interface CharacterAssociationView {
+  id: string
+  definitionId: string
+  kind: "title" | "equipment"
+  name: string
+  slot?: string
+  upgradeGroup?: string
+  /** Whether the linked catalog definition is currently archived. */
+  definitionArchived: boolean
+}
+
 export interface CharacterDetail {
   id: string
   name: string
@@ -240,6 +251,7 @@ export interface CharacterDetail {
   archived: boolean
   createdAt: string
   updatedAt: string
+  associations: CharacterAssociationView[]
   status?: StatusResult
 }
 
@@ -293,16 +305,57 @@ export interface AllocateResponse {
   status: StatusResult
 }
 
+export interface AssociationRequest {
+  kind: "title" | "equipment"
+  definitionId: string
+  operation: "add" | "remove"
+  version: number
+}
+
+export interface AssociationResponse {
+  character: CharacterDetail
+}
+
 export interface ProgressionEvent {
   kind: string
   payload: unknown
   createdAt: string
 }
 
+/** A snapshot of a linked catalog definition captured at export time. */
+export interface ExportDefinitionSnapshot {
+  id: string
+  name: string
+  kind: string
+  config: Record<string, unknown>
+  provenance: string
+  archived: boolean
+  stableId: string
+  updatedAt: string
+}
+
+/** An exported character association plus the snapshot of its definition. */
+export interface ExportAssociation {
+  id: string
+  definitionId: string
+  kind: "title" | "equipment"
+  createdAt: string
+  definition: ExportDefinitionSnapshot
+}
+
 export interface ExportResponse {
+  /** Bumped to "primal-character/2" when associations/liveState were added. */
   schema: string
   character: CharacterListItem
+  /** The immutable, stored base state (no synthesized effects/equipment). */
   state: CharacterState
+  /**
+   * The synthesized live state used by `status` (stored state merged with the
+   * effects/equipment from currently linked, unarchived definitions). An importer
+   * can reproduce the exact `status` from this without re-resolving links.
+   */
+  liveState: CharacterState
   status: StatusResult
+  associations: ExportAssociation[]
   events: ProgressionEvent[]
 }

@@ -32,6 +32,12 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   Admins can create and edit entries, set a `verified` / `inferred` / `house`
   provenance, attach a source URL, and store per-kind `config`. With
   `CATALOG_PUBLIC` unset, catalog reads require a session.
+- **Title & equipment linking**: a character can attach real catalog titles and
+  equip catalog equipment. Effects and equipment bonuses are synthesized live
+  from the **current**, unarchived catalog config at read time; the stored
+  `Character.state` and the event journal stay immutable, so editing a catalog
+  entry recalculates status without rewriting history. This is direct equip, not
+  an inventory claim (an inventory system is deferred).
 - **Auth & sessions**: email/password login with a JWT session cookie and an
   admin role. No real credentials are committed.
 
@@ -42,8 +48,6 @@ The engine and schema already account for these, but they are not wired up:
 - **Skill selection on a character**: skills exist in the catalog and the rules,
   but a character does not store skill references, so the Skills tab is a
   placeholder.
-- **Attaching equipment**: the engine can compute equipment bonuses, but no item
-  can be attached to a character yet, so no bonuses are granted.
 - **Consumables on a character**: the engine computes consumable status, but
   there is no way to attach or show them.
 - **Special abilities calculation**: the creation form records a "has special
@@ -150,16 +154,16 @@ The app container waits for Postgres to be healthy before starting
 
 ## Environment variables
 
-| Variable                                              | Required                          | Default                                    | Purpose                                                                                                                                                                |
-| ----------------------------------------------------- | --------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`                                        | yes                               | (compose sets it)                          | Prisma connection string                                                                                                                                               |
-| `AUTH_SECRET`                                         | yes (>= 32 chars)                 | -                                          | HS256 JWT signing secret                                                                                                                                               |
-| `ADMIN_EMAIL`                                         | for seed                          | `admin@primal.local`                       | Bootstrap admin email                                                                                                                                                  |
-| `ADMIN_PASSWORD`                                      | for seed (required in production) | `admin` (dev)                              | Bootstrap admin password. In production the seed refuses `admin`, `password`, and other placeholder values and requires >= 12 chars; compose requires it (no fallback) |
-| `CATALOG_PUBLIC`                                      | no                                | `false`                                    | Whether catalog reads are public                                                                                                                                       |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `POSTGRES_PASSWORD` required by compose; the others optional | `postgres` / `postgres` / `primal_creator` | Compose Postgres only. The default `postgres` password is a dev-only value; production must set a real one (see `docs/deployment.md`)|
-| `APP_PORT`                                            | no                                | `3000`                                     | Host port published by compose                                                                                                                                         |
-| `DOCKER_TAG`                                          | no                                | `latest`                                   | Image tag referenced by compose                                                                                                                                        |
+| Variable                                              | Required                                                     | Default                                    | Purpose                                                                                                                                                                |
+| ----------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                                        | yes                                                          | (compose sets it)                          | Prisma connection string                                                                                                                                               |
+| `AUTH_SECRET`                                         | yes (>= 32 chars)                                            | -                                          | HS256 JWT signing secret                                                                                                                                               |
+| `ADMIN_EMAIL`                                         | for seed                                                     | `admin@primal.local`                       | Bootstrap admin email                                                                                                                                                  |
+| `ADMIN_PASSWORD`                                      | for seed (required in production)                            | `admin` (dev)                              | Bootstrap admin password. In production the seed refuses `admin`, `password`, and other placeholder values and requires >= 12 chars; compose requires it (no fallback) |
+| `CATALOG_PUBLIC`                                      | no                                                           | `false`                                    | Whether catalog reads are public                                                                                                                                       |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `POSTGRES_PASSWORD` required by compose; the others optional | `postgres` / `postgres` / `primal_creator` | Compose Postgres only. The default `postgres` password is a dev-only value; production must set a real one (see `docs/deployment.md`)                                  |
+| `APP_PORT`                                            | no                                                           | `3000`                                     | Host port published by compose                                                                                                                                         |
+| `DOCKER_TAG`                                          | no                                                           | `latest`                                   | Image tag referenced by compose                                                                                                                                        |
 
 No real credentials are committed. The defaults above are safe development
 values; override them in a git-ignored `.env` or a deployment secret store.

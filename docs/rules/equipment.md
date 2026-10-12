@@ -43,3 +43,29 @@ The following are **requested default assumptions**, not canon:
 Both are configurable and documented in `docs/rules/assumptions.md`. The engine
 should treat these as parameters, not as sourced constants, and should not assert
 them as canon without a source citation.
+
+## Character attachment (catalog config)
+
+Equipment is attached to a saved character via a `CharacterAssociation` link
+(`kind = EQUIPMENT`), referencing a catalog `equipment` entry. This is **direct
+equip** onto the character - it is not an inventory ownership claim (an inventory
+system is deferred). The referenced definition is never deleted while a link
+points to it (`ON DELETE RESTRICT`).
+
+The `config` for an `equipment` catalog entry carries the existing fields (which
+are preserved):
+
+- `slot: string` - the equipment slot (e.g. Head, weapon slot). Equipping an item
+  replaces whatever currently occupies the same slot; the journal records the old
+  and new items.
+- `bonus?: PartialVector` - nonnegative-integer attribute bonuses. With `slot`
+  absent, an entry contributes nothing.
+
+Equipment bonuses are synthesized live from the **current, unarchived** catalog
+config at read time and never written into `Character.state`, so editing an item's
+config recalculates status without rewriting history. The caps (20% per-attribute
+aggregate / 15% overall) are house assumptions documented in
+`docs/rules/assumptions.md`.
+
+No equipment is silently auto-granted; only items a user explicitly equips produce
+bonuses.

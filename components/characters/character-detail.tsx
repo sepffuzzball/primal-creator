@@ -17,10 +17,14 @@ import {
   jsonInit,
   ATTRIBUTE_KEYS,
   type AttributeKey,
+  type CatalogItem,
+  type CatalogListResponse,
+  type CharacterAssociationView,
   type CharacterDetail,
   type CharacterResponse,
   type AdvanceResponse,
   type AllocateResponse,
+  type AssociationResponse,
   type ExportResponse,
   type EvolveResponse,
   type Grade,
@@ -36,6 +40,13 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
 import {
   Dialog,
   DialogContent,
@@ -157,6 +168,284 @@ function MetaRow({
   )
 }
 
+function formatVector(
+  v: Partial<Record<AttributeKey, number>> | undefined
+): string {
+  if (!v) return "0"
+  const entries = ATTRIBUTE_KEYS.filter((key) => (v[key] ?? 0) !== 0)
+  if (entries.length === 0) return "0"
+  return entries.map((key) => `${key}:${v[key] ?? 0}`).join(", ")
+}
+
+function slotFor(item: CatalogItem): string | undefined {
+  const slot = item.config?.slot
+  return typeof slot === "string" && slot.length > 0 ? slot : undefined
+}
+
+function bonusFor(item: CatalogItem): string {
+  const bonus = item.config?.bonus
+  return formatVector(
+    bonus as Partial<Record<AttributeKey, number>> | undefined
+  )
+}
+
+function titleFlatFor(item: CatalogItem): string {
+  const flat = item.config?.flat
+  return formatVector(flat as Partial<Record<AttributeKey, number>> | undefined)
+}
+
+function titlePercentFor(item: CatalogItem): string {
+  const pct = item.config?.percentBasisPoints
+  return formatVector(pct as Partial<Record<AttributeKey, number>> | undefined)
+}
+
+function upgradeGroupFor(item: CatalogItem): string | undefined {
+  const group = item.config?.upgradeGroup
+  return typeof group === "string" && group.length > 0 ? group : undefined
+}
+
+/**
+ * Right-hand panel for attaching/removing titles and equipment. It lists the
+ * real catalog entries and calls the associations endpoint with the current
+ * character version. Equipment is equipped directly onto the character - it is
+ * NOT an inventory claim (an inventory system is deferred). The caps noted here
+ * are house assumptions (20% per attribute / 15% overall), documented in
+ * docs/rules/assumptions.md.
+ */
+function AssociationSheet({
+  open,
+  onOpenChange,
+  character,
+  titles,
+  equipment,
+  loading,
+  busy,
+  onAdd,
+  onRemove,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  character: CharacterDetail
+  titles: CatalogItem[]
+  equipment: CatalogItem[]
+  loading: boolean
+  busy: boolean
+  onAdd: (kind: "title" | "equipment", definitionId: string) => void
+  onRemove: (kind: "title" | "equipment", definitionId: string) => void
+}) {
+  const linked = new Map(character.associations.map((a) => [a.definitionId, a]))
+  const equipmentStatusById = new Map(
+    (character.status?.equipment.items ?? []).map((item) => [item.id, item])
+  )
+
+  // Archived linked entries are NOT in the active catalog lists (listCatalog
+  // filters archived:false), so they would otherwise disappear and become
+  // impossible to remove. Keep them visible with a Remove button.
+  const titleIds = new Set(titles.map((t) => t.id))
+  const equipmentIds = new Set(equipment.map((e) => e.id))
+  const archivedLinkedTitles = character.associations.filter(
+    (a) =>
+      a.kind === "title" &&
+      a.definitionArchived &&
+      !titleIds.has(a.definitionId)
+  )
+  const archivedLinkedEquipment = character.associations.filter(
+    (a) =>
+      a.kind === "equipment" &&
+      a.definitionArchived &&
+      !equipmentIds.has(a.definitionId)
+  )
+
+  function archivedLinkedRow(a: CharacterAssociationView) {
+    return (
+      <div
+        key={a.id}
+        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+      >
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate font-medium">{a.name}</span>
+            <Badge variant="outline">Archived</Badge>
+          </div>
+          <div className="text-[0.6875rem] text-muted-foreground">
+            {a.kind === "equipment"
+              ? `Slot: ${a.slot ?? "unspecified"}`
+              : a.upgradeGroup
+                ? `Upgrade group: ${a.upgradeGroup}`
+                : "No upgrade group"}{" "}
+            - linked but archived, no longer contributing.
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy}
+          onClick={() => onRemove(a.kind, a.definitionId)}
+        >
+          Remove
+        </Button>
+      </div>
+    )
+  }
+
+  function equipmentRow(item: CatalogItem) {
+    const isLinked = linked.has(item.id)
+    const status = equipmentStatusById.get(item.id)
+    return (
+      <div
+        key={item.id}
+        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+      >
+        <div className="min-w-0">
+          <div className="truncate font-medium">{item.name}</div>
+          <div className="text-[0.6875rem] text-muted-foreground">
+            Slot: {slotFor(item) ?? "unspecified"} - Bonus: {bonusFor(item)}
+          </div>
+          {status ? (
+            <div className="mt-1 text-[0.6875rem] text-muted-foreground">
+              <span className="tabular-nums">
+                Requested: {formatVector(status.requested)}
+              </span>{" "}
+              /{" "}
+              <span className="tabular-nums">
+                Effective: {formatVector(status.applied)}
+              </span>{" "}
+              /{" "}
+              <span className="tabular-nums">
+                Suppressed: {formatVector(status.suppressed)}
+              </span>
+            </div>
+          ) : null}
+        </div>
+        {isLinked ? (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => onRemove("equipment", item.id)}
+          >
+            Remove
+          </Button>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => onAdd("equipment", item.id)}
+          >
+            Equip
+          </Button>
+        )}
+      </div>
+    )
+  }
+
+  function titleRow(item: CatalogItem) {
+    const isLinked = linked.has(item.id)
+    const group = upgradeGroupFor(item)
+    return (
+      <div
+        key={item.id}
+        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+      >
+        <div className="min-w-0">
+          <div className="truncate font-medium">{item.name}</div>
+          <div className="text-[0.6875rem] text-muted-foreground">
+            Flat: {titleFlatFor(item)} - Percent: {titlePercentFor(item)}
+            {group ? <> - Upgrade group: {group}</> : null}
+          </div>
+          {isLinked && group ? (
+            <div className="text-[0.6875rem] text-muted-foreground">
+              Replaces any title in group &quot;{group}&quot; (superseded tiers
+              never stack).
+            </div>
+          ) : null}
+        </div>
+        {isLinked ? (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => onRemove("title", item.id)}
+          >
+            Remove
+          </Button>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => onAdd("title", item.id)}
+          >
+            Add
+          </Button>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="flex flex-col gap-4">
+        <SheetHeader>
+          <SheetTitle>Titles & equipment</SheetTitle>
+          <SheetDescription>
+            Attach titles and equip equipment directly onto this character. This
+            is direct equip, not an inventory ownership claim - an inventory
+            system is deferred. Notes are written to the journal.
+          </SheetDescription>
+        </SheetHeader>
+
+        <Tabs defaultValue="titles">
+          <TabsList variant="line">
+            <TabsTrigger value="titles">Titles</TabsTrigger>
+            <TabsTrigger value="equipment">Equipment</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="titles" className="pt-3">
+            {loading ? (
+              <p className="text-xs text-muted-foreground">Loading titles...</p>
+            ) : titles.length === 0 && archivedLinkedTitles.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No titles in the catalog yet.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {titles.map(titleRow)}
+                {archivedLinkedTitles.map(archivedLinkedRow)}
+              </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="equipment" className="pt-3">
+            {loading ? (
+              <p className="text-xs text-muted-foreground">
+                Loading equipment...
+              </p>
+            ) : equipment.length === 0 &&
+              archivedLinkedEquipment.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No equipment in the catalog yet.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {equipment.map(equipmentRow)}
+                {archivedLinkedEquipment.map(archivedLinkedRow)}
+              </div>
+            )}
+            <p className="mt-3 text-[0.6875rem] text-muted-foreground">
+              Equipment bonuses are capped (house assumption): 20% of the
+              pre-equipment value per attribute (aggregate, not per item) and
+              15% of the total across all attributes. Suppressed values above
+              are what these caps reject.
+            </p>
+          </TabsContent>
+        </Tabs>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
 export function CharacterDetail() {
   const params = useParams<{ id: string }>()
   const id = params.id
@@ -182,6 +471,13 @@ export function CharacterDetail() {
   const [evolveOpen, setEvolveOpen] = React.useState(false)
   const [evolveBusy, setEvolveBusy] = React.useState(false)
   const [evolveError, setEvolveError] = React.useState<string | null>(null)
+  const [associationsOpen, setAssociationsOpen] = React.useState(false)
+  const [titlesCatalog, setTitlesCatalog] = React.useState<CatalogItem[]>([])
+  const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
+    []
+  )
+  const [catalogLoading, setCatalogLoading] = React.useState(false)
+  const [assocBusy, setAssocBusy] = React.useState(false)
 
   const reload = React.useCallback(async () => {
     if (!id) return
@@ -394,6 +690,84 @@ export function CharacterDetail() {
     }
   }, [character])
 
+  const loadCatalog = React.useCallback(
+    async (kind: "titles" | "equipment") => {
+      setCatalogLoading(true)
+      try {
+        const res = await apiFetch<CatalogListResponse>(`/api/catalog/${kind}`)
+        if (kind === "titles") setTitlesCatalog(res.items)
+        else setEquipmentCatalog(res.items)
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to load catalog."
+        )
+      } finally {
+        setCatalogLoading(false)
+      }
+    },
+    []
+  )
+
+  const openAssociations = React.useCallback(() => {
+    setAssociationsOpen(true)
+    if (titlesCatalog.length === 0) void loadCatalog("titles")
+    if (equipmentCatalog.length === 0) void loadCatalog("equipment")
+  }, [titlesCatalog.length, equipmentCatalog.length, loadCatalog])
+
+  const addAssociation = React.useCallback(
+    async (kind: "title" | "equipment", definitionId: string) => {
+      if (!character) return
+      setAssocBusy(true)
+      setError(null)
+      try {
+        await apiFetch<AssociationResponse>(
+          `/api/characters/${character.id}/associations`,
+          {
+            ...jsonInit("POST", {
+              kind,
+              definitionId,
+              operation: "add",
+              version: character.version,
+            }),
+          }
+        )
+        await reload()
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to attach.")
+      } finally {
+        setAssocBusy(false)
+      }
+    },
+    [character, reload]
+  )
+
+  const removeAssociation = React.useCallback(
+    async (kind: "title" | "equipment", definitionId: string) => {
+      if (!character) return
+      setAssocBusy(true)
+      setError(null)
+      try {
+        await apiFetch<AssociationResponse>(
+          `/api/characters/${character.id}/associations`,
+          {
+            ...jsonInit("POST", {
+              kind,
+              definitionId,
+              operation: "remove",
+              version: character.version,
+            }),
+          }
+        )
+        await reload()
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to remove.")
+      } finally {
+        setAssocBusy(false)
+      }
+    },
+    [character, reload]
+  )
+
   if (loading && !character) {
     return (
       <AppShell breadcrumbs={[{ label: "Character" }]}>
@@ -426,6 +800,12 @@ export function CharacterDetail() {
   const status = character.status
   const raceGrade = state.race.grade
   const evolveTarget = evolutionTarget(state.race.level, raceGrade)
+
+  // Archived linked equipment is not synthesized into `status`, so it never
+  // appears in the live table. Keep it visible so the link can be removed.
+  const archivedEquipmentLinks = character.associations.filter(
+    (a) => a.kind === "equipment" && a.definitionArchived
+  )
 
   const breadcrumbs = [
     { label: "Characters", href: "/" },
@@ -561,6 +941,7 @@ export function CharacterDetail() {
               Race / Class / Profession
             </TabsTrigger>
             <TabsTrigger value="skills">Skills</TabsTrigger>
+            <TabsTrigger value="titles">Titles</TabsTrigger>
             <TabsTrigger value="equipment">Equipment</TabsTrigger>
             <TabsTrigger value="history">History</TabsTrigger>
             <TabsTrigger value="notes">Notes</TabsTrigger>
@@ -708,9 +1089,75 @@ export function CharacterDetail() {
             </Card>
           </TabsContent>
 
+          <TabsContent value="titles" className="pt-3">
+            <Card>
+              <CardContent>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="font-heading text-sm font-medium">Titles</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Titles attached to this character. Their effects are
+                      synthesized live from the current catalog; the stored
+                      history is unchanged.
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={openAssociations}
+                  >
+                    Manage titles & equipment
+                  </Button>
+                </div>
+                {character.associations.filter((a) => a.kind === "title")
+                  .length === 0 ? (
+                  <p className="mt-3 text-xs text-muted-foreground">
+                    No titles attached yet.
+                  </p>
+                ) : (
+                  <div className="mt-3 flex flex-col gap-2">
+                    {character.associations
+                      .filter((a) => a.kind === "title")
+                      .map((a) => (
+                        <div
+                          key={a.id}
+                          className="flex items-center justify-between rounded-lg border bg-input/20 p-2"
+                        >
+                          <div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-medium">{a.name}</span>
+                              {a.definitionArchived ? (
+                                <Badge variant="outline">Archived</Badge>
+                              ) : null}
+                            </div>
+                            {a.upgradeGroup ? (
+                              <div className="text-[0.6875rem] text-muted-foreground">
+                                Upgrade group: {a.upgradeGroup}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
           <TabsContent value="equipment" className="pt-3">
+            <div className="flex items-start justify-between gap-3">
+              <p className="text-xs text-muted-foreground">
+                Equipment is equipped directly onto this character - not an
+                inventory ownership claim (an inventory system is deferred).
+                Bonuses are capped by the house assumption of 20% per attribute
+                (aggregate) and 15% overall.
+              </p>
+              <Button variant="outline" size="sm" onClick={openAssociations}>
+                Manage titles & equipment
+              </Button>
+            </div>
             {status && status.equipment.items.length > 0 ? (
-              <div className="overflow-x-auto rounded-lg border">
+              <div className="mt-3 overflow-x-auto rounded-lg border">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -747,16 +1194,36 @@ export function CharacterDetail() {
                 </Table>
               </div>
             ) : (
-              <Card>
+              <Card className="mt-3">
                 <CardContent>
                   <p className="text-xs text-muted-foreground">
-                    No equipment is attached to this character yet. Equipment
-                    bonuses are not currently granted, so no values are
-                    calculated here.
+                    {archivedEquipmentLinks.length > 0
+                      ? "No active equipment is contributing, but archived links remain."
+                      : "No equipment is attached to this character yet. Equip items from the catalog to see their bonuses."}
                   </p>
                 </CardContent>
               </Card>
             )}
+            {archivedEquipmentLinks.length > 0 ? (
+              <div className="mt-3 flex flex-col gap-2">
+                {archivedEquipmentLinks.map((a) => (
+                  <div
+                    key={a.id}
+                    className="flex items-center justify-between rounded-lg border bg-input/20 p-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate font-medium">{a.name}</span>
+                        <Badge variant="outline">Archived</Badge>
+                      </div>
+                      <div className="text-[0.6875rem] text-muted-foreground">
+                        Linked but archived - no longer contributing.
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </TabsContent>
 
           <TabsContent value="history" className="pt-3">
@@ -900,6 +1367,22 @@ export function CharacterDetail() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+        <AssociationSheet
+          open={associationsOpen}
+          onOpenChange={setAssociationsOpen}
+          character={character}
+          titles={titlesCatalog}
+          equipment={equipmentCatalog}
+          loading={catalogLoading}
+          busy={assocBusy}
+          onAdd={(kind, definitionId) =>
+            void addAssociation(kind, definitionId)
+          }
+          onRemove={(kind, definitionId) =>
+            void removeAssociation(kind, definitionId)
+          }
+        />
       </div>
     </AppShell>
   )
