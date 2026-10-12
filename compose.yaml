@@ -45,6 +45,11 @@ services:
       # seed additionally rejects weak/placeholder and <12 char values.
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Set a strong admin password}"
       CATALOG_PUBLIC: "${CATALOG_PUBLIC:-false}"
+      # Public browser origin for the CSRF same-origin check. Optional: when run
+      # behind a reverse proxy, set it to the real browser origin (e.g.
+      # "https://app.example.com", HTTPS in production) so the app can reject
+      # cross-origin writes; leave unset for a direct, non-proxied deploy.
+      APP_ORIGIN: "${APP_ORIGIN:-}"
     depends_on:
       postgres:
         condition: service_healthy

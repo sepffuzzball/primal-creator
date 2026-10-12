@@ -92,6 +92,24 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   group never stacks superseded tiers.
 - **Auth & sessions**: email/password login with a JWT session cookie and an
   admin role. No real credentials are committed.
+- **Admin-managed users, no public registration**: only an admin may create a
+  user (`POST /api/admin/users`); there is no sign-up endpoint. Admins can list
+  users, grant/revoke the admin role, disable access, and reset passwords from
+  the Settings page. Emails are normalized to lowercase (a duplicate is a 409),
+  and every password is hashed with bcrypt cost 12 (minimum 12 characters).
+- **Self-service password change with immediate session revocation**: an
+  authenticated user can change their own password (`POST /api/auth/password`)
+  after verifying the current one. Every role/disable/password change bumps a
+  per-user `sessionVersion`; a JWT carrying an older version is rejected, so a
+  password reset invalidates all of a user's previous tokens immediately. A
+  disabled user's session is revoked on the next request (login rejects them
+  with the same generic `invalid_credentials` response so account state is never
+  leaked).
+- **Last-admin protection**: an admin can never be demoted or disabled if that
+  would leave zero enabled admins. The check runs under a SERIALIZABLE
+  transaction so two concurrent demotions cannot both commit (the loser gets a
+  409). An admin also cannot demote or disable their own account from the
+  Settings page (self-demotion is rejected as an additional safety).
 
 ### Deferred (modelled or scaffolded, not yet exposed)
 

@@ -8,18 +8,20 @@ import { DELETE, POST } from "./route"
 import { prisma } from "@/lib/db/client"
 import { createSessionToken } from "@/lib/auth/session"
 import { PORTRAIT_KIND } from "@/lib/storage/portraits"
+import { resolveDbIntegration } from "@/lib/test/db-integration"
 
-// Real-Postgres integration test for the portrait route. Skips silently (so the
-// unit suite still runs) when a database is not reachable.
-let dbAvailable = false
-try {
-  await prisma.$queryRaw`SELECT 1`
-  dbAvailable = true
-} catch {
-  dbAvailable = false
-}
+// Real-Postgres integration test for the portrait route. Runs only when explicitly
+// opted in (RUN_DB_INTEGRATION_TESTS=1) against a test-named database. When the
+// caller has opted in but the database is missing/not test-named/unreachable, the
+// gate throws so this file fails loudly rather than silently skipping, while an
+// ordinary (non-opted-in) `pnpm test` still skips the suite.
+const gate = await resolveDbIntegration()
 
-describe.skipIf(!dbAvailable)(
+// The guard rejects unsafe methods without a matching Origin, so every mutating
+// request in this suite must carry one that matches the request URL's own origin.
+const ORIGIN = "http://localhost"
+
+describe.skipIf(!gate.run)(
   "POST /api/characters/[id]/portrait (real PG)",
   () => {
     let dir: string
@@ -82,7 +84,7 @@ describe.skipIf(!dbAvailable)(
         {
           method: "POST",
           body: form,
-          headers: { cookie: `primal_session=${token}` },
+          headers: { cookie: `primal_session=${token}`, origin: ORIGIN },
         }
       )
     }
@@ -92,7 +94,7 @@ describe.skipIf(!dbAvailable)(
         `http://localhost/api/characters/${charId}/portrait`,
         {
           method: "DELETE",
-          headers: { cookie: `primal_session=${token}` },
+          headers: { cookie: `primal_session=${token}`, origin: ORIGIN },
         }
       )
     }

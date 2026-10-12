@@ -179,6 +179,51 @@ export const loginSchema = z.object({
   password: z.string().min(1),
 })
 
+/**
+ * Self-service password change. The `currentPassword` is always required; the
+ * `newPassword` must be at least 12 characters (the same minimum enforced for
+ * admin-created and admin-reset passwords). Exactly matching the current password
+ * is rejected by the service layer after the current password is verified.
+ */
+export const passwordChangeSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(12),
+})
+
+/**
+ * Admin user creation. There is no public registration: only an admin may create
+ * a user. Email must be a valid address (normalized to lowercase server-side);
+ * password must be at least 12 characters and is hashed with bcrypt cost 12. The
+ * caller may promote the new user to admin by passing `isAdmin`.
+ */
+export const adminUserCreateSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(12),
+  isAdmin: z.boolean().optional(),
+})
+
+/**
+ * Admin user patch. At least one property must be present, and a reset password
+ * must be at least 12 characters. `isAdmin` / `disabled` toggle role and access;
+ * a password reset bumps `sessionVersion` so every previously issued token is
+ * revoked immediately.
+ */
+export const adminUserPatchSchema = z
+  .object({
+    isAdmin: z.boolean().optional(),
+    disabled: z.boolean().optional(),
+    password: z.string().min(12).optional(),
+  })
+  .refine(
+    (data) =>
+      data.isAdmin !== undefined ||
+      data.disabled !== undefined ||
+      data.password !== undefined,
+    {
+      message: "Provide at least one of isAdmin, disabled, or password",
+    }
+  )
+
 // ------------------------------------------------------------------ //
 // Characters
 // ------------------------------------------------------------------ //

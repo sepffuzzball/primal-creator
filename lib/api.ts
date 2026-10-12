@@ -70,6 +70,45 @@ export interface LoginResponse {
   user: SessionUser
 }
 
+/** A user as returned by the admin user routes. Never includes the password hash. */
+export interface AdminUser {
+  id: string
+  email: string
+  isAdmin: boolean
+  disabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AdminUsersResponse {
+  users: AdminUser[]
+}
+
+export interface AdminUserResponse {
+  user: AdminUser
+}
+
+export interface AdminUserCreateRequest {
+  email: string
+  password: string
+  isAdmin?: boolean
+}
+
+export interface AdminUserPatchRequest {
+  isAdmin?: boolean
+  disabled?: boolean
+  password?: string
+}
+
+export interface PasswordChangeRequest {
+  currentPassword: string
+  newPassword: string
+}
+
+export interface PasswordChangeResponse {
+  user: SessionUser
+}
+
 // ------------------------------------------------------------------ //
 // Catalog
 // ------------------------------------------------------------------ //

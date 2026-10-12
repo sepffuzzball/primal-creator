@@ -1,8 +1,29 @@
 "use client"
 
+import * as React from "react"
 import { useTheme } from "next-themes"
-import { LogOutIcon, ShieldIcon, UserIcon } from "lucide-react"
+import {
+  BanIcon,
+  CircleCheckIcon,
+  KeyRoundIcon,
+  LogOutIcon,
+  RefreshCwIcon,
+  ShieldIcon,
+  ShieldPlusIcon,
+  UserIcon,
+  UserPlusIcon,
+} from "lucide-react"
+import { toast } from "sonner"
 
+import {
+  apiFetch,
+  ApiError,
+  jsonInit,
+  type AdminUser,
+  type AdminUserResponse,
+  type AdminUsersResponse,
+  type PasswordChangeResponse,
+} from "@/lib/api"
 import { AppShell, useAppShell } from "@/components/app-shell"
 import { Button } from "@/components/ui/button"
 import {
@@ -13,6 +34,16 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 
 export default function SettingsPage() {
   return (
@@ -33,39 +64,15 @@ function SettingsContent() {
       <div>
         <h1 className="font-heading text-lg font-medium">Settings</h1>
         <p className="text-xs text-muted-foreground">
-          Account and appearance preferences.
+          Account, security and administrative preferences.
         </p>
       </div>
 
-      <Card className="max-w-lg">
-        <CardHeader>
-          <CardTitle>Account</CardTitle>
-          <CardDescription>Your signed-in identity.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-2">
-              <UserIcon className="size-4 text-muted-foreground" />
-              <span className="font-medium">{user.email}</span>
-              {user.isAdmin ? (
-                <Badge>
-                  <ShieldIcon className="mr-0.5 size-3" />
-                  Admin
-                </Badge>
-              ) : null}
-            </div>
-            <div className="text-xs text-muted-foreground">
-              User id: <span className="font-mono">{user.id}</span>
-            </div>
-            <div>
-              <Button variant="outline" className="gap-1" onClick={logout}>
-                <LogOutIcon />
-                Log out
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+      <AccountCard onLogout={logout} />
+
+      <ChangePasswordCard />
+
+      {user.isAdmin ? <AdminUsersCard /> : null}
 
       <Card className="max-w-lg">
         <CardHeader>
@@ -92,5 +99,449 @@ function SettingsContent() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+function AccountCard({ onLogout }: { onLogout: () => Promise<void> }) {
+  const { user } = useAppShell()
+  if (!user) return null
+  return (
+    <Card className="max-w-lg">
+      <CardHeader>
+        <CardTitle>Account</CardTitle>
+        <CardDescription>Your signed-in identity.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <UserIcon className="size-4 text-muted-foreground" />
+            <span className="font-medium">{user.email}</span>
+            {user.isAdmin ? (
+              <Badge>
+                <ShieldIcon className="mr-0.5 size-3" />
+                Admin
+              </Badge>
+            ) : null}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            User id: <span className="font-mono">{user.id}</span>
+          </div>
+          <div>
+            <Button variant="outline" className="gap-1" onClick={onLogout}>
+              <LogOutIcon />
+              Log out
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ChangePasswordCard() {
+  const { refreshUser } = useAppShell()
+  const [currentPassword, setCurrentPassword] = React.useState("")
+  const [newPassword, setNewPassword] = React.useState("")
+  const [submitting, setSubmitting] = React.useState(false)
+
+  const onSubmit = React.useCallback(
+    async (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      setSubmitting(true)
+      try {
+        await apiFetch<PasswordChangeResponse>("/api/auth/password", {
+          ...jsonInit("POST", { currentPassword, newPassword }),
+        })
+        toast.success("Password updated. Other sessions were signed out.")
+        // Clear passwords: they must never be kept around after submission.
+        setCurrentPassword("")
+        setNewPassword("")
+        await refreshUser()
+      } catch (err) {
+        toast.error(
+          err instanceof ApiError ? err.message : "Could not change the password."
+        )
+      } finally {
+        setSubmitting(false)
+      }
+    },
+    [currentPassword, newPassword, refreshUser]
+  )
+
+  return (
+    <Card className="max-w-lg">
+      <CardHeader>
+        <CardTitle>Change password</CardTitle>
+        <CardDescription>
+          Requires at least 12 characters and must differ from your current
+          password. Changing it signs out every other session immediately.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="current-password">Current password</Label>
+            <Input
+              id="current-password"
+              type="password"
+              autoComplete="current-password"
+              required
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="new-password">New password</Label>
+            <Input
+              id="new-password"
+              type="password"
+              autoComplete="new-password"
+              required
+              minLength={12}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+            />
+          </div>
+          <div>
+            <Button type="submit" disabled={submitting}>
+              <KeyRoundIcon />
+              {submitting ? "Updating..." : "Update password"}
+            </Button>
+          </div>
+        </form>
+      </CardContent>
+    </Card>
+  )
+}
+
+function AdminUsersCard() {
+  const [users, setUsers] = React.useState<AdminUser[]>([])
+  const [loading, setLoading] = React.useState(true)
+
+  const [newEmail, setNewEmail] = React.useState("")
+  const [newPassword, setNewPassword] = React.useState("")
+  const [newIsAdmin, setNewIsAdmin] = React.useState(false)
+  const [creating, setCreating] = React.useState(false)
+
+  const [resetTarget, setResetTarget] = React.useState<AdminUser | null>(null)
+  const [resetPassword, setResetPassword] = React.useState("")
+  const [resetting, setResetting] = React.useState(false)
+
+  const reload = React.useCallback(async () => {
+    try {
+      const res = await apiFetch<AdminUsersResponse>("/api/admin/users")
+      setUsers(res.users)
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.message : "Could not load users."
+      )
+    }
+  }, [])
+
+  // Initial load. The setState calls are deferred to the promise callbacks so a
+  // synchronous setState never runs inside the effect body.
+  React.useEffect(() => {
+    let active = true
+    apiFetch<AdminUsersResponse>("/api/admin/users")
+      .then((res) => {
+        if (active) setUsers(res.users)
+      })
+      .catch((err) => {
+        if (active) {
+          toast.error(
+            err instanceof ApiError ? err.message : "Could not load users."
+          )
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  // Returns true only when the PATCH succeeded; callers use it to decide whether
+  // to take follow-up UI actions (e.g. close the reset-password dialog).
+  const patchUser = React.useCallback(
+    async (
+      id: string,
+      patch: Record<string, unknown>,
+      message: string
+    ): Promise<boolean> => {
+      try {
+        const res = await apiFetch<AdminUserResponse>(
+          `/api/admin/users/${id}`,
+          jsonInit("PATCH", patch)
+        )
+        setUsers((prev) => prev.map((u) => (u.id === id ? res.user : u)))
+        toast.success(message)
+        return true
+      } catch (err) {
+        toast.error(err instanceof ApiError ? err.message : "Update failed.")
+        return false
+      }
+    },
+    []
+  )
+
+  const onCreate = React.useCallback(
+    async (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      setCreating(true)
+      try {
+        await apiFetch<AdminUserResponse>("/api/admin/users", {
+          ...jsonInit("POST", {
+            email: newEmail,
+            password: newPassword,
+            ...(newIsAdmin ? { isAdmin: true } : {}),
+          }),
+        })
+        toast.success(`Created account for "${newEmail}".`)
+        setNewEmail("")
+        setNewPassword("")
+        setNewIsAdmin(false)
+        await reload()
+      } catch (err) {
+        toast.error(err instanceof ApiError ? err.message : "Could not create user.")
+      } finally {
+        setCreating(false)
+      }
+    },
+    [newEmail, newPassword, newIsAdmin, reload]
+  )
+
+  const onReset = React.useCallback(
+    async (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      if (!resetTarget) return
+      setResetting(true)
+      try {
+        const ok = await patchUser(
+          resetTarget.id,
+          { password: resetPassword },
+          `Password reset for "${resetTarget.email}". Their existing sessions were signed out.`
+        )
+        // Close the dialog only after the update actually succeeded; on a failure
+        // the dialog stays open with the entered password so the admin can retry.
+        if (ok) {
+          setResetTarget(null)
+          setResetPassword("")
+        }
+      } finally {
+        setResetting(false)
+      }
+    },
+    [resetTarget, resetPassword, patchUser]
+  )
+
+  return (
+    <Card className="max-w-2xl">
+      <CardHeader>
+        <CardTitle>Users</CardTitle>
+        <CardDescription>
+          Admin-managed accounts. There is no public registration - only you can
+          create users.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="flex flex-col gap-6">
+          <form
+            onSubmit={onCreate}
+            className="grid gap-3 rounded-xl border border-dashed p-4"
+          >
+            <div className="text-xs font-medium text-muted-foreground">
+              Create user
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="new-user-email">Email</Label>
+                <Input
+                  id="new-user-email"
+                  type="email"
+                  autoComplete="off"
+                  required
+                  value={newEmail}
+                  onChange={(e) => setNewEmail(e.target.value)}
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="new-user-password">Password</Label>
+                <Input
+                  id="new-user-password"
+                  type="password"
+                  autoComplete="off"
+                  required
+                  minLength={12}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={newIsAdmin}
+                  onChange={(e) => setNewIsAdmin(e.target.checked)}
+                />
+                Grant admin role
+              </label>
+              <Button type="submit" disabled={creating || !newEmail || !newPassword}>
+                <UserPlusIcon />
+                {creating ? "Creating..." : "Create"}
+              </Button>
+            </div>
+          </form>
+
+          {loading ? (
+            <div className="text-xs text-muted-foreground">Loading users...</div>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {users.map((u) => (
+                <li
+                  key={u.id}
+                  className="flex flex-col gap-2 rounded-lg border p-3"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <UserIcon className="size-4 text-muted-foreground" />
+                    <span className="font-medium">{u.email}</span>
+                    {u.isAdmin ? (
+                      <Badge>
+                        <ShieldIcon className="mr-0.5 size-3" />
+                        Admin
+                      </Badge>
+                    ) : null}
+                    {u.disabled ? (
+                      <Badge variant="destructive">
+                        <BanIcon className="mr-0.5 size-3" />
+                        Disabled
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={u.disabled}
+                      onClick={() =>
+                        window.confirm(
+                          u.isAdmin
+                            ? `Demote "${u.email}" to a regular user?`
+                            : `Promote "${u.email}" to admin?`
+                        ) &&
+                        patchUser(
+                          u.id,
+                          { isAdmin: !u.isAdmin },
+                          u.isAdmin
+                            ? `Demoted "${u.email}".`
+                            : `Promoted "${u.email}".`
+                        )
+                      }
+                    >
+                      <ShieldPlusIcon />
+                      {u.isAdmin ? "Make regular" : "Make admin"}
+                    </Button>
+                    {u.disabled ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          patchUser(
+                            u.id,
+                            { disabled: false },
+                            `Enabled "${u.email}".`
+                          )
+                        }
+                      >
+                        <CircleCheckIcon />
+                        Enable
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          window.confirm(
+                            `Disable "${u.email}"? Their session is revoked immediately.`
+                          ) &&
+                          patchUser(
+                            u.id,
+                            { disabled: true },
+                            `Disabled "${u.email}".`
+                          )
+                        }
+                      >
+                        <BanIcon />
+                        Disable
+                      </Button>
+                    )}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setResetTarget(u)}
+                    >
+                      <RefreshCwIcon />
+                      Reset password
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </CardContent>
+
+      <Dialog
+        open={resetTarget != null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setResetTarget(null)
+            setResetPassword("")
+          }
+        }}
+      >
+        {resetTarget ? (
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Reset password</DialogTitle>
+              <DialogDescription>
+                Set a new password for &quot;{resetTarget.email}&quot;. This signs out all
+                of their existing sessions immediately.
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={onReset} className="flex flex-col gap-4">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="reset-password">New password</Label>
+                <Input
+                  id="reset-password"
+                  type="password"
+                  autoComplete="off"
+                  required
+                  minLength={12}
+                  value={resetPassword}
+                  onChange={(e) => setResetPassword(e.target.value)}
+                />
+              </div>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setResetTarget(null)
+                    setResetPassword("")
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={resetting || !resetPassword}>
+                  {resetting ? "Resetting..." : "Reset password"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+    </Card>
   )
 }

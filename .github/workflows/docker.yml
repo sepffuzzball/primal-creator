@@ -48,9 +48,61 @@ jobs:
       - name: Build
         run: pnpm build
 
+  db-checks:
+    name: DB integration checks (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: primal_creator_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d primal_creator_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Isolated test DB - never the dev/prod `primal_creator` database. The
+      # real-Postgres integration tests for the auth/drafts/portrait workflows run
+      # only when RUN_DB_INTEGRATION_TESTS=1 AND the effective DATABASE_URL names a
+      # test database (`_test`/`test_`). TEST_DATABASE_URL is preferred by
+      # lib/test/db-integration.setup.ts, which points the Prisma singleton at it
+      # before any test constructs it; the gate still validates the name.
+      RUN_DB_INTEGRATION_TESTS: "1"
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public
+      AUTH_SECRET: ci-only-auth-secret-for-primal-creator-dbchecks-123
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma generate
+
+      - name: Apply migrations (test DB, no auto-migration in requests)
+        run: pnpm db:migrate
+
+      - name: Run unit suite with DB integration tests enabled
+        run: pnpm test
+
   publish:
     name: Build & push multi-arch image
-    needs: checks
+    needs: [checks, db-checks]
     runs-on: ubuntu-latest
     permissions:
       contents: read

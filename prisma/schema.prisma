@@ -58,6 +58,13 @@ model User {
   // bcrypt hash; never plaintext. Seeded from ADMIN_EMAIL / ADMIN_PASSWORD.
   password  String
   isAdmin   Boolean     @default(false)
+  // When true the user cannot sign in; existing sessions are revoked because
+  // verifySessionToken rejects disabled users on every request.
+  disabled  Boolean     @default(false)
+  // Session-revocation counter. Any role/disable/password change increments this;
+  // a JWT carrying an older `sessionVersion` is rejected, so a password reset or
+  // role change invalidates all previously issued tokens immediately.
+  sessionVersion Int    @default(0)
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   characters Character[]

@@ -92,3 +92,51 @@ jobs:
 
       - name: Run DB smoke check
         run: node scripts/db-smoke.mjs
+
+  db-integration:
+    name: DB integration tests (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: primal_creator_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d primal_creator_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Isolated test DB - never the dev/prod `primal_creator` database. The
+      # real-Postgres integration tests run only when RUN_DB_INTEGRATION_TESTS=1
+      # AND the DB name is a test DB (`_test`/`test_`).
+      RUN_DB_INTEGRATION_TESTS: "1"
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/primal_creator_test?schema=public
+      AUTH_SECRET: ci-only-auth-secret-for-primal-creator-smoke-123
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma generate
+
+      - name: Apply migrations (test DB, no auto-migration in requests)
+        run: pnpm db:migrate
+
+      - name: Run unit suite with DB integration tests enabled
+        run: pnpm test

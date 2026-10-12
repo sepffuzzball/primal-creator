@@ -54,6 +54,9 @@ async function signedRequest(
   const headers = new Headers()
   headers.set("cookie", `${SESSION_COOKIE}=${token}`)
   headers.set("content-type", "application/json")
+  // The guard enforces the same-origin CSRF check on unsafe methods, so every
+  // mutating signed request must carry an Origin matching its own URL.
+  headers.set("origin", new URL(url).origin)
   return new Request(url, {
     method,
     headers,
@@ -64,6 +67,9 @@ async function signedRequest(
 beforeEach(() => {
   process.env.AUTH_SECRET = "x".repeat(40)
   dbMock.store.reset()
+  // Session verification now queries the user row on every request, so the
+  // signed requests in the route tests need the current user to exist.
+  dbMock.store.addUser({ id: user.id, email: user.email })
 })
 
 afterEach(() => {
@@ -131,6 +137,7 @@ describe("draft data schema (whitelist / bounds)", () => {
 describe("draft service (persistence + CAS)", () => {
   beforeEach(() => {
     dbMock.store.reset()
+    dbMock.store.addUser({ id: user.id, email: user.email })
   })
 
   it("getDraft returns null when no draft exists", async () => {
@@ -296,6 +303,7 @@ describe("draft service (persistence + CAS)", () => {
 describe("api drafts route (auth + validation)", () => {
   beforeEach(() => {
     dbMock.store.reset()
+    dbMock.store.addUser({ id: user.id, email: user.email })
   })
 
   it("GET rejects an unauthenticated request (no public reads)", async () => {
@@ -307,6 +315,7 @@ describe("api drafts route (auth + validation)", () => {
     const res = await PUT(
       new Request("http://test/api/drafts", {
         method: "PUT",
+        headers: { origin: "http://test" },
         body: JSON.stringify({ data: DATA }),
       })
     )

@@ -108,11 +108,48 @@ export interface TestDraftRow {
   updatedAt: Date
 }
 
+export interface TestUserRow {
+  id: string
+  email: string
+  password: string
+  isAdmin: boolean
+  disabled: boolean
+  sessionVersion: number
+  createdAt: Date
+  updatedAt: Date
+}
+
 export interface TestPrismaInstance {
   prisma: {
     $transaction: (
-      cb: (tx: Transaction) => Promise<unknown>
+      cb: (tx: Transaction) => Promise<unknown>,
+      options?: { isolationLevel?: unknown }
     ) => Promise<unknown>
+    user: {
+      findUnique: (args: {
+        where: { id: string } | { email: string }
+      }) => Promise<TestUserRow | null>
+      findMany: (args: {
+        where?: {
+          id?: { not?: string }
+          isAdmin?: boolean
+          disabled?: boolean
+          email?: string
+        }
+        orderBy?: unknown
+      }) => Promise<TestUserRow[]>
+      create: (args: {
+        data: Record<string, unknown>
+      }) => Promise<TestUserRow>
+      update: (args: {
+        where: { id: string }
+        data: Record<string, unknown>
+      }) => Promise<TestUserRow>
+      count: (args: {
+        where?: { id?: { not?: string }; isAdmin?: boolean; disabled?: boolean }
+      }) => Promise<number>
+      deleteMany: (args: { where?: { id?: string } }) => Promise<{ count: number }>
+    }
     catalogDefinition: {
       findUnique: (args: {
         where: { id: string }
@@ -211,11 +248,13 @@ export interface TestPrismaInstance {
     skillOffers: TestSkillOfferRow[]
     skillOfferOptions: TestSkillOfferOptionRow[]
     drafts: Map<string, TestDraftRow>
+    users: Map<string, TestUserRow>
     addCatalog(row: Partial<TestCatalogRow> & { id: string }): TestCatalogRow
     addCharacter(
       row: Partial<TestCharacterRow> & { id: string }
     ): TestCharacterRow
     addDraft(row: Partial<TestDraftRow> & { userId: string }): TestDraftRow
+    addUser(row: Partial<TestUserRow> & { id: string }): TestUserRow
     addAssociation(
       row: Partial<TestAssociationRow> & {
         characterId: string
@@ -228,6 +267,18 @@ export interface TestPrismaInstance {
 }
 
 interface Transaction {
+  user: {
+    findUnique: (args: {
+      where: { id: string } | { email: string }
+    }) => Promise<TestUserRow | null>
+    update: (args: {
+      where: { id: string }
+      data: Record<string, unknown>
+    }) => Promise<TestUserRow>
+    count: (args: {
+      where?: { id?: { not?: string }; isAdmin?: boolean; disabled?: boolean }
+    }) => Promise<number>
+  }
   character: {
     findUnique: (args: {
       where: { id: string }
@@ -330,6 +381,7 @@ export function createTestPrisma(): TestPrismaInstance {
   const skillOffers: TestSkillOfferRow[] = []
   const skillOfferOptions: TestSkillOfferOptionRow[] = []
   const drafts = new Map<string, TestDraftRow>()
+  const users = new Map<string, TestUserRow>()
   let idCounter = 0
   let eventCounter = 0
   let associationCounter = 0
@@ -408,6 +460,41 @@ export function createTestPrisma(): TestPrismaInstance {
   }
 
   const tx: Transaction = {
+    user: {
+      findUnique: async ({ where }) => {
+        const key =
+          "id" in where ? (where as { id: string }).id : (where as { email: string }).email
+        for (const u of users.values()) {
+          if (("id" in where && u.id === key) || ("email" in where && u.email === key)) {
+            return { ...u }
+          }
+        }
+        return null
+      },
+      update: async ({ where, data }) => {
+        const u = users.get(where.id)
+        if (!u) throw new Error(`User ${where.id} not found`)
+        const versionOp = data.sessionVersion as { increment?: number } | undefined
+        if (versionOp && typeof versionOp.increment === "number") {
+          u.sessionVersion += versionOp.increment
+        }
+        if (data.isAdmin != null) u.isAdmin = data.isAdmin as boolean
+        if (data.disabled != null) u.disabled = data.disabled as boolean
+        if (data.password != null) u.password = data.password as string
+        u.updatedAt = new Date()
+        return { ...u }
+      },
+      count: async ({ where }) => {
+        let n = 0
+        for (const u of users.values()) {
+          if (where?.isAdmin != null && u.isAdmin !== where.isAdmin) continue
+          if (where?.disabled != null && u.disabled !== where.disabled) continue
+          if (where?.id?.not != null && u.id === where.id.not) continue
+          n++
+        }
+        return n
+      },
+    },
     character: {
       findUnique: async ({ where }) => findChar(where.id),
       create: async ({ data }) => {
@@ -723,6 +810,7 @@ export function createTestPrisma(): TestPrismaInstance {
     const optionSnapshot = skillOfferOptions.map((o) => ({ ...o }))
     const charSnapshot = new Map([...characters].map(([k, v]) => [k, { ...v }]))
     const draftSnapshot = new Map([...drafts].map(([k, v]) => [k, { ...v }]))
+    const userSnapshot = new Map([...users].map(([k, v]) => [k, { ...v }]))
     return {
       assocSnapshot,
       eventSnapshot,
@@ -730,6 +818,7 @@ export function createTestPrisma(): TestPrismaInstance {
       optionSnapshot,
       charSnapshot,
       draftSnapshot,
+      userSnapshot,
     }
   }
 
@@ -746,10 +835,18 @@ export function createTestPrisma(): TestPrismaInstance {
     for (const [k, v] of snap.charSnapshot) characters.set(k, v)
     drafts.clear()
     for (const [k, v] of snap.draftSnapshot) drafts.set(k, v)
+    users.clear()
+    for (const [k, v] of snap.userSnapshot) users.set(k, v)
   }
 
   const prisma = {
-    $transaction: (cb: (t: Transaction) => Promise<unknown>) => {
+    $transaction: (
+      cb: (t: Transaction) => Promise<unknown>,
+      _options?: { isolationLevel?: unknown }
+    ) => {
+      // The in-memory mock ignores the requested isolation level but keeps the
+      // signature compatible with the real Prisma client.
+      void _options
       const run = transactionChain.then(async () => {
         const snap = snapshot()
         try {
@@ -772,6 +869,92 @@ export function createTestPrisma(): TestPrismaInstance {
       findMany: tx.catalogDefinition.findMany,
       update: tx.catalogDefinition.update,
     },
+    user: {
+      findUnique: async ({
+        where,
+      }: {
+        where: { id: string } | { email: string }
+      }) => {
+        const key =
+          "id" in where ? (where as { id: string }).id : (where as { email: string }).email
+        for (const u of users.values()) {
+          if (("id" in where && u.id === key) || ("email" in where && u.email === key)) {
+            return { ...u }
+          }
+        }
+        return null
+      },
+      findMany: async ({
+        where,
+        orderBy,
+      }: {
+        where?: {
+          id?: { not?: string }
+          isAdmin?: boolean
+          disabled?: boolean
+          email?: string
+        }
+        orderBy?: unknown
+      }) => {
+        let results = [...users.values()]
+        if (where?.isAdmin != null)
+          results = results.filter((u) => u.isAdmin === where.isAdmin)
+        if (where?.disabled != null)
+          results = results.filter((u) => u.disabled === where.disabled)
+        if (where?.id?.not != null)
+          results = results.filter((u) => u.id !== where.id!.not)
+        if (where?.email != null)
+          results = results.filter((u) => u.email === where.email)
+        const order = orderBy as { createdAt?: string } | undefined
+        if (order?.createdAt === "asc") {
+          results.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        } else {
+          results.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        }
+        return results.map((u) => ({ ...u }))
+      },
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        const email = data.email as string
+        for (const u of users.values()) {
+          if (u.email === email) {
+            throw {
+              name: "PrismaClientKnownRequestError",
+              code: "P2002",
+              meta: { target: ["email"] },
+            }
+          }
+        }
+        const id = (data.id as string) ?? `usr-${++idCounter}`
+        const now = new Date()
+        const row: TestUserRow = {
+          id,
+          email,
+          password: data.password as string,
+          isAdmin: (data.isAdmin as boolean) ?? false,
+          disabled: (data.disabled as boolean) ?? false,
+          sessionVersion: (data.sessionVersion as number) ?? 0,
+          createdAt: now,
+          updatedAt: now,
+        }
+        users.set(id, row)
+        return { ...row }
+      },
+      update: tx.user.update,
+      count: tx.user.count,
+      deleteMany: async ({
+        where,
+      }: {
+        where?: { id?: string }
+      }) => {
+        let removed = 0
+        for (const [id, u] of [...users]) {
+          if (where?.id != null && u.id !== where.id) continue
+          users.delete(id)
+          removed++
+        }
+        return { count: removed }
+      },
+    },
     character: tx.character,
     characterDraft: tx.characterDraft,
     characterAssociation: tx.characterAssociation,
@@ -789,6 +972,7 @@ export function createTestPrisma(): TestPrismaInstance {
       skillOffers,
       skillOfferOptions,
       drafts,
+      users,
       addCatalog(row) {
         const full: TestCatalogRow = {
           id: row.id,
@@ -839,6 +1023,21 @@ export function createTestPrisma(): TestPrismaInstance {
         drafts.set(id, full)
         return { ...full }
       },
+      addUser(row) {
+        const id = row.id ?? `usr-${++idCounter}`
+        const full: TestUserRow = {
+          id,
+          email: row.email ?? `user-${id}@test.local`,
+          password: row.password ?? "x",
+          isAdmin: row.isAdmin ?? false,
+          disabled: row.disabled ?? false,
+          sessionVersion: row.sessionVersion ?? 0,
+          createdAt: row.createdAt ?? new Date(),
+          updatedAt: row.updatedAt ?? new Date(),
+        }
+        users.set(id, full)
+        return { ...full }
+      },
       addAssociation(row) {
         const id = row.id ?? `asc-${++associationCounter}`
         const full: TestAssociationRow = {
@@ -860,6 +1059,7 @@ export function createTestPrisma(): TestPrismaInstance {
         skillOffers.splice(0, skillOffers.length)
         skillOfferOptions.splice(0, skillOfferOptions.length)
         drafts.clear()
+        users.clear()
         idCounter = 0
         eventCounter = 0
         associationCounter = 0

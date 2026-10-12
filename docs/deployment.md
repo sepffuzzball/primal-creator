@@ -45,6 +45,16 @@ request handling" contract.
   guessable credential. Generate one with `openssl rand -base64 24`. Use the
   same value in the app container's derived `DATABASE_URL`, which compose builds
   from `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`.
+- `APP_ORIGIN` is **optional** but strongly recommended behind a reverse proxy.
+  It is the real public browser origin (scheme + host + optional port, no path,
+  e.g. `https://app.example.com`, always HTTPS in production). Every
+  cookie-authenticated state-changing (POST/PUT/PATCH/DELETE) API call must carry
+  an `Origin` header that exactly matches `APP_ORIGIN` (or, when it is unset, the
+  request's own origin) - this is the CSRF same-origin defence in
+  `lib/auth/guard.ts`. A mismatch, missing header, or a sibling subdomain is
+  rejected with `403 bad_origin`. Leave it unset only when the app is served
+  directly (no proxy), because in that case the request's URL origin is the real
+  browser origin.
 
 ### 1.3 Migrate and seed
 
@@ -117,6 +127,14 @@ The image listens on `HOSTNAME=0.0.0.0:3000`. Put it behind a reverse proxy that
 terminates TLS (e.g. Traefik, Caddy, nginx). The session cookie is set
 `Secure` when `NODE_ENV=production`, so TLS is required for auth cookies to be
 sent in production.
+
+When the app is behind a reverse proxy, set `APP_ORIGIN` to the real, public
+browser origin (always HTTPS in production). Without it the CSRF same-origin
+check in `lib/auth/guard.ts` compares `Origin` against the request's own origin,
+which behind a proxy is the proxy's origin (for example
+`http://proxy.internal:3000`), not the browser origin, so legitimate browser
+writes would be rejected with `403 bad_origin`. Keep it unset only for a direct,
+non-proxied deployment.
 
 ### 4.3 Scaling
 

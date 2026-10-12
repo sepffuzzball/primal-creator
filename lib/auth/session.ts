@@ -2,12 +2,23 @@
  * JWT session helpers (via `jose`) plus cookie read/write primitives.
  *
  * The session is a stateless HS256 JWT carrying the user's id, email and admin
- * flag. It is delivered as an HttpOnly, SameSite=Lax cookie that is marked
- * `Secure` in production. `AUTH_SECRET` must be at least 32 characters.
+ * flag plus a numeric `sessionVersion`. It is delivered as an HttpOnly,
+ * SameSite=Lax cookie that is marked `Secure` in production. `AUTH_SECRET` must
+ * be at least 32 characters.
+ *
+ * Session revocation is enforced by the `sessionVersion` counter: every
+ * role/disable/password change increments it in the database, and
+ * `verifySessionToken` rejects any token whose version does not match the row.
+ * Tokens that predate the counter (legacy, no `sessionVersion` claim) are also
+ * rejected so old JWTs are invalidated. On every verification we query the user
+ * row, so a disabled or deleted user loses their session immediately and the
+ * returned email/isAdmin always reflect the current database (never the stale
+ * JWT claims).
  */
 
 import { SignJWT, jwtVerify } from "jose"
 import { cookies } from "next/headers"
+import { prisma } from "@/lib/db/client"
 
 export const SESSION_COOKIE = "primal_session"
 export const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7 // 7 days
@@ -26,9 +37,22 @@ function authSecret(): Uint8Array {
   return new TextEncoder().encode(secret)
 }
 
-export async function createSessionToken(user: SessionUser): Promise<string> {
+/**
+ * Sign a session token for `user`. The `sessionVersion` is the user's current
+ * counter from the database; it defaults to 0 for convenience in tests, where a
+ * freshly created user always has version 0. It is embedded as a numeric claim so
+ * a later password/role change invalidates the token.
+ */
+export async function createSessionToken(
+  user: SessionUser,
+  sessionVersion = 0
+): Promise<string> {
   const secret = authSecret()
-  return new SignJWT({ email: user.email, isAdmin: user.isAdmin })
+  return new SignJWT({
+    email: user.email,
+    isAdmin: user.isAdmin,
+    sessionVersion,
+  })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setSubject(user.id)
     .setIssuedAt()
@@ -36,22 +60,43 @@ export async function createSessionToken(user: SessionUser): Promise<string> {
     .sign(secret)
 }
 
+/**
+ * Verify a session token against the database.
+ *
+ * Rejects the token (returns null) when any of the following hold:
+ *   - the JWT is invalid/expired,
+ *   - the token carries no `sessionVersion` (a legacy, pre-counter JWT),
+ *   - the token's `sessionVersion` differs from the user's current counter (the
+ *     session was revoked by a password/role/disable change),
+ *   - the user no longer exists, or
+ *   - the user is `disabled`.
+ *
+ * On success the returned email/isAdmin come from the current user row, never
+ * from the JWT claims, so a role change takes effect immediately.
+ */
 export async function verifySessionToken(
   token: string
 ): Promise<SessionUser | null> {
   const secret = authSecret()
+  let payload: { sub?: unknown; sessionVersion?: unknown }
   try {
-    const { payload } = await jwtVerify(token, secret, {
+    const result = await jwtVerify(token, secret, {
       algorithms: ["HS256"],
     })
-    const sub = payload.sub
-    const email = payload.email
-    const isAdmin = payload.isAdmin
-    if (typeof sub !== "string" || typeof email !== "string") return null
-    return { id: sub, email, isAdmin: isAdmin === true }
+    payload = result.payload
   } catch {
     return null
   }
+  const sub = payload.sub
+  const version = payload.sessionVersion
+  if (typeof sub !== "string") return null
+  // Reject legacy tokens that predate the sessionVersion counter.
+  if (typeof version !== "number" || !Number.isFinite(version)) return null
+  const user = await prisma.user.findUnique({ where: { id: sub } })
+  if (!user) return null
+  if (user.disabled) return null
+  if (user.sessionVersion !== version) return null
+  return { id: user.id, email: user.email, isAdmin: user.isAdmin }
 }
 
 export function cookieOptions(extra?: { maxAge?: number }) {
