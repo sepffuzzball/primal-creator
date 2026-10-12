@@ -227,6 +227,27 @@ export const associationSchema = z.object({
   version: z.number().int().nonnegative(),
 })
 
+export const skillSelectSchema = z.object({
+  operation: z.literal("select"),
+  offerId: z.string().min(1),
+  definitionId: z.string().min(1),
+  version: z.number().int().nonnegative(),
+})
+
+export const skillGrantSchema = z.object({
+  operation: z.literal("grant"),
+  definitionId: z.string().min(1),
+  version: z.number().int().nonnegative(),
+  reason: z.string().min(1),
+})
+
+// Discriminated union: a skill action is either a player/admin selection of a
+// pending offer option, or an admin-only manual grant.
+export const skillsPostSchema = z.discriminatedUnion("operation", [
+  skillSelectSchema,
+  skillGrantSchema,
+])
+
 // ------------------------------------------------------------------ //
 // Catalog
 // ------------------------------------------------------------------ //
@@ -303,12 +324,88 @@ export const equipmentConfigSchema = z
   })
   .passthrough()
 
+/**
+ * A single declarative passive effect carried by a skill's catalog config.
+ *
+ * Only the phases the engine can synthesize live from a catalog entry are
+ * accepted: `flat` (a signed integer attribute vector, so a skill may be a
+ * debuff) and `percent` (nonnegative integer basis points). A skill may carry an
+ * optional `condition` (reusing the engine's existing EffectCondition shape) and
+ * declares its own `stacking`. `group` is the per-effect stacking group and is
+ * preserved as-is by the service layer, so a single skill can carry independent
+ * flat AND percent effects that both apply. The skill's `upgradeGroup` is used
+ * only to remove superseded linked skills on select/grant, never as an effect
+ * replace group. `stacking` is optional for legacy entries that predate the
+ * modern shape; it defaults to "stack" (or "replace" when a `group` is set).
+ */
+const skillEffectBase = {
+  condition: effectConditionSchema.optional(),
+  stacking: z.enum(["replace", "stack", "stackCapped"]).optional(),
+  group: z.string().optional(),
+}
+
+const skillEffectSchema = z.discriminatedUnion("phase", [
+  z.object({
+    ...skillEffectBase,
+    phase: z.literal("flat"),
+    amount: partialVectorSchema,
+  }),
+  z.object({
+    ...skillEffectBase,
+    phase: z.literal("percent"),
+    basisPoints: nonnegativePartialVectorSchema,
+  }),
+])
+
+/**
+ * Catalog config for a `skills` entry.
+ *
+ * `track` is read permissively so a legacy entry carrying an arbitrary string
+ * (e.g. "Class") never breaks a read: such a config stays readable/editable and
+ * its effects still synthesize, and the unrecognized track is simply ignored for
+ * offers (it never matches an advancing "class"/"profession" track). A NEW or
+ * CONFIG-CHANGED skill must use the enum value; the service layer rejects any
+ * other string via `hasInvalidSkillTrack`.
+ */
 export const skillConfigSchema = z
   .object({
-    milestone: z.number().int().nonnegative().optional(),
     track: z.string().optional(),
+    milestone: z.number().int().nonnegative().optional(),
+    choiceGroup: z.string().min(1).optional(),
+    eligibleDefinitionStableIds: z.array(z.string()).optional(),
+    effects: z.array(skillEffectSchema).optional(),
+    upgradeGroup: z.string().optional(),
   })
   .passthrough()
+
+/**
+ * A skill config is "offer-incomplete" when it declares exactly one of
+ * `track` / `milestone`. An offer-eligible milestone skill requires BOTH: the
+ * track the milestone applies to, and the level at which it is offered. Legacy
+ * partial configs that carry neither (or carry only one) are still readable and
+ * editable as metadata-only, but a NEW or CONFIG-CHANGED skill is rejected by
+ * the service layer when this returns true, so an admin cannot create a skill
+ * that silently never offers.
+ */
+export function isIncompleteSkillConfig(
+  config: Record<string, unknown>
+): boolean {
+  const hasTrack = config.track != null
+  const hasMilestone = config.milestone != null
+  return hasTrack !== hasMilestone
+}
+
+/**
+ * Detect a `skills` config whose `track` is present but not a recognized enum
+ * value (`"class"` / `"profession"`). A legacy config may carry an arbitrary
+ * track string that is safe to read and ignore for offers, but a NEW or
+ * CONFIG-CHANGED skill is rejected by the service layer when this returns true.
+ */
+export function hasInvalidSkillTrack(config: Record<string, unknown>): boolean {
+  const track = config.track
+  if (track == null) return false
+  return track !== "class" && track !== "profession"
+}
 
 export const titleConfigSchema = z
   .object({

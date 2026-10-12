@@ -39,10 +39,34 @@ export interface TestAssociationRow {
   id: string
   characterId: string
   definitionId: string
-  kind: "TITLE" | "EQUIPMENT"
+  kind: "TITLE" | "EQUIPMENT" | "SKILL"
   createdAt: Date
   // Relation, only set on the object returned by findUnique/create.
   definition?: TestCatalogRow | null
+}
+
+export interface TestSkillOfferOptionRow {
+  id: string
+  offerId: string
+  definitionId: string
+  nameSnapshot: string
+  configSnapshot: unknown
+  // Relation, only set on the object returned by findUnique/findMany.
+  definition?: TestCatalogRow | null
+}
+
+export interface TestSkillOfferRow {
+  id: string
+  characterId: string
+  track: string
+  level: number
+  choiceGroup: string
+  selectedDefinitionId: string | null
+  selectedDefinition?: TestCatalogRow | null
+  offeredAt: Date
+  selectedAt: Date | null
+  // Relational options, only set on the object returned by findUnique/findMany.
+  options?: TestSkillOfferOptionRow[]
 }
 
 export interface TestCharacterRow {
@@ -64,6 +88,7 @@ export interface TestCharacterRow {
   class?: TestCatalogRow | null
   profession?: TestCatalogRow | null
   associations?: TestAssociationRow[]
+  skillOffers?: TestSkillOfferRow[]
 }
 
 export interface TestEventRow {
@@ -83,6 +108,9 @@ export interface TestPrismaInstance {
       findUnique: (args: {
         where: { id: string }
       }) => Promise<TestCatalogRow | null>
+      findMany: (args: {
+        where?: { kind?: string; archived?: boolean }
+      }) => Promise<TestCatalogRow[]>
       update: (args: {
         where: { id: string }
         data: Record<string, unknown>
@@ -122,12 +150,41 @@ export interface TestPrismaInstance {
         orderBy?: unknown
       }) => Promise<TestEventRow[]>
     }
+    skillOffer: {
+      create: (args: {
+        data: Record<string, unknown>
+        include?: unknown
+      }) => Promise<TestSkillOfferRow>
+      findUnique: (args: {
+        where:
+          | { id: string }
+          | {
+              characterId_track_level_choiceGroup: {
+                characterId: string
+                track: string
+                level: number
+                choiceGroup: string
+              }
+            }
+        include?: unknown
+      }) => Promise<TestSkillOfferRow | null>
+      findMany: (args: {
+        where?: { characterId?: string }
+        include?: unknown
+      }) => Promise<TestSkillOfferRow[]>
+      update: (args: {
+        where: { id: string }
+        data: Record<string, unknown>
+      }) => Promise<TestSkillOfferRow>
+    }
   }
   store: {
     characters: Map<string, TestCharacterRow>
     catalog: Map<string, TestCatalogRow>
     associations: TestAssociationRow[]
     events: TestEventRow[]
+    skillOffers: TestSkillOfferRow[]
+    skillOfferOptions: TestSkillOfferOptionRow[]
     addCatalog(row: Partial<TestCatalogRow> & { id: string }): TestCatalogRow
     addCharacter(
       row: Partial<TestCharacterRow> & { id: string }
@@ -136,7 +193,7 @@ export interface TestPrismaInstance {
       row: Partial<TestAssociationRow> & {
         characterId: string
         definitionId: string
-        kind: "TITLE" | "EQUIPMENT"
+        kind: "TITLE" | "EQUIPMENT" | "SKILL"
       }
     ): TestAssociationRow
     reset(): void
@@ -162,6 +219,9 @@ interface Transaction {
     findUnique: (args: {
       where: { id: string }
     }) => Promise<TestCatalogRow | null>
+    findMany: (args: {
+      where?: { kind?: string; archived?: boolean }
+    }) => Promise<TestCatalogRow[]>
     update: (args: {
       where: { id: string }
       data: Record<string, unknown>
@@ -178,6 +238,7 @@ interface Transaction {
       where?: {
         definitionId?: string
         characterId?: string
+        kind?: "TITLE" | "EQUIPMENT" | "SKILL"
       }
       include?: unknown
     }) => Promise<Array<TestAssociationRow & { character?: TestCharacterRow }>>
@@ -189,6 +250,33 @@ interface Transaction {
       orderBy?: unknown
     }) => Promise<TestEventRow[]>
   }
+  skillOffer: {
+    create: (args: {
+      data: Record<string, unknown>
+      include?: unknown
+    }) => Promise<TestSkillOfferRow>
+    findUnique: (args: {
+      where:
+        | { id: string }
+        | {
+            characterId_track_level_choiceGroup: {
+              characterId: string
+              track: string
+              level: number
+              choiceGroup: string
+            }
+          }
+      include?: unknown
+    }) => Promise<TestSkillOfferRow | null>
+    findMany: (args: {
+      where?: { characterId?: string }
+      include?: unknown
+    }) => Promise<TestSkillOfferRow[]>
+    update: (args: {
+      where: { id: string }
+      data: Record<string, unknown>
+    }) => Promise<TestSkillOfferRow>
+  }
 }
 
 export function createTestPrisma(): TestPrismaInstance {
@@ -196,9 +284,13 @@ export function createTestPrisma(): TestPrismaInstance {
   const catalog = new Map<string, TestCatalogRow>()
   const associations: TestAssociationRow[] = []
   const events: TestEventRow[] = []
+  const skillOffers: TestSkillOfferRow[] = []
+  const skillOfferOptions: TestSkillOfferOptionRow[] = []
   let idCounter = 0
   let eventCounter = 0
   let associationCounter = 0
+  let offerCounter = 0
+  let optionCounter = 0
 
   function attachAssociations(char: TestCharacterRow): TestAssociationRow[] {
     return associations
@@ -211,6 +303,25 @@ export function createTestPrisma(): TestPrismaInstance {
       }))
   }
 
+  function attachSkillOffers(char: TestCharacterRow): TestSkillOfferRow[] {
+    return skillOffers
+      .filter((o) => o.characterId === char.id)
+      .map((o) => ({
+        ...o,
+        selectedDefinition: o.selectedDefinitionId
+          ? (catalog.get(o.selectedDefinitionId) ?? null)
+          : null,
+        options: skillOfferOptions
+          .filter((opt) => opt.offerId === o.id)
+          .map((opt) => ({
+            ...opt,
+            definition: opt.definitionId
+              ? (catalog.get(opt.definitionId) ?? null)
+              : null,
+          })),
+      }))
+  }
+
   function attachRelations(char: TestCharacterRow): TestCharacterRow {
     return {
       ...char,
@@ -220,12 +331,35 @@ export function createTestPrisma(): TestPrismaInstance {
         ? (catalog.get(char.professionId) ?? null)
         : null,
       associations: attachAssociations(char),
+      skillOffers: attachSkillOffers(char),
     }
   }
 
   function findChar(id: string): TestCharacterRow | null {
     const c = characters.get(id)
     return c ? attachRelations(c) : null
+  }
+
+  function findOfferByKey(where: {
+    id?: string
+    characterId_track_level_choiceGroup?: {
+      characterId: string
+      track: string
+      level: number
+      choiceGroup: string
+    }
+  }): TestSkillOfferRow | undefined {
+    const key = where.characterId_track_level_choiceGroup
+    if (key) {
+      return skillOffers.find(
+        (o) =>
+          o.characterId === key.characterId &&
+          o.track === key.track &&
+          o.level === key.level &&
+          o.choiceGroup === key.choiceGroup
+      )
+    }
+    return skillOffers.find((o) => o.id === where.id)
   }
 
   const tx: Transaction = {
@@ -275,6 +409,18 @@ export function createTestPrisma(): TestPrismaInstance {
     catalogDefinition: {
       findUnique: async ({ where }: { where: { id: string } }) =>
         catalog.get(where.id) ?? null,
+      findMany: async ({
+        where,
+      }: {
+        where?: { kind?: string; archived?: boolean }
+      }) => {
+        let results = [...catalog.values()]
+        if (where?.kind != null)
+          results = results.filter((r) => r.kind === where.kind)
+        if (where?.archived != null)
+          results = results.filter((r) => r.archived === where.archived)
+        return results
+      },
       update: async ({
         where,
         data,
@@ -309,7 +455,7 @@ export function createTestPrisma(): TestPrismaInstance {
           id,
           characterId: data.characterId as string,
           definitionId: data.definitionId as string,
-          kind: data.kind as "TITLE" | "EQUIPMENT",
+          kind: data.kind as "TITLE" | "EQUIPMENT" | "SKILL",
           createdAt: new Date(),
           definition: catalog.get(data.definitionId as string) ?? null,
         }
@@ -336,6 +482,8 @@ export function createTestPrisma(): TestPrismaInstance {
           results = results.filter((a) => a.definitionId === where.definitionId)
         if (where?.characterId)
           results = results.filter((a) => a.characterId === where.characterId)
+        if (where?.kind != null)
+          results = results.filter((a) => a.kind === where.kind)
         return results.map((a) => {
           const char = include ? findChar(a.characterId) : null
           const out: TestAssociationRow & { character?: TestCharacterRow } = {
@@ -369,6 +517,79 @@ export function createTestPrisma(): TestPrismaInstance {
         )
       },
     },
+    skillOffer: {
+      create: async ({ data }) => {
+        const id = (data.id as string) ?? `off-${++offerCounter}`
+        const now = new Date()
+        const offer: TestSkillOfferRow = {
+          id,
+          characterId: data.characterId as string,
+          track: data.track as string,
+          level: data.level as number,
+          choiceGroup: data.choiceGroup as string,
+          selectedDefinitionId: null,
+          offeredAt: now,
+          selectedAt: null,
+        }
+        skillOffers.push(offer)
+        const nestedOptions = (
+          data.options as { create?: Array<Record<string, unknown>> }
+        )?.create
+        if (nestedOptions && nestedOptions.length > 0) {
+          for (const opt of nestedOptions) {
+            const optionId = (opt.id as string) ?? `opt-${++optionCounter}`
+            skillOfferOptions.push({
+              id: optionId,
+              offerId: id,
+              definitionId: opt.definitionId as string,
+              nameSnapshot: opt.nameSnapshot as string,
+              configSnapshot: opt.configSnapshot,
+              definition: catalog.get(opt.definitionId as string) ?? null,
+            })
+          }
+        }
+        return attachOffer(offer)
+      },
+      findUnique: async ({ where, include }) => {
+        const offer = findOfferByKey(where)
+        if (!offer) return null
+        return include ? attachOffer(offer) : { ...offer }
+      },
+      findMany: async ({ where }) => {
+        let results = skillOffers
+        if (where?.characterId != null)
+          results = results.filter((o) => o.characterId === where.characterId)
+        return results.map((o) => attachOffer(o))
+      },
+      update: async ({ where, data }) => {
+        const offer = skillOffers.find((o) => o.id === where.id)
+        if (!offer) throw new Error(`SkillOffer ${where.id} not found`)
+        if (data.selectedDefinitionId != null) {
+          offer.selectedDefinitionId = data.selectedDefinitionId as string
+        }
+        if (data.selectedAt != null) {
+          offer.selectedAt = data.selectedAt as Date
+        }
+        return attachOffer(offer)
+      },
+    },
+  }
+
+  function attachOffer(o: TestSkillOfferRow): TestSkillOfferRow {
+    return {
+      ...o,
+      selectedDefinition: o.selectedDefinitionId
+        ? (catalog.get(o.selectedDefinitionId) ?? null)
+        : null,
+      options: skillOfferOptions
+        .filter((opt) => opt.offerId === o.id)
+        .map((opt) => ({
+          ...opt,
+          definition: opt.definitionId
+            ? (catalog.get(opt.definitionId) ?? null)
+            : null,
+        })),
+    }
   }
 
   // The mock runs transactions strictly serially so that each callback observes
@@ -380,15 +601,29 @@ export function createTestPrisma(): TestPrismaInstance {
   let transactionChain: Promise<unknown> = Promise.resolve()
 
   function snapshot() {
-    const assocSnapshot = [...associations]
+    const assocSnapshot = associations.map((a) => ({ ...a }))
     const eventSnapshot = [...events]
+    const offerSnapshot = skillOffers.map((o) => ({ ...o }))
+    const optionSnapshot = skillOfferOptions.map((o) => ({ ...o }))
     const charSnapshot = new Map([...characters].map(([k, v]) => [k, { ...v }]))
-    return { assocSnapshot, eventSnapshot, charSnapshot }
+    return {
+      assocSnapshot,
+      eventSnapshot,
+      offerSnapshot,
+      optionSnapshot,
+      charSnapshot,
+    }
   }
 
   function restore(snap: ReturnType<typeof snapshot>) {
     associations.splice(0, associations.length, ...snap.assocSnapshot)
     events.splice(0, events.length, ...snap.eventSnapshot)
+    skillOffers.splice(0, skillOffers.length, ...snap.offerSnapshot)
+    skillOfferOptions.splice(
+      0,
+      skillOfferOptions.length,
+      ...snap.optionSnapshot
+    )
     characters.clear()
     for (const [k, v] of snap.charSnapshot) characters.set(k, v)
   }
@@ -414,11 +649,13 @@ export function createTestPrisma(): TestPrismaInstance {
     catalogDefinition: {
       findUnique: async ({ where }: { where: { id: string } }) =>
         catalog.get(where.id) ?? null,
+      findMany: tx.catalogDefinition.findMany,
       update: tx.catalogDefinition.update,
     },
     character: tx.character,
     characterAssociation: tx.characterAssociation,
     progressionEvent: tx.progressionEvent,
+    skillOffer: tx.skillOffer,
   }
 
   return {
@@ -428,6 +665,8 @@ export function createTestPrisma(): TestPrismaInstance {
       catalog,
       associations,
       events,
+      skillOffers,
+      skillOfferOptions,
       addCatalog(row) {
         const full: TestCatalogRow = {
           id: row.id,
@@ -483,9 +722,13 @@ export function createTestPrisma(): TestPrismaInstance {
         catalog.clear()
         associations.splice(0, associations.length)
         events.splice(0, events.length)
+        skillOffers.splice(0, skillOffers.length)
+        skillOfferOptions.splice(0, skillOfferOptions.length)
         idCounter = 0
         eventCounter = 0
         associationCounter = 0
+        offerCounter = 0
+        optionCounter = 0
       },
     },
   }

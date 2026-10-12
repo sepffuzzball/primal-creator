@@ -45,6 +45,7 @@ enum Provenance {
 enum AssociationKind {
   TITLE
   EQUIPMENT
+  SKILL
 }
 
 // ------------------------------------------------------------------ //
@@ -117,6 +118,7 @@ model Character {
   events        ProgressionEvent[]
   assets        Asset[]
   associations  CharacterAssociation[]
+  skillOffers   SkillOffer[]
 
   @@index([ownerId])
   @@index([archived])
@@ -168,6 +170,8 @@ model CatalogDefinition {
   classCharacters     Character[] @relation("CharacterClass")
   professionCharacters Character[] @relation("CharacterProfession")
   characterAssociations CharacterAssociation[] @relation("AssociationDefinition")
+  skillOfferOptions   SkillOfferOption[] @relation("SkillOfferOptionDefinition")
+  skillOfferSelections SkillOffer[] @relation("SkillOfferSelection")
 
   @@unique([kind, stableId])
   @@index([kind])
@@ -203,4 +207,58 @@ model CharacterAssociation {
   @@index([characterId])
   @@index([kind])
   @@map("character_associations")
+}
+
+// ------------------------------------------------------------------ //
+// Skill offers (offered milestone choices, not automatic awards)
+// ------------------------------------------------------------------ //
+//
+// Skills are acquired by explicit selection from a milestone offer, never by
+// automatic award. When a character levels a class/profession track, the service
+// queries the unarchived skills catalog and creates AT MOST ONE offer per choice
+// group. Each offer carries read-only option snapshots (name + config) so a later
+// catalog edit never rewrites what the character was actually offered. Selecting
+// an option links the skill as a CharacterAssociation (kind SKILL), stamps the
+// offer as selected, and the live state synthesizes the skill's passive effects
+// from the CURRENT catalog config (history stays immutable).
+
+model SkillOffer {
+  id                   String             @id @default(cuid())
+  characterId          String
+  character            Character          @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  // The advancing track the offer was generated for: "class" or "profession".
+  track                String
+  // The track level reached at the time the offer was generated.
+  level                Int
+  // Choice group the offered options share ("standard" when none is configured).
+  choiceGroup          String
+  // The option the character selected. Null while the offer is still pending.
+  selectedDefinitionId String?
+  selectedDefinition   CatalogDefinition? @relation("SkillOfferSelection", fields: [selectedDefinitionId], references: [id], onDelete: Restrict)
+  offeredAt            DateTime           @default(now())
+  // Set only when an option is selected (atomic with the link + event).
+  selectedAt           DateTime?
+  options              SkillOfferOption[]
+
+  @@unique([characterId, track, level, choiceGroup])
+  @@index([characterId])
+  @@index([track, level])
+  @@map("skill_offers")
+}
+
+model SkillOfferOption {
+  id             String            @id @default(cuid())
+  offerId        String
+  offer          SkillOffer        @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  definitionId   String
+  definition     CatalogDefinition @relation("SkillOfferOptionDefinition", fields: [definitionId], references: [id], onDelete: Restrict)
+  // Immutable snapshots captured when the offer was generated; the definition may
+  // later be edited, but the character was offered THIS config.
+  nameSnapshot   String
+  configSnapshot Json
+
+  @@unique([offerId, definitionId])
+  @@index([offerId])
+  @@index([definitionId])
+  @@map("skill_offer_options")
 }

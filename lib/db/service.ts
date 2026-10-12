@@ -30,6 +30,7 @@ import {
   zeroVector,
   type AttributeVector,
   type CharacterState,
+  type EffectCondition,
   type Grade,
   type PartialVector,
   type RaceDefinition,
@@ -41,6 +42,8 @@ import {
 import { prisma } from "@/lib/db/client"
 import {
   characterStateSchema,
+  hasInvalidSkillTrack,
+  isIncompleteSkillConfig,
   isLegacyConsumableConfig,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
@@ -56,6 +59,9 @@ const characterInclude = {
   class: true,
   profession: true,
   associations: { include: { definition: true } },
+  skillOffers: {
+    include: { options: { include: { definition: true } } },
+  },
 } as const
 
 type CharacterWithCatalog = Prisma.CharacterGetPayload<{
@@ -67,12 +73,36 @@ type DbClient = Prisma.TransactionClient | typeof prisma
 export interface CharacterAssociationView {
   id: string
   definitionId: string
-  kind: "title" | "equipment"
+  kind: "title" | "equipment" | "skill"
   name: string
   slot?: string
   upgradeGroup?: string
+  /** Catalog grade of the linked definition (skills use this for tiers). */
+  grade?: string
+  /** Provenance label of the linked definition. */
+  provenance?: string
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
+}
+
+export interface SkillOfferOptionView {
+  definitionId: string
+  nameSnapshot: string
+  /** Whether the offered option's catalog definition is currently archived. */
+  archived: boolean
+  /** Catalog tier grade of the offered definition, when set. */
+  grade?: string
+  /** Provenance label of the offered definition. */
+  provenance?: string
+}
+
+export interface SkillOfferView {
+  id: string
+  track: string
+  level: number
+  choiceGroup: string
+  options: SkillOfferOptionView[]
+  selectedDefinitionId: string | null
 }
 
 export interface CharacterDetail {
@@ -92,6 +122,8 @@ export interface CharacterDetail {
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
+  /** Pending + selected skill offers (milestone choices) for this character. */
+  skillOffers: SkillOfferView[]
   status?: StatusResult
   /**
    * Server-computed permanent-consumable capacity per attribute (authoritative;
@@ -393,6 +425,47 @@ function liveState(character: CharacterWithCatalog): CharacterState {
           stacking: "stack",
         })
       }
+    } else if (def.kind === "skills") {
+      // Synthesize each declarative passive effect from the current catalog
+      // config. History stays immutable; editing a skill's effects recalculates
+      // the live status without rewriting the stored state or the journal.
+      const effects = (config.effects ?? []) as Array<{
+        phase: string
+        amount?: PartialVector
+        basisPoints?: PartialVector
+        condition?: EffectCondition
+        stacking?: "replace" | "stack" | "stackCapped"
+        group?: string
+      }>
+      for (let i = 0; i < effects.length; i++) {
+        const eff = effects[i]
+        // Each effect retains its OWN stacking/replace group. The skill's
+        // `upgradeGroup` is used only on select/grant to remove superseded linked
+        // skills - it is never an effect replace group, so a single skill's flat
+        // AND percent effects both apply (they never collapse into one another).
+        const group = eff.group
+        const base = {
+          id: `${def.id}:eff-${i}`,
+          source: def.name,
+          provenance: def.provenance,
+          condition: eff.condition,
+          group,
+          stacking: eff.stacking ?? (group ? "replace" : "stack"),
+        }
+        if (eff.phase === "flat") {
+          activeEffects.push({
+            ...base,
+            phase: "flat",
+            amount: makeVector(eff.amount ?? {}),
+          })
+        } else if (eff.phase === "percent") {
+          activeEffects.push({
+            ...base,
+            phase: "percent",
+            basisPoints: makeVector(eff.basisPoints ?? {}),
+          })
+        }
+      }
     }
   }
   return { ...state, equipment, activeEffects }
@@ -459,7 +532,12 @@ function associationView(
     link.definition.kind,
     link.definition.config ?? {}
   )
-  const kind = link.kind === "TITLE" ? "title" : "equipment"
+  const kind: CharacterAssociationView["kind"] =
+    link.kind === "TITLE"
+      ? "title"
+      : link.kind === "EQUIPMENT"
+        ? "equipment"
+        : "skill"
   const view: CharacterAssociationView = {
     id: link.id,
     definitionId: link.definitionId,
@@ -471,11 +549,37 @@ function associationView(
     const slot = config.slot as string | undefined
     if (slot) view.slot = slot
   }
-  if (kind === "title") {
+  if (kind === "title" || kind === "skill") {
     const upgradeGroup = config.upgradeGroup as string | undefined
     if (upgradeGroup) view.upgradeGroup = upgradeGroup
   }
+  if (kind === "skill") {
+    if (link.definition.grade) view.grade = link.definition.grade
+    view.provenance = link.definition.provenance
+  }
   return view
+}
+
+/** Build the read-time skill-offer view with the current archived status of each option. */
+function skillOfferView(
+  offer: CharacterWithCatalog["skillOffers"][number]
+): SkillOfferView {
+  return {
+    id: offer.id,
+    track: offer.track,
+    level: offer.level,
+    choiceGroup: offer.choiceGroup,
+    options: offer.options.map((o) => ({
+      definitionId: o.definitionId,
+      nameSnapshot: o.nameSnapshot,
+      archived: o.definition?.archived ?? false,
+      ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
+      ...(o.definition?.provenance
+        ? { provenance: o.definition.provenance }
+        : {}),
+    })),
+    selectedDefinitionId: offer.selectedDefinitionId,
+  }
 }
 
 function toDetail(
@@ -501,6 +605,7 @@ function toDetail(
     createdAt: character.createdAt.toISOString(),
     updatedAt: character.updatedAt.toISOString(),
     associations: character.associations.map(associationView),
+    skillOffers: character.skillOffers.map(skillOfferView),
     status: withStatus ? statusFor(character, config) : undefined,
     permanentConsumableCap: consumableInfo.cap,
     permanentConsumableRemaining: consumableInfo.remaining,
@@ -759,6 +864,115 @@ export async function archiveCharacter(
   })
 }
 
+/**
+ * Create ONE skill offer per choice group for a character that just leveled a
+ * track. It queries the unarchived `skills` catalog and keeps only the entries
+ * whose config `track` / `milestone` exactly match the advanced track/level, whose
+ * explicit `grade` (when set) equals the character's current race grade (no
+ * inferred compatibility), and whose `eligibleDefinitionStableIds` (when present)
+ * includes the character's selected track catalog stableId. The surviving
+ * entries are grouped by `choiceGroup ?? "standard"`; a single offer with
+ * read-only option snapshots is created per group. A pre-existing offer for the
+ * same (character, track, level, choiceGroup) is left untouched (unique guard).
+ * Returns the created offers (id + choiceGroup) so the caller can surface them.
+ */
+async function createSkillOffersForAdvance(
+  tx: DbClient,
+  characterId: string,
+  track: "class" | "profession",
+  newLevel: number,
+  raceGrade: string,
+  trackStableId: string | undefined
+): Promise<Array<{ id: string; choiceGroup: string }>> {
+  const skillDefs = await tx.catalogDefinition.findMany({
+    where: { kind: "skills", archived: false },
+  })
+  const eligible: Array<{
+    def: {
+      id: string
+      name: string
+      grade: string | null
+      config: unknown
+    }
+    choiceGroup: string
+  }> = []
+
+  for (const def of skillDefs) {
+    const config = parseCatalogConfig("skills", def.config ?? {})
+    if (config.track !== track) continue
+    const milestone = Number(config.milestone)
+    if (!Number.isFinite(milestone) || milestone !== newLevel) continue
+    // Grade, when specified, must match the character's current grade exactly.
+    if (def.grade && def.grade !== raceGrade) continue
+    // Filter to the selected track's catalog stableId when the skill constrains
+    // its eligible class/profession definitions. When `eligibleDefinitionStableIds`
+    // is present - even as an empty array - the restriction applies via `includes`:
+    // an empty list offers nothing (no selected stableId can be included), while an
+    // absent list imposes no restriction.
+    const stableIds = config.eligibleDefinitionStableIds
+    if (
+      Array.isArray(stableIds) &&
+      (!trackStableId || !stableIds.includes(trackStableId))
+    ) {
+      continue
+    }
+    const group =
+      typeof config.choiceGroup === "string" && config.choiceGroup.length > 0
+        ? config.choiceGroup
+        : "standard"
+    eligible.push({
+      def: { id: def.id, name: def.name, grade: def.grade, config: def.config },
+      choiceGroup: group,
+    })
+  }
+
+  const byGroup = new Map<string, typeof eligible>()
+  for (const e of eligible) {
+    const arr = byGroup.get(e.choiceGroup)
+    if (arr) arr.push(e)
+    else byGroup.set(e.choiceGroup, [e])
+  }
+
+  const created: Array<{ id: string; choiceGroup: string }> = []
+  for (const [choiceGroup, entries] of byGroup) {
+    // Enforce the unique identity (characterId, track, level, choiceGroup) by
+    // checking for a pre-existing offer BEFORE creating, inside this live
+    // transaction. A pre-existing offer (e.g. a prior advance) is left untouched
+    // and never duplicated, so a re-advance produces no duplicate. If a concurrent
+    // request inserts the same identity between this check and the create, the
+    // resulting unique violation is NOT swallowed here - it propagates and aborts
+    // the entire transaction (no silent skip, no half-applied advance).
+    const existing = await tx.skillOffer.findUnique({
+      where: {
+        characterId_track_level_choiceGroup: {
+          characterId,
+          track,
+          level: newLevel,
+          choiceGroup,
+        },
+      },
+    })
+    if (existing) continue
+    const offer = await tx.skillOffer.create({
+      data: {
+        characterId,
+        track,
+        level: newLevel,
+        choiceGroup,
+        options: {
+          create: entries.map((e) => ({
+            definitionId: e.def.id,
+            nameSnapshot: e.def.name,
+            configSnapshot: (e.def.config ?? {}) as Prisma.InputJsonValue,
+          })),
+        },
+      },
+    })
+    created.push({ id: offer.id, choiceGroup })
+  }
+  return created
+}
+
 export async function advanceCharacter(
   id: string,
   body: { track: "class" | "profession"; version: number },
@@ -794,6 +1008,34 @@ export async function advanceCharacter(
         `Version mismatch: expected ${body.version}, got a newer version`
       )
     }
+
+    // Skills are offered, never auto-awarded: on a LEVEL-UP only, generate one
+    // offer per choice group from the current unarchived skills catalog. A
+    // quarter-only advance (no level up) produces no offers. The offers are
+    // created inside the same transaction as the CAS state write and the
+    // immutable advance event, so a conflict rolls all of them back together.
+    let skillOffers: Array<{ id: string; choiceGroup: string }> = []
+    if (result.journal.leveledUp) {
+      const newLevel = result.journal.levelAfter
+      const raceGrade = result.state.race.grade
+      const trackStableId =
+        body.track === "class" ? row.class?.stableId : row.profession?.stableId
+      skillOffers = await createSkillOffersForAdvance(
+        tx,
+        id,
+        body.track,
+        newLevel,
+        raceGrade,
+        trackStableId ?? undefined
+      )
+    }
+
+    const advanceJournal: Record<string, unknown> = { ...result.journal }
+    if (skillOffers.length > 0) {
+      advanceJournal.skillOffers = skillOffers
+      advanceJournal.skillOfferIds = skillOffers.map((o) => o.id)
+    }
+
     await tx.progressionEvent.create({
       data: {
         characterId: id,
@@ -801,7 +1043,7 @@ export async function advanceCharacter(
         payload: {
           track: body.track,
           definitionId: definition.id,
-          journal: result.journal,
+          journal: advanceJournal,
         } as unknown as Prisma.InputJsonValue,
       },
     })
@@ -809,7 +1051,304 @@ export async function advanceCharacter(
       where: { id },
       include: characterInclude,
     }))!
-    return { character: toDetail(updated, true), journal: result.journal }
+    return {
+      character: toDetail(updated, true),
+      journal: advanceJournal,
+    }
+  })
+}
+
+/**
+ * Resolve the skill config's upgrade group from a definition, or undefined.
+ */
+function skillUpgradeGroup(def: {
+  kind: string
+  config?: unknown
+}): string | undefined {
+  const group = parseCatalogConfig(def.kind, def.config ?? {}).upgradeGroup
+  return typeof group === "string" && group.length > 0 ? group : undefined
+}
+
+/**
+ * Delete every skill link on the character that shares `upgradeGroup` (never
+ * stack superseded tiers). The newly acquired definition is excluded, and only
+ * SKILL-kind links are considered.
+ */
+async function removeSameUpgradeGroupSkills(
+  tx: DbClient,
+  characterId: string,
+  associations: CharacterWithCatalog["associations"],
+  definitionId: string,
+  upgradeGroup: string
+): Promise<Array<{ definitionId: string; name: string }>> {
+  const removed: Array<{ definitionId: string; name: string }> = []
+  for (const link of associations) {
+    if (link.kind !== "SKILL") continue
+    if (link.definitionId === definitionId) continue
+    if (skillUpgradeGroup(link.definition) !== upgradeGroup) continue
+    removed.push({
+      definitionId: link.definitionId,
+      name: link.definition.name,
+    })
+    await tx.characterAssociation.deleteMany({
+      where: { characterId, definitionId: link.definitionId },
+    })
+  }
+  return removed
+}
+
+type SkillSelectInput = {
+  operation: "select"
+  offerId: string
+  definitionId: string
+  version: number
+}
+
+type SkillGrantInput = {
+  operation: "grant"
+  definitionId: string
+  version: number
+  reason: string
+}
+
+type SkillActionInput = SkillSelectInput | SkillGrantInput
+
+/**
+ * Answer a skill offer (`select`) or grant a skill manually (`grant`).
+ *
+ * SELECT: the owner or an admin picks one own pending offer option. The option
+ * must belong to the offer, its definition must be unarchived, the skill must not
+ * already be acquired, and the offer must still be pending (a repeat selection or
+ * a selection on an already-answered offer is rejected). Selecting links the skill
+ * as a CharacterAssociation (kind SKILL), removes any linked skill in the same
+ * upgrade group (never stack), stamps the offer `selected*`, and appends an
+ * immutable `skill_select` event - all atomically under the character's CAS
+ * version.
+ *
+ * GRANT: admin-only. Requires a nonempty reason; the definition must be an
+ * unarchived `skills` entry. It records provenance "manual" in the event, and
+ * applies the same upgrade-group replacement as a select.
+ */
+export async function skillCharacter(
+  id: string,
+  input: SkillActionInput,
+  user: SessionUser
+): Promise<{ character: CharacterDetail }> {
+  return prisma.$transaction(async (tx) => {
+    const row = await assertOwner(tx, id, user)
+
+    if (input.operation === "select") {
+      const offer = await tx.skillOffer.findUnique({
+        where: { id: input.offerId },
+        include: { options: { include: { definition: true } } },
+      })
+      if (!offer || offer.characterId !== id) {
+        throw notFound("offer_not_found", "Skill offer not found")
+      }
+      // Repeat selection / already-answered offer.
+      if (offer.selectedDefinitionId != null) {
+        throw badRequest(
+          "offer_already_selected",
+          "This skill offer has already been answered"
+        )
+      }
+      const option = offer.options.find(
+        (o) => o.definitionId === input.definitionId
+      )
+      if (!option) {
+        throw badRequest(
+          "option_not_found",
+          "Selected skill is not one of this offer's options"
+        )
+      }
+      const def = option.definition
+      if (def.archived) {
+        throw badRequest(
+          "catalog_archived",
+          `Offered skill "${def.name}" is archived; re-enable it in the catalog to select it`
+        )
+      }
+      if (
+        row.associations.some(
+          (a) => a.definitionId === def.id && a.kind === "SKILL"
+        )
+      ) {
+        throw badRequest("duplicate", `Skill "${def.name}" is already acquired`)
+      }
+
+      const defConfig = parseCatalogConfig(def.kind, def.config ?? {})
+      const upgradeGroup =
+        typeof defConfig.upgradeGroup === "string" &&
+        defConfig.upgradeGroup.length > 0
+          ? defConfig.upgradeGroup
+          : undefined
+      const removed =
+        upgradeGroup != null
+          ? await removeSameUpgradeGroupSkills(
+              tx,
+              id,
+              row.associations,
+              def.id,
+              upgradeGroup
+            )
+          : []
+
+      await tx.characterAssociation.create({
+        data: {
+          characterId: id,
+          definitionId: def.id,
+          kind: "SKILL" as never,
+        },
+      })
+      await tx.skillOffer.update({
+        where: { id: offer.id },
+        data: { selectedDefinitionId: def.id, selectedAt: new Date() },
+      })
+
+      const updatedMany = await tx.character.updateMany({
+        where: { id, version: input.version },
+        data: { version: { increment: 1 } },
+      })
+      if (updatedMany.count !== 1) {
+        throw conflict(
+          "version_conflict",
+          `Version mismatch: expected ${input.version}, got a newer version`
+        )
+      }
+
+      await tx.progressionEvent.create({
+        data: {
+          characterId: id,
+          kind: "skill_select",
+          payload: {
+            operation: "select",
+            offerId: offer.id,
+            definitionId: def.id,
+            track: offer.track,
+            level: offer.level,
+            choiceGroup: offer.choiceGroup,
+            definition: {
+              id: def.id,
+              name: def.name,
+              stableId: def.stableId,
+              grade: def.grade,
+              provenance: def.provenance,
+              upgradeGroup: upgradeGroup ?? null,
+            },
+            selectedAt: new Date().toISOString(),
+            removed,
+          } as unknown as Prisma.InputJsonValue,
+        },
+      })
+
+      const updated = (await tx.character.findUnique({
+        where: { id },
+        include: characterInclude,
+      }))!
+      return { character: toDetail(updated, true) }
+    }
+
+    // GRANT (admin only)
+    if (!user.isAdmin) {
+      throw forbidden("forbidden", "Only an admin can grant a skill")
+    }
+    const reason = input.reason.trim()
+    if (!reason) {
+      throw badRequest(
+        "reason_required",
+        "A reason is required to grant a skill"
+      )
+    }
+    const def = await tx.catalogDefinition.findUnique({
+      where: { id: input.definitionId },
+    })
+    if (!def) {
+      throw notFound("catalog_not_found", "Catalog entry not found")
+    }
+    if (def.kind !== "skills") {
+      throw badRequest(
+        "wrong_kind",
+        `Catalog entry has wrong kind (expected "skills")`
+      )
+    }
+    if (def.archived) {
+      throw badRequest(
+        "catalog_archived",
+        "Catalog entry is archived and cannot be granted"
+      )
+    }
+    if (
+      row.associations.some(
+        (a) => a.definitionId === def.id && a.kind === "SKILL"
+      )
+    ) {
+      throw badRequest("duplicate", `Skill "${def.name}" is already acquired`)
+    }
+
+    const defConfig = parseCatalogConfig(def.kind, def.config ?? {})
+    const upgradeGroup =
+      typeof defConfig.upgradeGroup === "string" &&
+      defConfig.upgradeGroup.length > 0
+        ? defConfig.upgradeGroup
+        : undefined
+    const removed =
+      upgradeGroup != null
+        ? await removeSameUpgradeGroupSkills(
+            tx,
+            id,
+            row.associations,
+            def.id,
+            upgradeGroup
+          )
+        : []
+
+    await tx.characterAssociation.create({
+      data: {
+        characterId: id,
+        definitionId: def.id,
+        kind: "SKILL" as never,
+      },
+    })
+
+    const updatedMany = await tx.character.updateMany({
+      where: { id, version: input.version },
+      data: { version: { increment: 1 } },
+    })
+    if (updatedMany.count !== 1) {
+      throw conflict(
+        "version_conflict",
+        `Version mismatch: expected ${input.version}, got a newer version`
+      )
+    }
+
+    await tx.progressionEvent.create({
+      data: {
+        characterId: id,
+        kind: "skill_grant",
+        payload: {
+          operation: "grant",
+          definitionId: def.id,
+          reason,
+          provenance: "manual",
+          definition: {
+            id: def.id,
+            name: def.name,
+            stableId: def.stableId,
+            grade: def.grade,
+            provenance: def.provenance,
+            upgradeGroup: upgradeGroup ?? null,
+          },
+          grantedAt: new Date().toISOString(),
+          removed,
+        } as unknown as Prisma.InputJsonValue,
+      },
+    })
+
+    const updated = (await tx.character.findUnique({
+      where: { id },
+      include: characterInclude,
+    }))!
+    return { character: toDetail(updated, true) }
   })
 }
 
@@ -1450,6 +1989,18 @@ export async function createCatalogItem(
       'Consumable config is missing required "type" and "amount" fields'
     )
   }
+  if (kind === "skills" && isIncompleteSkillConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
+    )
+  }
+  if (kind === "skills" && hasInvalidSkillTrack(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Skill config has an invalid "track": expected "class" or "profession"'
+    )
+  }
   let stableId = input.stableId
   if (!stableId) {
     stableId =
@@ -1485,12 +2036,13 @@ export async function createCatalogItem(
 }
 
 /**
- * Reject a catalog update that would make an equipment `slot` or a title
- * `upgradeGroup` collide on an EXISTING character link. The rule is that a
- * character can never have two effective (non-archived) effects in the same
- * group/slot, so a config edit that introduces such a collision is rejected with
- * 409 and the whole update is rolled back. Archived definitions are inert and
- * never collide. The check runs inside the same transaction as the update.
+ * Reject a catalog update that would make an equipment `slot`, a title
+ * `upgradeGroup`, or a skill `upgradeGroup` collide on an EXISTING character
+ * link. The rule is that a character can never have two effective (non-archived)
+ * effects in the same group/slot, so a config edit that introduces such a
+ * collision is rejected with 409 and the whole update is rolled back. Archived
+ * definitions are inert and never collide. The check runs inside the same
+ * transaction as the update.
  */
 async function assertNoLinkCollision(
   tx: DbClient,
@@ -1499,18 +2051,21 @@ async function assertNoLinkCollision(
   finalConfig: Record<string, unknown>,
   finalArchived: boolean
 ): Promise<void> {
-  // Only slots (equipment) and upgrade groups (titles) can collide; archived
-  // definitions synthesise no effect so they cannot conflict.
-  if (kind !== "equipment" && kind !== "titles") return
+  // Only slots (equipment) and upgrade groups (titles/skills) can collide;
+  // archived definitions synthesise no effect so they cannot conflict.
+  if (kind !== "equipment" && kind !== "titles" && kind !== "skills") return
   if (finalArchived) return
 
   const slot = kind === "equipment" ? slotForConfig(finalConfig) : undefined
   const group =
-    kind === "titles" ? upgradeGroupForConfig(finalConfig) : undefined
+    kind === "titles" || kind === "skills"
+      ? upgradeGroupForConfig(finalConfig)
+      : undefined
   const value = slot ?? group
   if (!value) return
 
-  const expectedAssocKind = kind === "equipment" ? "EQUIPMENT" : "TITLE"
+  const expectedAssocKind =
+    kind === "equipment" ? "EQUIPMENT" : kind === "titles" ? "TITLE" : "SKILL"
   const links = await tx.characterAssociation.findMany({
     where: { definitionId },
     include: {
@@ -1583,6 +2138,18 @@ export async function updateCatalogItem(
       throw badRequest(
         "invalid_config",
         'Consumable config is missing required "type" and "amount" fields'
+      )
+    }
+    if (kind === "skills" && isIncompleteSkillConfig(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
+      )
+    }
+    if (kind === "skills" && hasInvalidSkillTrack(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Skill config has an invalid "track": expected "class" or "profession"'
       )
     }
   }

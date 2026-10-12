@@ -45,6 +45,16 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   assumption pending verification); temporary potions produce a temporary effect
   that expires after a number of quarters. Every consumption mutates the stored
   state and writes an immutable `consume` progression event to the journal.
+- **Skill milestone offers & selection**: skills are **offered, never
+  auto-awarded**. The milestone schedule and rarity ladder are data-driven
+  (per-skill catalog config), not hard-coded formulas. When a character levels up
+  a class/profession track, the service generates one skill offer per choice group
+  from the unarchived skills catalog (snapshotted options, so later catalog edits
+  never rewrite what was offered). The player (or an admin) selects an option, which
+  links the skill to the character; administrators can also grant a skill manually
+  with a reason (provenance `manual`). Skill effects are synthesized live from the
+  current, unarchived catalog config - history stays immutable, and an upgrade
+  group never stacks superseded tiers.
 - **Auth & sessions**: email/password login with a JWT session cookie and an
   admin role. No real credentials are committed.
 
@@ -52,9 +62,6 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
 
 The engine and schema already account for these, but they are not wired up:
 
-- **Skill selection on a character**: skills exist in the catalog and the rules,
-  but a character does not store skill references, so the Skills tab is a
-  placeholder.
 - **Special abilities calculation**: the creation form records a "has special
   abilities" flag, but it is informational and does not change any numbers.
 - **Uploading portraits / user media**: assets are metadata-only (an `Asset`

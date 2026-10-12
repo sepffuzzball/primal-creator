@@ -30,8 +30,9 @@ import {
   type EvolveResponse,
   type Grade,
   type JournalDelta,
+  type SkillResponse,
 } from "@/lib/api"
-import { AppShell } from "@/components/app-shell"
+import { AppShell, useAppShell } from "@/components/app-shell"
 import { AllocationEditor } from "@/components/characters/allocation-editor"
 import { Alert } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -56,6 +57,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import {
   Table,
   TableBody,
@@ -302,7 +310,9 @@ function AssociationSheet({
           variant="outline"
           size="sm"
           disabled={busy}
-          onClick={() => onRemove(a.kind, a.definitionId)}
+          onClick={() =>
+            onRemove(a.kind as "title" | "equipment", a.definitionId)
+          }
         >
           Remove
         </Button>
@@ -622,6 +632,8 @@ function AssociationSheet({
 export function CharacterDetail() {
   const params = useParams<{ id: string }>()
   const id = params.id
+  const { user } = useAppShell()
+  const isAdmin = user?.isAdmin ?? false
 
   const [character, setCharacter] = React.useState<CharacterDetail | null>(null)
   const [loading, setLoading] = React.useState(true)
@@ -657,6 +669,16 @@ export function CharacterDetail() {
   const [consumeBusy, setConsumeBusy] = React.useState(false)
   const [consumeConfirm, setConsumeConfirm] =
     React.useState<CatalogItem | null>(null)
+  const [skillsCatalog, setSkillsCatalog] = React.useState<CatalogItem[]>([])
+  const [skillBusy, setSkillBusy] = React.useState(false)
+  const [selectConfirm, setSelectConfirm] = React.useState<{
+    offerId: string
+    definitionId: string
+    name: string
+  } | null>(null)
+  const [grantOpen, setGrantOpen] = React.useState(false)
+  const [grantSkillId, setGrantSkillId] = React.useState("")
+  const [grantReason, setGrantReason] = React.useState("")
 
   const reload = React.useCallback(async () => {
     if (!id) return
@@ -1000,6 +1022,81 @@ export function CharacterDetail() {
     await doConsume(item.id, item.name)
   }, [consumeConfirm, doConsume])
 
+  const selectSkill = React.useCallback(
+    async (offerId: string, definitionId: string) => {
+      if (!character) return
+      setSkillBusy(true)
+      setError(null)
+      try {
+        await apiFetch<SkillResponse>(
+          `/api/characters/${character.id}/skills`,
+          {
+            ...jsonInit("POST", {
+              operation: "select",
+              offerId,
+              definitionId,
+              version: character.version,
+            }),
+          }
+        )
+        setSelectConfirm(null)
+        toast.success("Skill selected.")
+        await reload()
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Skill selection failed."
+        )
+      } finally {
+        setSkillBusy(false)
+      }
+    },
+    [character, reload]
+  )
+
+  const grantSkill = React.useCallback(async () => {
+    if (!character || !grantSkillId || !grantReason.trim()) return
+    setSkillBusy(true)
+    setError(null)
+    try {
+      await apiFetch<SkillResponse>(`/api/characters/${character.id}/skills`, {
+        ...jsonInit("POST", {
+          operation: "grant",
+          definitionId: grantSkillId,
+          version: character.version,
+          reason: grantReason.trim(),
+        }),
+      })
+      setGrantOpen(false)
+      setGrantSkillId("")
+      setGrantReason("")
+      toast.success("Skill granted.")
+      await reload()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Skill grant failed.")
+    } finally {
+      setSkillBusy(false)
+    }
+  }, [character, grantSkillId, grantReason, reload])
+
+  // Load the skills catalog when the Skills tab is opened by an admin (needed for
+  // the manual grant). It is only required for admins; owners just select options.
+  React.useEffect(() => {
+    if (activeTab !== "skills" || !isAdmin || skillsCatalog.length > 0) return
+    let active = true
+    apiFetch<CatalogListResponse>(`/api/catalog/skills`)
+      .then((res) => {
+        if (active) setSkillsCatalog(res.items)
+      })
+      .catch((err) =>
+        toast.error(
+          err instanceof Error ? err.message : "Failed to load skills catalog."
+        )
+      )
+    return () => {
+      active = false
+    }
+  }, [activeTab, isAdmin, skillsCatalog.length])
+
   if (loading && !character) {
     return (
       <AppShell breadcrumbs={[{ label: "Character" }]}>
@@ -1037,6 +1134,11 @@ export function CharacterDetail() {
   // appears in the live table. Keep it visible so the link can be removed.
   const archivedEquipmentLinks = character.associations.filter(
     (a) => a.kind === "equipment" && a.definitionArchived
+  )
+
+  // Skills acquired via milestone selection (kind "skill") or manual grant.
+  const skillAssociations = character.associations.filter(
+    (a) => a.kind === "skill"
   )
 
   const breadcrumbs = [
@@ -1314,10 +1416,194 @@ export function CharacterDetail() {
           <TabsContent value="skills" className="pt-3">
             <Card>
               <CardContent>
-                <p className="text-xs text-muted-foreground">
-                  Skills are not yet tracked on characters. A character does not
-                  record skill references yet, so none can be shown here.
-                </p>
+                <div className="flex flex-col gap-4">
+                  <div>
+                    <h3 className="font-heading text-sm font-medium">
+                      Skill offers
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      Skills are offered at class/profession milestones - never
+                      auto-awarded. Choose one option from a pending offer, or
+                      re-open the catalog to edit what is offered.
+                    </p>
+                  </div>
+
+                  {character.skillOffers.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No skill offers yet. Advance a class or profession to its
+                      milestone to be offered skills.
+                    </p>
+                  ) : (
+                    <div className="flex flex-col gap-2">
+                      {character.skillOffers.map((offer) => {
+                        const allArchived =
+                          offer.options.length > 0 &&
+                          offer.options.every((o) => o.archived)
+                        const selected = offer.selectedDefinitionId
+                        const selectedName = selected
+                          ? offer.options.find(
+                              (o) => o.definitionId === selected
+                            )?.nameSnapshot ?? null
+                          : null
+                        return (
+                          <div
+                            key={offer.id}
+                            className="rounded-lg border bg-input/20 p-2"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-medium">
+                                {offer.track === "class"
+                                  ? "Class"
+                                  : "Profession"}{" "}
+                                level {offer.level} - {offer.choiceGroup}
+                              </span>
+                              {selected ? (
+                                <Badge variant="outline">Selected</Badge>
+                              ) : allArchived ? (
+                                <Badge variant="outline">Blocked</Badge>
+                              ) : (
+                                <Badge variant="outline">Pending</Badge>
+                              )}
+                            </div>
+                            {selected ? (
+                              <div className="text-xs text-muted-foreground">
+                                Selected: {selectedName ?? "?"}
+                              </div>
+                            ) : (
+                              <div className="mt-1 flex flex-col gap-1.5">
+                                {offer.options.map((opt) => (
+                                  <div
+                                    key={opt.definitionId}
+                                    className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-1.5"
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        <span className="truncate font-medium">
+                                          {opt.nameSnapshot}
+                                        </span>
+                                        {opt.grade ? (
+                                          <Badge variant="outline">
+                                            {opt.grade}
+                                          </Badge>
+                                        ) : null}
+                                        {opt.archived ? (
+                                          <Badge variant="outline">
+                                            Archived
+                                          </Badge>
+                                        ) : null}
+                                      </div>
+                                      <div className="text-[0.6875rem] text-muted-foreground">
+                                        Provenance: {opt.provenance ?? "house"}
+                                        {opt.archived
+                                          ? " - unavailable until re-enabled in the catalog"
+                                          : ""}
+                                      </div>
+                                    </div>
+                                    {opt.archived ? null : (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={skillBusy}
+                                        onClick={() =>
+                                          setSelectConfirm({
+                                            offerId: offer.id,
+                                            definitionId: opt.definitionId,
+                                            name: opt.nameSnapshot,
+                                          })
+                                        }
+                                      >
+                                        Select
+                                      </Button>
+                                    )}
+                                  </div>
+                                ))}
+                                {allArchived ? (
+                                  <p className="text-xs text-muted-foreground">
+                                    Every offered choice is archived. An admin can
+                                    re-enable one in the catalog to unlock this
+                                    offer.
+                                  </p>
+                                ) : null}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+
+                  <Separator />
+
+                  <div>
+                    <h3 className="font-heading text-sm font-medium">
+                      Acquired skills
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      Effects are synthesized live from the current catalog; the
+                      stored history is unchanged. Archived skills no longer
+                      contribute.
+                    </p>
+                  </div>
+                  {skillAssociations.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No skills acquired yet.
+                    </p>
+                  ) : (
+                    <div className="flex flex-col gap-2">
+                      {skillAssociations.map((a) => (
+                        <div
+                          key={a.id}
+                          className="rounded-lg border bg-input/20 p-2"
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-medium">{a.name}</span>
+                            {a.definitionArchived ? (
+                              <Badge variant="outline">Archived</Badge>
+                            ) : null}
+                            {a.grade ? (
+                              <Badge variant="outline">{a.grade}</Badge>
+                            ) : null}
+                          </div>
+                          <div className="text-[0.6875rem] text-muted-foreground">
+                            Provenance: {a.provenance ?? "house"}
+                            {a.upgradeGroup
+                              ? ` - Upgrade group: ${a.upgradeGroup}`
+                              : ""}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {isAdmin ? (
+                    <>
+                      <Separator />
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <h3 className="font-heading text-sm font-medium">
+                            Admin: manually grant a skill
+                          </h3>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setGrantSkillId("")
+                              setGrantReason("")
+                              setGrantOpen(true)
+                            }}
+                          >
+                            Grant skill
+                          </Button>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Grants a skill immediately (provenance manual) with a
+                          required reason. Owners can only select offered options
+                          - they cannot grant.
+                        </p>
+                      </div>
+                    </>
+                  ) : null}
+                </div>
               </CardContent>
             </Card>
           </TabsContent>
@@ -1713,6 +1999,113 @@ export function CharacterDetail() {
                 disabled={consumeBusy}
               >
                 {consumeBusy ? "Consuming..." : "Consume"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog
+          open={!!selectConfirm}
+          onOpenChange={(open) => {
+            if (!open) setSelectConfirm(null)
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Select skill</DialogTitle>
+              <DialogDescription>
+                Link &quot;{selectConfirm?.name ?? ""}&quot; to this character?
+                Its effects are synthesized live from the current catalog;
+                archived options are unavailable until re-enabled in the catalog.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setSelectConfirm(null)}
+                disabled={skillBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() =>
+                  selectConfirm &&
+                  void selectSkill(
+                    selectConfirm.offerId,
+                    selectConfirm.definitionId
+                  )
+                }
+                disabled={skillBusy}
+              >
+                {skillBusy ? "Selecting..." : "Select"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={grantOpen} onOpenChange={setGrantOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Grant a skill</DialogTitle>
+              <DialogDescription>
+                Grants a skill immediately with provenance &quot;manual&quot;
+                and a required reason. Owners can only select offered options -
+                they cannot grant.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="grant-skill">Skill</Label>
+                <Select
+                  value={grantSkillId}
+                  onValueChange={(value) => setGrantSkillId(value ?? "")}
+                >
+                  <SelectTrigger id="grant-skill" className="w-full">
+                    <SelectValue placeholder="Choose a skill" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {skillsCatalog.length === 0 ? (
+                      <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                        No skills in the catalog.
+                      </div>
+                    ) : (
+                      skillsCatalog.map((skill) => (
+                        <SelectItem key={skill.id} value={skill.id}>
+                          {skill.name}
+                          {skill.grade ? ` (${skill.grade})` : ""}
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="grant-reason">Reason (required)</Label>
+                <Input
+                  id="grant-reason"
+                  value={grantReason}
+                  onChange={(e) => setGrantReason(e.target.value)}
+                  placeholder="Why is this granted?"
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setGrantOpen(false)
+                  setGrantSkillId("")
+                  setGrantReason("")
+                }}
+                disabled={skillBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void grantSkill()}
+                disabled={skillBusy || !grantSkillId || !grantReason.trim()}
+              >
+                {skillBusy ? "Granting..." : "Grant"}
               </Button>
             </DialogFooter>
           </DialogContent>
