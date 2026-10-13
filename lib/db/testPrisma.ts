@@ -33,6 +33,9 @@ export interface TestCatalogRow {
   provenance?: string
   sourceUrl?: string | null
   archived?: boolean
+  // The resolved patron-god FK for a `blessings` entry (self-FK to another
+  // catalog definition). Null for every non-blessing kind.
+  patronId?: string | null
   createdAt: Date
   updatedAt: Date
 }
@@ -41,7 +44,7 @@ export interface TestAssociationRow {
   id: string
   characterId: string
   definitionId: string
-  kind: "TITLE" | "EQUIPMENT" | "SKILL"
+  kind: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
   createdAt: Date
   // Relation, only set on the object returned by findUnique/create.
   definition?: TestCatalogRow | null
@@ -169,8 +172,11 @@ export interface TestPrismaInstance {
         }
       }) => Promise<TestCatalogRow | null>
       findMany: (args: {
-        where?: { kind?: string; archived?: boolean }
+        where?: { kind?: string; archived?: boolean; patronId?: string | null }
       }) => Promise<TestCatalogRow[]>
+      create: (args: {
+        data: Record<string, unknown>
+      }) => Promise<TestCatalogRow>
       update: (args: {
         where: { id: string }
         data: Record<string, unknown>
@@ -286,7 +292,7 @@ export interface TestPrismaInstance {
       row: Partial<TestAssociationRow> & {
         characterId: string
         definitionId: string
-        kind: "TITLE" | "EQUIPMENT" | "SKILL"
+        kind: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
       }
     ): TestAssociationRow
     reset(): void
@@ -341,8 +347,9 @@ interface Transaction {
       where: { id?: string; kind_stableId?: { kind: string; stableId: string } }
     }) => Promise<TestCatalogRow | null>
     findMany: (args: {
-      where?: { kind?: string; archived?: boolean }
+      where?: { kind?: string; archived?: boolean; patronId?: string | null }
     }) => Promise<TestCatalogRow[]>
+    create: (args: { data: Record<string, unknown> }) => Promise<TestCatalogRow>
     update: (args: {
       where: { id: string }
       data: Record<string, unknown>
@@ -359,7 +366,7 @@ interface Transaction {
       where?: {
         definitionId?: string
         characterId?: string
-        kind?: "TITLE" | "EQUIPMENT" | "SKILL"
+        kind?: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
       }
       include?: unknown
     }) => Promise<Array<TestAssociationRow & { character?: TestCharacterRow }>>
@@ -611,6 +618,11 @@ export function createTestPrisma(): TestPrismaInstance {
         }
         if (data.archived != null) c.archived = data.archived as boolean
         if (data.raceId !== undefined) c.raceId = data.raceId as string | null
+        if (data.classId !== undefined)
+          c.classId = data.classId as string | null
+        if (data.professionId !== undefined) {
+          c.professionId = data.professionId as string | null
+        }
         if (data.state !== undefined) c.state = data.state
         c.updatedAt = new Date()
         return { count: 1 }
@@ -699,14 +711,50 @@ export function createTestPrisma(): TestPrismaInstance {
       findMany: async ({
         where,
       }: {
-        where?: { kind?: string; archived?: boolean }
+        where?: { kind?: string; archived?: boolean; patronId?: string | null }
       }) => {
         let results = [...catalog.values()]
         if (where?.kind != null)
           results = results.filter((r) => r.kind === where.kind)
         if (where?.archived != null)
           results = results.filter((r) => r.archived === where.archived)
+        if (where?.patronId != null)
+          results = results.filter((r) => r.patronId === where.patronId)
         return results
+      },
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        const now = new Date()
+        const id = (data.id as string) ?? `cat-${++idCounter}`
+        const kind = data.kind as string
+        const stableId = data.stableId as string
+        // Enforce the unique (kind, stableId) constraint as PostgreSQL would, so a
+        // colliding create surfaces as a P2002 the service translates to a 409.
+        for (const r of catalog.values()) {
+          if (r.kind === kind && r.stableId === stableId) {
+            throw {
+              name: "PrismaClientKnownRequestError",
+              code: "P2002",
+              meta: { target: ["kind", "stableId"] },
+            }
+          }
+        }
+        const row: TestCatalogRow = {
+          id,
+          kind,
+          stableId,
+          name: data.name as string,
+          config: (data.config ?? {}) as Record<string, unknown>,
+          description: (data.description as string | null) ?? null,
+          grade: (data.grade as string | null) ?? null,
+          provenance: (data.provenance as string) ?? "house",
+          sourceUrl: (data.sourceUrl as string | null) ?? null,
+          archived: (data.archived as boolean) ?? false,
+          patronId: (data.patronId as string | null) ?? null,
+          createdAt: now,
+          updatedAt: now,
+        }
+        catalog.set(id, row)
+        return row
       },
       update: async ({
         where,
@@ -730,6 +778,8 @@ export function createTestPrisma(): TestPrismaInstance {
         if (data.archived != null) updated.archived = data.archived as boolean
         if (data.config !== undefined)
           updated.config = data.config as Record<string, unknown>
+        if (data.patronId !== undefined)
+          updated.patronId = data.patronId as string | null
         updated.updatedAt = new Date()
         catalog.set(where.id, updated)
         return updated
@@ -742,7 +792,8 @@ export function createTestPrisma(): TestPrismaInstance {
           id,
           characterId: data.characterId as string,
           definitionId: data.definitionId as string,
-          kind: data.kind as "TITLE" | "EQUIPMENT" | "SKILL",
+          kind: data.kind as
+            "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE",
           createdAt: new Date(),
           definition: catalog.get(data.definitionId as string) ?? null,
         }
@@ -991,6 +1042,7 @@ export function createTestPrisma(): TestPrismaInstance {
         }
       }) => findCatalog(where) ?? null,
       findMany: tx.catalogDefinition.findMany,
+      create: tx.catalogDefinition.create,
       update: tx.catalogDefinition.update,
     },
     user: {
@@ -1112,6 +1164,7 @@ export function createTestPrisma(): TestPrismaInstance {
           provenance: row.provenance ?? "house",
           sourceUrl: row.sourceUrl ?? null,
           archived: row.archived ?? false,
+          patronId: row.patronId ?? null,
           createdAt: new Date(),
           updatedAt: new Date(),
         }

@@ -264,6 +264,8 @@ export interface TrackState {
   level: number
   quarter: number
   definitionId: string
+  /** Optional explicit class/profession grade state; absent on legacy states. */
+  grade?: Grade
 }
 
 export interface RaceState {
@@ -309,7 +311,7 @@ export interface CharacterListItem {
 export interface CharacterAssociationView {
   id: string
   definitionId: string
-  kind: "title" | "equipment" | "skill"
+  kind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
   name: string
   slot?: string
   upgradeGroup?: string
@@ -419,21 +421,31 @@ export interface EvolveJournal {
   from: Grade
   to: Grade
   level: number
-  /** Present when the evolution came from a catalog race path choice. */
-  source?: "catalog"
+  /** Present when the evolution came from a catalog race or track path choice. */
+  source?: "catalog" | "track"
+  /** The class/profession track evolved (present on track evolutions). */
+  track?: "class" | "profession"
   /** Catalog id of the chosen evolution path (present for path evolutions). */
   optionId?: string
   option?: { id: string; name: string; stableId: string }
   prerequisites?: {
-    fromRaceStableId: string
-    toRaceStableId: string
-    fromGrade: Grade
-    toGrade: Grade
-    minRaceLevel: number | null
-    requiredTitleStableIds: string[]
-    requiredSkillStableIds: string[]
+    fromRaceStableId?: string
+    toRaceStableId?: string
+    fromGrade?: Grade
+    toGrade?: Grade
+    minRaceLevel?: number | null
+    fromDefinitionStableId?: string
+    toDefinitionStableId?: string
+    minTrackLevel?: number | null
+    requiredTitleStableIds?: string[]
+    requiredSkillStableIds?: string[]
   }
   destinationRace?: { id: string; stableId: string; name: string }
+  /** Destination definition snapshot for a class/profession track evolution. */
+  destination?: { id: string; stableId: string; name: string; grade: Grade }
+  /** Engine track-evolution journal fields: old/new track definition ids. */
+  oldDefinitionId?: string
+  newDefinitionId?: string
   /** Admin narrative reason recorded for the evolution (null when none). */
   reason?: string | null
 }
@@ -443,14 +455,17 @@ export interface EvolveResponse {
   journal: EvolveJournal
 }
 
-/** A contextual race evolution option derived from an `evolutions` catalog entry. */
+/** A contextual evolution option derived from an `evolutions` catalog entry. */
 export interface EvolutionOptionView {
   id: string
   name: string
   description: string | null
   fromGrade: Grade
   toGrade: Grade
-  toRaceName: string
+  /** Destination display name (race, class, or profession name). */
+  toTrackName: string
+  /** The track this evolution path targets. */
+  track: "race" | "class" | "profession"
   provenance: string
   sourceUrl: string | null
   /** Whether all mechanical (hard) requirements are met. */
@@ -487,7 +502,7 @@ export interface ConsumeResponse {
 }
 
 export interface AssociationRequest {
-  kind: "title" | "equipment"
+  kind: "title" | "equipment" | "blessing" | "bloodline"
   definitionId: string
   operation: "add" | "remove"
   version: number
@@ -539,7 +554,7 @@ export interface ExportDefinitionSnapshot {
 export interface ExportAssociation {
   id: string
   definitionId: string
-  kind: "title" | "equipment" | "skill"
+  kind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
   createdAt: string
   definition: ExportDefinitionSnapshot
 }

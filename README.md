@@ -32,6 +32,19 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   retained as a fallback and is accepted only when NO valid catalog path to the
   requested grade exists (otherwise the server returns `409
 evolution_choice_required`).
+- **Contextual class/profession track evolution paths**: class and profession
+  tracks are graded independently of the race. A new character is stamped with an
+  explicit `F` grade and a `stableId:F` definition on each selected track, so
+  each track has its own progression gate (the catalog must define a `grades.F`
+  per-level config for the track). The `evolutions` catalog kind also carries
+  active **class/profession paths** (`track: "class"|"profession"` with
+  `fromDefinitionStableId`/`toDefinitionStableId`/`fromGrade`/`toGrade`, plus
+  optional `minTrackLevel`, required title/skill stableIds, and a
+  `manualRequirementsText` gate). The client fetches the track-specific options
+  via `GET /api/characters/[id]/evolutions?track=class|profession` and submits a
+  chosen `optionId` to `POST /api/characters/[id]/evolve`. There is **no**
+  grade-only legacy fallback for class/profession; only the target track's grade
+  and definition are updated, and the race grade is never auto-changed.
 - **Resumable creation drafts**: the questionnaire is persisted per user as an
   authenticated, owner-scoped draft (one per user) so work is never lost. A draft
   stores only validated, whitelisted fields (`step`, name/description, origin,
@@ -140,13 +153,15 @@ evolution_choice_required`).
 
 ### Deferred (modelled or scaffolded, not yet exposed)
 
-The engine and schema already account for these, but they are not wired up:
+The engine and schema already account for these, but they are not fully wired up:
 
-- **Special abilities calculation**: blessings, bloodlines and transcendents can
-  be defined in the encyclopedia/catalog, but they are not yet attached to a
-  character. The creation wizard does not record a "has special abilities" flag;
-  it shows the step as "Not assigned" and never treats the special category as
-  character state until that feature is wired up.
+- **Transcendents**: blessings and bloodlines are now wired as character
+  associations that synthesize declared numeric effects into live status (see
+  `docs/rules/blessings.md` and `docs/rules/bloodlines.md`), but transcendents
+  can still only be defined in the encyclopedia/catalog and are not yet attached
+  to a character. The creation wizard does not record a "has special abilities"
+  flag; it shows the special category as "Not assigned" and never treats it as
+  character state.
 - **Catalog import**: the catalog is populated by `db:seed`; there is no bulk
   import from the wiki, CSV or JSON (character backups are imported, but catalog
   content is resolved against existing entries, never auto-created).

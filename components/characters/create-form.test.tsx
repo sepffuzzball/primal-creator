@@ -665,11 +665,22 @@ describe("CreateCharacterForm special abilities", () => {
     expect(screen.queryByText(/Recorded \(not calculated\)/)).toBeNull()
     expect(screen.queryByText(/Recorded, but not yet calculated/)).toBeNull()
 
-    // The step now explains the deferred feature and shows it as not assigned,
-    // with a pointer to configure it once the feature is available.
-    expect(screen.getAllByText(/Not assigned/).length).toBeGreaterThan(0)
+    // The step now explains the deferred feature accurately: nothing is assigned
+    // during creation - blessings/bloodlines attach AFTER creation - and
+    // transcendents remain unavailable (defined in the encyclopedia but not yet
+    // attached to a character).
     expect(
-      screen.getByText(/Configure when the feature is available/)
+      screen.getAllByText(/Not assigned during creation/).length
+    ).toBeGreaterThan(0)
+    expect(
+      screen.getAllByText(
+        /Attach blessings or bloodlines after creating the character/
+      ).length
+    ).toBeGreaterThan(0)
+    expect(
+      screen.getByText(
+        /transcendents are defined in the encyclopedia but not yet attached/i
+      )
     ).toBeTruthy()
   })
 
@@ -690,7 +701,14 @@ describe("CreateCharacterForm special abilities", () => {
     await flush()
 
     // The legacy flag surfaces as an informative warning, not a silent feature.
-    expect(screen.getByText(/recorded special abilities/i)).toBeTruthy()
+    // The special step now says that a legacy draft only records the yes/no
+    // answer and that blessings/bloodlines are attached after creation.
+    expect(screen.getByText(/records your answer only/i)).toBeTruthy()
+    expect(
+      screen.getAllByText(
+        /Attach blessings or bloodlines after creating the character/
+      ).length
+    ).toBeGreaterThan(0)
 
     // Editing marks the draft dirty and triggers the debounced autosave.
     fireEvent.change(screen.getByPlaceholderText("Character name"), {

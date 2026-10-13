@@ -5,6 +5,7 @@ import {
   availablePoints,
   deriveRaceLevel,
   evolveGrade,
+  evolveTrackGrade,
 } from "./progression"
 import { calculateStatus } from "./calculate"
 import { character, config, trackDef } from "./testUtils"
@@ -579,5 +580,206 @@ describe("grade threshold level-up (G9->10 / F24->25)", () => {
     })
     const def = trackDef("class-def", { strength: 1 }, 0)
     expect(() => advanceQuarter(state, "class", def, cfg)).toThrow(/threshold/)
+  })
+})
+
+describe("graded track ceiling (class / profession)", () => {
+  const raceDefsF = {
+    raceDefinitions: {
+      F: { id: "race-f", perLevel: { strength: 1 }, freePerLevel: 1 },
+    },
+  }
+
+  it("permits a graded class to reach the next grade's entry level (F24->25)", () => {
+    const state = character({ classLevel: 24, professionLevel: 24 })
+    state.tracks["class"].grade = "F"
+    state.tracks["class"].quarter = 3
+    const cfg = config(raceDefsF)
+    const result = advanceQuarter(
+      state,
+      "class",
+      trackDef("class-def", { strength: 1 }, 0),
+      cfg
+    )
+    expect(result.journal.leveledUp).toBe(true)
+    expect(result.state.tracks["class"].level).toBe(25)
+    // The track stays graded F; evolution is still explicit.
+    expect(result.state.tracks["class"].grade).toBe("F")
+  })
+
+  it("blocks a graded class from advancing past the next entry level until track evolution", () => {
+    const state = character({ classLevel: 25, professionLevel: 24 })
+    state.tracks["class"].grade = "F"
+    state.tracks["class"].quarter = 3
+    const cfg = config(raceDefsF)
+    const def = trackDef("class-def", { strength: 1 }, 0)
+    expect(() => advanceQuarter(state, "class", def, cfg)).toThrow(/threshold/)
+  })
+
+  it("caps the profession track independently with its own grade", () => {
+    const state = character({ classLevel: 24, professionLevel: 24 })
+    state.tracks["profession"].grade = "F"
+    state.tracks["profession"].quarter = 3
+    const cfg = config(raceDefsF)
+    const result = advanceQuarter(
+      state,
+      "profession",
+      trackDef("prof-def", { strength: 1 }, 0),
+      cfg
+    )
+    expect(result.journal.leveledUp).toBe(true)
+    expect(result.state.tracks["profession"].level).toBe(25)
+    // The class track is untouched by a profession advance.
+    expect(result.state.tracks["class"].level).toBe(24)
+    // And a further profession level-up is capped by ITS OWN grade, not the class.
+    const blocked = character({ classLevel: 24, professionLevel: 25 })
+    blocked.tracks["profession"].grade = "F"
+    blocked.tracks["profession"].quarter = 3
+    expect(() =>
+      advanceQuarter(
+        blocked,
+        "profession",
+        trackDef("prof-def", { strength: 1 }, 0),
+        cfg
+      )
+    ).toThrow(/threshold/)
+  })
+
+  it("keeps class and profession grades independent across track evolution", () => {
+    const state = character({ classLevel: 25, professionLevel: 25 })
+    state.tracks["class"].grade = "F"
+    state.tracks["profession"].grade = "F"
+    const result = evolveTrackGrade(
+      state,
+      "profession",
+      "E",
+      "prof-e",
+      config()
+    )
+    expect(result.ok).toBe(true)
+    expect(result.state?.tracks["profession"].grade).toBe("E")
+    expect(result.state?.tracks["profession"].definitionId).toBe("prof-e")
+    // The class grade and definition are untouched by the profession evolution.
+    expect(result.state?.tracks["class"].grade).toBe("F")
+    expect(result.state?.tracks["class"].definitionId).toBe("class-def")
+  })
+
+  it("lets a derived race gate block independently of the class track ceiling", () => {
+    // Class track is already past its own ceiling (grade E at level 28), so the
+    // track ceiling would NOT block. The derived race still closes over the F->E
+    // threshold (25) and must block on its own.
+    const state = character({ classLevel: 28, professionLevel: 23 })
+    state.tracks["class"].grade = "E"
+    state.tracks["class"].quarter = 3
+    const cfg = config(raceDefsF)
+    const def = trackDef("class-def", { strength: 1 }, 0)
+    expect(() => advanceQuarter(state, "class", def, cfg)).toThrow(/threshold/)
+  })
+
+  it("leaves ungraded tracks unaffected by the track ceiling", () => {
+    // No track grade is set (legacy state), so a class can advance past the E
+    // entry level (25) freely even though the room is past it.
+    const state = character({
+      classLevel: 26,
+      professionLevel: 26,
+      raceGrade: "E",
+    })
+    state.tracks["class"].quarter = 3
+    const cfg = config({
+      raceDefinitions: {
+        E: { id: "race-e", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    const result = advanceQuarter(
+      state,
+      "class",
+      trackDef("class-def", { strength: 1 }, 0),
+      cfg
+    )
+    expect(result.journal.leveledUp).toBe(true)
+    expect(result.state.tracks["class"].level).toBe(27)
+  })
+
+  it("evolves a graded track definition while old awards stay snapshotted", () => {
+    const state = character({ classLevel: 25, professionLevel: 25 })
+    state.tracks["class"].grade = "F"
+    state.tracks["class"].definitionId = "class-f"
+    state.historicalLevelAwards.push({
+      track: "class",
+      level: 24,
+      definitionId: "class-f",
+      fixed: vec({ strength: 3 }),
+      free: 2,
+    })
+    const result = evolveTrackGrade(state, "class", "E", "class-e", config())
+    expect(result.ok).toBe(true)
+    expect(result.state?.tracks["class"].grade).toBe("E")
+    expect(result.state?.tracks["class"].definitionId).toBe("class-e")
+    expect(result.state?.tracks["class"].level).toBe(25)
+    // Old awards remain snapshotted, unchanged by the evolution.
+    expect(result.state?.historicalLevelAwards).toHaveLength(1)
+    expect(result.state?.historicalLevelAwards[0]).toEqual(
+      state.historicalLevelAwards[0]
+    )
+    expect(result.journal).toEqual({
+      track: "class",
+      from: "F",
+      to: "E",
+      level: 25,
+      oldDefinitionId: "class-f",
+      newDefinitionId: "class-e",
+    })
+  })
+
+  it("evolveTrackGrade rejects an unknown track", () => {
+    const state = character()
+    const result = evolveTrackGrade(state, "bogus", "E", "x", config())
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(" ")).toMatch(/unknown track/)
+  })
+
+  it("evolveTrackGrade rejects an ungraded track", () => {
+    const state = character()
+    const result = evolveTrackGrade(state, "class", "E", "x", config())
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(" ")).toMatch(/no explicit grade/)
+  })
+
+  it("evolveTrackGrade rejects a target that is not the next grade", () => {
+    const state = character({ classLevel: 25, professionLevel: 25 })
+    state.tracks["class"].grade = "F"
+    const result = evolveTrackGrade(state, "class", "D", "class-d", config())
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(" ")).toMatch(/not the next grade/)
+  })
+
+  it("evolveTrackGrade rejects a track level outside the target band", () => {
+    const state = character({ classLevel: 4, professionLevel: 4 })
+    state.tracks["class"].grade = "G"
+    const result = evolveTrackGrade(state, "class", "F", "class-f", config())
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(" ")).toMatch(/does not qualify/)
+  })
+
+  it("evolveTrackGrade rejects a closed grade gate", () => {
+    const state = character({ classLevel: 25, professionLevel: 25 })
+    state.tracks["class"].grade = "F"
+    const result = evolveTrackGrade(
+      state,
+      "class",
+      "E",
+      "class-e",
+      config({ gradeGates: { E: false } })
+    )
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(" ")).toMatch(/grade gate closed/)
+  })
+
+  it("evolveTrackGrade rejects an empty target definition id", () => {
+    const state = character({ classLevel: 25, professionLevel: 25 })
+    state.tracks["class"].grade = "F"
+    const result = evolveTrackGrade(state, "class", "E", "", config())
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(" ")).toMatch(/nonempty target definition id/)
   })
 })

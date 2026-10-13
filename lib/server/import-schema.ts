@@ -48,7 +48,7 @@ const definitionRefSchema = z.object({
 
 /** An exported character association, resolved by kind + stableId on import. */
 const associationRefSchema = z.object({
-  kind: z.enum(["title", "equipment", "skill"]),
+  kind: z.enum(["title", "equipment", "skill", "blessing", "bloodline"]),
   definition: definitionRefSchema,
 })
 

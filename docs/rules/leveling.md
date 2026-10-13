@@ -42,3 +42,30 @@ per-grade base values captured per level, rather than from a single derived XP
 formula. See `docs/architecture/calculation-engine.md`. Where a multiplier is
 needed but unsourced (e.g. derived resource pools), it remains an unresolved
 configurable placeholder (`docs/rules/assumptions.md`).
+
+## Track grade ceiling (class / profession)
+
+In addition to the grade gate that applies to the **derived race level**, a class
+or profession track may carry an **optional explicit grade** (`TrackState.grade`).
+This is a house-state addition, not a source claim, and it is never inferred for a
+state that lacks it (legacy states stay untouched).
+
+When a track grade is present, `advanceQuarter` applies an **independent
+track-grade ceiling**: a level-up may reach exactly the entry level of the **next**
+grade but may not push the track level past it until the caller explicitly evolves
+the track grade via the pure engine function `evolveTrackGrade`. Quarter progress
+(0/25/50/75) is preserved across that boundary, and the class/profession may evolve
+ahead of the race: because this ceiling checks the **track level** (not the derived
+race level), a class or profession can be advanced and evolved even while the
+derived race level is still below its own grade boundary. The existing race-grade
+gate remains separately enforced against the derived race level, so a race that
+reaches its own threshold still blocks further derived race gain until the **race**
+evolves.
+
+`evolveTrackGrade(state, track, targetGrade, targetDefinitionId, config)` is a pure
+validation function: it rejects an unknown or ungraded track, a target that is not
+the immediate next grade, a track level outside the target grade band, a closed
+grade gate, and an empty target definition id. On success it returns a new state
+with only the track's `grade` and `definitionId` updated; historical awards and
+every other ledger stay snapshotted, and the track then continues under the new
+grade (and the new definition id, which must match on subsequent advances).

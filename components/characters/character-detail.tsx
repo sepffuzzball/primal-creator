@@ -43,6 +43,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { useAppShell } from "@/components/app-shell"
 import { AllocationEditor } from "@/components/characters/allocation-editor"
+import { TrackEvolutionDialog } from "@/components/characters/track-evolution-dialog"
 import { Alert } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
@@ -251,12 +252,16 @@ function AssociationSheet({
   titles,
   equipment,
   consumables,
+  blessings,
+  bloodlines,
   loading,
   busy,
   consumeBusy,
   onAdd,
   onRemove,
   onConsume,
+  onPowerAdd,
+  onPowerRemove,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -264,12 +269,16 @@ function AssociationSheet({
   titles: CatalogItem[]
   equipment: CatalogItem[]
   consumables: CatalogItem[]
+  blessings: CatalogItem[]
+  bloodlines: CatalogItem[]
   loading: boolean
   busy: boolean
   consumeBusy: boolean
   onAdd: (kind: "title" | "equipment", definitionId: string) => void
   onRemove: (kind: "title" | "equipment", definitionId: string) => void
   onConsume: (definitionId: string) => void
+  onPowerAdd: (kind: "blessing" | "bloodline", definitionId: string) => void
+  onPowerRemove: (kind: "blessing" | "bloodline", definitionId: string) => void
 }) {
   const linked = new Map(character.associations.map((a) => [a.definitionId, a]))
   const equipmentStatusById = new Map(
@@ -503,12 +512,12 @@ function AssociationSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="flex flex-col gap-4">
         <SheetHeader>
-          <SheetTitle>Titles, equipment & consumables</SheetTitle>
+          <SheetTitle>Character associations</SheetTitle>
           <SheetDescription>
-            Attach titles, equip equipment, and consume consumables directly
-            onto this character. This is direct application, not an inventory
-            ownership claim - an inventory system is deferred. Actions are
-            written to the journal.
+            Manage titles, equipment, consumables, blessings, and bloodlines
+            directly onto this character. This is direct application, not an
+            inventory ownership claim - an inventory system is deferred. Actions
+            are written to the journal.
           </SheetDescription>
         </SheetHeader>
 
@@ -517,6 +526,8 @@ function AssociationSheet({
             <TabsTrigger value="titles">Titles</TabsTrigger>
             <TabsTrigger value="equipment">Equipment</TabsTrigger>
             <TabsTrigger value="consumables">Consumables</TabsTrigger>
+            <TabsTrigger value="blessings">Blessings</TabsTrigger>
+            <TabsTrigger value="bloodlines">Bloodlines</TabsTrigger>
           </TabsList>
 
           <TabsContent value="titles" className="pt-3">
@@ -631,6 +642,113 @@ function AssociationSheet({
               )}
             </div>
           </TabsContent>
+          {(["blessing", "bloodline"] as const).map((kind) => {
+            const catalog = kind === "blessing" ? blessings : bloodlines
+            const linkedPower = character.associations.filter(
+              (a) => a.kind === kind
+            )
+            const options = [
+              ...catalog,
+              ...linkedPower
+                .filter(
+                  (a) =>
+                    a.definitionArchived &&
+                    !catalog.some((c) => c.id === a.definitionId)
+                )
+                .map(
+                  (a) =>
+                    ({
+                      id: a.definitionId,
+                      name: a.name,
+                      description: null,
+                      provenance: a.provenance ?? "house",
+                      grade: a.grade ?? null,
+                      archived: true,
+                      config: {},
+                    }) as CatalogItem
+                ),
+            ]
+            return (
+              <TabsContent
+                key={kind}
+                value={kind === "blessing" ? "blessings" : "bloodlines"}
+                className="pt-3"
+              >
+                {loading ? (
+                  <p className="text-xs text-muted-foreground">
+                    Loading {kind}s...
+                  </p>
+                ) : options.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No {kind}s in the catalog yet.
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {options.map((item) => {
+                      const association = linkedPower.find(
+                        (a) => a.definitionId === item.id
+                      )
+                      const patron = item.config?.patronGodStableId
+                      const tier = item.config?.tier
+                      return (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium">{item.name}</span>
+                              {item.grade ? (
+                                <Badge variant="outline">{item.grade}</Badge>
+                              ) : null}
+                              {item.archived ? (
+                                <Badge variant="outline">
+                                  Archived - inert
+                                </Badge>
+                              ) : null}
+                            </div>
+                            <div className="text-[0.6875rem] text-muted-foreground">
+                              Provenance: {item.provenance}
+                              {typeof tier === "string"
+                                ? ` - Tier: ${tier}`
+                                : ""}
+                              {typeof patron === "string"
+                                ? ` - Patron: ${patron}`
+                                : ""}
+                            </div>
+                            {item.description ? (
+                              <p className="text-xs text-muted-foreground">
+                                {item.description}
+                              </p>
+                            ) : null}
+                          </div>
+                          {association ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => onPowerRemove(kind, item.id)}
+                            >
+                              Remove
+                            </Button>
+                          ) : item.archived ? null : (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => onPowerAdd(kind, item.id)}
+                            >
+                              Add
+                            </Button>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </TabsContent>
+            )
+          })}
         </Tabs>
       </SheetContent>
     </Sheet>
@@ -676,12 +794,21 @@ export function CharacterDetail({
     "option" | "legacy"
   >("option")
   const [evolveReason, setEvolveReason] = React.useState("")
+  const [trackEvolveTrack, setTrackEvolveTrack] = React.useState<
+    "class" | "profession" | null
+  >(null)
   const [associationsOpen, setAssociationsOpen] = React.useState(false)
   const [titlesCatalog, setTitlesCatalog] = React.useState<CatalogItem[]>([])
   const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
     []
   )
   const [consumablesCatalog, setConsumablesCatalog] = React.useState<
+    CatalogItem[]
+  >([])
+  const [blessingsCatalog, setBlessingsCatalog] = React.useState<CatalogItem[]>(
+    []
+  )
+  const [bloodlinesCatalog, setBloodlinesCatalog] = React.useState<
     CatalogItem[]
   >([])
   const [catalogLoading, setCatalogLoading] = React.useState(false)
@@ -1081,13 +1208,17 @@ export function CharacterDetail({
   }, [character])
 
   const loadCatalog = React.useCallback(
-    async (kind: "titles" | "equipment" | "consumables") => {
+    async (
+      kind: "titles" | "equipment" | "consumables" | "blessings" | "bloodlines"
+    ) => {
       setCatalogLoading(true)
       try {
         const res = await apiFetch<CatalogListResponse>(`/api/catalog/${kind}`)
         if (kind === "titles") setTitlesCatalog(res.items)
         else if (kind === "equipment") setEquipmentCatalog(res.items)
-        else setConsumablesCatalog(res.items)
+        else if (kind === "consumables") setConsumablesCatalog(res.items)
+        else if (kind === "blessings") setBlessingsCatalog(res.items)
+        else setBloodlinesCatalog(res.items)
       } catch (err) {
         toast.error(
           err instanceof Error ? err.message : "Failed to load catalog."
@@ -1104,15 +1235,22 @@ export function CharacterDetail({
     if (titlesCatalog.length === 0) void loadCatalog("titles")
     if (equipmentCatalog.length === 0) void loadCatalog("equipment")
     if (consumablesCatalog.length === 0) void loadCatalog("consumables")
+    if (blessingsCatalog.length === 0) void loadCatalog("blessings")
+    if (bloodlinesCatalog.length === 0) void loadCatalog("bloodlines")
   }, [
     titlesCatalog.length,
     equipmentCatalog.length,
     consumablesCatalog.length,
+    blessingsCatalog.length,
+    bloodlinesCatalog.length,
     loadCatalog,
   ])
 
   const addAssociation = React.useCallback(
-    async (kind: "title" | "equipment", definitionId: string) => {
+    async (
+      kind: "title" | "equipment" | "blessing" | "bloodline",
+      definitionId: string
+    ) => {
       if (!character) return
       setAssocBusy(true)
       setError(null)
@@ -1139,7 +1277,10 @@ export function CharacterDetail({
   )
 
   const removeAssociation = React.useCallback(
-    async (kind: "title" | "equipment", definitionId: string) => {
+    async (
+      kind: "title" | "equipment" | "blessing" | "bloodline",
+      definitionId: string
+    ) => {
       if (!character) return
       setAssocBusy(true)
       setError(null)
@@ -1486,6 +1627,41 @@ export function CharacterDetail({
             {professionTrack.quarter})
           </Button>
         ) : null}
+        {classTrack ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1"
+            onClick={() => setTrackEvolveTrack("class")}
+            disabled={busy}
+            title={
+              classTrack.grade
+                ? `Evolve class grade from ${classTrack.grade}`
+                : "Class has no explicit grade yet (legacy state)"
+            }
+          >
+            <SparklesIcon />
+            Evolve class{classTrack.grade ? ` (${classTrack.grade})` : ""}
+          </Button>
+        ) : null}
+        {professionTrack ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1"
+            onClick={() => setTrackEvolveTrack("profession")}
+            disabled={busy}
+            title={
+              professionTrack.grade
+                ? `Evolve profession grade from ${professionTrack.grade}`
+                : "Profession has no explicit grade yet (legacy state)"
+            }
+          >
+            <SparklesIcon />
+            Evolve profession
+            {professionTrack.grade ? ` (${professionTrack.grade})` : ""}
+          </Button>
+        ) : null}
         <Button
           variant="outline"
           size="sm"
@@ -1521,6 +1697,7 @@ export function CharacterDetail({
           <TabsTrigger value="attributes">Attributes</TabsTrigger>
           <TabsTrigger value="identity">Race / Class / Profession</TabsTrigger>
           <TabsTrigger value="skills">Skills</TabsTrigger>
+          <TabsTrigger value="powers">Powers</TabsTrigger>
           <TabsTrigger value="titles">Titles</TabsTrigger>
           <TabsTrigger value="equipment">Equipment</TabsTrigger>
           <TabsTrigger value="consumables">Consumables</TabsTrigger>
@@ -1546,6 +1723,90 @@ export function CharacterDetail({
                   {character.professionName ?? "None"}
                 </MetaRow>
                 <MetaRow label="Updated">{character.updatedAt}</MetaRow>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="powers" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="font-heading text-sm font-medium">
+                      Blessings and bloodlines
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      Linked blessing and bloodline effects are catalog-defined.
+                      Numeric status and effective values are calculated by the
+                      server; this sheet does not assume canonical bonuses or
+                      treat narrative power as numeric.
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={openAssociations}
+                  >
+                    Manage powers
+                  </Button>
+                </div>
+                {(["blessing", "bloodline"] as const).map((kind) => {
+                  const links = character.associations.filter(
+                    (a) => a.kind === kind
+                  )
+                  return (
+                    <section
+                      key={kind}
+                      aria-label={
+                        kind === "blessing" ? "Blessing" : "Bloodlines"
+                      }
+                    >
+                      <h4 className="text-xs font-medium capitalize">
+                        {kind === "blessing" ? "Blessing" : "Bloodlines"}
+                      </h4>
+                      {links.length ? (
+                        <div className="mt-1 flex flex-col gap-2">
+                          {links.map((a) => (
+                            <div
+                              key={a.id}
+                              className="rounded-lg border bg-input/20 p-2"
+                            >
+                              <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                                {a.name}
+                                {a.grade ? (
+                                  <Badge variant="outline">{a.grade}</Badge>
+                                ) : null}
+                                {a.definitionArchived ? (
+                                  <Badge variant="outline">
+                                    Archived - inert
+                                  </Badge>
+                                ) : null}
+                              </div>
+                              <p className="text-[0.6875rem] text-muted-foreground">
+                                Provenance: {a.provenance ?? "unspecified"}
+                                {a.definitionArchived
+                                  ? " - linked but not effective"
+                                  : ""}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          No linked {kind}s.
+                        </p>
+                      )}
+                    </section>
+                  )
+                })}
+                {status ? (
+                  <p className="text-xs text-muted-foreground">
+                    Current attribute values below reflect server-calculated
+                    live effects.
+                  </p>
+                ) : null}
               </div>
             </CardContent>
           </Card>
@@ -2199,7 +2460,14 @@ export function CharacterDetail({
                       <Badge variant="outline">
                         {option.fromGrade} {"->"} {option.toGrade}
                       </Badge>
-                      <Badge variant="outline">Race: {option.toRaceName}</Badge>
+                      <Badge variant="outline">
+                        {option.track === "race"
+                          ? "Race"
+                          : option.track === "class"
+                            ? "Class"
+                            : "Profession"}
+                        : {option.toTrackName}
+                      </Badge>
                       {option.manualReview ? (
                         <Badge variant="outline">Manual review</Badge>
                       ) : null}
@@ -2315,6 +2583,26 @@ export function CharacterDetail({
         </DialogContent>
       </Dialog>
 
+      {trackEvolveTrack === "class" ? (
+        <TrackEvolutionDialog
+          track="class"
+          character={character}
+          isAdmin={isAdmin}
+          onClose={() => setTrackEvolveTrack(null)}
+          onEvolved={() => void reload()}
+        />
+      ) : null}
+
+      {trackEvolveTrack === "profession" ? (
+        <TrackEvolutionDialog
+          track="profession"
+          character={character}
+          isAdmin={isAdmin}
+          onClose={() => setTrackEvolveTrack(null)}
+          onEvolved={() => void reload()}
+        />
+      ) : null}
+
       <AssociationSheet
         open={associationsOpen}
         onOpenChange={setAssociationsOpen}
@@ -2322,6 +2610,8 @@ export function CharacterDetail({
         titles={titlesCatalog}
         equipment={equipmentCatalog}
         consumables={consumablesCatalog}
+        blessings={blessingsCatalog}
+        bloodlines={bloodlinesCatalog}
         loading={catalogLoading}
         busy={assocBusy}
         consumeBusy={consumeBusy}
@@ -2332,6 +2622,51 @@ export function CharacterDetail({
         onConsume={(definitionId) => {
           const item = consumablesCatalog.find((c) => c.id === definitionId)
           if (item) requestConsume(item)
+        }}
+        onPowerAdd={(kind, definitionId) => {
+          const displaced =
+            kind === "blessing"
+              ? character.associations.filter(
+                  (a) => a.kind === kind && a.definitionId !== definitionId
+                )
+              : []
+          const item = [...blessingsCatalog, ...bloodlinesCatalog].find(
+            (entry) => entry.id === definitionId
+          )
+          const group = item?.config?.upgradeGroup
+          const replacements =
+            kind === "bloodline" && typeof group === "string"
+              ? character.associations.filter(
+                  (a) =>
+                    a.kind === kind &&
+                    a.definitionId !== definitionId &&
+                    a.upgradeGroup === group
+                )
+              : []
+          const names = [...displaced, ...replacements].map((a) =>
+            a.definitionArchived ? `${a.name} (archived, inert)` : a.name
+          )
+          if (
+            names.length &&
+            !window.confirm(
+              `${item?.name ?? "Power"} will replace ${names.join(", ")}. Continue?`
+            )
+          )
+            return
+          if (
+            !window.confirm(
+              `Add ${item?.name ?? "this power"} to ${character.name}?`
+            )
+          )
+            return
+          void addAssociation(kind, definitionId)
+        }}
+        onPowerRemove={(kind, definitionId) => {
+          const name =
+            character.associations.find((a) => a.definitionId === definitionId)
+              ?.name ?? "this power"
+          if (window.confirm(`Remove ${name} from ${character.name}?`))
+            void removeAssociation(kind, definitionId)
         }}
       />
 

@@ -42,3 +42,20 @@ and a grade-based **cap** that limits how much can be added in a grade. The cap
 distribution is a house choice (see `docs/rules/assumptions.md`). No invented
 formula is used to derive the caps; E-grade (28/34) and D-grade (84/100) are used
 as sourced anchors where available.
+
+A class track may also carry an **optional explicit grade** on its track state
+(`TrackState.grade`); this is a house-state addition, not a source claim. When a
+class grade is present, the class track's level-up is independently capped at the
+entry level of the **next** grade (the track may reach exactly that threshold but
+may not pass it) until the caller explicitly evolves the class grade via the pure
+engine function `evolveTrackGrade`. Quarter progress (0/25/50/75) is preserved
+across that boundary, and the class may evolve ahead of the derived race grade
+when the race level is still below its own boundary. A class state **without** a
+grade is unaffected (legacy behavior preserved); the engine never infers one
+(see `docs/rules/leveling.md`).
+
+A new class created through the wizard is stamped with an explicit `F` grade and
+a `stableId:F` definition, so the catalog must define an `F`-grade per-level
+config (`grades.F`) for it - the service refuses to create such a class
+otherwise. Class evolution is then a catalog-driven per-track path choice with
+**no** grade-only legacy fallback (see `docs/rules/evolution.md`).

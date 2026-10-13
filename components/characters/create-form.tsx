@@ -1114,19 +1114,19 @@ export function CreateCharacterForm() {
           <QuestionnaireItem name="special">
             <QuestionnaireTitle>Special abilities</QuestionnaireTitle>
             <QuestionnaireDescription>
-              Blessings, bloodlines and transcendents can be defined in the
-              encyclopedia, but they are not yet attached to a new character.
-              Nothing is recorded here, so no numbers are affected.
+              Blessings and bloodlines can be attached after character creation.
+              They are not assigned during creation. Nothing is recorded here,
+              so no numbers are affected.
             </QuestionnaireDescription>
             {draft.special === "yes" ? (
               <p className="text-xs text-muted-foreground">
-                This draft recorded special abilities, but they are not yet
-                attached to a character. Configure them when the feature is
-                available.
+                This draft records your answer only. Attach blessings or
+                bloodlines after creating the character.
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">
-                Not assigned. Configure when the feature is available.
+                Not assigned during creation. Attach blessings or bloodlines
+                after creating the character.
               </p>
             )}
             {/* The questionnaire only advances past an item that reports an

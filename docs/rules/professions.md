@@ -40,3 +40,19 @@ Profession is modeled like class: a progression track with per-level bonuses and
 grade-based cap. If a race has **no profession**, the engine treats the missing
 profession level as 0 per the house assumption in `docs/rules/races.md` and
 `docs/rules/assumptions.md`.
+
+As with class, a profession track may carry an **optional explicit grade**
+(`TrackState.grade`) that independently caps the profession track's level-up at
+the entry level of the **next** grade until the caller explicitly evolves the
+profession grade via `evolveTrackGrade`. Quarter progress (0/25/50/75) is
+preserved, and a profession may evolve ahead of the derived race grade when the
+race level is below its own boundary. A profession state **without** a grade is
+unaffected (legacy behavior preserved); the engine never infers one
+(see `docs/rules/leveling.md`).
+
+A new profession created through the wizard is stamped with an explicit `F`
+grade and a `stableId:F` definition, so the catalog must define an `F`-grade
+per-level config (`grades.F`) for it - the service refuses to create such a
+profession otherwise. Profession evolution is then a catalog-driven per-track
+path choice with **no** grade-only legacy fallback (see
+`docs/rules/evolution.md`).

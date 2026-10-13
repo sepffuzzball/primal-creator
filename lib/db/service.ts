@@ -22,11 +22,13 @@ import {
   allocatedPoints,
   applyPermanentConsumable,
   ATTRIBUTES,
+  bandForGrade,
   calculateStatus,
   consumableToEffect,
   defaultRulesConfig,
   deriveRaceLevel,
   evolveGrade,
+  evolveTrackGrade,
   gradeOrderIndex,
   makeVector,
   nextGrade,
@@ -37,6 +39,7 @@ import {
   type CharacterState,
   type EffectCondition,
   type Grade,
+  type GradeBand,
   type PartialVector,
   type RaceDefinition,
   type RulesConfig,
@@ -54,8 +57,12 @@ import {
   characterStateSchema,
   hasInvalidSkillTrack,
   isIncompleteSkillConfig,
+  isLegacyBlessingConfig,
+  isLegacyBloodlineConfig,
   isLegacyConsumableConfig,
+  isValidEvolutionConfig,
   isValidRaceEvolutionConfig,
+  isValidTrackEvolutionConfig,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
 import {
@@ -88,7 +95,7 @@ type DbClient = Prisma.TransactionClient | typeof prisma
 export interface CharacterAssociationView {
   id: string
   definitionId: string
-  kind: "title" | "equipment" | "skill"
+  kind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
   name: string
   slot?: string
   upgradeGroup?: string
@@ -284,15 +291,32 @@ function gradeIndex(grade: string): number {
   return Number.isFinite(idx) ? idx : 0
 }
 
+/** Whether a class/profession catalog row defines per-level gains for `grade`. */
+function trackHasGradeConfig(row: CatalogRow, grade: string): boolean {
+  const config = parseCatalogConfig(row.kind, row.config ?? {})
+  const grades = (config.grades ?? {}) as Record<string, unknown>
+  return grades[grade] != null
+}
+
 /**
- * Resolve the track definition to use for advancing `trackId`. The definition is
- * chosen by the character's current race grade; if that grade has no definition
- * in the catalog row, the lowest-defined grade is used. Returns null when the
- * catalog row defines no per-grade track gains.
+ * Resolve the track definition to use for advancing `track`.
+ *
+ * - A **graded** track (`state.tracks[track].grade` present) selects EXACTLY that
+ *   grade's per-grade config and returns null when the catalog row defines no
+ *   config for it - it never falls back to another grade. This keeps a graded
+ *   class/profession pinned to its declared grade, so a missing per-grade config
+ *   surfaces as an actionable "no_definition" rather than silently using a
+ *   different grade's gains.
+ * - An **ungraded legacy** track keeps the race-grade fallback: the definition is
+ *   chosen by the character's current race grade, and if that grade has no
+ *   definition in the catalog row, the lowest-defined grade is used.
+ *
+ * Returns null when the catalog row defines no per-grade track gains.
  */
 export function resolveTrackDefinition(
   row: CatalogRow | null,
-  state: CharacterState
+  state: CharacterState,
+  track: TrackId
 ): TrackDefinition | null {
   if (!row) return null
   const config = parseCatalogConfig(row.kind, row.config ?? {})
@@ -302,6 +326,21 @@ export function resolveTrackDefinition(
   >
   const entries = Object.entries(grades)
   if (entries.length === 0) return null
+
+  const gradedTrack = state.tracks[track]?.grade
+  if (gradedTrack) {
+    const chosen = entries.find(([g]) => g === gradedTrack)
+    if (!chosen) return null
+    const [grade, def] = chosen
+    return {
+      id: `${row.stableId}:${grade}`,
+      name: row.name,
+      fixed: makeVector(def.fixed ?? {}),
+      free: def.free ?? 0,
+      grade: grade as Grade,
+    }
+  }
+
   entries.sort((a, b) => gradeIndex(a[0]) - gradeIndex(b[0]))
   let chosen = entries.find(([g]) => g === state.race.grade)
   if (!chosen) chosen = entries[0]
@@ -328,11 +367,20 @@ export function resolveTrackDefinition(
  *   provenance-driven starting grade, not derived from level.
  * - No awards are granted at creation; every award is a server-side snapshot from
  *   the catalog. Base attributes are zero (no fabricated starting stats).
+ *
+ * `classRow` is optional: it is supplied by the real `createCharacter` flow and
+ * marks a "graded" new character. When present, the class track (and, if
+ * `professionRow` is also supplied, the profession track) is stamped with the
+ * explicit starting F grade and the `stableId:F` definition, so a new class or
+ * profession is immediately gated by its own (not the race's) grade. Existing
+ * pure-helper callers that omit `classRow` keep the legacy ungraded state (empty
+ * definitionId, no explicit grade), preserving their behavior.
  */
 export function createInitialState(
   origin: "integrated" | "born",
   raceRow: CatalogRow | null,
-  professionRow: CatalogRow | null
+  professionRow: CatalogRow | null,
+  classRow?: CatalogRow | null
 ): CharacterState {
   const tracks: CharacterState["tracks"] = {}
   const classLevel = 0
@@ -341,13 +389,15 @@ export function createInitialState(
   tracks["class"] = {
     level: classLevel,
     quarter: 0,
-    definitionId: "",
+    definitionId: classRow ? `${classRow.stableId}:F` : "",
+    ...(classRow ? { grade: "F" as const } : {}),
   }
   if (professionRow) {
     tracks["profession"] = {
       level: professionLevel,
       quarter: 0,
-      definitionId: "",
+      definitionId: classRow ? `${professionRow.stableId}:F` : "",
+      ...(classRow ? { grade: "F" as const } : {}),
     }
   }
 
@@ -385,10 +435,22 @@ export function applyAdvance(
   if (!existing) {
     throw badRequest("unknown_track", `Character has no "${trackId}" track`)
   }
+  // A graded track (explicit class/profession grade) is pinned to exactly one
+  // per-grade definition: advancing with a definition from a different grade is a
+  // 400, never a silent swap. Only an UNGRADED legacy state permits the silent
+  // definition-id transition after an evolution (the engine's consistency guard
+  // would otherwise reject the advance).
+  if (
+    existing.grade != null &&
+    existing.definitionId &&
+    existing.definitionId !== definition.id
+  ) {
+    throw badRequest(
+      "definition_mismatch",
+      `Track "${trackId}" is grade ${existing.grade} with definition "${existing.definitionId}"; cannot advance with definition "${definition.id}"`
+    )
+  }
   let next = state
-  // After an evolution the character's grade changes and the correct track
-  // definition for the new grade differs. Update the recorded definitionId so
-  // the engine's consistency guard is satisfied before advancing.
   if (existing.definitionId && existing.definitionId !== definition.id) {
     next = {
       ...next,
@@ -427,6 +489,59 @@ export function applyEvolve(
 // ------------------------------------------------------------------ //
 // DTO helpers
 // ------------------------------------------------------------------ //
+
+/** A single declarative passive effect read out of a catalog `config.effects`. */
+type DeclarativeEffect = {
+  phase: string
+  amount?: PartialVector
+  basisPoints?: PartialVector
+  condition?: EffectCondition
+  stacking?: "replace" | "stack" | "stackCapped"
+  group?: string
+}
+
+/**
+ * Synthesize a list of declarative catalog effects into `activeEffects`,
+ * preserving each effect's OWN phase/condition/stacking/group. The `upgradeGroup`
+ * on the catalog entry is never used here (it is only an add/select replacement
+ * group), so a single entry's flat AND percent effects both apply. `idBase` is
+ * the prefix used to give every effect a unique id - for a skill/blessing it is
+ * the definition id, and for a bloodline's grade-scaled effects it is
+ * `def.id:grade-<grade>` so a base effect and a grade effect never share an id.
+ * `provenance` and `source` always come from the catalog row.
+ */
+function appendDeclarativeEffects(
+  activeEffects: CharacterState["activeEffects"],
+  def: { id: string; name: string; provenance: string },
+  effects: DeclarativeEffect[],
+  idBase: string
+): void {
+  for (let i = 0; i < effects.length; i++) {
+    const eff = effects[i]
+    const group = eff.group
+    const base = {
+      id: `${idBase}:eff-${i}`,
+      source: def.name,
+      provenance: def.provenance,
+      condition: eff.condition,
+      group,
+      stacking: eff.stacking ?? (group ? "replace" : "stack"),
+    }
+    if (eff.phase === "flat") {
+      activeEffects.push({
+        ...base,
+        phase: "flat",
+        amount: makeVector(eff.amount ?? {}),
+      })
+    } else if (eff.phase === "percent") {
+      activeEffects.push({
+        ...base,
+        phase: "percent",
+        basisPoints: makeVector(eff.basisPoints ?? {}),
+      })
+    }
+  }
+}
 
 /**
  * Build a read-time "live" CharacterState by merging the immutable stored state
@@ -480,43 +595,51 @@ function liveState(character: CharacterWithCatalog): CharacterState {
     } else if (def.kind === "skills") {
       // Synthesize each declarative passive effect from the current catalog
       // config. History stays immutable; editing a skill's effects recalculates
-      // the live status without rewriting the stored state or the journal.
-      const effects = (config.effects ?? []) as Array<{
-        phase: string
-        amount?: PartialVector
-        basisPoints?: PartialVector
-        condition?: EffectCondition
-        stacking?: "replace" | "stack" | "stackCapped"
-        group?: string
-      }>
-      for (let i = 0; i < effects.length; i++) {
-        const eff = effects[i]
-        // Each effect retains its OWN stacking/replace group. The skill's
-        // `upgradeGroup` is used only on select/grant to remove superseded linked
-        // skills - it is never an effect replace group, so a single skill's flat
-        // AND percent effects both apply (they never collapse into one another).
-        const group = eff.group
-        const base = {
-          id: `${def.id}:eff-${i}`,
-          source: def.name,
-          provenance: def.provenance,
-          condition: eff.condition,
-          group,
-          stacking: eff.stacking ?? (group ? "replace" : "stack"),
-        }
-        if (eff.phase === "flat") {
-          activeEffects.push({
-            ...base,
-            phase: "flat",
-            amount: makeVector(eff.amount ?? {}),
-          })
-        } else if (eff.phase === "percent") {
-          activeEffects.push({
-            ...base,
-            phase: "percent",
-            basisPoints: makeVector(eff.basisPoints ?? {}),
-          })
-        }
+      // the live status without rewriting the stored state or the journal. Each
+      // effect retains its OWN stacking/replace group; the skill's `upgradeGroup`
+      // is only an add/select replacement group, never an effect replace group.
+      appendDeclarativeEffects(
+        activeEffects,
+        def,
+        (config.effects ?? []) as DeclarativeEffect[],
+        def.id
+      )
+    } else if (def.kind === "blessings") {
+      // A blessing's modern `effects` are declared in the catalog config and are
+      // synthesized live. The legacy `{ grade, effect }` config carries no
+      // `effects`, so it contributes nothing (no invented numeric bonus). Archived
+      // definitions are skipped earlier, so an archived link is inert.
+      appendDeclarativeEffects(
+        activeEffects,
+        def,
+        (config.effects ?? []) as DeclarativeEffect[],
+        def.id
+      )
+    } else if (def.kind === "bloodlines") {
+      // Bloodlines apply their declared `effects` live AND, EXACTLY when the
+      // character's current race grade matches a key in `gradeEffects`, apply that
+      // grade's effects on top (no fallback to another grade - a mismatched grade
+      // contributes nothing rather than inferring a bonus). The grade effects use
+      // a distinct id prefix so a base effect and a grade-scaled effect never
+      // share an id. Legacy `{ grade, vector }` config contributes nothing.
+      appendDeclarativeEffects(
+        activeEffects,
+        def,
+        (config.effects ?? []) as DeclarativeEffect[],
+        def.id
+      )
+      const gradeEffects = (config.gradeEffects ?? {}) as Record<
+        string,
+        DeclarativeEffect[]
+      >
+      const gradeEff = gradeEffects[state.race.grade]
+      if (gradeEff && gradeEff.length > 0) {
+        appendDeclarativeEffects(
+          activeEffects,
+          def,
+          gradeEff,
+          `${def.id}:grade-${state.race.grade}`
+        )
       }
     }
   }
@@ -594,6 +717,10 @@ const associationViewKinds: Record<
   TITLE: "title",
   EQUIPMENT: "equipment",
   SKILL: "skill",
+  // Not wired to characters yet (phase 2), but the persisted kind must map to a
+  // typed view label so a stored BLESSING/BLOODLINE link is never mislabelled.
+  BLESSING: "blessing",
+  BLOODLINE: "bloodline",
 }
 
 function associationViewKind(
@@ -621,7 +748,12 @@ function associationView(
     const slot = config.slot as string | undefined
     if (slot) view.slot = slot
   }
-  if (kind === "title" || kind === "skill") {
+  if (
+    kind === "title" ||
+    kind === "skill" ||
+    kind === "blessing" ||
+    kind === "bloodline"
+  ) {
     const upgradeGroup = config.upgradeGroup as string | undefined
     if (upgradeGroup) view.upgradeGroup = upgradeGroup
   }
@@ -833,7 +965,23 @@ export async function createCharacter(
     )
   }
 
-  const state = createInitialState(input.origin, race, profession)
+  // A graded new character requires an explicit F-grade per-level config for the
+  // selected class (and profession when one is chosen). Without it the class track
+  // cannot be stamped with its `stableId:F` definition and would fail to advance.
+  if (!trackHasGradeConfig(cls, "F")) {
+    throw badRequest(
+      "invalid_class_grade",
+      `Class "${cls.name}" defines no F-grade per-level config; add a "grades.F" entry to create it`
+    )
+  }
+  if (profession && !trackHasGradeConfig(profession, "F")) {
+    throw badRequest(
+      "invalid_profession_grade",
+      `Profession "${profession.name}" defines no F-grade per-level config; add a "grades.F" entry to create it`
+    )
+  }
+
+  const state = createInitialState(input.origin, race, profession, cls)
   const serialized = serializeState(state)
 
   // Create the character and append the "create" progression event atomically: a
@@ -1005,8 +1153,10 @@ export async function archiveCharacter(
  * Create ONE skill offer per choice group for a character that just leveled a
  * track. It queries the unarchived `skills` catalog and keeps only the entries
  * whose config `track` / `milestone` exactly match the advanced track/level, whose
- * explicit `grade` (when set) equals the character's current race grade (no
- * inferred compatibility), and whose `eligibleDefinitionStableIds` (when present)
+ * explicit `grade` (when set) equals the OFFER grade (no inferred compatibility).
+ * For a graded class/profession track the offer grade is the TRACK's own grade;
+ * the caller falls back to the character's race grade only for an ungraded
+ * legacy track. `eligibleDefinitionStableIds` (when present)
  * includes the character's selected track catalog stableId. The surviving
  * entries are grouped by `choiceGroup ?? "standard"`; a single offer with
  * read-only option snapshots is created per group. A pre-existing offer for the
@@ -1018,7 +1168,7 @@ async function createSkillOffersForAdvance(
   characterId: string,
   track: "class" | "profession",
   newLevel: number,
-  raceGrade: string,
+  offerGrade: string,
   trackStableId: string | undefined
 ): Promise<Array<{ id: string; choiceGroup: string }>> {
   const skillDefs = await tx.catalogDefinition.findMany({
@@ -1039,8 +1189,10 @@ async function createSkillOffersForAdvance(
     if (config.track !== track) continue
     const milestone = Number(config.milestone)
     if (!Number.isFinite(milestone) || milestone !== newLevel) continue
-    // Grade, when specified, must match the character's current grade exactly.
-    if (def.grade && def.grade !== raceGrade) continue
+    // Grade, when specified, must match the offer grade exactly. For a graded
+    // class/profession track this is the TRACK's own grade (independent of the
+    // race grade); for an ungraded legacy track it falls back to the race grade.
+    if (def.grade && def.grade !== offerGrade) continue
     // Filter to the selected track's catalog stableId when the skill constrains
     // its eligible class/profession definitions. When `eligibleDefinitionStableIds`
     // is present - even as an empty array - the restriction applies via `includes`:
@@ -1121,7 +1273,7 @@ export async function advanceCharacter(
     const state = deserializeState(row.state)
     const config = configFor(row, houseRules.config)
     const trackRow = body.track === "class" ? row.class : row.profession
-    const definition = resolveTrackDefinition(trackRow, state)
+    const definition = resolveTrackDefinition(trackRow, state, body.track)
     if (!definition) {
       throw badRequest(
         "no_definition",
@@ -1156,6 +1308,10 @@ export async function advanceCharacter(
     if (result.journal.leveledUp) {
       const newLevel = result.journal.levelAfter
       const raceGrade = result.state.race.grade
+      // A graded class/profession track filters milestone offers by the track's OWN
+      // grade (independent of the race grade); an ungraded legacy track uses the
+      // race grade.
+      const trackGrade = result.state.tracks[body.track]?.grade ?? raceGrade
       const trackStableId =
         body.track === "class" ? row.class?.stableId : row.profession?.stableId
       skillOffers = await createSkillOffersForAdvance(
@@ -1163,7 +1319,7 @@ export async function advanceCharacter(
         id,
         body.track,
         newLevel,
-        raceGrade,
+        trackGrade,
         trackStableId ?? undefined
       )
     }
@@ -1535,8 +1691,22 @@ export async function allocateCharacter(
 }
 
 export type EvolveCharacterInput =
-  | { optionId: string; version: number; reason?: string }
-  | { grade: Grade; version: number }
+  | {
+      // A race path choice. `track` is `"race"` only when an explicit new client
+      // sends it; old clients omit the key entirely. Either way this is NOT a
+      // class/profession track, so it must never be routed to evolveTrackCharacter.
+      track?: "race"
+      optionId: string
+      version: number
+      reason?: string
+    }
+  | { grade: Grade; version: number; track?: undefined }
+  | {
+      track: "class" | "profession"
+      optionId: string
+      version: number
+      reason?: string
+    }
 
 export interface EvolutionOptionView {
   id: string
@@ -1544,7 +1714,10 @@ export interface EvolutionOptionView {
   description: string | null
   fromGrade: Grade
   toGrade: Grade
-  toRaceName: string
+  /** Destination display name (race, class, or profession name). */
+  toTrackName: string
+  /** The track this evolution path targets. */
+  track: "race" | "class" | "profession"
   provenance: string
   sourceUrl: string | null
   eligible: boolean
@@ -1601,6 +1774,67 @@ function parseRaceEvolutionPath(row: {
     minRaceLevel:
       typeof config.minRaceLevel === "number"
         ? (config.minRaceLevel as number)
+        : undefined,
+    requiredTitleStableIds: Array.isArray(config.requiredTitleStableIds)
+      ? (config.requiredTitleStableIds as string[])
+      : [],
+    requiredSkillStableIds: Array.isArray(config.requiredSkillStableIds)
+      ? (config.requiredSkillStableIds as string[])
+      : [],
+    manualRequirementsText:
+      typeof config.manualRequirementsText === "string"
+        ? (config.manualRequirementsText as string)
+        : undefined,
+  }
+}
+
+/**
+ * A parsed, validated class/profession evolution path from an `evolutions` catalog
+ * row's config. Only set when `isValidTrackEvolutionConfig` passes; a legacy
+ * metadata-only config yields null (readable but not a usable path).
+ */
+interface TrackEvolutionPath {
+  id: string
+  name: string
+  description: string | null
+  provenance: string
+  sourceUrl: string | null
+  track: "class" | "profession"
+  fromDefinitionStableId: string
+  toDefinitionStableId: string
+  fromGrade: Grade
+  toGrade: Grade
+  minTrackLevel: number | undefined
+  requiredTitleStableIds: string[]
+  requiredSkillStableIds: string[]
+  manualRequirementsText: string | undefined
+}
+
+function parseTrackEvolutionPath(row: {
+  id: string
+  name: string
+  description: string | null
+  provenance: string
+  sourceUrl: string | null
+  config: unknown
+}): TrackEvolutionPath | null {
+  const config = parseCatalogConfig("evolutions", row.config ?? {})
+  if (!isValidTrackEvolutionConfig(config)) return null
+  const track = config.track === "profession" ? "profession" : "class"
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    provenance: row.provenance,
+    sourceUrl: row.sourceUrl,
+    track,
+    fromDefinitionStableId: config.fromDefinitionStableId as string,
+    toDefinitionStableId: config.toDefinitionStableId as string,
+    fromGrade: config.fromGrade as Grade,
+    toGrade: config.toGrade as Grade,
+    minTrackLevel:
+      typeof config.minTrackLevel === "number"
+        ? (config.minTrackLevel as number)
         : undefined,
     requiredTitleStableIds: Array.isArray(config.requiredTitleStableIds)
       ? (config.requiredTitleStableIds as string[])
@@ -1705,6 +1939,163 @@ async function collectValidRacePathsForTarget(
   return out
 }
 
+interface TrackEvolutionEligibilityContext {
+  currentDefinitionStableId: string | null
+  currentGrade: Grade
+  trackLevel: number
+  linkedTitleStableIds: Set<string>
+  linkedSkillStableIds: Set<string>
+}
+
+/**
+ * Evaluate the mechanical (hard) requirements of a class/profession path. Only the
+ * definition-stableId match, the track grade match, the minimum track level, and
+ * the explicitly required title/skill associations (linked, unarchived
+ * definitions) count here; the narrative `manualRequirementsText` gate is tracked
+ * separately via `manualReview`.
+ */
+function evaluateTrackPathEligibility(
+  path: TrackEvolutionPath,
+  ctx: TrackEvolutionEligibilityContext
+): { eligible: boolean; blockers: string[] } {
+  const blockers: string[] = []
+  if (
+    ctx.currentDefinitionStableId == null ||
+    path.fromDefinitionStableId !== ctx.currentDefinitionStableId
+  ) {
+    blockers.push(`Requires ${path.track} "${path.fromDefinitionStableId}"`)
+  }
+  if (path.fromGrade !== ctx.currentGrade) {
+    blockers.push(`Requires current grade ${path.fromGrade}`)
+  }
+  if (path.minTrackLevel != null && ctx.trackLevel < path.minTrackLevel) {
+    blockers.push(
+      `Requires ${path.track} level ${path.minTrackLevel} or higher (currently ${ctx.trackLevel})`
+    )
+  }
+  for (const stableId of path.requiredTitleStableIds) {
+    if (!ctx.linkedTitleStableIds.has(stableId)) {
+      blockers.push(`Requires title "${stableId}"`)
+    }
+  }
+  for (const stableId of path.requiredSkillStableIds) {
+    if (!ctx.linkedSkillStableIds.has(stableId)) {
+      blockers.push(`Requires skill "${stableId}"`)
+    }
+  }
+  return { eligible: blockers.length === 0, blockers }
+}
+
+/**
+ * Engine-level grade-band / grade-gate blockers for a class/profession evolution,
+ * mirroring exactly what the pure `evolveTrackGrade` rejects (a missing band, a
+ * track level below the target band's entry level or above its max, and a closed
+ * grade gate). GET must agree with POST, so the choice list surfaces these reasons
+ * up front rather than reporting a falsely-eligible option that the POST would
+ * then reject. The destination definition/grade gating is handled separately by
+ * `collectValidTrackPathsForTarget` and `evaluateTrackPathEligibility`.
+ */
+function trackGradeBandBlockers(
+  track: "class" | "profession",
+  targetGrade: Grade,
+  trackLevel: number,
+  config: RulesConfig
+): string[] {
+  const blockers: string[] = []
+  if (config.gradeGates[targetGrade] === false) {
+    blockers.push(`grade gate closed for ${targetGrade}`)
+  }
+  const band = bandForGrade(targetGrade, config.gradeTable)
+  if (!band) {
+    blockers.push(`no grade band defined for ${targetGrade}`)
+  } else if (trackLevel < band.entryLevel || trackLevel > band.max) {
+    blockers.push(
+      `${track} level ${trackLevel} does not qualify for ${targetGrade} (needs ${band.entryLevel}-${band.max})`
+    )
+  }
+  return blockers
+}
+
+/**
+ * Engine-level grade-band / grade-gate blockers for a race evolution, mirroring
+ * exactly what the pure `evolveGrade` rejects (a missing band, a race level below
+ * the target band's entry level or above its max, and a closed grade gate). GET
+ * must agree with POST, so the race choice list surfaces these reasons up front
+ * rather than reporting a falsely-eligible option that the POST would then
+ * reject. `raceLevel` is the value `evolveGrade` itself resolves for the level
+ * check (the derived race level in derived mode, the stored level otherwise), so
+ * the two sides cannot drift. The destination race/grade gating is handled
+ * separately by `collectValidRacePathsForTarget` and `evaluateRacePathEligibility`.
+ */
+export function raceGradeBandBlockers(
+  targetGrade: Grade,
+  raceLevel: number,
+  config: RulesConfig
+): string[] {
+  const blockers: string[] = []
+  if (config.gradeGates[targetGrade] === false) {
+    blockers.push(`grade gate closed for ${targetGrade}`)
+  }
+  const band = bandForGrade(targetGrade, config.gradeTable)
+  if (!band) {
+    blockers.push(`no grade band defined for ${targetGrade}`)
+  } else if (raceLevel < band.entryLevel || raceLevel > band.max) {
+    blockers.push(
+      `race level ${raceLevel} does not qualify for ${targetGrade} (needs ${band.entryLevel}-${band.max})`
+    )
+  }
+  return blockers
+}
+
+interface ValidTrackPath {
+  path: TrackEvolutionPath
+  destDefinition: CatalogLookupRow
+}
+
+/**
+ * Collect the UNARCHIVED `evolutions` catalog entries whose config is a valid full
+ * class/profession path for the given `track`, matching the character's current
+ * class/profession definition stableId and grade AND targeting `targetGrade`,
+ * where the destination definition exists, is enabled and defines a
+ * `grades[targetGrade]` gain. A malformed, archived, wrong-track, wrong-definition,
+ * wrong-grade, non-target-grade or missing-destination entry is ignored.
+ */
+async function collectValidTrackPathsForTarget(
+  db: DbClient,
+  track: "class" | "profession",
+  currentDefinitionStableId: string | null,
+  currentGrade: Grade,
+  targetGrade: Grade
+): Promise<ValidTrackPath[]> {
+  const rows = await db.catalogDefinition.findMany({
+    where: { kind: "evolutions", archived: false },
+  })
+  const destKind = track === "class" ? "classes" : "professions"
+  const out: ValidTrackPath[] = []
+  for (const row of rows) {
+    const path = parseTrackEvolutionPath(row)
+    if (!path) continue
+    if (path.track !== track) continue
+    if (path.fromDefinitionStableId !== currentDefinitionStableId) continue
+    if (path.fromGrade !== currentGrade) continue
+    if (path.toGrade !== targetGrade) continue
+    const destDefinition = await findCatalogByStableId(
+      db,
+      destKind,
+      path.toDefinitionStableId
+    )
+    if (!destDefinition || destDefinition.archived) continue
+    const destConfig = parseCatalogConfig(
+      destDefinition.kind,
+      destDefinition.config ?? {}
+    )
+    const grades = (destConfig.grades ?? {}) as Record<string, unknown>
+    if (!(path.toGrade in grades)) continue
+    out.push({ path, destDefinition })
+  }
+  return out
+}
+
 function linkedStableIds(
   row: CharacterWithCatalog,
   kind: "TITLE" | "SKILL"
@@ -1719,23 +2110,58 @@ function linkedStableIds(
 }
 
 /**
- * GET /api/characters/[id]/evolutions (owner/admin). Returns the contextual race
- * evolution options for the character's current race/grade/level derived from
- * the editable `evolutions` catalog, plus whether the legacy grade-only house
- * fallback is available (true only when NO valid catalog path matches).
+ * GET /api/characters/[id]/evolutions?track=race|class|profession (owner/admin,
+ * default race). Returns contextual next-grade-only evolution options for the
+ * selected track derived from the editable `evolutions` catalog.
+ *
+ * - For `race`, the options are derived from the character's current race
+ *   stableId/grade/level, and `legacyAvailable` is true only when NO valid
+ *   catalog race path matches (the grade-only house fallback is then offered).
+ *   Each option is additionally marked ineligible with grade-band / grade-gate
+ *   blockers when the race level does not qualify for the target grade, matching
+ *   exactly what the pure evolveGrade engine would reject at POST time.
+ * - For `class`/`profession`, the options are derived from the current class or
+ *   profession definition stableId, the track's own grade and track level, and
+ *   the linked unarchived titles/skills. There is NO class/profession legacy
+ *   grade-only fallback, so `legacyAvailable` is always false. A track without an
+ *   explicit grade (`TrackState.grade` absent - a legacy graded-unknown state)
+ *   returns no options and no fallback.
  */
 export async function getEvolutionOptions(
   id: string,
-  user: SessionUser
+  user: SessionUser,
+  track: "race" | "class" | "profession" = "race"
 ): Promise<EvolutionOptionsResult> {
   const row = await assertOwner(prisma, id, user)
   const state = deserializeState(row.state)
+  const linkedTitleStableIds = linkedStableIds(row, "TITLE")
+  const linkedSkillStableIds = linkedStableIds(row, "SKILL")
+
+  // Build the rules config ONCE, shared by BOTH the track and race branches, so
+  // both surfaces the same grade-band / grade-gate blockers that the pure
+  // evolveTrackGrade / evolveGrade engine would reject at POST time. The grade
+  // table and gates are engine defaults that the house rules never override, but
+  // they are still resolved through the same configFor path the POST uses so the
+  // two sides cannot drift.
+  const houseRules = await loadHouseRules(prisma)
+  const config = buildRulesConfig(row.race, houseRules.config)
+
+  if (track !== "race") {
+    return getTrackEvolutionOptions(
+      row,
+      state,
+      track,
+      {
+        linkedTitleStableIds,
+        linkedSkillStableIds,
+      },
+      config
+    )
+  }
+
   const currentGrade = state.race.grade
   const currentRaceStableId = row.race?.stableId ?? null
   const targetGrade = nextGrade(currentGrade)
-
-  const linkedTitleStableIds = linkedStableIds(row, "TITLE")
-  const linkedSkillStableIds = linkedStableIds(row, "SKILL")
 
   const valid =
     targetGrade == null
@@ -1747,26 +2173,40 @@ export async function getEvolutionOptions(
           targetGrade
         )
 
+  // The race level resolved exactly as the pure evolveGrade engine does for its
+  // band check (derived in derived mode, stored otherwise), so GET and POST cannot
+  // disagree about whether the level qualifies for the target band.
+  const raceLevel =
+    state.race.mode === "derived"
+      ? deriveRaceLevel(state, config)
+      : state.race.level
+
   const options: EvolutionOptionView[] = []
   for (const { path, destRace } of valid) {
-    const { eligible, blockers } = evaluateRacePathEligibility(path, {
+    const { blockers } = evaluateRacePathEligibility(path, {
       currentRaceStableId,
       currentGrade,
       raceLevel: state.race.level,
       linkedTitleStableIds,
       linkedSkillStableIds,
     })
+    // GET must agree with POST: surface the same grade-band / grade-gate blockers
+    // that the pure evolveGrade engine would reject at POST time, so a choice never
+    // appears eligible when the POST would reject it.
+    const gradeBlockers = raceGradeBandBlockers(path.toGrade, raceLevel, config)
+    const allBlockers = [...blockers, ...gradeBlockers]
     options.push({
       id: path.id,
       name: path.name,
       description: path.description,
       fromGrade: path.fromGrade,
       toGrade: path.toGrade,
-      toRaceName: destRace.name,
+      toTrackName: destRace.name,
+      track: "race",
       provenance: path.provenance,
       sourceUrl: path.sourceUrl,
-      eligible,
-      blockers,
+      eligible: allBlockers.length === 0,
+      blockers: allBlockers,
       manualReview: path.manualRequirementsText != null,
     })
   }
@@ -1775,6 +2215,80 @@ export async function getEvolutionOptions(
     options,
     legacyAvailable: targetGrade != null && valid.length === 0,
   }
+}
+
+/**
+ * Build class/profession evolution options for the selected track. Because there
+ * is no class/profession grade-only legacy fallback, `legacyAvailable` is always
+ * false.
+ */
+async function getTrackEvolutionOptions(
+  row: CharacterWithCatalog,
+  state: CharacterState,
+  track: "class" | "profession",
+  links: {
+    linkedTitleStableIds: Set<string>
+    linkedSkillStableIds: Set<string>
+  },
+  config: RulesConfig
+): Promise<EvolutionOptionsResult> {
+  const trackGrade = state.tracks[track]?.grade
+  if (!trackGrade) {
+    return { options: [], legacyAvailable: false }
+  }
+  const currentDefinitionStableId =
+    track === "class"
+      ? (row.class?.stableId ?? null)
+      : (row.profession?.stableId ?? null)
+  const targetGrade = nextGrade(trackGrade)
+
+  const valid =
+    targetGrade == null
+      ? []
+      : await collectValidTrackPathsForTarget(
+          prisma,
+          track,
+          currentDefinitionStableId,
+          trackGrade,
+          targetGrade
+        )
+
+  const options: EvolutionOptionView[] = []
+  for (const { path, destDefinition } of valid) {
+    const { blockers } = evaluateTrackPathEligibility(path, {
+      currentDefinitionStableId,
+      currentGrade: trackGrade,
+      trackLevel: state.tracks[track]?.level ?? 0,
+      linkedTitleStableIds: links.linkedTitleStableIds,
+      linkedSkillStableIds: links.linkedSkillStableIds,
+    })
+    // GET must agree with POST: surface the same grade-band / grade-gate blockers
+    // that the pure evolveTrackGrade engine would reject at POST time, so a choice
+    // never appears eligible when the POST would reject it.
+    const gradeBlockers = trackGradeBandBlockers(
+      track,
+      path.toGrade,
+      state.tracks[track]?.level ?? 0,
+      config
+    )
+    const allBlockers = [...blockers, ...gradeBlockers]
+    options.push({
+      id: path.id,
+      name: path.name,
+      description: path.description,
+      fromGrade: path.fromGrade,
+      toGrade: path.toGrade,
+      toTrackName: destDefinition.name,
+      track,
+      provenance: path.provenance,
+      sourceUrl: path.sourceUrl,
+      eligible: allBlockers.length === 0,
+      blockers: allBlockers,
+      manualReview: path.manualRequirementsText != null,
+    })
+  }
+
+  return { options, legacyAvailable: false }
 }
 
 export async function evolveCharacter(
@@ -1788,6 +2302,15 @@ export async function evolveCharacter(
     const state = deserializeState(row.state)
     const currentGrade = state.race.grade
     const currentRaceStableId = row.race?.stableId ?? null
+
+    // ---- Class/profession track evolution path --------------------------- //
+    // Discriminated on the track value, not on key presence: a race path may carry
+    // an explicit `track: "race"` (new clients) or omit the key (legacy clients),
+    // so `"track" in body` would wrongly route a `track: "race"` body here. Only a
+    // `"class"` / `"profession"` value is a track evolution.
+    if (body.track === "class" || body.track === "profession") {
+      return evolveTrackCharacter(tx, row, state, body, user, houseRules)
+    }
 
     // ---- Legacy grade-only path (house fallback) ------------------------- //
     if ("grade" in body) {
@@ -2031,6 +2554,236 @@ export async function evolveCharacter(
 }
 
 /**
+ * POST /api/characters/[id]/evolve (track branch).
+ *
+ * Evolve a graded class/profession track to the next grade via a catalog path
+ * choice. This is the class/profession analogue of the race catalog path
+ * evolution: only the target track's `grade` and `definitionId` change, and the
+ * race grade is never touched. There is no class/profession grade-only legacy
+ * fallback here - a track path choice is always required.
+ */
+async function evolveTrackCharacter(
+  tx: DbClient,
+  row: CharacterWithCatalog,
+  state: CharacterState,
+  body: Extract<EvolveCharacterInput, { track: "class" | "profession" }>,
+  user: SessionUser,
+  houseRules: HouseRulesRow
+): Promise<{ character: CharacterDetail; journal: unknown }> {
+  const track = body.track
+
+  // The selected evolutions catalog entry must exist and be an unarchived
+  // class/profession evolution path.
+  const evo = await tx.catalogDefinition.findUnique({
+    where: { id: body.optionId },
+  })
+  if (!evo || evo.kind !== "evolutions") {
+    throw notFound("evolution_not_found", "Evolution path not found")
+  }
+  if (evo.archived) {
+    throw badRequest(
+      "catalog_archived",
+      `Evolution path "${evo.name}" is archived`
+    )
+  }
+  const path = parseTrackEvolutionPath(evo)
+  if (!path) {
+    throw badRequest(
+      "evolution_invalid_config",
+      `Evolution path "${evo.name}" has no usable ${track} config`
+    )
+  }
+  if (path.track !== track) {
+    throw badRequest(
+      "evolution_track_mismatch",
+      `Path targets ${path.track}; character is evolving ${track}`
+    )
+  }
+
+  const trackState = state.tracks[track]
+  if (!trackState) {
+    throw badRequest("unknown_track", `Character has no "${track}" track`)
+  }
+  const trackGrade = trackState.grade
+  if (!trackGrade) {
+    // Legacy graded-unknown state: no explicit grade to evolve.
+    throw badRequest(
+      "track_grade_unknown",
+      `Character's "${track}" track has no explicit grade to evolve`
+    )
+  }
+
+  const currentDefinitionStableId =
+    track === "class"
+      ? (row.class?.stableId ?? null)
+      : (row.profession?.stableId ?? null)
+  if (
+    currentDefinitionStableId == null ||
+    path.fromDefinitionStableId !== currentDefinitionStableId
+  ) {
+    throw badRequest(
+      "evolution_track_mismatch",
+      `Path requires ${track} "${path.fromDefinitionStableId}", character is "${currentDefinitionStableId ?? "(none)"}"`
+    )
+  }
+  if (path.fromGrade !== trackGrade) {
+    throw badRequest(
+      "evolution_grade_mismatch",
+      `Path requires current grade ${path.fromGrade}, character ${track} is ${trackGrade}`
+    )
+  }
+
+  // Only the NEXT grade may be targeted. A skip-grade path (e.g. F->D while the
+  // track level already qualifies for D) is rejected up front - the character must
+  // never jump a grade.
+  const targetGrade = nextGrade(trackGrade)
+  if (path.toGrade !== targetGrade) {
+    throw badRequest(
+      "invalid_evolution_grade",
+      `Path evolves to grade ${path.toGrade}; character ${track} is grade ${trackGrade} and can only evolve to the next grade ${targetGrade ?? "(none)"}`
+    )
+  }
+
+  // Destination definition must exist, be enabled and define the target grade.
+  const destKind = track === "class" ? "classes" : "professions"
+  const destDefinition = await findCatalogByStableId(
+    tx,
+    destKind,
+    path.toDefinitionStableId
+  )
+  if (!destDefinition) {
+    throw badRequest(
+      "evolution_destination_missing",
+      `Destination ${track} "${path.toDefinitionStableId}" is not in the catalog`
+    )
+  }
+  if (destDefinition.archived) {
+    throw badRequest(
+      "evolution_destination_archived",
+      `Destination ${track} "${destDefinition.name}" is archived`
+    )
+  }
+  const destConfig = parseCatalogConfig(destKind, destDefinition.config ?? {})
+  const destGrades = (destConfig.grades ?? {}) as Record<string, unknown>
+  if (!(path.toGrade in destGrades)) {
+    throw badRequest(
+      "evolution_destination_definition_missing",
+      `Destination ${track} "${destDefinition.name}" has no ${path.toGrade}-grade track definition`
+    )
+  }
+
+  // Re-evaluate eligibility INSIDE the transaction. A user or admin reason can
+  // never bypass a mechanical blocker; manualRequirementsText can be overridden
+  // only by a nonempty admin reason.
+  const { eligible, blockers } = evaluateTrackPathEligibility(path, {
+    currentDefinitionStableId,
+    currentGrade: trackGrade,
+    trackLevel: trackState.level,
+    linkedTitleStableIds: linkedStableIds(row, "TITLE"),
+    linkedSkillStableIds: linkedStableIds(row, "SKILL"),
+  })
+  if (!eligible) {
+    throw badRequest("evolution_prerequisites", blockers.join("; "))
+  }
+  if (path.manualRequirementsText != null) {
+    const canBypass =
+      user.isAdmin &&
+      typeof body.reason === "string" &&
+      body.reason.trim().length > 0
+    if (!canBypass) {
+      throw badRequest(
+        "evolution_manual_required",
+        user.isAdmin
+          ? `A reason is required to override manual requirements: ${path.manualRequirementsText}`
+          : `Requires manual (admin) review: ${path.manualRequirementsText}`
+      )
+    }
+  }
+
+  // Run the pure engine (evolveTrackGrade) with the character's rules config. Only
+  // the target track's grade/definitionId change; the race grade and every other
+  // ledger (historical awards, allocations, associations) are preserved.
+  const config = configFor(row, houseRules.config)
+  const result = evolveTrackGrade(
+    state,
+    track,
+    path.toGrade,
+    `${destDefinition.stableId}:${path.toGrade}`,
+    config
+  )
+  if (!result.ok) {
+    throw badRequest("evolution", result.errors.join("; "))
+  }
+  const serialized = serializeState(result.state!)
+  const updatedMany = await tx.character.updateMany({
+    where: { id: row.id, version: body.version },
+    data: {
+      ...(track === "class"
+        ? { classId: destDefinition.id }
+        : { professionId: destDefinition.id }),
+      state: serialized as Prisma.InputJsonValue,
+      version: { increment: 1 },
+    },
+  })
+  if (updatedMany.count !== 1) {
+    throw conflict(
+      "version_conflict",
+      `Version mismatch: expected ${body.version}, got a newer version`
+    )
+  }
+
+  const reason =
+    typeof body.reason === "string" && body.reason.trim().length > 0
+      ? body.reason.trim()
+      : null
+  const journal: Record<string, unknown> = {
+    ...result.journal,
+    source: "track",
+    track,
+    optionId: evo.id,
+    option: { id: evo.id, name: evo.name, stableId: evo.stableId },
+    prerequisites: {
+      fromDefinitionStableId: path.fromDefinitionStableId,
+      toDefinitionStableId: path.toDefinitionStableId,
+      fromGrade: path.fromGrade,
+      toGrade: path.toGrade,
+      minTrackLevel: path.minTrackLevel ?? null,
+      requiredTitleStableIds: path.requiredTitleStableIds,
+      requiredSkillStableIds: path.requiredSkillStableIds,
+    },
+    destination: {
+      id: destDefinition.id,
+      stableId: destDefinition.stableId,
+      name: destDefinition.name,
+      grade: path.toGrade,
+    },
+    reason,
+  }
+
+  await tx.progressionEvent.create({
+    data: {
+      characterId: row.id,
+      kind: "evolve",
+      payload: {
+        optionId: evo.id,
+        track,
+        journal,
+        reason,
+      } as Prisma.InputJsonValue,
+    },
+  })
+  const updated = (await tx.character.findUnique({
+    where: { id: row.id },
+    include: characterInclude,
+  }))!
+  const updatedConfig = buildRulesConfig(updated.race, houseRules.config)
+  return {
+    character: toDetail(updated, true, updatedConfig, houseRules.version),
+    journal,
+  }
+}
+
+/**
  * Consume a catalog consumable onto a character.
  *
  * The consumer must be the owner or an admin, the target catalog entry must be
@@ -2248,199 +3001,325 @@ function definitionUpgradeGroup(def: {
   return typeof group === "string" && group.length > 0 ? group : undefined
 }
 
+/** A human label for each associable kind, used only in error messages. */
+function labelForKind(
+  kind: "title" | "equipment" | "blessing" | "bloodline"
+): string {
+  switch (kind) {
+    case "title":
+      return "title"
+    case "equipment":
+      return "equipment piece"
+    case "blessing":
+      return "blessing"
+    case "bloodline":
+      return "bloodline"
+  }
+}
+
+/**
+ * Attach (`add`) or detach (`remove`) a catalog definition as a character
+ * association. Only a title, equipment piece, blessing or bloodline can be
+ * linked here (skills are handled by `skillCharacter`).
+ *
+ * - **title / equipment**: an add never stacks superseded entries; it atomically
+ *   removes whatever currently occupies the SAME title upgrade group / equipment
+ *   slot.
+ * - **blessing**: exactly one ACTIVE unarchived blessing may exist at a time, so
+ *   an add atomically replaces EVERY existing blessing link on the character
+ *   (including archived links), and a remove detaches only the named link.
+ * - **bloodline**: bloodlines coexist. An add with NO `upgradeGroup` appends
+ *   without displacing anything; an add that DOES declare an `upgradeGroup`
+ *   atomically replaces every existing bloodline link sharing that group. The
+ *   group is only an add/select replacement group - never an effect stacking
+ *   group.
+ *
+ * A duplicate add is rejected; an archived catalog entry can never be newly
+ * attached but an archived linked entry can always be removed. The mutation runs
+ * under SERIALIZABLE isolation and CASes the character version (`version`); a
+ * stale version 409s (and rolls back the link delete/create and the event), and a
+ * concurrent write that fails to serialize also 409s.
+ */
 export async function associateCharacter(
   id: string,
   body: {
-    kind: "title" | "equipment"
+    kind: "title" | "equipment" | "blessing" | "bloodline"
     definitionId: string
     operation: "add" | "remove"
     version: number
   },
   user: SessionUser
 ): Promise<{ character: CharacterDetail }> {
-  return prisma.$transaction(async (tx) => {
-    const row = await assertOwner(tx, id, user)
-    const houseRules = await loadHouseRules(tx)
+  return prisma
+    .$transaction(
+      async (tx) => {
+        const row = await assertOwner(tx, id, user)
+        const houseRules = await loadHouseRules(tx)
 
-    const definition = await tx.catalogDefinition.findUnique({
-      where: { id: body.definitionId },
-    })
-    if (!definition) {
-      throw notFound("catalog_not_found", "Catalog entry not found")
-    }
-    const expectedKind = body.kind === "title" ? "titles" : "equipment"
-    if (definition.kind !== expectedKind) {
-      throw badRequest(
-        "wrong_kind",
-        `Catalog entry has wrong kind (expected "${expectedKind}")`
-      )
-    }
-
-    const assocKind = body.kind === "title" ? "TITLE" : "EQUIPMENT"
-    const existing = row.associations
-    const existingLink = existing.find(
-      (l) =>
-        l.definitionId === body.definitionId &&
-        (body.kind === "title" ? l.kind === "TITLE" : l.kind === "EQUIPMENT")
-    )
-
-    // Links the operation displaces: for an add, every existing link that shares
-    // the equipment slot / title upgrade group; for a remove, the single link
-    // being removed (an archived linked entry is always removable).
-    const displaced: Array<{ id: string; definitionId: string; name: string }> =
-      []
-
-    if (body.operation === "add") {
-      // An archived catalog entry cannot be newly attached.
-      if (definition.archived) {
-        throw badRequest(
-          "catalog_archived",
-          "Catalog entry is archived and cannot be attached"
-        )
-      }
-      if (existingLink) {
-        throw badRequest(
-          "duplicate",
-          `This ${body.kind === "title" ? "title" : "equipment piece"} is already attached`
-        )
-      }
-
-      const config = parseCatalogConfig(
-        definition.kind,
-        definition.config ?? {}
-      )
-
-      // Equipment add replaces whatever currently occupies the SAME slot. Remove
-      // every such link atomically - never leave a second effective item in a
-      // slot.
-      if (body.kind === "equipment") {
-        const slot = config.slot as string | undefined
-        if (slot) {
-          const sameSlotLinks = existing.filter(
-            (l) =>
-              l.kind === "EQUIPMENT" && definitionSlot(l.definition) === slot
-          )
-          for (const link of sameSlotLinks) {
-            displaced.push({
-              id: link.id,
-              definitionId: link.definitionId,
-              name: link.definition.name,
-            })
-            await tx.characterAssociation.deleteMany({
-              where: {
-                characterId: id,
-                definitionId: link.definitionId,
-              },
-            })
-          }
+        const definition = await tx.catalogDefinition.findUnique({
+          where: { id: body.definitionId },
+        })
+        if (!definition) {
+          throw notFound("catalog_not_found", "Catalog entry not found")
         }
-      }
-
-      // Title add never stacks superseded tiers: it removes every title that
-      // currently occupies the same upgrade group.
-      if (body.kind === "title") {
-        const upgradeGroup = config.upgradeGroup as string | undefined
-        if (upgradeGroup) {
-          const sameGroupLinks = existing.filter(
-            (l) =>
-              l.kind === "TITLE" &&
-              definitionUpgradeGroup(l.definition) === upgradeGroup
+        const expectedKind = ASSOC_KIND_TO_DEF_KIND[body.kind]
+        if (definition.kind !== expectedKind) {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind (expected "${expectedKind}")`
           )
-          for (const link of sameGroupLinks) {
-            displaced.push({
-              id: link.id,
-              definitionId: link.definitionId,
-              name: link.definition.name,
-            })
-            await tx.characterAssociation.deleteMany({
-              where: {
-                characterId: id,
-                definitionId: link.definitionId,
-              },
-            })
-          }
         }
-      }
 
-      await tx.characterAssociation.create({
-        data: {
-          characterId: id,
-          definitionId: definition.id,
-          kind: assocKind as never,
-        },
-      })
-    } else {
-      if (!existingLink) {
-        throw badRequest(
-          "not_linked",
-          `This ${body.kind === "title" ? "title" : "equipment piece"} is not attached to the character`
+        const assocKind = ASSOC_KIND_TO_DB[body.kind]
+        const existing = row.associations
+        const existingLink = existing.find(
+          (l) => l.definitionId === body.definitionId && l.kind === assocKind
         )
-      }
-      displaced.push({
-        id: existingLink.id,
-        definitionId: existingLink.definitionId,
-        name: existingLink.definition.name,
-      })
-      await tx.characterAssociation.deleteMany({
-        where: {
-          characterId: id,
-          definitionId: existingLink.definitionId,
-        },
-      })
-    }
 
-    // CAS: the character version must match the expected value. A mismatch
-    // returns 409 and rolls back the link create/delete and the event.
-    const updatedMany = await tx.character.updateMany({
-      where: { id, version: body.version },
-      data: { version: { increment: 1 } },
-    })
-    if (updatedMany.count !== 1) {
-      throw conflict(
-        "version_conflict",
-        `Version mismatch: expected ${body.version}, got a newer version`
-      )
-    }
+        // Links the operation displaces: for an add, every existing link that
+        // shares the equipment slot / title or bloodline upgrade group, or - for
+        // a blessing - every existing blessing link; for a remove, the single link
+        // being removed (an archived linked entry is always removable).
+        const displaced: Array<{
+          id: string
+          definitionId: string
+          name: string
+          kind: string
+        }> = []
 
-    const config = parseCatalogConfig(definition.kind, definition.config ?? {})
-    await tx.progressionEvent.create({
-      data: {
-        characterId: id,
-        kind: "associate",
-        payload: {
-          operation: body.operation,
-          kind: body.kind,
-          definitionId: definition.id,
-          definition: {
-            id: definition.id,
-            name: definition.name,
-            ...(body.kind === "equipment"
-              ? {
-                  slot: (config.slot as string | undefined) ?? null,
-                }
-              : {}),
-            ...(body.kind === "title"
-              ? {
-                  upgradeGroup:
-                    (config.upgradeGroup as string | undefined) ?? null,
-                }
-              : {}),
+        if (body.operation === "add") {
+          // An archived catalog entry cannot be newly attached.
+          if (definition.archived) {
+            throw badRequest(
+              "catalog_archived",
+              "Catalog entry is archived and cannot be attached"
+            )
+          }
+          if (existingLink) {
+            throw badRequest(
+              "duplicate",
+              `This ${labelForKind(body.kind)} is already attached`
+            )
+          }
+
+          const config = parseCatalogConfig(
+            definition.kind,
+            definition.config ?? {}
+          )
+
+          // A blessing never stacks. Adding one atomically replaces EVERY existing
+          // blessing link on the character (active or archived - an archived link
+          // is still removable, and exactly one active blessing may exist).
+          if (body.kind === "blessing") {
+            const sameKindLinks = existing.filter((l) => l.kind === "BLESSING")
+            for (const link of sameKindLinks) {
+              displaced.push({
+                id: link.id,
+                definitionId: link.definitionId,
+                name: link.definition.name,
+                kind: link.kind,
+              })
+              await tx.characterAssociation.deleteMany({
+                where: {
+                  characterId: id,
+                  definitionId: link.definitionId,
+                },
+              })
+            }
+          }
+
+          // Equipment add replaces whatever currently occupies the SAME slot.
+          // Remove every such link atomically - never leave a second effective
+          // item in a slot.
+          if (body.kind === "equipment") {
+            const slot = config.slot as string | undefined
+            if (slot) {
+              const sameSlotLinks = existing.filter(
+                (l) =>
+                  l.kind === "EQUIPMENT" &&
+                  definitionSlot(l.definition) === slot
+              )
+              for (const link of sameSlotLinks) {
+                displaced.push({
+                  id: link.id,
+                  definitionId: link.definitionId,
+                  name: link.definition.name,
+                  kind: link.kind,
+                })
+                await tx.characterAssociation.deleteMany({
+                  where: {
+                    characterId: id,
+                    definitionId: link.definitionId,
+                  },
+                })
+              }
+            }
+          }
+
+          // Title add never stacks superseded tiers: it removes every title that
+          // currently occupies the same upgrade group.
+          if (body.kind === "title") {
+            const upgradeGroup = config.upgradeGroup as string | undefined
+            if (upgradeGroup) {
+              const sameGroupLinks = existing.filter(
+                (l) =>
+                  l.kind === "TITLE" &&
+                  definitionUpgradeGroup(l.definition) === upgradeGroup
+              )
+              for (const link of sameGroupLinks) {
+                displaced.push({
+                  id: link.id,
+                  definitionId: link.definitionId,
+                  name: link.definition.name,
+                  kind: link.kind,
+                })
+                await tx.characterAssociation.deleteMany({
+                  where: {
+                    characterId: id,
+                    definitionId: link.definitionId,
+                  },
+                })
+              }
+            }
+          }
+
+          // Bloodlines coexist: a new bloodline with NO upgradeGroup is added
+          // without displacing anything. One that DOES declare an upgradeGroup
+          // atomically replaces every existing bloodline link sharing that group
+          // (the group is only an add/select replacement group, never an effect
+          // stacking group).
+          if (body.kind === "bloodline") {
+            const upgradeGroup = config.upgradeGroup as string | undefined
+            if (upgradeGroup) {
+              const sameGroupLinks = existing.filter(
+                (l) =>
+                  l.kind === "BLOODLINE" &&
+                  definitionUpgradeGroup(l.definition) === upgradeGroup
+              )
+              for (const link of sameGroupLinks) {
+                displaced.push({
+                  id: link.id,
+                  definitionId: link.definitionId,
+                  name: link.definition.name,
+                  kind: link.kind,
+                })
+                await tx.characterAssociation.deleteMany({
+                  where: {
+                    characterId: id,
+                    definitionId: link.definitionId,
+                  },
+                })
+              }
+            }
+          }
+
+          await tx.characterAssociation.create({
+            data: {
+              characterId: id,
+              definitionId: definition.id,
+              kind: assocKind as never,
+            },
+          })
+        } else {
+          if (!existingLink) {
+            throw badRequest(
+              "not_linked",
+              `This ${labelForKind(body.kind)} is not attached to the character`
+            )
+          }
+          displaced.push({
+            id: existingLink.id,
+            definitionId: existingLink.definitionId,
+            name: existingLink.definition.name,
+            kind: existingLink.kind,
+          })
+          await tx.characterAssociation.deleteMany({
+            where: {
+              characterId: id,
+              definitionId: existingLink.definitionId,
+            },
+          })
+        }
+
+        // CAS: the character version must match the expected value. A mismatch
+        // returns 409 and rolls back the link create/delete and the event.
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: body.version },
+          data: { version: { increment: 1 } },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${body.version}, got a newer version`
+          )
+        }
+
+        const config = parseCatalogConfig(
+          definition.kind,
+          definition.config ?? {}
+        )
+        await tx.progressionEvent.create({
+          data: {
+            characterId: id,
+            kind: "associate",
+            payload: {
+              operation: body.operation,
+              kind: body.kind,
+              definitionId: definition.id,
+              definition: {
+                id: definition.id,
+                name: definition.name,
+                kind: definition.kind,
+                stableId: definition.stableId,
+                grade: definition.grade,
+                provenance: definition.provenance,
+                ...(body.kind === "equipment"
+                  ? {
+                      slot: (config.slot as string | undefined) ?? null,
+                    }
+                  : {}),
+                ...(body.kind === "title" || body.kind === "bloodline"
+                  ? {
+                      upgradeGroup:
+                        (config.upgradeGroup as string | undefined) ?? null,
+                    }
+                  : {}),
+                ...(body.kind === "blessing"
+                  ? {
+                      upgradeGroup:
+                        (config.upgradeGroup as string | undefined) ?? null,
+                      tier: (config.tier as string | undefined) ?? null,
+                    }
+                  : {}),
+              },
+              added:
+                body.operation === "add"
+                  ? { id: definition.id, name: definition.name }
+                  : null,
+              removed: displaced,
+            } as Prisma.InputJsonValue,
           },
-          added:
-            body.operation === "add"
-              ? { id: definition.id, name: definition.name }
-              : null,
-          removed: displaced,
-        } as Prisma.InputJsonValue,
-      },
-    })
+        })
 
-    const updated = (await tx.character.findUnique({
-      where: { id },
-      include: characterInclude,
-    }))!
-    return { character: detailFor(updated, houseRules) }
-  })
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return { character: detailFor(updated, houseRules) }
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      // A concurrent association write that cannot serialize surfaces as P2034;
+      // map it to a 409 rather than a raw 500.
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "catalog_serialization_conflict",
+          "Concurrent character association write conflict; retry the change"
+        )
+      }
+      throw err
+    })
 }
 
 export async function exportCharacter(
@@ -2560,6 +3439,37 @@ async function findCatalogByStableId(
   return row
 }
 
+/**
+ * Resolve a blessing config's `patronGodStableId` to the FK `patronId`, or null
+ * when no patron is configured. The referenced definition MUST be an unarchived
+ * `gods` entry; a missing definition (including a wrong-kind stableId, because
+ * the lookup is scoped to `gods`) or an archived god is rejected with an
+ * actionable 400, never a dangling FK. Phase 2 will synthesize the god's
+ * metadata when the blessing is linked to a character; the FK is the only
+ * authoritative reference stored for now.
+ */
+async function resolveBlessingPatronId(
+  db: DbClient,
+  config: Record<string, unknown>
+): Promise<string | null> {
+  const stableId = config.patronGodStableId
+  if (typeof stableId !== "string" || stableId.length === 0) return null
+  const god = await findCatalogByStableId(db, "gods", stableId)
+  if (!god) {
+    throw badRequest(
+      "patron_god_not_found",
+      `Patron god "${stableId}" is not in the catalog`
+    )
+  }
+  if (god.archived) {
+    throw badRequest(
+      "patron_god_archived",
+      `Patron god "${god.name}" is archived; unarchive it before granting its blessing`
+    )
+  }
+  return god.id
+}
+
 async function resolveIdentityRef(
   db: DbClient,
   kind: string,
@@ -2592,17 +3502,21 @@ const ASSOC_KIND_TO_DB = {
   title: "TITLE",
   equipment: "EQUIPMENT",
   skill: "SKILL",
+  blessing: "BLESSING",
+  bloodline: "BLOODLINE",
 } as const
 
 const ASSOC_KIND_TO_DEF_KIND = {
   title: "titles",
   equipment: "equipment",
   skill: "skills",
+  blessing: "blessings",
+  bloodline: "bloodlines",
 } as const
 
 type ResolvedAssoc = {
-  sourceKind: "title" | "equipment" | "skill"
-  dbKind: "TITLE" | "EQUIPMENT" | "SKILL"
+  sourceKind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
+  dbKind: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
   definitionId: string
   definition: CatalogLookupRow
 }
@@ -2641,7 +3555,7 @@ async function resolveAssociationRefs(
     seen.add(def.id)
     resolved.push({
       sourceKind: a.kind,
-      dbKind: ASSOC_KIND_TO_DB[a.kind] as "TITLE" | "EQUIPMENT" | "SKILL",
+      dbKind: ASSOC_KIND_TO_DB[a.kind],
       definitionId: def.id,
       definition: def,
     })
@@ -2650,15 +3564,18 @@ async function resolveAssociationRefs(
 }
 
 /**
- * Reject a pair of active (unarchived) associations that would collide: two
- * equipment links sharing a slot, or two title / skill links sharing an upgrade
- * group. Archived definitions are inert and never collide. This mirrors the
- * runtime invariant enforced by `associateCharacter` and `assertNoLinkCollision`.
+ * Reject a pair of active (unarchived) associations that would collide. Active
+ * equipment links sharing a slot, title / skill / bloodline links sharing an
+ * upgrade group, and more than one active blessing all collide. Archived
+ * definitions are inert and never collide. This mirrors the runtime invariant
+ * enforced by `associateCharacter` and `assertNoLinkCollision`.
  */
 function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
   const slots = new Map<string, string>()
   const titleGroups = new Map<string, string>()
   const skillGroups = new Map<string, string>()
+  const bloodlineGroups = new Map<string, string>()
+  let activeBlessingName: string | null = null
   for (const r of resolved) {
     if (r.definition.archived) continue
     const config = parseCatalogConfig(
@@ -2689,7 +3606,7 @@ function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
         }
         titleGroups.set(group, r.definition.name)
       }
-    } else {
+    } else if (r.sourceKind === "skill") {
       const group = upgradeGroupForConfig(config)
       if (group) {
         const existing = skillGroups.get(group)
@@ -2700,6 +3617,26 @@ function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
           )
         }
         skillGroups.set(group, r.definition.name)
+      }
+    } else if (r.sourceKind === "blessing") {
+      if (activeBlessingName != null) {
+        throw badRequest(
+          "import_link_collision",
+          `More than one active blessing: "${activeBlessingName}" and "${r.definition.name}"`
+        )
+      }
+      activeBlessingName = r.definition.name
+    } else if (r.sourceKind === "bloodline") {
+      const group = upgradeGroupForConfig(config)
+      if (group) {
+        const existing = bloodlineGroups.get(group)
+        if (existing) {
+          throw badRequest(
+            "import_link_collision",
+            `Bloodline upgrade group "${group}" is occupied by both "${existing}" and "${r.definition.name}"`
+          )
+        }
+        bloodlineGroups.set(group, r.definition.name)
       }
     }
   }
@@ -2830,7 +3767,7 @@ function normalizeImportedState(
 
   const tracks: CharacterState["tracks"] = { ...state.tracks }
   if (tracks["class"]) {
-    const def = resolveTrackDefinition(classRow, resolvedState)
+    const def = resolveTrackDefinition(classRow, resolvedState, "class")
     if (!def) {
       throw badRequest(
         "invalid_import",
@@ -2840,7 +3777,7 @@ function normalizeImportedState(
     tracks["class"] = { ...tracks["class"], definitionId: def.id }
   }
   if (profRow && tracks["profession"]) {
-    const def = resolveTrackDefinition(profRow, resolvedState)
+    const def = resolveTrackDefinition(profRow, resolvedState, "profession")
     if (!def) {
       throw badRequest(
         "invalid_import",
@@ -2860,12 +3797,29 @@ function normalizeImportedState(
 }
 
 /**
+ * Assert a grade band drawn from the configured grade table is usable: the
+ * published min/max and the evolution entry level must all be nonnegative. A
+ * malformed band would make the imported track threshold comparisons meaningless
+ * (a negative entry level would silently permit an un-advanceable track), so we
+ * reject rather than miscompute a ceiling.
+ */
+function assertGradeBand(band: GradeBand, context: string): void {
+  if (band.min < 0 || band.max < 0 || band.entryLevel < 0) {
+    throw badRequest(
+      "invalid_import",
+      `${context} grade ${band.grade} band must be nonnegative (min ${band.min}, max ${band.max}, entryLevel ${band.entryLevel})`
+    )
+  }
+}
+
+/**
  * Validate the imported state's self-consistency before persisting. Rejects a
  * backup that (after Zod shape validation) has the wrong track set, out-of-range
- * track levels/quarters, disagrees on origin, carries negative or non-integer
- * attribute/allocation values, over-allocates free points, or (for a derived
- * race) declares a race level inconsistent with the track levels. Every failure
- * is a 400 `invalid_import` raised BEFORE any DB write. No automatic
+ * track levels/quarters, a graded class/profession track already sitting past the
+ * entry threshold of its NEXT grade, disagrees on origin, carries negative or
+ * non-integer attribute/allocation values, over-allocates free points, or (for a
+ * derived race) declares a race level inconsistent with the track levels. Every
+ * failure is a 400 `invalid_import` raised BEFORE any DB write. No automatic
  * user-provided effects are added beyond the validated state.
  */
 function assertImportState(
@@ -2916,6 +3870,48 @@ function assertImportState(
         "invalid_import",
         `Imported track "${track}" quarter ${String(t.quarter)} must be an integer in 0..3`
       )
+    }
+    // Graded track ceiling: a track carrying an explicit grade must not already sit
+    // PAST the entry level of its NEXT grade, or the first level-up would throw
+    // "without completed track evolution" and the imported character could never
+    // advance. A value exactly AT the threshold is legal (the engine allows
+    // reaching it); only a level strictly beyond it is rejected. The FINAL grade
+    // has no next band, so its level is bounded by the published band max instead.
+    // Legacy ungraded tracks (no `grade`) are exempt. Thresholds come from the
+    // configured grade table via the engine's `nextGrade`/`bandForGrade` - never a
+    // hand-rolled grade->level remapping - and every consulted band is checked to
+    // be nonnegative so a malformed table cannot silently widen a ceiling.
+    if (t.grade != null) {
+      const currentBand = bandForGrade(t.grade, config.gradeTable)
+      if (!currentBand) {
+        throw badRequest(
+          "invalid_import",
+          `Imported track "${track}" grade "${t.grade}" has no grade band defined`
+        )
+      }
+      assertGradeBand(currentBand, `Imported track "${track}"`)
+      const next = nextGrade(t.grade)
+      if (next) {
+        const nextBand = bandForGrade(next, config.gradeTable)
+        if (!nextBand) {
+          throw badRequest(
+            "invalid_import",
+            `Imported track "${track}" next grade "${next}" has no grade band defined`
+          )
+        }
+        assertGradeBand(nextBand, `Imported track "${track}"`)
+        if (t.level > nextBand.entryLevel) {
+          throw badRequest(
+            "invalid_import",
+            `Imported track "${track}" level ${t.level} exceeds the ${t.grade}->${next} threshold (${nextBand.entryLevel}); advancing would fail`
+          )
+        }
+      } else if (currentBand.max != null && t.level > currentBand.max) {
+        throw badRequest(
+          "invalid_import",
+          `Imported track "${track}" level ${t.level} exceeds the final grade ${t.grade} max (${currentBand.max})`
+        )
+      }
     }
   }
 
@@ -3146,6 +4142,21 @@ function isUniqueViolation(err: unknown): boolean {
   )
 }
 
+/**
+ * Detect a Prisma serialization/deadlock failure (P2034). Under SERIALIZABLE
+ * isolation two concurrent catalog writes that race on the same row (e.g. two
+ * concurrent blessing creates with the same stableId, or two concurrent god
+ * stableId changes) cannot both commit; the loser surfaces as P2034 and we map
+ * it to a 409 rather than a raw 500.
+ */
+function isSerializationFailure(err: unknown): boolean {
+  return (
+    !!err &&
+    typeof err === "object" &&
+    (err as { code?: string }).code === "P2034"
+  )
+}
+
 function catalogItem(row: {
   id: string
   kind: string
@@ -3229,12 +4240,28 @@ export async function createCatalogItem(
       'Skill config has an invalid "track": expected "class" or "profession"'
     )
   }
-  // A NEW evolutions entry must be a valid full race path; a legacy
-  // metadata-only config cannot be used as an optionId choice.
-  if (kind === "evolutions" && !isValidRaceEvolutionConfig(config)) {
+  // A NEW evolutions entry must be a valid full race OR class/profession path; a
+  // legacy metadata-only config cannot be used as an optionId choice.
+  if (kind === "evolutions" && !isValidEvolutionConfig(config)) {
     throw badRequest(
       "invalid_config",
-      'Evolution config is not a valid race path: it requires track "race", fromRaceStableId, toRaceStableId, fromGrade and toGrade'
+      'Evolution config is not a valid path: it must be a complete race path (track "race", fromRaceStableId, toRaceStableId, fromGrade, toGrade) OR a complete class/profession path (track "class"/"profession", fromDefinitionStableId, toDefinitionStableId, fromGrade, toGrade)'
+    )
+  }
+  // A NEW blessing must carry the modern `tier` + `effects` shape; a legacy
+  // metadata-only config is accepted only for existing entries, never here.
+  if (kind === "blessings" && isLegacyBlessingConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Blessing config is missing required "tier" and "effects" fields'
+    )
+  }
+  // A NEW bloodline must carry the modern `effects` shape; a legacy
+  // metadata-only config is accepted only for existing entries, never here.
+  if (kind === "bloodlines" && isLegacyBloodlineConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Bloodline config is missing required "effects" field'
     )
   }
   let stableId = input.stableId
@@ -3245,21 +4272,40 @@ export async function createCatalogItem(
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || "entry"
   }
+  // A blessing's configured patron god resolves to the FK `patronId`; every other
+  // kind keeps it null. Resolution is a READ, so it happens inside the SAME
+  // transaction as the create so an invalid/archived patron is rejected up front
+  // (never a dangling FK) and the read never races the write.
+  //
+  // Blessings and bloodlines run under SERIALIZABLE isolation: two concurrent
+  // creates that race on the same (kind, stableId) cannot both commit, and the
+  // loser surfaces as P2034 which we map to a 409 rather than a silent 500.
+  const serializable =
+    kind === "blessings" || kind === "bloodlines"
+      ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+      : undefined
   try {
-    const row = await prisma.catalogDefinition.create({
-      data: {
-        kind: kind as never,
-        stableId,
-        name: input.name,
-        description: input.description ?? null,
-        grade: input.grade ?? null,
-        provenance: input.provenance ?? "house",
-        sourceUrl: input.sourceUrl ?? null,
-        archived: input.archived ?? false,
-        config: config as Prisma.InputJsonValue,
-      },
-    })
-    return catalogItem(row)
+    return await prisma.$transaction(async (tx) => {
+      const patronData: { patronId?: string | null } =
+        kind === "blessings"
+          ? { patronId: await resolveBlessingPatronId(tx, config) }
+          : {}
+      const row = await tx.catalogDefinition.create({
+        data: {
+          kind: kind as never,
+          stableId,
+          name: input.name,
+          description: input.description ?? null,
+          grade: input.grade ?? null,
+          provenance: input.provenance ?? "house",
+          sourceUrl: input.sourceUrl ?? null,
+          archived: input.archived ?? false,
+          config: config as Prisma.InputJsonValue,
+          ...patronData,
+        },
+      })
+      return catalogItem(row)
+    }, serializable)
   } catch (err) {
     if (isUniqueViolation(err)) {
       throw conflict(
@@ -3267,18 +4313,27 @@ export async function createCatalogItem(
         `Catalog entry with stableId "${stableId}" already exists`
       )
     }
+    if (isSerializationFailure(err)) {
+      throw conflict(
+        "catalog_serialization_conflict",
+        "Concurrent catalog write conflict; retry the change"
+      )
+    }
     throw err
   }
 }
 
 /**
- * Reject a catalog update that would make an equipment `slot`, a title
- * `upgradeGroup`, or a skill `upgradeGroup` collide on an EXISTING character
- * link. The rule is that a character can never have two effective (non-archived)
- * effects in the same group/slot, so a config edit that introduces such a
- * collision is rejected with 409 and the whole update is rolled back. Archived
- * definitions are inert and never collide. The check runs inside the same
- * transaction as the update.
+ * Reject a catalog update that would introduce a link collision on an EXISTING
+ * character:
+ *   - an equipment `slot`, a title `upgradeGroup`, a skill `upgradeGroup`, or a
+ *     bloodline `upgradeGroup` collision (a character can never have two effective
+ *     non-archived links in the same slot/group), or
+ *   - a blessing that would leave a character with more than one ACTIVE
+ *     (unarchived) blessing link.
+ * A config edit / unarchive that introduces such a collision is rejected with 409
+ * and the whole update is rolled back. Archived definitions are inert and never
+ * collide. The check runs inside the same transaction as the update.
  */
 async function assertNoLinkCollision(
   tx: DbClient,
@@ -3287,21 +4342,20 @@ async function assertNoLinkCollision(
   finalConfig: Record<string, unknown>,
   finalArchived: boolean
 ): Promise<void> {
-  // Only slots (equipment) and upgrade groups (titles/skills) can collide;
-  // archived definitions synthesise no effect so they cannot conflict.
-  if (kind !== "equipment" && kind !== "titles" && kind !== "skills") return
+  // Only slots (equipment), upgrade groups (titles/skills/bloodlines) and the
+  // single-active-blessing invariant can collide. Archived definitions synthesise
+  // no effect so they cannot conflict.
+  if (
+    kind !== "equipment" &&
+    kind !== "titles" &&
+    kind !== "skills" &&
+    kind !== "bloodlines" &&
+    kind !== "blessings"
+  ) {
+    return
+  }
   if (finalArchived) return
 
-  const slot = kind === "equipment" ? slotForConfig(finalConfig) : undefined
-  const group =
-    kind === "titles" || kind === "skills"
-      ? upgradeGroupForConfig(finalConfig)
-      : undefined
-  const value = slot ?? group
-  if (!value) return
-
-  const expectedAssocKind =
-    kind === "equipment" ? "EQUIPMENT" : kind === "titles" ? "TITLE" : "SKILL"
   const links = await tx.characterAssociation.findMany({
     where: { definitionId },
     include: {
@@ -3311,6 +4365,47 @@ async function assertNoLinkCollision(
     },
   })
 
+  // A blessing is a "one active at a time" link: unarchiving or editing a linked
+  // blessing must not leave its character with more than one active blessing.
+  if (kind === "blessings") {
+    for (const link of links) {
+      const character = link.character
+      if (!character) continue
+      let otherActive: string | null = null
+      for (const other of character.associations ?? []) {
+        if (other.definitionId === definitionId) continue
+        if (other.kind !== "BLESSING") continue
+        const def = other.definition
+        if (!def || def.archived) continue
+        otherActive = def.name
+        break
+      }
+      if (otherActive != null) {
+        throw conflict(
+          "link_collision",
+          `Catalog edit would leave "${character.name}" with more than one active blessing: "${otherActive}" already occupies the active blessing slot`
+        )
+      }
+    }
+    return
+  }
+
+  const slot = kind === "equipment" ? slotForConfig(finalConfig) : undefined
+  const group =
+    kind === "titles" || kind === "skills" || kind === "bloodlines"
+      ? upgradeGroupForConfig(finalConfig)
+      : undefined
+  const value = slot ?? group
+  if (!value) return
+
+  const expectedAssocKind =
+    kind === "equipment"
+      ? "EQUIPMENT"
+      : kind === "titles"
+        ? "TITLE"
+        : kind === "skills"
+          ? "SKILL"
+          : "BLOODLINE"
   for (const link of links) {
     const character = link.character
     if (!character) continue
@@ -3360,47 +4455,96 @@ export async function updateCatalogItem(
     config?: Record<string, unknown>
   }
 ): Promise<CatalogItem> {
-  const existing = await prisma.catalogDefinition.findUnique({ where: { id } })
-  if (!existing || existing.kind !== kind) {
-    throw notFound("catalog_not_found", "Catalog entry not found")
-  }
-  // Legacy consumable configs remain editable for metadata-only PATCHes (no
-  // `config` in the payload): the existing config is re-parsed permissively. A
-  // config-changing PATCH, like a new POST, requires the modern full shape.
-  let config: Record<string, unknown> | undefined
-  if (patch.config != null) {
-    config = parseConfigOr400(kind, patch.config)
-    if (kind === "consumables" && isLegacyConsumableConfig(config)) {
-      throw badRequest(
-        "invalid_config",
-        'Consumable config is missing required "type" and "amount" fields'
-      )
-    }
-    if (kind === "skills" && isIncompleteSkillConfig(config)) {
-      throw badRequest(
-        "invalid_config",
-        'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
-      )
-    }
-    if (kind === "skills" && hasInvalidSkillTrack(config)) {
-      throw badRequest(
-        "invalid_config",
-        'Skill config has an invalid "track": expected "class" or "profession"'
-      )
-    }
-    if (kind === "evolutions" && !isValidRaceEvolutionConfig(config)) {
-      throw badRequest(
-        "invalid_config",
-        'Evolution config is not a valid race path: it requires track "race", fromRaceStableId, toRaceStableId, fromGrade and toGrade'
-      )
-    }
-  }
-  const finalConfig = config ?? parseCatalogConfig(kind, existing.config ?? {})
-  const finalArchived =
-    patch.archived != null ? patch.archived : existing.archived
-  return prisma.$transaction(async (tx) => {
-    await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
-    try {
+  // A god stableId change and every blessing / bloodline config change read the
+  // existing row and then write it, so they run under SERIALIZABLE isolation:
+  // two concurrent edits that race on the same catalog row cannot both commit,
+  // and the loser surfaces as P2034 which we map to a 409.
+  const serializable =
+    kind === "gods" || kind === "blessings" || kind === "bloodlines"
+      ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+      : undefined
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const existing = await tx.catalogDefinition.findUnique({
+        where: { id },
+      })
+      if (!existing || existing.kind !== kind) {
+        throw notFound("catalog_not_found", "Catalog entry not found")
+      }
+      // Legacy consumable configs remain editable for metadata-only PATCHes (no
+      // `config` in the payload): the existing config is re-parsed permissively. A
+      // config-changing PATCH, like a new POST, requires the modern full shape.
+      let config: Record<string, unknown> | undefined
+      if (patch.config != null) {
+        config = parseConfigOr400(kind, patch.config)
+        if (kind === "consumables" && isLegacyConsumableConfig(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Consumable config is missing required "type" and "amount" fields'
+          )
+        }
+        if (kind === "skills" && isIncompleteSkillConfig(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
+          )
+        }
+        if (kind === "skills" && hasInvalidSkillTrack(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Skill config has an invalid "track": expected "class" or "profession"'
+          )
+        }
+        if (kind === "evolutions" && !isValidEvolutionConfig(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Evolution config is not a valid path: it must be a complete race path (track "race", fromRaceStableId, toRaceStableId, fromGrade, toGrade) OR a complete class/profession path (track "class"/"profession", fromDefinitionStableId, toDefinitionStableId, fromGrade, toGrade)'
+          )
+        }
+        if (kind === "blessings" && isLegacyBlessingConfig(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Blessing config is missing required "tier" and "effects" fields'
+          )
+        }
+        if (kind === "bloodlines" && isLegacyBloodlineConfig(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Bloodline config is missing required "effects" field'
+          )
+        }
+      }
+      const finalConfig =
+        config ?? parseCatalogConfig(kind, existing.config ?? {})
+      const finalArchived =
+        patch.archived != null ? patch.archived : existing.archived
+      // A god's stableId cannot change while any blessing still names it as its
+      // patron (via the FK patronId): the JSON `patronGodStableId` in that blessing
+      // config would go stale and diverge from the FK, so reject the change (409)
+      // rather than silently breaking the reference.
+      if (
+        kind === "gods" &&
+        patch.stableId != null &&
+        patch.stableId !== existing.stableId
+      ) {
+        const patronizing = await tx.catalogDefinition.findMany({
+          where: { kind: "blessings", patronId: id },
+        })
+        if (patronizing.length > 0) {
+          throw conflict(
+            "patron_stable_id_in_use",
+            `God "${existing.name}" is the patron of ${patronizing.length} blessing(s); its stableId cannot change while they reference it`
+          )
+        }
+      }
+      // A config-changing blessing PATCH must update the FK in the SAME transaction
+      // as the config, so the JSON `patronGodStableId` and the stored `patronId`
+      // always agree (a change to the stableId repoints the FK; a removal clears it).
+      const patronData: { patronId?: string | null } =
+        kind === "blessings" && config != null
+          ? { patronId: await resolveBlessingPatronId(tx, config) }
+          : {}
+      await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
       const row = await tx.catalogDefinition.update({
         where: { id },
         data: {
@@ -3416,17 +4560,24 @@ export async function updateCatalogItem(
           ...(config != null
             ? { config: config as Prisma.InputJsonValue }
             : {}),
+          ...patronData,
         },
       })
       return catalogItem(row)
-    } catch (err) {
-      if (isUniqueViolation(err)) {
-        throw conflict(
-          "catalog_stable_id_conflict",
-          `Catalog entry with stableId "${patch.stableId}" already exists`
-        )
-      }
-      throw err
+    }, serializable)
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw conflict(
+        "catalog_stable_id_conflict",
+        `Catalog entry with stableId "${patch.stableId}" already exists`
+      )
     }
-  })
+    if (isSerializationFailure(err)) {
+      throw conflict(
+        "catalog_serialization_conflict",
+        "Concurrent catalog write conflict; retry the change"
+      )
+    }
+    throw err
+  }
 }

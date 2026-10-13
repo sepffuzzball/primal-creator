@@ -20,6 +20,23 @@ import { z } from "zod"
 // the Zod output type is the literal union, not a widened string.
 export const gradeSchema = z.enum(["G", "F", "E", "D", "C", "B", "A", "S"])
 
+/**
+ * The seven-level blessing hierarchy, lowest to highest (docs/rules/blessings.md).
+ * A blessing must declare one of these tiers; no other value is accepted on a NEW
+ * or CONFIG-CHANGED write (legacy rows are readable without it).
+ */
+export const blessingTierSchema = z.enum([
+  "Minor",
+  "Lesser",
+  "Intermediate",
+  "Major",
+  "Greater",
+  "Divine",
+  "True",
+])
+
+export type BlessingTier = z.infer<typeof blessingTierSchema>
+
 /** Full attribute vector: every canonical key required, numeric. */
 const fullVectorSchema = z.object({
   strength: z.number(),
@@ -64,6 +81,25 @@ export const nonnegativePartialVectorSchema = z.object({
   willpower: z.number().int().nonnegative().optional(),
 })
 
+/**
+ * Sparse attribute patch whose values are finite integers (signed, unlike the
+ * nonnegative basis-point vector). Used for blessing / bloodline effect `flat`
+ * amounts: a value must be a whole JSON-safe number - never a float, `NaN` or
+ * `Infinity` - so the stored config round-trips through JSON and stays a plain
+ * declarative data object.
+ */
+export const integerPartialVectorSchema = z.object({
+  strength: z.number().int().optional(),
+  agility: z.number().int().optional(),
+  endurance: z.number().int().optional(),
+  vitality: z.number().int().optional(),
+  toughness: z.number().int().optional(),
+  wisdom: z.number().int().optional(),
+  intelligence: z.number().int().optional(),
+  perception: z.number().int().optional(),
+  willpower: z.number().int().optional(),
+})
+
 // ------------------------------------------------------------------ //
 // Engine CharacterState (mirrors lib/rules/types.ts)
 // ------------------------------------------------------------------ //
@@ -72,6 +108,9 @@ const trackStateSchema = z.object({
   level: z.number().int().nonnegative(),
   quarter: z.number().int().min(0).max(3),
   definitionId: z.string(),
+  // Optional explicit class/profession grade state; absent on legacy states. The
+  // engine never infers a grade for a missing field.
+  grade: gradeSchema.optional(),
 })
 
 const raceStateSchema = z.object({
@@ -271,11 +310,19 @@ export const consumeSchema = z.object({
  * optional and is only ever recorded (or, for an admin, used to override the
  * narrative `manualRequirementsText` hard gate). A user-provided reason never
  * bypasses a mechanical requirement.
+ *
+ * `track` is a LITERAL optional `"race"` - never a free string. This is what
+ * keeps a class/profession track path (`track: "class"` / `track: "profession"`)
+ * from being matched (and silently stripped) here: when Zod reaches this branch
+ * with `track: "class"`, the value fails the literal and the union moves on to
+ * `evolveTrackPathSchema`, which preserves the track. Old clients that omit
+ * `track` entirely (the legacy race shape) still parse here unchanged.
  */
 export const evolvePathSchema = z.object({
   optionId: z.string().min(1),
   version: z.number().int().nonnegative(),
   reason: z.string().optional(),
+  track: z.literal("race").optional(),
 })
 
 /**
@@ -288,10 +335,30 @@ export const evolveGradeSchema = z.object({
   version: z.number().int().nonnegative(),
 })
 
-export const evolveSchema = z.union([evolvePathSchema, evolveGradeSchema])
+/**
+ * A CLASS/PROFESSION track evolution path choice. The client supplies the id of
+ * an unarchived `evolutions` catalog entry that declares a valid
+ * `track: "class"` / `track: "profession"` path config, plus the target `track`.
+ * `reason` is optional and is only ever recorded (or, for an admin, used to
+ * override the narrative `manualRequirementsText` hard gate). A user-provided
+ * reason never bypasses a mechanical requirement. The selected track is only
+ * that track's `grade`/`definitionId`; the race grade is never touched.
+ */
+export const evolveTrackPathSchema = z.object({
+  track: z.enum(["class", "profession"]),
+  optionId: z.string().min(1),
+  version: z.number().int().nonnegative(),
+  reason: z.string().optional(),
+})
+
+export const evolveSchema = z.union([
+  evolvePathSchema,
+  evolveGradeSchema,
+  evolveTrackPathSchema,
+])
 
 export const associationSchema = z.object({
-  kind: z.enum(["title", "equipment"]),
+  kind: z.enum(["title", "equipment", "blessing", "bloodline"]),
   definitionId: z.string().min(1),
   operation: z.enum(["add", "remove"]),
   version: z.number().int().nonnegative(),
@@ -333,6 +400,7 @@ export const catalogKindSchema = z.enum([
   "bloodlines",
   "consumables",
   "evolutions",
+  "gods",
 ])
 
 const catalogBase = {
@@ -428,6 +496,30 @@ const skillEffectSchema = z.discriminatedUnion("phase", [
 ])
 
 /**
+ * The declarative passive-effect shape shared by blessings and bloodlines. It is
+ * the same flat/percent discriminated union as a skill effect, but the `flat`
+ * amount is restricted to finite integers (see `integerPartialVectorSchema`) so
+ * the stored config stays a plain JSON-safe, whole-number vector. A blessing may
+ * also carry a `grade`/`effect` legacy field for readability; bloodlines carry a
+ * `vector` legacy field. `SkillEffect` is the typed interface both config kinds
+ * use; a bloodline with narrative-only effects (no numbers) uses `effects: []`.
+ */
+export const catalogEffectSchema = z.discriminatedUnion("phase", [
+  z.object({
+    ...skillEffectBase,
+    phase: z.literal("flat"),
+    amount: integerPartialVectorSchema,
+  }),
+  z.object({
+    ...skillEffectBase,
+    phase: z.literal("percent"),
+    basisPoints: nonnegativePartialVectorSchema,
+  }),
+])
+
+export type SkillEffect = z.infer<typeof catalogEffectSchema>
+
+/**
  * Catalog config for a `skills` entry.
  *
  * `track` is read permissively so a legacy entry carrying an arbitrary string
@@ -487,17 +579,115 @@ export const titleConfigSchema = z
   })
   .passthrough()
 
+/**
+ * Catalog config for a `blessings` entry.
+ *
+ * Modern shape (required on NEW or CONFIG-CHANGED writes):
+ *   - `tier` is the seven-level blessing hierarchy (Minor..True).
+ *   - `effects` is the typed flat/percent declarative effect list. A blessing
+ *     with purely narrative benefits (no numeric effect) may use `effects: []`.
+ *   - `patronGodStableId` (optional) names the unarchived `gods` entry that is
+ *     the blessing's patron; when provided the service stores the resolved FK
+ *     `patronId` in the same transaction.
+ *   - `compatibleBlessingStableIds` (optional) and `upgradeGroup` (optional) are
+ *     forwarded as-is.
+ *
+ * The schema reads permissively (passthrough) so a LEGACY `{grade, effect}`
+ * config stays readable and metadata-only-PATCHable: it carries no `tier` /
+ * `effects`, and `isLegacyBlessingConfig` returns true so the service layer
+ * rejects only NEW/CONFIG-CHANGED writes (never a read).
+ */
 export const blessingConfigSchema = z
   .object({
     grade: gradeSchema.optional(),
+    // Legacy single-effect object; readable, not part of the modern shape.
     effect: z.record(z.string(), z.unknown()).optional(),
+    tier: blessingTierSchema.optional(),
+    patronGodStableId: z.string().min(1).optional(),
+    effects: z.array(catalogEffectSchema).optional(),
+    compatibleBlessingStableIds: z.array(z.string()).optional(),
+    upgradeGroup: z.string().optional(),
   })
   .passthrough()
 
+/**
+ * Detects a `blessings` config that lacks the modern `tier`/`effects` shape.
+ * Such a config is permitted for reads and metadata-only PATCHes (see
+ * `blessingConfigSchema`), but the service layer requires the modern shape
+ * whenever a blessing is created or its config is changed.
+ */
+export function isLegacyBlessingConfig(
+  config: Record<string, unknown>
+): boolean {
+  return config.tier == null || config.effects == null
+}
+
+/**
+ * Catalog config for a `bloodlines` entry.
+ *
+ * Modern shape (required on NEW or CONFIG-CHANGED writes):
+ *   - `effects` is the typed flat/percent declarative effect list. May be `[]`
+ *     for a narrative-only bloodline that grants no numeric effect.
+ *   - `gradeEffects` (optional) is a partial map of grade -> effect list, so a
+ *     bloodline like the Primal Hunter's can scale its Perception bonus per
+ *     grade (see docs/rules/bloodlines.md). Grade-specific effects overlay the
+ *     flat `effects` for matching grades.
+ *   - `upgradeGroup` (optional) is forwarded as-is.
+ *
+ * The schema reads permissively (passthrough) so a LEGACY `{grade, vector}`
+ * config stays readable and metadata-only-PATCHable; `isLegacyBloodlineConfig`
+ * returns true so the service layer rejects only NEW/CONFIG-CHANGED writes.
+ */
 export const bloodlineConfigSchema = z
   .object({
     grade: gradeSchema.optional(),
+    // Legacy stat vector; readable, not part of the modern shape.
     vector: partialVectorSchema.optional(),
+    effects: z.array(catalogEffectSchema).optional(),
+    gradeEffects: z.record(z.string(), z.array(catalogEffectSchema)).optional(),
+    upgradeGroup: z.string().optional(),
+  })
+  .passthrough()
+  .superRefine((config, ctx) => {
+    if (config.gradeEffects == null) return
+    for (const key of Object.keys(config.gradeEffects)) {
+      if (
+        !gradeSchema.options.includes(
+          key as (typeof gradeSchema.options)[number]
+        )
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `bloodline gradeEffects has an invalid grade "${key}"`,
+          path: ["gradeEffects", key],
+        })
+      }
+    }
+  })
+
+/**
+ * Detects a `bloodlines` config that lacks the modern `effects` shape. Such a
+ * config is permitted for reads and metadata-only PATCHes, but the service layer
+ * requires the modern shape whenever a bloodline is created or its config is
+ * changed.
+ */
+export function isLegacyBloodlineConfig(
+  config: Record<string, unknown>
+): boolean {
+  return config.effects == null
+}
+
+/**
+ * Catalog config for a `gods` entry (the Gods & Patrons catalog kind). The god
+ * config is intentionally metadata-only in this phase: `pantheon` and
+ * `divineRank` are free-text descriptors the UI may surface, and a `gods` entry
+ * is never granted numeric effects to characters (phase 2 wires blessing/bloodline
+ * associations). It reads permissively so a future shape cannot break a read.
+ */
+export const godConfigSchema = z
+  .object({
+    pantheon: z.string().optional(),
+    divineRank: z.string().optional(),
   })
   .passthrough()
 
@@ -609,9 +799,13 @@ export const evolutionConfigSchema = z
     fromGrade: gradeSchema.optional(),
     toGrade: gradeSchema.optional(),
     minRaceLevel: z.number().int().nonnegative().optional(),
+    minTrackLevel: z.number().int().nonnegative().optional(),
     requiredTitleStableIds: z.array(z.string()).optional(),
     requiredSkillStableIds: z.array(z.string()).optional(),
     manualRequirementsText: z.string().optional(),
+    // Class/profession path fields (a fully-formed track evolution path).
+    fromDefinitionStableId: z.string().optional(),
+    toDefinitionStableId: z.string().optional(),
   })
   .passthrough()
 
@@ -672,6 +866,82 @@ export function isValidRaceEvolutionConfig(
   return true
 }
 
+/**
+ * Whether an `evolutions` config is a fully-formed, active class/profession
+ * (track) evolution path.
+ *
+ * A track path declares `track: "class"` or `track: "profession"` plus the
+ * required `fromDefinitionStableId`, `toDefinitionStableId`, `fromGrade` and
+ * `toGrade`. The optional `minTrackLevel`, `requiredTitleStableIds`,
+ * `requiredSkillStableIds` and `manualRequirementsText` are validated the same
+ * way as a race path. A legacy metadata-only config (the old `{from,to,titleId}`
+ * shape) is readable and editable, but is NOT a full track path, so this returns
+ * false. The service layer rejects NEW or CONFIG-CHANGED evolutions entries whose
+ * config is neither a complete race path nor a complete class/profession path.
+ */
+export function isValidTrackEvolutionConfig(
+  config: Record<string, unknown>
+): boolean {
+  if (config.track !== "class" && config.track !== "profession") return false
+  if (
+    typeof config.fromDefinitionStableId !== "string" ||
+    config.fromDefinitionStableId.length === 0
+  ) {
+    return false
+  }
+  if (
+    typeof config.toDefinitionStableId !== "string" ||
+    config.toDefinitionStableId.length === 0
+  ) {
+    return false
+  }
+  if (!isGradeValue(config.fromGrade)) return false
+  if (!isGradeValue(config.toGrade)) return false
+  if (
+    config.minTrackLevel != null &&
+    (typeof config.minTrackLevel !== "number" ||
+      !Number.isInteger(config.minTrackLevel) ||
+      config.minTrackLevel < 0)
+  ) {
+    return false
+  }
+  if (
+    config.requiredTitleStableIds != null &&
+    (!Array.isArray(config.requiredTitleStableIds) ||
+      config.requiredTitleStableIds.some((s) => typeof s !== "string"))
+  ) {
+    return false
+  }
+  if (
+    config.requiredSkillStableIds != null &&
+    (!Array.isArray(config.requiredSkillStableIds) ||
+      config.requiredSkillStableIds.some((s) => typeof s !== "string"))
+  ) {
+    return false
+  }
+  if (
+    config.manualRequirementsText != null &&
+    typeof config.manualRequirementsText !== "string"
+  ) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Whether an `evolutions` config is a fully-formed path: either a complete race
+ * path OR a complete class/profession path. A legacy metadata-only config (the
+ * old `{from,to,titleId}` shape) is readable/editable but not a usable path, so
+ * this returns false and it can never be selected by `optionId`.
+ */
+export function isValidEvolutionConfig(
+  config: Record<string, unknown>
+): boolean {
+  return (
+    isValidRaceEvolutionConfig(config) || isValidTrackEvolutionConfig(config)
+  )
+}
+
 const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   races: raceConfigSchema,
   classes: trackConfigSchema,
@@ -683,6 +953,7 @@ const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   bloodlines: bloodlineConfigSchema,
   consumables: consumableConfigSchema,
   evolutions: evolutionConfigSchema,
+  gods: godConfigSchema,
 }
 
 /**

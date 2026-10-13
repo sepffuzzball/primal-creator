@@ -80,6 +80,7 @@ const CATALOG_KINDS = [
   { kind: "bloodlines", label: "Bloodlines" },
   { kind: "consumables", label: "Consumables" },
   { kind: "evolutions", label: "Evolutions" },
+  { kind: "gods", label: "Gods & Patrons" },
 ] as const
 
 function isCatalogActive(pathname: string, kind: string): boolean {

@@ -195,6 +195,16 @@ export interface TrackState {
   /** Quarter index within the level: 0 = 0%, 1 = 25%, 2 = 50%, 3 = 75%. */
   quarter: number
   definitionId: string
+  /**
+   * Optional explicit class/profession grade state. When present the track is
+   * "graded": its level-up is independently capped at the entry level of the NEXT
+   * grade (it may reach exactly that threshold but may not pass it) until the
+   * caller explicitly evolves the track grade via `evolveTrackGrade`. This is
+   * separate from the derived race grade, so a class/profession may evolve ahead
+   * of the race when the race level is below its own boundary. Absent on legacy
+   * states; the engine never infers a grade for a missing field.
+   */
+  grade?: Grade
 }
 
 export type RaceMode = "derived" | "independent"

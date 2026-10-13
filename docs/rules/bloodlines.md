@@ -56,3 +56,51 @@ Treat bloodlines as innate, outside-the-System modifiers that may scale **by
 grade**. Where a numeric gradient is sourced (the Primal Hunter bloodline), use it;
 otherwise leave bloodline values as configurable data rather than inventing
 defaults.
+
+## Catalog config (modern shape)
+
+A `bloodlines` catalog entry must declare the modern shape on create or any
+config-changing update:
+
+```ts
+{
+  // Required: the typed flat/percent declarative effects. May be [] for a
+  // narrative-only bloodline (the wiki catalogs holders, not numeric effects).
+  // Every vector value must be a finite integer (never a float, NaN or Infinity).
+  effects: SkillEffect[],
+  // Optional: per-grade effect lists, so a bloodline like the Primal Hunter's can
+  // scale its Perception bonus by grade (G +5%, F +10%, ...). Grade-specific
+  // effects overlay the flat `effects` for matching grades.
+  gradeEffects?: Partial<Record<Grade, SkillEffect[]>>,
+  // Optional: forwarded as-is.
+  upgradeGroup?: string,
+}
+```
+
+`SkillEffect` is the shared flat/percent discriminated union used by skills,
+blessings and bloodlines: `{ phase: "flat", amount }` or
+`{ phase: "percent", basisPoints }`, each optionally carrying `condition`,
+`stacking`, and `group`. The server validates that every effect vector is a
+finite integer so the stored config is a plain JSON-safe data object.
+
+Legacy entries carrying the old `{ grade, vector }` shape remain readable and
+metadata-only-PATCHable; a create or config-changing update is rejected unless
+`effects` is present.
+
+## Character associations (wired)
+
+Bloodlines can be attached to a character as an association. The server
+synthesizes the declared `effects` (and, exactly when the character's current
+race grade matches a key in `gradeEffects` and nothing otherwise, that grade's
+effects) into the character's live `status` without rewriting the stored state,
+so catalog edits recalculate live effects and never mutate historical awards.
+Archived bloodlines are inert: a linked but archived definition contributes no
+effect.
+
+Bloodlines coexist: adding a bloodline with no `upgradeGroup` appends without
+displacing anything, and one that declares an `upgradeGroup` atomically replaces
+every existing bloodline link on the character that shares that group. The
+`upgradeGroup` is only an add/select replacement group - it is never an effect
+stacking group. Adding a bloodline that shares a group with a link already on
+the character is not accepted as a duplicate; declaring the group with the new
+add is how it is replaced.

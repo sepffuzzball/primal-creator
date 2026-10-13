@@ -75,6 +75,25 @@ function toForm(item: CatalogItem): FormState {
   }
 }
 
+/**
+ * Stable JSON stringifier that sorts object keys, so two semantically identical
+ * config objects (differing only in key order) produce the same string. Used to
+ * decide whether an edit's parsed config is semantically unchanged from the
+ * currently persisted one, so a redundant `config` can be omitted from a PATCH
+ * (which avoids re-validating and re-stamping unchanged config server-side).
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value)
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => stableStringify(v)).join(",")}]`
+  }
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableStringify(record[k])}`)
+    .join(",")}}`
+}
+
 export function CatalogManager({ kind }: { kind: string }) {
   const { user } = useAppShell()
   const isAdmin = user?.isAdmin === true
@@ -173,7 +192,15 @@ export function CatalogManager({ kind }: { kind: string }) {
         ...(form.grade.trim() ? { grade: form.grade } : {}),
         provenance: form.provenance,
         ...(form.sourceUrl.trim() ? { sourceUrl: form.sourceUrl } : {}),
-        config,
+        // On an EDIT whose parsed config is semantically unchanged from the
+        // currently persisted one, omit `config` entirely so the PATCH does not
+        // re-validate / re-stamp the config server-side. Only send `config` when
+        // it actually changed (or on create). The comparison is a deep stable
+        // stringify, so key reordering alone is treated as unchanged.
+        ...(editing == null ||
+        stableStringify(config) !== stableStringify(editing.config ?? {})
+          ? { config }
+          : {}),
       }
       if (editing) {
         await apiFetch<{ item: CatalogItem }>(

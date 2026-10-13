@@ -223,6 +223,25 @@ export function advanceQuarter(
     journal.notes.push(`quarter advanced for ${track}; no level-up`)
   }
 
+  // Independent track-grade ceiling: when a track carries an explicit grade
+  // (graded class/profession state), a level-up may reach exactly the NEXT grade's
+  // entry level but may not push past it until the caller explicitly evolves the
+  // track grade via `evolveTrackGrade`. This is deliberately independent of the
+  // race gate below, so a class/profession may evolve ahead of the race when the
+  // derived race level is still below its own boundary. Legacy ungraded tracks
+  // (no `grade`) are unaffected by this gate.
+  if (leveledUp && existing.grade) {
+    const trackNext = nextGrade(existing.grade)
+    if (trackNext) {
+      const trackNextBand = bandForGrade(trackNext, config.gradeTable)
+      if (trackNextBand && newLevel > trackNextBand.entryLevel) {
+        throw new Error(
+          `advanceQuarter: level-up on "${track}" would push ${track} level past the ${existing.grade}->${trackNext} threshold (${trackNextBand.entryLevel}) without completed track evolution`
+        )
+      }
+    }
+  }
+
   // Race recomputation (derived mode only).
   if (state.race.mode === "derived") {
     const oldRaceLevel = newState.race.level
@@ -412,6 +431,112 @@ export function evolveGrade(
     errors: [],
     state: newState,
     journal: { from, to: targetGrade, level },
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * evolveTrackGrade (explicit class/profession grade evolution)
+ * ------------------------------------------------------------------ */
+
+export interface EvolveTrackJournal {
+  track: TrackId
+  from: Grade
+  to: Grade
+  level: number
+  oldDefinitionId: string
+  newDefinitionId: string
+}
+
+export interface EvolveTrackResult {
+  ok: boolean
+  errors: string[]
+  state?: CharacterState
+  journal?: EvolveTrackJournal
+}
+
+/**
+ * Explicitly evolve a graded class/profession track to the NEXT grade, switching
+ * its recorded definition and un-capping the track-grade ceiling established in
+ * `advanceQuarter`. This differs from `evolveGrade`, which acts on the derived
+ * race grade. It only ever changes the target track's `grade` and `definitionId`;
+ * historical awards and every other ledger are left untouched (the caller must
+ * resolve a missing `grade` on a legacy state separately).
+ */
+export function evolveTrackGrade(
+  state: CharacterState,
+  track: TrackId,
+  targetGrade: Grade,
+  targetDefinitionId: string,
+  config: RulesConfig
+): EvolveTrackResult {
+  const errors: string[] = []
+  const existing = state.tracks[track]
+  if (!existing) {
+    errors.push(`evolveTrackGrade: unknown track "${track}"`)
+    return { ok: false, errors }
+  }
+
+  const from = existing.grade
+  if (!from) {
+    errors.push(
+      `evolveTrackGrade: track "${track}" has no explicit grade to evolve`
+    )
+    return { ok: false, errors }
+  }
+
+  const expected = nextGrade(from)
+  if (expected !== targetGrade) {
+    errors.push(
+      `target grade ${targetGrade} is not the next grade after ${from} (expected ${expected ?? "none"})`
+    )
+  }
+
+  const gate = config.gradeGates[targetGrade]
+  if (gate === false) {
+    errors.push(`grade gate closed for ${targetGrade}`)
+  }
+
+  const band = bandForGrade(targetGrade, config.gradeTable)
+  if (!band) {
+    errors.push(`no grade band defined for ${targetGrade}`)
+  } else if (existing.level < band.entryLevel || existing.level > band.max) {
+    errors.push(
+      `track "${track}" level ${existing.level} does not qualify for ${targetGrade} (needs ${band.entryLevel}-${band.max})`
+    )
+  }
+
+  if (targetDefinitionId.length === 0) {
+    errors.push(
+      `evolveTrackGrade: track "${track}" requires a nonempty target definition id`
+    )
+  }
+
+  if (errors.length > 0) return { ok: false, errors }
+
+  const newState: CharacterState = {
+    ...state,
+    tracks: {
+      ...state.tracks,
+      [track]: {
+        ...existing,
+        grade: targetGrade,
+        definitionId: targetDefinitionId,
+      },
+    },
+  }
+
+  return {
+    ok: true,
+    errors: [],
+    state: newState,
+    journal: {
+      track,
+      from,
+      to: targetGrade,
+      level: existing.level,
+      oldDefinitionId: existing.definitionId,
+      newDefinitionId: targetDefinitionId,
+    },
   }
 }
 

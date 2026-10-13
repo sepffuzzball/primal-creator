@@ -17,6 +17,7 @@ const KIND_LABELS: Record<string, string> = {
   bloodlines: "Bloodlines",
   consumables: "Consumables",
   evolutions: "Evolutions",
+  gods: "Gods & Patrons",
 }
 
 export default function CatalogPage() {

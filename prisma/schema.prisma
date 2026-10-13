@@ -34,6 +34,7 @@ enum CatalogKind {
   bloodlines
   consumables
   evolutions
+  gods
 }
 
 enum Provenance {
@@ -46,6 +47,8 @@ enum AssociationKind {
   TITLE
   EQUIPMENT
   SKILL
+  BLESSING
+  BLOODLINE
 }
 
 // ------------------------------------------------------------------ //
@@ -203,6 +206,15 @@ model CatalogDefinition {
   sourceUrl   String?
   archived    Boolean     @default(false)
   config      Json        @default("{}")
+  // The patron god for a `blessings` entry. Set only when the blessing config
+  // declares a `patronGodStableId`; the FK is resolved to the matching unarchived
+  // `gods` definition so the JSON stableId and the FK never diverge. RESTRICT
+  // because a referenced god is never deleted (its stableId must not change while
+  // any blessing references it - see updateCatalogItem).
+  patronId    String?
+  patron      CatalogDefinition? @relation("CatalogPatron", fields: [patronId], references: [id], onDelete: Restrict)
+  // Reverse relation: the `blessings` entries that name this definition as patron.
+  patronFor   CatalogDefinition[] @relation("CatalogPatron")
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
@@ -216,6 +228,7 @@ model CatalogDefinition {
   @@unique([kind, stableId])
   @@index([kind])
   @@index([kind, archived])
+  @@index([patronId])
   @@map("catalog_definitions")
 }
 
