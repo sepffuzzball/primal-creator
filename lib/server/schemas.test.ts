@@ -6,6 +6,8 @@ import {
   godConfigSchema,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
+  isLegacyTranscendentSkillConfig,
+  transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
 describe("evolveSchema (evolution union)", () => {
@@ -178,6 +180,70 @@ describe("blessing / bloodline / god catalog config", () => {
 
   it("reads a god config that only carries unknown fields", () => {
     const parsed = godConfigSchema.safeParse({ realm: "the void" })
+    expect(parsed.success).toBe(true)
+  })
+})
+
+describe("transcendent_skills catalog config", () => {
+  it("parses a modern transcendent config and preserves its typed passive effects", () => {
+    const parsed = transcendentSkillConfigSchema.safeParse({
+      costDescription: "Loses a Path level to use",
+      acquisitionNotes: "Granted after reaching S-grade",
+      passiveEffects: [
+        { phase: "flat", amount: { strength: 5, wisdom: -2 } },
+        {
+          phase: "percent",
+          basisPoints: { perception: 500 },
+          condition: { kind: "gradeAtLeast", grade: "C" },
+          stacking: "stackCapped",
+          group: "holyland",
+        },
+      ],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.passiveEffects).toHaveLength(2)
+      expect(parsed.data.passiveEffects?.[0]).toMatchObject({
+        phase: "flat",
+      })
+      expect(parsed.data.passiveEffects?.[1]).toMatchObject({
+        phase: "percent",
+        group: "holyland",
+      })
+    }
+  })
+
+  it("reads a legacy transcendent config (no passiveEffects) without error", () => {
+    const parsed = transcendentSkillConfigSchema.safeParse({
+      costDescription: "Heavy cost",
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("detects a legacy vs modern transcendent config", () => {
+    expect(isLegacyTranscendentSkillConfig({ costDescription: "x" })).toBe(true)
+    expect(isLegacyTranscendentSkillConfig({ passiveEffects: [] })).toBe(false)
+  })
+
+  it("rejects a flat passive effect vector that is not a finite integer", () => {
+    const parsed = transcendentSkillConfigSchema.safeParse({
+      passiveEffects: [{ phase: "flat", amount: { strength: 1.5 } }],
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a percent passive effect with negative basis points", () => {
+    const parsed = transcendentSkillConfigSchema.safeParse({
+      passiveEffects: [{ phase: "percent", basisPoints: { perception: -5 } }],
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("parses a narrative-only transcendent with an empty passiveEffects list", () => {
+    const parsed = transcendentSkillConfigSchema.safeParse({
+      passiveEffects: [],
+      acquisitionNotes: "A punch that ignores durability.",
+    })
     expect(parsed.success).toBe(true)
   })
 })

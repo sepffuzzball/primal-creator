@@ -60,6 +60,7 @@ import {
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyConsumableConfig,
+  isLegacyTranscendentSkillConfig,
   isValidEvolutionConfig,
   isValidRaceEvolutionConfig,
   isValidTrackEvolutionConfig,
@@ -95,7 +96,8 @@ type DbClient = Prisma.TransactionClient | typeof prisma
 export interface CharacterAssociationView {
   id: string
   definitionId: string
-  kind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
+  kind:
+    "title" | "equipment" | "skill" | "blessing" | "bloodline" | "transcendent"
   name: string
   slot?: string
   upgradeGroup?: string
@@ -143,6 +145,13 @@ export interface CharacterDetail {
   archived: boolean
   /** True when the character was created from a user-supplied trusted-backup import. */
   imported: boolean
+  /**
+   * Derived transcendent quality: true when at least one unarchived linked
+   * `transcendent_skills` (AssociationKind TRANSCENDENT) definition exists. Not a
+   * persisted flag - it is recomputed at read time from the live links, so
+   * archiving/unlinking the last active definition clears it.
+   */
+  isTranscendent: boolean
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
@@ -641,6 +650,19 @@ function liveState(character: CharacterWithCatalog): CharacterState {
           `${def.id}:grade-${state.race.grade}`
         )
       }
+    } else if (def.kind === "transcendent_skills") {
+      // A transcendent skill's `passiveEffects` are declared in the catalog config
+      // and synthesized live exactly like a skill/blessing/bloodline effect - each
+      // effect keeps its OWN condition/stacking/group from the shared skill effect
+      // schema. `costDescription` / `acquisitionNotes` are never interpreted here
+      // (no cost deduction, no triggered always-on power), and a legacy config that
+      // omits `passiveEffects` contributes nothing (no invented numeric bonus).
+      appendDeclarativeEffects(
+        activeEffects,
+        def,
+        (config.passiveEffects ?? []) as DeclarativeEffect[],
+        def.id
+      )
     }
   }
   return { ...state, equipment, activeEffects }
@@ -721,6 +743,7 @@ const associationViewKinds: Record<
   // typed view label so a stored BLESSING/BLOODLINE link is never mislabelled.
   BLESSING: "blessing",
   BLOODLINE: "bloodline",
+  TRANSCENDENT: "transcendent",
 }
 
 function associationViewKind(
@@ -757,7 +780,7 @@ function associationView(
     const upgradeGroup = config.upgradeGroup as string | undefined
     if (upgradeGroup) view.upgradeGroup = upgradeGroup
   }
-  if (kind === "skill") {
+  if (kind === "skill" || kind === "transcendent") {
     if (link.definition.grade) view.grade = link.definition.grade
     view.provenance = link.definition.provenance
   }
@@ -786,6 +809,20 @@ function skillOfferView(
   }
 }
 
+/**
+ * Derive a character's transcendent quality at read time. True when at least one
+ * linked `TRANSCENDENT` association points at an unarchived catalog definition.
+ * Archived links are inert (they contribute no live effect and do not make a
+ * character a transcendent), and an archived/unlinked last active definition
+ * clears the flag. No persisted flag - this is always recomputed from the current
+ * links, so the derived quality can never diverge from the live links.
+ */
+function isTranscendentFor(character: CharacterWithCatalog): boolean {
+  return character.associations.some(
+    (a) => a.kind === "TRANSCENDENT" && !!a.definition && !a.definition.archived
+  )
+}
+
 function toDetail(
   character: CharacterWithCatalog,
   withStatus: boolean,
@@ -808,6 +845,7 @@ function toDetail(
     version: character.version,
     archived: character.archived,
     imported: character.imported,
+    isTranscendent: isTranscendentFor(character),
     createdAt: character.createdAt.toISOString(),
     updatedAt: character.updatedAt.toISOString(),
     associations: character.associations.map(associationView),
@@ -3003,7 +3041,7 @@ function definitionUpgradeGroup(def: {
 
 /** A human label for each associable kind, used only in error messages. */
 function labelForKind(
-  kind: "title" | "equipment" | "blessing" | "bloodline"
+  kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent"
 ): string {
   switch (kind) {
     case "title":
@@ -3014,6 +3052,8 @@ function labelForKind(
       return "blessing"
     case "bloodline":
       return "bloodline"
+    case "transcendent":
+      return "transcendent skill"
   }
 }
 
@@ -3033,6 +3073,9 @@ function labelForKind(
  *   atomically replaces every existing bloodline link sharing that group. The
  *   group is only an add/select replacement group - never an effect stacking
  *   group.
+ * - **transcendent**: transcendent skills coexist freely. There is no blessing
+ *   singleton and no `upgradeGroup` replacement, so an add simply appends a new
+ *   distinct skill link and a remove detaches only the named link.
  *
  * A duplicate add is rejected; an archived catalog entry can never be newly
  * attached but an archived linked entry can always be removed. The mutation runs
@@ -3043,7 +3086,7 @@ function labelForKind(
 export async function associateCharacter(
   id: string,
   body: {
-    kind: "title" | "equipment" | "blessing" | "bloodline"
+    kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent"
     definitionId: string
     operation: "add" | "remove"
     version: number
@@ -3393,6 +3436,9 @@ export async function exportCharacter(
     state,
     liveState: live,
     status: statusFor(row, config),
+    // Informational derived quality for the exporting UI; NOT authoritative on
+    // import (the importer recomputes it from the re-linked associations).
+    isTranscendent: isTranscendentFor(row),
     associations,
     events: events.map((e) => ({
       kind: e.kind,
@@ -3504,6 +3550,7 @@ const ASSOC_KIND_TO_DB = {
   skill: "SKILL",
   blessing: "BLESSING",
   bloodline: "BLOODLINE",
+  transcendent: "TRANSCENDENT",
 } as const
 
 const ASSOC_KIND_TO_DEF_KIND = {
@@ -3512,11 +3559,14 @@ const ASSOC_KIND_TO_DEF_KIND = {
   skill: "skills",
   blessing: "blessings",
   bloodline: "bloodlines",
+  transcendent: "transcendent_skills",
 } as const
 
 type ResolvedAssoc = {
-  sourceKind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
-  dbKind: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
+  sourceKind:
+    "title" | "equipment" | "skill" | "blessing" | "bloodline" | "transcendent"
+  dbKind:
+    "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
   definitionId: string
   definition: CatalogLookupRow
 }
@@ -4187,9 +4237,16 @@ function catalogItem(row: {
   }
 }
 
-export async function listCatalog(kind: string): Promise<CatalogItem[]> {
+export async function listCatalog(
+  kind: string,
+  opts: { includeArchived?: boolean } = {}
+): Promise<CatalogItem[]> {
+  const includeArchived = opts.includeArchived === true
   const rows = await prisma.catalogDefinition.findMany({
-    where: { kind: kind as never, archived: false },
+    where: {
+      kind: kind as never,
+      ...(includeArchived ? {} : { archived: false }),
+    },
     orderBy: [{ grade: "asc" }, { name: "asc" }],
   })
   return rows.map(catalogItem)
@@ -4262,6 +4319,18 @@ export async function createCatalogItem(
     throw badRequest(
       "invalid_config",
       'Bloodline config is missing required "effects" field'
+    )
+  }
+  // A NEW transcendent skill must carry the modern `passiveEffects` shape; a
+  // legacy metadata-only config is accepted only for existing entries, never
+  // here (a missing list never yields a fabricated default bonus).
+  if (
+    kind === "transcendent_skills" &&
+    isLegacyTranscendentSkillConfig(config)
+  ) {
+    throw badRequest(
+      "invalid_config",
+      'Transcendent skill config is missing required "passiveEffects" field'
     )
   }
   let stableId = input.stableId
@@ -4511,6 +4580,15 @@ export async function updateCatalogItem(
           throw badRequest(
             "invalid_config",
             'Bloodline config is missing required "effects" field'
+          )
+        }
+        if (
+          kind === "transcendent_skills" &&
+          isLegacyTranscendentSkillConfig(config)
+        ) {
+          throw badRequest(
+            "invalid_config",
+            'Transcendent skill config is missing required "passiveEffects" field'
           )
         }
       }

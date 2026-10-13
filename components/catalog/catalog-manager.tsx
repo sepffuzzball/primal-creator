@@ -2,7 +2,13 @@
 
 import * as React from "react"
 import { toast } from "sonner"
-import { PlusIcon, SearchIcon, PencilIcon, LinkIcon } from "lucide-react"
+import {
+  PlusIcon,
+  SearchIcon,
+  PencilIcon,
+  LinkIcon,
+  ArchiveRestoreIcon,
+} from "lucide-react"
 
 import {
   apiFetch,
@@ -107,10 +113,16 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM)
   const [submitting, setSubmitting] = React.useState(false)
   const [formError, setFormError] = React.useState<string | null>(null)
+  const [showArchived, setShowArchived] = React.useState(false)
+  const [unarchiving, setUnarchiving] = React.useState<string | null>(null)
+  const [unarchiveError, setUnarchiveError] = React.useState<string | null>(
+    null
+  )
+  const catalogUrl = `/api/catalog/${kind}${isAdmin && showArchived ? "?includeArchived=1" : ""}`
 
   const load = React.useCallback(async () => {
     try {
-      const res = await apiFetch<CatalogListResponse>(`/api/catalog/${kind}`)
+      const res = await apiFetch<CatalogListResponse>(catalogUrl)
       setItems(res.items)
       setError(null)
     } catch (err) {
@@ -118,11 +130,11 @@ export function CatalogManager({ kind }: { kind: string }) {
     } finally {
       setLoading(false)
     }
-  }, [kind])
+  }, [catalogUrl])
 
   React.useEffect(() => {
     let active = true
-    apiFetch<CatalogListResponse>(`/api/catalog/${kind}`)
+    apiFetch<CatalogListResponse>(catalogUrl)
       .then((res) => {
         if (!active) return
         setItems(res.items)
@@ -138,18 +150,46 @@ export function CatalogManager({ kind }: { kind: string }) {
     return () => {
       active = false
     }
-  }, [kind])
+  }, [catalogUrl])
 
   const visible = React.useMemo(() => {
     if (!items) return []
     const q = query.trim().toLowerCase()
-    if (!q) return items
-    return items.filter(
+    const available = items.filter((item) =>
+      isAdmin && showArchived ? true : !item.archived
+    )
+    if (!q) return available
+    return available.filter(
       (item) =>
         item.name.toLowerCase().includes(q) ||
         item.stableId.toLowerCase().includes(q)
     )
-  }, [items, query])
+  }, [items, query, isAdmin, showArchived])
+
+  const unarchive = React.useCallback(
+    async (item: CatalogItem) => {
+      if (!isAdmin || !window.confirm(`Unarchive "${item.name}"?`)) return
+      setUnarchiving(item.id)
+      setUnarchiveError(null)
+      try {
+        await apiFetch<{ item: CatalogItem }>(
+          `/api/catalog/${kind}/${item.id}`,
+          {
+            ...jsonInit("PATCH", { archived: false }),
+          }
+        )
+        toast.success(`Unarchived "${item.name}".`)
+        await load()
+      } catch (err) {
+        const message = `Could not unarchive "${item.name}". ${err instanceof Error ? err.message : "Please try again."}`
+        setUnarchiveError(message)
+        toast.error(message)
+      } finally {
+        setUnarchiving(null)
+      }
+    },
+    [isAdmin, kind, load]
+  )
 
   const openCreate = React.useCallback(() => {
     setEditing(null)
@@ -241,10 +281,20 @@ export function CatalogManager({ kind }: { kind: string }) {
           </p>
         </div>
         {isAdmin ? (
-          <Button className="gap-1" onClick={openCreate}>
-            <PlusIcon />
-            New entry
-          </Button>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={showArchived}
+                onChange={(event) => setShowArchived(event.target.checked)}
+              />
+              Show archived
+            </label>
+            <Button className="gap-1" onClick={openCreate}>
+              <PlusIcon />
+              New entry
+            </Button>
+          </div>
         ) : null}
       </div>
 
@@ -276,6 +326,10 @@ export function CatalogManager({ kind }: { kind: string }) {
             Retry
           </Button>
         </Alert>
+      ) : null}
+
+      {unarchiveError ? (
+        <Alert variant="destructive">{unarchiveError}</Alert>
       ) : null}
 
       {loading ? (
@@ -312,7 +366,14 @@ export function CatalogManager({ kind }: { kind: string }) {
               ) : (
                 visible.map((item) => (
                   <TableRow key={item.id}>
-                    <TableCell className="font-medium">{item.name}</TableCell>
+                    <TableCell className="font-medium">
+                      {item.name}
+                      {item.archived ? (
+                        <span className="ml-2 rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                          Archived
+                        </span>
+                      ) : null}
+                    </TableCell>
                     <TableCell>{item.grade ?? "-"}</TableCell>
                     <TableCell className="capitalize">
                       {item.provenance}
@@ -344,6 +405,19 @@ export function CatalogManager({ kind }: { kind: string }) {
                         >
                           <PencilIcon />
                         </Button>
+                        {item.archived ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={unarchiving === item.id}
+                            onClick={() => unarchive(item)}
+                          >
+                            <ArchiveRestoreIcon />
+                            {unarchiving === item.id
+                              ? "Unarchiving..."
+                              : "Unarchive"}
+                          </Button>
+                        ) : null}
                       </TableCell>
                     ) : null}
                   </TableRow>

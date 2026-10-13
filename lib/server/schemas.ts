@@ -358,7 +358,7 @@ export const evolveSchema = z.union([
 ])
 
 export const associationSchema = z.object({
-  kind: z.enum(["title", "equipment", "blessing", "bloodline"]),
+  kind: z.enum(["title", "equipment", "blessing", "bloodline", "transcendent"]),
   definitionId: z.string().min(1),
   operation: z.enum(["add", "remove"]),
   version: z.number().int().nonnegative(),
@@ -401,6 +401,7 @@ export const catalogKindSchema = z.enum([
   "consumables",
   "evolutions",
   "gods",
+  "transcendent_skills",
 ])
 
 const catalogBase = {
@@ -675,6 +676,52 @@ export function isLegacyBloodlineConfig(
   config: Record<string, unknown>
 ): boolean {
   return config.effects == null
+}
+
+/**
+ * Catalog config for a `transcendent_skills` entry.
+ *
+ * A transcendent skill is a self-created skill that breaks some fundamental rule
+ * of the system (see docs/rules/transcendents.md). It is character-linkable and
+ * may carry an explicit `passiveEffects` list (typed flat/percent per-effect
+ * declarative effects, the same discriminated union as a skill/blessing/bloodline
+ * effect so stacking group/condition come from the shared skill effect schema),
+ * plus optional narrative `costDescription` and `acquisitionNotes` that the
+ * engine never interprets mechanically (no auto-activation, no cost deduction, no
+ * universal eligibility threshold).
+ *
+ * Modern shape (required on NEW or CONFIG-CHANGED writes):
+ *   - `passiveEffects` is the typed flat/percent declarative effect list. May be
+ *     `[]` for a narrative-only transcendent that grants no numeric effect. A
+ *     config that omits it is rejected by the service layer (it never fabricates
+ *     a default bonus).
+ *   - `costDescription` / `acquisitionNotes` (optional) are prose only - they are
+ *     surfaced to the UI but never treated as a mechanical cost or a triggered
+ *     always-on power.
+ *
+ * The schema reads permissively (passthrough) so a LEGACY config that predates
+ * `passiveEffects` stays readable and metadata-only-PATCHable;
+ * `isLegacyTranscendentSkillConfig` returns true so the service layer requires the
+ * modern shape only on NEW/CONFIG-CHANGED writes (never a read).
+ */
+export const transcendentSkillConfigSchema = z
+  .object({
+    costDescription: z.string().optional(),
+    acquisitionNotes: z.string().optional(),
+    passiveEffects: z.array(catalogEffectSchema).optional(),
+  })
+  .passthrough()
+
+/**
+ * Detects a `transcendent_skills` config that lacks the modern `passiveEffects`
+ * shape. Such a config is permitted for reads and metadata-only PATCHes, but the
+ * service layer requires the modern shape whenever a transcendent skill is
+ * created or its config is changed.
+ */
+export function isLegacyTranscendentSkillConfig(
+  config: Record<string, unknown>
+): boolean {
+  return config.passiveEffects == null
 }
 
 /**
@@ -954,6 +1001,7 @@ const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   consumables: consumableConfigSchema,
   evolutions: evolutionConfigSchema,
   gods: godConfigSchema,
+  transcendent_skills: transcendentSkillConfigSchema,
 }
 
 /**

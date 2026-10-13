@@ -254,6 +254,7 @@ function AssociationSheet({
   consumables,
   blessings,
   bloodlines,
+  transcendentSkills,
   loading,
   busy,
   consumeBusy,
@@ -271,14 +272,21 @@ function AssociationSheet({
   consumables: CatalogItem[]
   blessings: CatalogItem[]
   bloodlines: CatalogItem[]
+  transcendentSkills: CatalogItem[]
   loading: boolean
   busy: boolean
   consumeBusy: boolean
   onAdd: (kind: "title" | "equipment", definitionId: string) => void
   onRemove: (kind: "title" | "equipment", definitionId: string) => void
   onConsume: (definitionId: string) => void
-  onPowerAdd: (kind: "blessing" | "bloodline", definitionId: string) => void
-  onPowerRemove: (kind: "blessing" | "bloodline", definitionId: string) => void
+  onPowerAdd: (
+    kind: "blessing" | "bloodline" | "transcendent",
+    definitionId: string
+  ) => void
+  onPowerRemove: (
+    kind: "blessing" | "bloodline" | "transcendent",
+    definitionId: string
+  ) => void
 }) {
   const linked = new Map(character.associations.map((a) => [a.definitionId, a]))
   const equipmentStatusById = new Map(
@@ -302,6 +310,34 @@ function AssociationSheet({
       a.definitionArchived &&
       !equipmentIds.has(a.definitionId)
   )
+
+  // Archived linked transcendent skills are NOT in the active-only catalog list
+  // (listCatalog filters archived:false), so they would otherwise disappear and
+  // become impossible to remove. Keep them visible with a Remove button. Active
+  // linked transcendent skills missing from the catalog (e.g. a failed catalog
+  // fetch) are kept visible too so an existing link can always be removed
+  // without depending on the catalog list.
+  const transcendentOptions: CatalogItem[] = [
+    ...transcendentSkills,
+    ...character.associations
+      .filter(
+        (a) =>
+          a.kind === "transcendent" &&
+          !transcendentSkills.some((c) => c.id === a.definitionId)
+      )
+      .map(
+        (a) =>
+          ({
+            id: a.definitionId,
+            name: a.name,
+            description: null,
+            provenance: a.provenance ?? "house",
+            grade: a.grade ?? null,
+            archived: a.definitionArchived,
+            config: {},
+          }) as CatalogItem
+      ),
+  ]
 
   function archivedLinkedRow(a: CharacterAssociationView) {
     return (
@@ -528,6 +564,7 @@ function AssociationSheet({
             <TabsTrigger value="consumables">Consumables</TabsTrigger>
             <TabsTrigger value="blessings">Blessings</TabsTrigger>
             <TabsTrigger value="bloodlines">Bloodlines</TabsTrigger>
+            <TabsTrigger value="transcendent">Transcendent skills</TabsTrigger>
           </TabsList>
 
           <TabsContent value="titles" className="pt-3">
@@ -749,6 +786,100 @@ function AssociationSheet({
               </TabsContent>
             )
           })}
+          <TabsContent value="transcendent" className="pt-3">
+            {loading ? (
+              <p className="text-xs text-muted-foreground">
+                Loading transcendent skills...
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {transcendentOptions.map((item) => {
+                  const association = character.associations.find(
+                    (a) =>
+                      a.kind === "transcendent" && a.definitionId === item.id
+                  )
+                  const cost = item.config?.costDescription
+                  const acquisition = item.config?.acquisitionNotes
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                          {item.name}
+                          {item.grade ? (
+                            <Badge variant="outline">{item.grade}</Badge>
+                          ) : null}
+                          {item.archived ? (
+                            <Badge variant="outline">Archived</Badge>
+                          ) : null}
+                        </div>
+                        <p className="text-[0.6875rem] text-muted-foreground">
+                          Provenance: {item.provenance}
+                          {item.sourceUrl ? (
+                            <>
+                              {" "}
+                              -{" "}
+                              <a
+                                className="underline"
+                                href={item.sourceUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Source
+                              </a>
+                            </>
+                          ) : (
+                            ""
+                          )}
+                        </p>
+                        {item.description ? (
+                          <p className="text-xs text-muted-foreground">
+                            {item.description}
+                          </p>
+                        ) : null}
+                        {typeof cost === "string" ? (
+                          <p className="text-xs text-muted-foreground">
+                            Cost description (reference only): {cost}
+                          </p>
+                        ) : null}
+                        {typeof acquisition === "string" ? (
+                          <p className="text-xs text-muted-foreground">
+                            Acquisition notes: {acquisition}
+                          </p>
+                        ) : null}
+                      </div>
+                      {association ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => onPowerRemove("transcendent", item.id)}
+                        >
+                          Remove
+                        </Button>
+                      ) : item.archived ? null : (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => onPowerAdd("transcendent", item.id)}
+                        >
+                          Attach
+                        </Button>
+                      )}
+                    </div>
+                  )
+                })}
+                {transcendentOptions.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No transcendent skills in the catalog.
+                  </p>
+                ) : null}
+              </div>
+            )}
+          </TabsContent>
         </Tabs>
       </SheetContent>
     </Sheet>
@@ -809,6 +940,9 @@ export function CharacterDetail({
     []
   )
   const [bloodlinesCatalog, setBloodlinesCatalog] = React.useState<
+    CatalogItem[]
+  >([])
+  const [transcendentCatalog, setTranscendentCatalog] = React.useState<
     CatalogItem[]
   >([])
   const [catalogLoading, setCatalogLoading] = React.useState(false)
@@ -1209,7 +1343,13 @@ export function CharacterDetail({
 
   const loadCatalog = React.useCallback(
     async (
-      kind: "titles" | "equipment" | "consumables" | "blessings" | "bloodlines"
+      kind:
+        | "titles"
+        | "equipment"
+        | "consumables"
+        | "blessings"
+        | "bloodlines"
+        | "transcendent_skills"
     ) => {
       setCatalogLoading(true)
       try {
@@ -1218,7 +1358,8 @@ export function CharacterDetail({
         else if (kind === "equipment") setEquipmentCatalog(res.items)
         else if (kind === "consumables") setConsumablesCatalog(res.items)
         else if (kind === "blessings") setBlessingsCatalog(res.items)
-        else setBloodlinesCatalog(res.items)
+        else if (kind === "bloodlines") setBloodlinesCatalog(res.items)
+        else setTranscendentCatalog(res.items)
       } catch (err) {
         toast.error(
           err instanceof Error ? err.message : "Failed to load catalog."
@@ -1237,18 +1378,21 @@ export function CharacterDetail({
     if (consumablesCatalog.length === 0) void loadCatalog("consumables")
     if (blessingsCatalog.length === 0) void loadCatalog("blessings")
     if (bloodlinesCatalog.length === 0) void loadCatalog("bloodlines")
+    if (transcendentCatalog.length === 0)
+      void loadCatalog("transcendent_skills")
   }, [
     titlesCatalog.length,
     equipmentCatalog.length,
     consumablesCatalog.length,
     blessingsCatalog.length,
     bloodlinesCatalog.length,
+    transcendentCatalog.length,
     loadCatalog,
   ])
 
   const addAssociation = React.useCallback(
     async (
-      kind: "title" | "equipment" | "blessing" | "bloodline",
+      kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent",
       definitionId: string
     ) => {
       if (!character) return
@@ -1278,7 +1422,7 @@ export function CharacterDetail({
 
   const removeAssociation = React.useCallback(
     async (
-      kind: "title" | "equipment" | "blessing" | "bloodline",
+      kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent",
       definitionId: string
     ) => {
       if (!character) return
@@ -1801,6 +1945,76 @@ export function CharacterDetail({
                     </section>
                   )
                 })}
+                <section aria-label="Transcendent skills">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h4 className="text-xs font-medium">Transcendent skills</h4>
+                    {character.isTranscendent ? (
+                      <Badge variant="outline">Transcendent</Badge>
+                    ) : null}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Transcendent skills are distinct from blessings, bloodlines,
+                    and acquired skills. Listed descriptions and costs are
+                    reference only; this app does not activate skills or deduct
+                    costs.
+                  </p>
+                  {character.associations.filter(
+                    (a) => a.kind === "transcendent"
+                  ).length ? (
+                    <div className="mt-1 flex flex-col gap-2">
+                      {character.associations
+                        .filter((a) => a.kind === "transcendent")
+                        .map((a) => (
+                          <div
+                            key={a.id}
+                            className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                          >
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                                {a.name}
+                                {a.definitionArchived ? (
+                                  <Badge variant="outline">
+                                    Archived - inert
+                                  </Badge>
+                                ) : null}
+                                {a.grade ? (
+                                  <Badge variant="outline">{a.grade}</Badge>
+                                ) : null}
+                              </div>
+                              <p className="text-[0.6875rem] text-muted-foreground">
+                                Provenance: {a.provenance ?? "unspecified"}
+                                {a.definitionArchived
+                                  ? " - linked but not effective"
+                                  : ""}
+                              </p>
+                            </div>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={assocBusy}
+                              onClick={() => {
+                                if (
+                                  window.confirm(
+                                    `Remove ${a.name} from ${character.name}?`
+                                  )
+                                )
+                                  void removeAssociation(
+                                    "transcendent",
+                                    a.definitionId
+                                  )
+                              }}
+                            >
+                              Remove
+                            </Button>
+                          </div>
+                        ))}
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      No linked transcendent skills.
+                    </p>
+                  )}
+                </section>
                 {status ? (
                   <p className="text-xs text-muted-foreground">
                     Current attribute values below reflect server-calculated
@@ -2612,6 +2826,7 @@ export function CharacterDetail({
         consumables={consumablesCatalog}
         blessings={blessingsCatalog}
         bloodlines={bloodlinesCatalog}
+        transcendentSkills={transcendentCatalog}
         loading={catalogLoading}
         busy={assocBusy}
         consumeBusy={consumeBusy}
@@ -2624,6 +2839,17 @@ export function CharacterDetail({
           if (item) requestConsume(item)
         }}
         onPowerAdd={(kind, definitionId) => {
+          if (kind === "transcendent") {
+            const item = transcendentCatalog.find(
+              (entry) => entry.id === definitionId
+            )
+            if (
+              item &&
+              window.confirm(`Attach ${item.name} to ${character.name}?`)
+            )
+              void addAssociation(kind, definitionId)
+            return
+          }
           const displaced =
             kind === "blessing"
               ? character.associations.filter(

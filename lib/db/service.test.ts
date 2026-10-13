@@ -15,9 +15,11 @@ import {
   deserializeState,
   evolveCharacter,
   exportCharacter,
+  getCatalogItem,
   getCharacter,
   getEvolutionOptions,
   importCharacter,
+  listCatalog,
   raceGradeBandBlockers,
   resolveTrackDefinition,
   serializeState,
@@ -1721,11 +1723,408 @@ describe("associateCharacter (blessings / bloodlines)", () => {
   })
 })
 
-describe("updateCatalogItem link-collision rejection", () => {
+describe("transcendent skills (associations / derived quality / live effects)", () => {
   beforeEach(() => {
     dbMock.store.reset()
   })
 
+  function seedCharacter(
+    attrs: { strength?: number } = {},
+    grade: Grade = "G"
+  ): unknown {
+    const state = createInitialState("integrated", null, null)
+    if (attrs.strength != null) state.baseAttributes.strength = attrs.strength
+    state.race = { ...state.race, grade }
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedTranscendent(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "transcendent_skills",
+      stableId: id,
+      name: extra.name ?? `Transcendent ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function flatDelta(status: unknown, name: string): number | undefined {
+    const phases = (
+      status as {
+        traces?: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces?.find((t) => t.attribute === name)?.phases
+    return phases?.find((p) => p.phase === "flat")?.delta
+  }
+
+  it("rejects a NEW transcendent skill that omits passiveEffects (no fabricated default)", async () => {
+    await expect(
+      createCatalogItem("transcendent_skills", {
+        stableId: "trans-1",
+        name: "Holyland",
+        config: { costDescription: "Loses a Path level to use" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("creates a narrative-only transcendent skill with an explicit empty passiveEffects", async () => {
+    const item = await createCatalogItem("transcendent_skills", {
+      stableId: "trans-1",
+      name: "Holyland",
+      config: {
+        passiveEffects: [],
+        acquisitionNotes: "A realm to house the souls of the blessed.",
+      },
+    })
+    expect(item.kind).toBe("transcendent_skills")
+    expect(item.config.passiveEffects).toEqual([])
+  })
+
+  it("reads a legacy transcendent config without passiveEffects and allows a metadata-only PATCH", async () => {
+    dbMock.store.addCatalog({
+      id: "trans-legacy",
+      kind: "transcendent_skills",
+      stableId: "trans-legacy",
+      name: "Legacy",
+      config: { costDescription: "Heavy cost" },
+    })
+    const item = await getCatalogItem("transcendent_skills", "trans-legacy")
+    expect(item.config).toMatchObject({ costDescription: "Heavy cost" })
+    // A metadata-only PATCH (no config) keeps the legacy config readable.
+    const patched = await updateCatalogItem(
+      "transcendent_skills",
+      "trans-legacy",
+      {
+        name: "Legacy Renamed",
+      }
+    )
+    expect(patched.name).toBe("Legacy Renamed")
+    expect(patched.config).toMatchObject({ costDescription: "Heavy cost" })
+    // A config-changing PATCH without passiveEffects is rejected.
+    await expect(
+      updateCatalogItem("transcendent_skills", "trans-legacy", {
+        config: { costDescription: "New" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+  })
+
+  it("rejects an association on a character the user does not own (403 via the owner guard)", async () => {
+    seedCharacter()
+    seedTranscendent("trans-1", { passiveEffects: [] })
+    const other = { id: "user-2", email: "other@example.com", isAdmin: false }
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "transcendent",
+          definitionId: "trans-1",
+          operation: "add",
+          version: 0,
+        },
+        other
+      )
+    ).rejects.toMatchObject({ status: 403 })
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects a stale version (409) and rolls back the transcendent link and event", async () => {
+    seedCharacter()
+    seedTranscendent("trans-1", { passiveEffects: [] })
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "transcendent",
+          definitionId: "trans-1",
+          operation: "add",
+          version: 99,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.associations).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("lets two distinct transcendent skills coexist (no blessing singleton or upgradeGroup replacement)", async () => {
+    seedCharacter()
+    seedTranscendent("trans-a", {
+      passiveEffects: [{ phase: "flat", amount: { strength: 3 } }],
+    })
+    seedTranscendent("trans-b", {
+      passiveEffects: [{ phase: "flat", amount: { agility: 2 } }],
+    })
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-a",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const after1 = await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-b",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    expect(after1.character.associations).toHaveLength(2)
+    expect(
+      after1.character.associations.map((a) => a.definitionId).sort()
+    ).toEqual(["trans-a", "trans-b"])
+    expect(after1.character.isTranscendent).toBe(true)
+    // Both distinct skills apply independently.
+    expect(flatDelta(after1.character.status, "strength")).toBe(3)
+    expect(flatDelta(after1.character.status, "agility")).toBe(2)
+  })
+
+  it("removes an archived linked transcendent (only add is blocked)", async () => {
+    seedCharacter()
+    seedTranscendent("trans-1", {
+      passiveEffects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-1",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    // Archive the linked definition.
+    dbMock.store.addCatalog({
+      id: "trans-1",
+      kind: "transcendent_skills",
+      stableId: "trans-1",
+      name: "Transcendent trans-1",
+      config: { passiveEffects: [{ phase: "flat", amount: { strength: 5 } }] },
+      archived: true,
+    })
+    // Adding an archived entry is blocked.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "transcendent",
+          definitionId: "trans-1",
+          operation: "add",
+          version: 1,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+    // Removing an archived linked entry is allowed.
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-1",
+        operation: "remove",
+        version: 1,
+      },
+      user
+    )
+    expect(res.character.associations).toHaveLength(0)
+  })
+
+  it("derives isTranscendent only from an unarchived link: archive clears, unarchive restores, unlink clears", async () => {
+    seedCharacter()
+    seedTranscendent("trans-1", { passiveEffects: [] })
+    const added = await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-1",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(added.character.isTranscendent).toBe(true)
+    // Archive the linked definition -> derived flag false.
+    dbMock.store.addCatalog({
+      id: "trans-1",
+      kind: "transcendent_skills",
+      stableId: "trans-1",
+      name: "Transcendent trans-1",
+      config: { passiveEffects: [] },
+      archived: true,
+    })
+    const archivedDetail = await getCharacter("chr-1", user)
+    expect(archivedDetail.isTranscendent).toBe(false)
+    // Unarchive restores true.
+    dbMock.store.addCatalog({
+      id: "trans-1",
+      kind: "transcendent_skills",
+      stableId: "trans-1",
+      name: "Transcendent trans-1",
+      config: { passiveEffects: [] },
+      archived: false,
+    })
+    const restoredDetail = await getCharacter("chr-1", user)
+    expect(restoredDetail.isTranscendent).toBe(true)
+    // Unlink the last active definition clears it.
+    const removed = await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-1",
+        operation: "remove",
+        version: 1,
+      },
+      user
+    )
+    expect(removed.character.isTranscendent).toBe(false)
+  })
+
+  it("synthesizes passive effects live from the current config (source/provenance/distinct ids) and never rewrites stored state; an archived link is inert", async () => {
+    seedCharacter({ strength: 100 })
+    seedTranscendent("trans-1", {
+      passiveEffects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-1",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const before = await getCharacter("chr-1", user)
+    expect(flatDelta(before.status, "strength")).toBe(5)
+    const beforeVersion = before.version
+    const beforeState = before.state
+
+    // Edit the effect magnitude in the catalog.
+    await updateCatalogItem("transcendent_skills", "trans-1", {
+      config: { passiveEffects: [{ phase: "flat", amount: { strength: 10 } }] },
+    })
+    const after = await getCharacter("chr-1", user)
+    expect(flatDelta(after.status, "strength")).toBe(10)
+    // No character mutation: version and stored state are untouched; no event.
+    expect(after.version).toBe(beforeVersion)
+    expect(after.state).toEqual(beforeState)
+    expect(
+      (after.state as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(1)
+
+    // The live effect carries the definition source + provenance + a distinct id.
+    const portable = await exportCharacter("chr-1", user)
+    const active = (
+      portable.liveState as {
+        activeEffects: Array<{ source: string; provenance: string; id: string }>
+      }
+    ).activeEffects
+    expect(active).toHaveLength(1)
+    expect(active[0]).toMatchObject({
+      source: "Transcendent trans-1",
+      provenance: "house",
+      phase: "flat",
+      amount: { strength: 10 },
+    })
+    expect(active[0].id).toBe("trans-1:eff-0")
+
+    // Archive the linked definition -> inert (no synthesized effect, updated status).
+    dbMock.store.addCatalog({
+      id: "trans-1",
+      kind: "transcendent_skills",
+      stableId: "trans-1",
+      name: "Transcendent trans-1",
+      config: { passiveEffects: [{ phase: "flat", amount: { strength: 10 } }] },
+      archived: true,
+    })
+    const archivedDetail = await getCharacter("chr-1", user)
+    // When the linked definition is archived it contributes no effect; the "flat"
+    // phase is still present in the trace but its delta must be 0.
+    expect(flatDelta(archivedDetail.status, "strength")).toBe(0)
+    expect(archivedDetail.isTranscendent).toBe(false)
+  })
+
+  it("exports multiple distinct transcendent links with stable ids and leaves historical state untouched", async () => {
+    seedCharacter()
+    seedTranscendent(
+      "trans-a",
+      { passiveEffects: [{ phase: "flat", amount: { strength: 3 } }] },
+      { name: "Holyland" }
+    )
+    seedTranscendent(
+      "trans-b",
+      {
+        passiveEffects: [
+          { phase: "percent", basisPoints: { perception: 500 } },
+        ],
+      },
+      { name: "Fighting Spirit" }
+    )
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-a",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-b",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    const portable = await exportCharacter("chr-1", user)
+    expect(portable.isTranscendent).toBe(true)
+    const assocs = portable.associations as Array<{
+      kind: string
+      definition: { stableId: string }
+    }>
+    expect(assocs).toHaveLength(2)
+    expect(assocs.every((a) => a.kind === "transcendent")).toBe(true)
+    expect(assocs.map((a) => a.definition.stableId).sort()).toEqual([
+      "trans-a",
+      "trans-b",
+    ])
+    // The stored `state` (historical awards) stays untouched.
+    expect(
+      (portable.state as { activeEffects: unknown[] }).activeEffects
+    ).toEqual([])
+  })
+})
+
+describe("updateCatalogItem link-collision rejection", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
   function seedState() {
     const state = createInitialState("integrated", null, null)
     state.baseAttributes = {
@@ -3817,6 +4216,71 @@ describe("importCharacter (trusted backup v3)", () => {
     // SKILL kinds; the imported blessing/bloodline must use the new DB kinds.
     const kinds = dbMock.store.associations.map((a) => a.kind).sort()
     expect(kinds).toEqual(["BLESSING", "BLOODLINE"])
+  })
+
+  it("imports multiple distinct transcendent links by stableId and derives isTranscendent (no singleton)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "transcendent_skills",
+      "trans-1",
+      { passiveEffects: [] },
+      { name: "Holyland" }
+    )
+    addImportCatalog(
+      "transcendent_skills",
+      "trans-2",
+      { passiveEffects: [] },
+      { name: "Fighting Spirit" }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "transcendent",
+          definition: { kind: "transcendent_skills", stableId: "trans-1" },
+        },
+        {
+          kind: "transcendent",
+          definition: { kind: "transcendent_skills", stableId: "trans-2" },
+        },
+      ],
+    })
+    const result = await importCharacter(doc, user)
+    expect(result.associations).toHaveLength(2)
+    expect(result.associations.map((a) => a.kind).sort()).toEqual([
+      "transcendent",
+      "transcendent",
+    ])
+    expect(result.isTranscendent).toBe(true)
+    // Distinct DB kinds are persisted, never a blessing singleton.
+    const kinds = dbMock.store.associations.map((a) => a.kind).sort()
+    expect(kinds).toEqual(["TRANSCENDENT", "TRANSCENDENT"])
+    // Historical (stored engine) state is unaffected by synthesized effects.
+    const stored = dbMock.store.characters.get(result.id)!
+    expect(
+      (stored.state as { activeEffects: unknown[] }).activeEffects
+    ).toEqual([])
+  })
+
+  it("rejects an association whose definition kind does not match a transcendent link kind", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "skills",
+      "skill-1",
+      { effects: [] },
+      { name: "Skill One" }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "transcendent",
+          definition: { kind: "skills", stableId: "skill-1" },
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_kind_mismatch",
+    })
   })
 
   it("rejects more than one active blessing on import", async () => {
@@ -6134,5 +6598,67 @@ describe("house rules threading (admin-editable defaults)", () => {
     ).historicalLevelAwards
     expect(afterAwards).toEqual(beforeAwards)
     expect(afterAwards[0]).toMatchObject({ track: "class" })
+  })
+})
+
+describe("listCatalog (archived visibility)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedRace(id: string, extra: Partial<{ archived: boolean }> = {}) {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "races",
+      stableId: id,
+      name: `Race ${id}`,
+      config: {},
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  it("default list returns only active definitions", async () => {
+    seedRace("race-active")
+    seedRace("race-archived", { archived: true })
+
+    const items = await listCatalog("races")
+    expect(items.map((i) => i.stableId)).toEqual(["race-active"])
+    expect(items.every((i) => i.archived === false)).toBe(true)
+  })
+
+  it("includeArchived:true returns both active and archived definitions", async () => {
+    seedRace("race-active")
+    seedRace("race-archived", { archived: true })
+
+    const items = await listCatalog("races", { includeArchived: true })
+    const ids = items.map((i) => i.stableId).sort()
+    expect(ids).toEqual(["race-active", "race-archived"])
+    expect(items.find((i) => i.stableId === "race-archived")?.archived).toBe(
+      true
+    )
+  })
+
+  it("includeArchived:false (explicit) behaves like the default (active-only)", async () => {
+    seedRace("race-active")
+    seedRace("race-archived", { archived: true })
+
+    const items = await listCatalog("races", { includeArchived: false })
+    expect(items.map((i) => i.stableId)).toEqual(["race-active"])
+  })
+
+  it("only returns definitions of the requested kind even with includeArchived", async () => {
+    seedRace("race-active")
+    dbMock.store.addCatalog({
+      id: "title-archived",
+      kind: "titles",
+      stableId: "title-archived",
+      name: "Title archived",
+      config: {},
+      archived: true,
+    })
+
+    const items = await listCatalog("races", { includeArchived: true })
+    const ids = items.map((i) => i.stableId).sort()
+    expect(ids).toEqual(["race-active"])
   })
 })

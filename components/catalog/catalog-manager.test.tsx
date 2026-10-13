@@ -12,9 +12,10 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }))
 
+let mockIsAdmin = true
 vi.mock("@/components/app-shell", () => ({
   useAppShell: () => ({
-    user: { id: "user-1", email: "u@example.com", isAdmin: true },
+    user: { id: "user-1", email: "u@example.com", isAdmin: mockIsAdmin },
   }),
 }))
 
@@ -178,6 +179,7 @@ async function openEdit(itemName: string, mock: ReturnType<typeof vi.fn>) {
 
 describe("CatalogManager config omission on edit", () => {
   afterEach(() => {
+    mockIsAdmin = true
     cleanup()
   })
 
@@ -219,5 +221,113 @@ describe("CatalogManager config omission on edit", () => {
     ) as Record<string, unknown>
     expect(body).toHaveProperty("config")
     expect((body.config as Record<string, unknown>).tier).toBe("Major")
+  })
+
+  it("loads archived entries only after an admin enables Show archived", async () => {
+    const mock = setupMock()
+    const archived = {
+      ...item,
+      id: "bless-archived",
+      name: "Old Blessing",
+      archived: true,
+    }
+    mock.mockImplementation(async (url: string) => ({
+      kind: "blessings",
+      items: url.includes("includeArchived") ? [item, archived] : [item],
+    }))
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    expect(
+      mock.mock.calls.some(([url]) => String(url).includes("includeArchived=1"))
+    ).toBe(false)
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    expect(mock).toHaveBeenCalledWith(
+      "/api/catalog/blessings?includeArchived=1"
+    )
+    expect(screen.getByText("Archived")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Unarchive" })).toBeTruthy()
+  })
+
+  it("never requests archived entries for a non-admin", async () => {
+    mockIsAdmin = false
+    const mock = setupMock()
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    expect(
+      mock.mock.calls.every(([url]) => !String(url).includes("includeArchived"))
+    ).toBe(true)
+    expect(screen.queryByLabelText("Show archived")).toBeNull()
+  })
+
+  it("unarchives with PATCH, confirms, and reloads while retaining archived view", async () => {
+    const mock = setupMock()
+    const archived = {
+      ...item,
+      id: "bless-archived",
+      name: "Old Blessing",
+      archived: true,
+    }
+    mock.mockImplementation(async (url: string) => ({
+      kind: "blessings",
+      items: url.includes("includeArchived") ? [item, archived] : [item],
+    }))
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Unarchive" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([url, init]) =>
+        String(url).endsWith("bless-archived") &&
+        (init as RequestInit)?.method === "PATCH"
+    )
+    expect(call).toBeTruthy()
+    expect(JSON.parse((call?.[1] as RequestInit).body as string)).toEqual({
+      archived: false,
+    })
+    expect(
+      mock.mock.calls.some(
+        ([url]) => url === "/api/catalog/blessings?includeArchived=1"
+      )
+    ).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it("shows an actionable unarchive error", async () => {
+    const mock = setupMock()
+    const archived = {
+      ...item,
+      id: "bless-archived",
+      name: "Old Blessing",
+      archived: true,
+    }
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH")
+        throw new Error("Permission denied; ask an administrator.")
+      return {
+        kind: "blessings",
+        items: url.includes("includeArchived") ? [item, archived] : [item],
+      }
+    })
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Unarchive" }))
+    await flush()
+    expect(
+      screen.getByText(/Could not unarchive.*Permission denied/)
+    ).toBeTruthy()
+    vi.unstubAllGlobals()
   })
 })

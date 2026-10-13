@@ -679,7 +679,7 @@ describe("CreateCharacterForm special abilities", () => {
     ).toBeGreaterThan(0)
     expect(
       screen.getByText(
-        /transcendents are defined in the encyclopedia but not yet attached/i
+        /transcendent skills can also be attached after creation, but are not auto-awarded/i
       )
     ).toBeTruthy()
   })

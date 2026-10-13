@@ -78,6 +78,7 @@ const CATALOG_KINDS = [
   { kind: "skills", label: "Skills" },
   { kind: "blessings", label: "Blessings" },
   { kind: "bloodlines", label: "Bloodlines" },
+  { kind: "transcendent_skills", label: "Transcendent Skills" },
   { kind: "consumables", label: "Consumables" },
   { kind: "evolutions", label: "Evolutions" },
   { kind: "gods", label: "Gods & Patrons" },

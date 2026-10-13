@@ -18,6 +18,7 @@ const KIND_LABELS: Record<string, string> = {
   consumables: "Consumables",
   evolutions: "Evolutions",
   gods: "Gods & Patrons",
+  transcendent_skills: "Transcendent Skills",
 }
 
 export default function CatalogPage() {

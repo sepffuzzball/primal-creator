@@ -50,6 +50,56 @@ that includes a **Transcendent** title.
 
 ## Engine note
 
-Model a transcendent as a (boolean) quality plus a transcendent skill, both of
-which exist "outside the system" and can carry a cost. Because the trigger is
-unspecified, treat it as a configurable flag rather than a derived formula.
+Model a transcendent as a **character quality plus a transcendent skill**, both of
+which exist "outside the system."
+
+The project implements this as:
+
+- A **`transcendent_skills` catalog kind** (`/api/catalog/transcendent_skills`).
+  Each entry's modern config is:
+  ```ts
+  {
+    // Prose only - surfaced to the UI, never treated as a mechanical cost,
+    // activation, or triggered always-on power. The engine never interprets it.
+    costDescription?: string,   // e.g. "Loses a Path level to use"
+    acquisitionNotes?: string,  // e.g. "Received after reaching S-grade"
+    // Declarative passive effects synthesized live into the character's status.
+    // May be [] for a narrative-only transcendent. REQUIRED on a NEW or
+    // CONFIG-CHANGED entry (a missing list is rejected - never a fabricated
+    // default bonus). Each effect uses the shared skill-effect schema
+    // (flat/percent, condition, per-effect stacking group).
+    passiveEffects: Array<{
+      phase: "flat" | "percent",
+      amount?: Record<string, number>,       // flat: finite integer vector
+      basisPoints?: Record<string, number>,  // percent: nonnegative integer bps
+      condition?: ...,
+      stacking?: "replace" | "stack" | "stackCapped",
+      group?: string,                        // per-effect stacking/replace group
+    }>,
+  }
+  ```
+  A **legacy** config that predates `passiveEffects` (e.g. only prose) stays
+  readable and metadata-only-PATCHable; only a NEW/CONFIG-CHANGED write requires
+  the modern shape.
+- A **character association kind `transcendent`** (DB `TRANSCENDENT`) pointing at
+  a `transcendent_skills` definition. Multiple **distinct** transcendent skills
+  coexist on a character - there is no blessing singleton and no `upgradeGroup`
+  replacement. Adding is an explicit user action (no automatic reward);
+  removing unlinks only the named skill. An archived definition can never be
+  newly attached but an archived linked one can always be removed.
+- A **derived `isTranscendent` boolean** on the character detail. Never persisted:
+  it is recomputed at read time from whether at least one linked, **unarchived**
+  `transcendent_skills` definition exists. Archiving the last active definition
+  clears it; unarchiving restores it; unlinking the last one clears it.
+- **Live passive effects**: the active `passiveEffects` of each linked, unarchived
+  definition are synthesized into the character's live status at read time,
+  exactly like a skill/blessing/bloodline effect. History (`Character.state` and
+  the event journal) stays immutable; editing a transcendent skill's
+  `passiveEffects` recalculates the live status without rewriting historical
+  awards. Because the exact **threshold/reward** is wiki-uncertain, nothing here
+  models a universal eligibility gate or an automatic bestowal - transcendence is
+  only ever an explicit, human-directed link.
+
+This is a **house model**: the wiki never pins the exact trigger or reward
+mechanics, so the project treats transcendence as manually-assigned data and
+never infers a formula for it.

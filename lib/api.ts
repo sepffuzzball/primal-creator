@@ -311,7 +311,8 @@ export interface CharacterListItem {
 export interface CharacterAssociationView {
   id: string
   definitionId: string
-  kind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
+  kind:
+    "title" | "equipment" | "skill" | "blessing" | "bloodline" | "transcendent"
   name: string
   slot?: string
   upgradeGroup?: string
@@ -359,6 +360,11 @@ export interface CharacterDetail {
   archived: boolean
   /** True when the character was created from a user-supplied trusted-backup import. */
   imported: boolean
+  /**
+   * Derived transcendent quality, recomputed server-side from the current
+   * unarchived linked `transcendent_skills` definitions. Not a persisted flag.
+   */
+  isTranscendent: boolean
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
@@ -502,7 +508,7 @@ export interface ConsumeResponse {
 }
 
 export interface AssociationRequest {
-  kind: "title" | "equipment" | "blessing" | "bloodline"
+  kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent"
   definitionId: string
   operation: "add" | "remove"
   version: number
@@ -554,7 +560,8 @@ export interface ExportDefinitionSnapshot {
 export interface ExportAssociation {
   id: string
   definitionId: string
-  kind: "title" | "equipment" | "skill" | "blessing" | "bloodline"
+  kind:
+    "title" | "equipment" | "skill" | "blessing" | "bloodline" | "transcendent"
   createdAt: string
   definition: ExportDefinitionSnapshot
 }
@@ -601,6 +608,11 @@ export interface ExportResponse {
    */
   liveState: CharacterState
   status: StatusResult
+  /**
+   * Informational derived quality for the exporting UI. Advisory on import - the
+   * importer recomputes it from the re-linked associations.
+   */
+  isTranscendent: boolean
   associations: ExportAssociation[]
   events: ProgressionEvent[]
   skillOffers: SkillOfferExport[]

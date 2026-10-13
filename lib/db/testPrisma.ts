@@ -44,7 +44,8 @@ export interface TestAssociationRow {
   id: string
   characterId: string
   definitionId: string
-  kind: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
+  kind:
+    "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
   createdAt: Date
   // Relation, only set on the object returned by findUnique/create.
   definition?: TestCatalogRow | null
@@ -292,7 +293,13 @@ export interface TestPrismaInstance {
       row: Partial<TestAssociationRow> & {
         characterId: string
         definitionId: string
-        kind: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
+        kind:
+          | "TITLE"
+          | "EQUIPMENT"
+          | "SKILL"
+          | "BLESSING"
+          | "BLOODLINE"
+          | "TRANSCENDENT"
       }
     ): TestAssociationRow
     reset(): void
@@ -366,7 +373,13 @@ interface Transaction {
       where?: {
         definitionId?: string
         characterId?: string
-        kind?: "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE"
+        kind?:
+          | "TITLE"
+          | "EQUIPMENT"
+          | "SKILL"
+          | "BLESSING"
+          | "BLOODLINE"
+          | "TRANSCENDENT"
       }
       include?: unknown
     }) => Promise<Array<TestAssociationRow & { character?: TestCharacterRow }>>
@@ -793,7 +806,12 @@ export function createTestPrisma(): TestPrismaInstance {
           characterId: data.characterId as string,
           definitionId: data.definitionId as string,
           kind: data.kind as
-            "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE",
+            | "TITLE"
+            | "EQUIPMENT"
+            | "SKILL"
+            | "BLESSING"
+            | "BLOODLINE"
+            | "TRANSCENDENT",
           createdAt: new Date(),
           definition: catalog.get(data.definitionId as string) ?? null,
         }

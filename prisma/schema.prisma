@@ -35,6 +35,7 @@ enum CatalogKind {
   consumables
   evolutions
   gods
+  transcendent_skills
 }
 
 enum Provenance {
@@ -49,6 +50,7 @@ enum AssociationKind {
   SKILL
   BLESSING
   BLOODLINE
+  TRANSCENDENT
 }
 
 // ------------------------------------------------------------------ //
@@ -243,7 +245,10 @@ model CatalogDefinition {
 // immutable, so catalog edits recalculate live effects without rewriting
 // historical awards.
 //
-// - `kind` TITLE or EQUIPMENT. Only one link per (character, definition).
+// - `kind` TITLE, EQUIPMENT, SKILL, BLESSING, BLOODLINE or TRANSCENDENT.
+//   Only one link per (character, definition).
+// - Multiple distinct transcendents coexist on a character; there is no
+//   blessing singleton and no upgradeGroup replacement for them.
 // - Deleting a character cascades to its links. Deleting a catalog definition
 //   that is referenced is RESTRICTed (a referenced definition is never removed).
 

@@ -54,6 +54,7 @@ const CATALOG = {
   skill1: "catalog-skill-1",
   pgGod1: "catalog-pg-god-1",
   pgBloodline1: "catalog-pg-bloodline-1",
+  pgTranscendent1: "catalog-pg-transcendent-1",
 } as const
 
 function attr(n: number) {
@@ -180,6 +181,13 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       "PG Bloodline One",
       { effects: [] }
     )
+    await seedCatalog(
+      CATALOG.pgTranscendent1,
+      "transcendent_skills",
+      "pg-transcendent-1",
+      "PG Transcendent One",
+      { passiveEffects: [{ phase: "flat", amount: { strength: 3 } }] }
+    )
   })
 
   afterAll(async () => {
@@ -291,6 +299,13 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
         kind: "BLOODLINE",
       },
     })
+    await prisma.characterAssociation.create({
+      data: {
+        characterId: src.id,
+        definitionId: CATALOG.pgTranscendent1,
+        kind: "TRANSCENDENT",
+      },
+    })
 
     const rawDoc = await exportCharacter(src.id, ownerUser)
     const doc = rawDoc as unknown as CharacterImportDocument
@@ -303,9 +318,12 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       class: { stableId: "archer" },
       profession: { stableId: "alchemist" },
     })
-    expect(doc.associations).toHaveLength(5)
+    expect(doc.associations).toHaveLength(6)
     expect(doc.skillOffers).toHaveLength(1)
     expect(doc.skillOffers[0].selectedStableId).toBe("skill-1")
+    expect((doc as unknown as { isTranscendent: boolean }).isTranscendent).toBe(
+      true
+    )
 
     const imported = await importCharacter(doc, adminUser)
     createdCharacterIds.push(imported.id)
@@ -315,9 +333,12 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     expect(imported.raceName).toBe("Human")
     expect(imported.className).toBe("Archer")
     expect(imported.professionName).toBe("Alchemist")
-    expect(imported.associations).toHaveLength(5)
+    expect(imported.associations).toHaveLength(6)
     expect(imported.skillOffers).toHaveLength(1)
     expect(imported.skillOffers[0].selectedDefinitionId).toBe(CATALOG.skill1)
+    expect(
+      (imported as unknown as { isTranscendent: boolean }).isTranscendent
+    ).toBe(true)
 
     // The historical selection timestamp is preserved verbatim (not restamped).
     const importedOffer = await prisma.skillOffer.findFirst({
@@ -349,9 +370,12 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       adminUser
     )) as unknown as CharacterImportDocument
     expect(roundtrip.identity).toEqual(doc.identity)
-    expect(roundtrip.associations).toHaveLength(5)
+    expect(roundtrip.associations).toHaveLength(6)
     expect(roundtrip.skillOffers).toHaveLength(1)
     expect(roundtrip.skillOffers[0].selectedStableId).toBe("skill-1")
+    expect(
+      (roundtrip as unknown as { isTranscendent: boolean }).isTranscendent
+    ).toBe(true)
   })
 
   it("rejects a backup whose race definition is missing and creates no character", async () => {

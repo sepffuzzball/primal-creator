@@ -1204,9 +1204,9 @@ export function CreateCharacterForm() {
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              Blessings, bloodlines and transcendents are defined in the
-              encyclopedia but not yet attached to a character; configure them
-              when the feature is available.
+              Blessings and bloodlines can be configured after creation.
+              Transcendent skills can also be attached after creation, but are
+              not auto-awarded by this questionnaire.
             </p>
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="create-portrait">Portrait (optional)</Label>

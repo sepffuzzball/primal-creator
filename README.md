@@ -130,6 +130,19 @@ evolution_choice_required`).
   with a reason (provenance `manual`). Skill effects are synthesized live from the
   current, unarchived catalog config - history stays immutable, and an upgrade
   group never stacks superseded tiers.
+- **Transcendent skills**: transcendents are no longer encyclopedia-only. A
+  `transcendent_skills` catalog kind and a `transcendent` character association
+  kind let an owner/admin explicitly link one or more distinct transcendent skills
+  to a character (no automatic reward, no blessing singleton, no `upgradeGroup`
+  replacement). Each entry declares a modern `passiveEffects` list (typed
+  flat/percent with per-effect stacking group + condition, using the shared skill
+  effect schema) and optional prose `costDescription` / `acquisitionNotes` that
+  are surfaced but never treated as a mechanical cost or triggered power. The
+  character detail derives an `isTranscendent` boolean from whether at least one
+  linked, unarchived `transcendent_skills` definition exists - recomputed at read
+  time, never persisted - and passive effects are synthesized live from the
+  current catalog config so history stays immutable. See
+  `docs/rules/transcendents.md`.
 - **Auth & sessions**: email/password login with a JWT session cookie and an
   admin role. No real credentials are committed.
 - **Admin-managed users, no public registration**: only an admin may create a
@@ -155,13 +168,11 @@ evolution_choice_required`).
 
 The engine and schema already account for these, but they are not fully wired up:
 
-- **Transcendents**: blessings and bloodlines are now wired as character
-  associations that synthesize declared numeric effects into live status (see
-  `docs/rules/blessings.md` and `docs/rules/bloodlines.md`), but transcendents
-  can still only be defined in the encyclopedia/catalog and are not yet attached
-  to a character. The creation wizard does not record a "has special abilities"
-  flag; it shows the special category as "Not assigned" and never treats it as
-  character state.
+- **Wizard "has special abilities" flag**: the creation wizard does not record a
+  "has special abilities" answer; it shows the special category as "Not assigned"
+  and never treats it as character state. Blessings, bloodlines and transcendents
+  are attached after creation (transcendents are shipped as a character
+  association kind, see the Shipped section).
 - **Catalog import**: the catalog is populated by `db:seed`; there is no bulk
   import from the wiki, CSV or JSON (character backups are imported, but catalog
   content is resolved against existing entries, never auto-created).

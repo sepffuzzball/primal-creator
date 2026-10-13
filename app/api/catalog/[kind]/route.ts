@@ -14,8 +14,14 @@ export async function GET(req: Request, ctx: Ctx) {
     const parsed = catalogKindSchema.safeParse(kind)
     if (!parsed.success)
       throw badRequest("invalid_kind", `Unknown catalog kind "${kind}"`)
-    if (!isCatalogPublic()) await requireUser(req)
-    const items = await listCatalog(kind)
+    const includeArchived =
+      new URL(req.url).searchParams.get("includeArchived") === "1"
+    if (includeArchived) {
+      await requireAdmin(req)
+    } else if (!isCatalogPublic()) {
+      await requireUser(req)
+    }
+    const items = await listCatalog(kind, { includeArchived })
     return Response.json({ kind, items })
   })
 }

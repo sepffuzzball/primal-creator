@@ -249,6 +249,7 @@ let evolutionsError: unknown = null
 let associationsError: unknown = null
 let blessingsCatalog: import("@/lib/api").CatalogItem[] = []
 let bloodlinesCatalog: import("@/lib/api").CatalogItem[] = []
+let transcendentCatalog: import("@/lib/api").CatalogItem[] = []
 let activeCharacter: import("@/lib/api").CharacterDetail = character
 
 /** Build a blessing/bloodline catalog item with documented defaults. */
@@ -258,10 +259,10 @@ function catalogItem(
     name: string
   }
 ): import("@/lib/api").CatalogItem {
-  const { id, name, ...rest } = overrides
+  const { id, name, kind, ...rest } = overrides
   return {
     id,
-    kind: "blessing",
+    kind: kind ?? "blessing",
     stableId: id,
     name,
     description: null,
@@ -280,7 +281,7 @@ function catalogItem(
 function association(
   overrides: Partial<import("@/lib/api").CharacterAssociationView> & {
     id: string
-    kind: "blessing" | "bloodline"
+    kind: "blessing" | "bloodline" | "transcendent"
     definitionId: string
     name: string
   }
@@ -304,7 +305,7 @@ function association(
 function applyAssociation(
   current: import("@/lib/api").CharacterDetail,
   body: {
-    kind: "blessing" | "bloodline"
+    kind: "blessing" | "bloodline" | "transcendent"
     definitionId: string
     operation: "add" | "remove"
     version: number
@@ -312,7 +313,11 @@ function applyAssociation(
 ): import("@/lib/api").CharacterDetail {
   if (body.operation === "add") {
     const source =
-      body.kind === "blessing" ? blessingsCatalog : bloodlinesCatalog
+      body.kind === "blessing"
+        ? blessingsCatalog
+        : body.kind === "bloodline"
+          ? bloodlinesCatalog
+          : transcendentCatalog
     const item = source.find((c) => c.id === body.definitionId)
     const assoc = association({
       id: `${body.kind}-${body.definitionId}`,
@@ -341,11 +346,13 @@ function setupMock(options?: {
   associationsError?: unknown
   blessings?: import("@/lib/api").CatalogItem[]
   bloodlines?: import("@/lib/api").CatalogItem[]
+  transcendentSkills?: import("@/lib/api").CatalogItem[]
 }) {
   activeCharacter = options?.character ?? character
   associationsError = options?.associationsError ?? null
   blessingsCatalog = options?.blessings ?? []
   bloodlinesCatalog = options?.bloodlines ?? []
+  transcendentCatalog = options?.transcendentSkills ?? []
 
   const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
   mock.mockReset()
@@ -365,6 +372,9 @@ function setupMock(options?: {
     if (url === "/api/catalog/bloodlines") {
       return { kind: "catalog", items: bloodlinesCatalog }
     }
+    if (url === "/api/catalog/transcendent_skills") {
+      return { kind: "catalog", items: transcendentCatalog }
+    }
     if (
       url === "/api/catalog/titles" ||
       url === "/api/catalog/equipment" ||
@@ -375,7 +385,7 @@ function setupMock(options?: {
     if (url === "/api/characters/chr-1/associations" && method === "POST") {
       if (associationsError) throw associationsError
       const body = JSON.parse((init?.body as string) ?? "{}") as {
-        kind: "blessing" | "bloodline"
+        kind: "blessing" | "bloodline" | "transcendent"
         definitionId: string
         operation: "add" | "remove"
         version: number
@@ -714,5 +724,222 @@ describe("CharacterDetail power associations", () => {
     const blessingSection = within(screen.getByLabelText("Blessing"))
     expect(blessingSection.getByText("Blessing of Fire")).toBeTruthy()
     expect(blessingSection.queryByText("New Blessing")).toBeNull()
+  })
+})
+
+describe("CharacterDetail transcendent skills", () => {
+  it("Powers tab derives the transcendent badge from the server flag and marks an archived link inert", async () => {
+    setupMock({
+      character: {
+        ...character,
+        isTranscendent: true,
+        associations: [
+          association({
+            id: "assoc-trans-zen",
+            kind: "transcendent",
+            definitionId: "trans-zen",
+            name: "Zen Transcendence",
+          }),
+          association({
+            id: "assoc-trans-old",
+            kind: "transcendent",
+            definitionId: "trans-old",
+            name: "Old Transcendence",
+            definitionArchived: true,
+          }),
+        ],
+      },
+    })
+
+    await renderDetail()
+    fireEvent.click(screen.getByText("Powers"))
+    await flush()
+
+    const section = within(screen.getByLabelText("Transcendent skills"))
+    // The badge is the server-computed flag, never a client derivation.
+    expect(section.getByText("Transcendent")).toBeTruthy()
+    expect(section.getByText("Zen Transcendence")).toBeTruthy()
+    expect(section.getByText("Old Transcendence")).toBeTruthy()
+    expect(section.getByText("Archived - inert")).toBeTruthy()
+  })
+
+  it("Powers tab does not fabricate the transcendent badge when the server flag is false", async () => {
+    setupMock({
+      character: {
+        ...character,
+        isTranscendent: false,
+        associations: [
+          association({
+            id: "assoc-trans-zen",
+            kind: "transcendent",
+            definitionId: "trans-zen",
+            name: "Zen Transcendence",
+          }),
+        ],
+      },
+    })
+
+    await renderDetail()
+    fireEvent.click(screen.getByText("Powers"))
+    await flush()
+
+    const section = within(screen.getByLabelText("Transcendent skills"))
+    expect(section.getByText("Zen Transcendence")).toBeTruthy()
+    // No client-derived activation: the badge is absent when the server says no.
+    expect(section.queryByText("Transcendent")).toBeNull()
+  })
+
+  it("an archived linked transcendent omitted by the active-only catalog stays removable and POSTs kind transcendent/remove/version then reloads it away", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    setupMock({
+      character: {
+        ...character,
+        isTranscendent: true,
+        associations: [
+          association({
+            id: "assoc-trans-old",
+            kind: "transcendent",
+            definitionId: "trans-old",
+            name: "Old Transcendence",
+            definitionArchived: true,
+          }),
+        ],
+      },
+      // The active-only catalog omits the archived linked skill entirely.
+      transcendentSkills: [],
+    })
+
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Transcendent skills" }))
+    fireEvent.click(screen.getAllByText("Remove")[0])
+    await flush()
+
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const removePost = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(removePost).toBeTruthy()
+    const body = JSON.parse((removePost![1] as RequestInit).body as string) as {
+      kind: string
+      definitionId: string
+      operation: string
+      version: number
+    }
+    expect(body).toEqual({
+      kind: "transcendent",
+      definitionId: "trans-old",
+      operation: "remove",
+      version: 3,
+    })
+
+    // The reload reflects the removal: no UI still lists the old skill.
+    expect(screen.queryByText("Old Transcendence")).toBeNull()
+    expect(screen.queryByText("Archived - inert")).toBeNull()
+  })
+
+  it("attaching one of several transcendent candidates POSTs kind transcendent/add/version and reload marks it linked", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    setupMock({
+      character: {
+        ...character,
+        isTranscendent: false,
+      },
+      transcendentSkills: [
+        catalogItem({
+          id: "trans-a",
+          name: "Transcendence A",
+          kind: "transcendent_skills",
+        }),
+        catalogItem({
+          id: "trans-b",
+          name: "Transcendence B",
+          kind: "transcendent_skills",
+        }),
+      ],
+    })
+
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+
+    const attachA = screen
+      .getAllByRole("button", { name: "Attach" })
+      .find((btn) =>
+        btn.closest("div")?.textContent?.includes("Transcendence A")
+      )
+    expect(attachA).toBeTruthy()
+    fireEvent.click(attachA!)
+    await flush()
+
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const addPost = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(addPost).toBeTruthy()
+    const body = JSON.parse((addPost![1] as RequestInit).body as string) as {
+      kind: string
+      definitionId: string
+      operation: string
+      version: number
+    }
+    expect(body).toEqual({
+      kind: "transcendent",
+      definitionId: "trans-a",
+      operation: "add",
+      version: 3,
+    })
+
+    // The reload reflects the attach: candidate A is now linked (Remove action)
+    // while candidate B remains unattached.
+    const removeA = screen
+      .getAllByRole("button", { name: "Remove" })
+      .find((btn) =>
+        btn.closest("div")?.textContent?.includes("Transcendence A")
+      )
+    expect(removeA).toBeTruthy()
+    const attachB = screen
+      .getAllByRole("button", { name: "Attach" })
+      .find((btn) =>
+        btn.closest("div")?.textContent?.includes("Transcendence B")
+      )
+    expect(attachB).toBeTruthy()
+  })
+
+  it("a failed transcendent attach POST surfaces the error and leaves the candidate unlinked", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    setupMock({
+      associationsError: new Error("network down"),
+      character: {
+        ...character,
+        isTranscendent: false,
+      },
+      transcendentSkills: [
+        catalogItem({
+          id: "trans-a",
+          name: "Transcendence A",
+          kind: "transcendent_skills",
+        }),
+      ],
+    })
+
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByText("Attach"))
+    await flush()
+
+    // The failure is surfaced, not swallowed.
+    expect(toast.error).toHaveBeenCalledWith(
+      expect.stringContaining("network down")
+    )
+    // No fake success: the candidate is still unattached (Attach, no Remove).
+    expect(screen.getByText("Attach")).toBeTruthy()
+    expect(screen.queryByText("Remove")).toBeNull()
   })
 })
