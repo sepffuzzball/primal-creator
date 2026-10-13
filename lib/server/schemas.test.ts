@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest"
 import {
   blessingConfigSchema,
   bloodlineConfigSchema,
+  characterCreateSchema,
   evolveSchema,
   godConfigSchema,
   inventoryPostSchema,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
+  specialAbilitiesSchema,
   transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
@@ -336,5 +338,69 @@ describe("transcendent_skills catalog config", () => {
       acquisitionNotes: "A punch that ignores durability.",
     })
     expect(parsed.success).toBe(true)
+  })
+})
+
+describe("specialAbilitiesSchema / characterCreateSchema", () => {
+  it("accepts an omitted or empty special-ability selection", () => {
+    expect(specialAbilitiesSchema.safeParse({}).success).toBe(true)
+    expect(
+      characterCreateSchema.safeParse({
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        specialAbilities: {},
+      }).success
+    ).toBe(true)
+  })
+
+  it("accepts an explicit selection of a blessing, bloodlines and transcendent skills", () => {
+    const parsed = characterCreateSchema.safeParse({
+      name: "Kael",
+      origin: "integrated",
+      raceId: "race-1",
+      classId: "cls-1",
+      specialAbilities: {
+        blessingId: "bless-1",
+        bloodlineIds: ["blood-1", "blood-2"],
+        transcendentSkillIds: ["trans-1"],
+      },
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects an empty blessingId", () => {
+    expect(specialAbilitiesSchema.safeParse({ blessingId: "" }).success).toBe(
+      false
+    )
+  })
+
+  it("rejects a bloodline array with more than 8 ids", () => {
+    const ids = Array.from({ length: 9 }, (_, i) => `blood-${i}`)
+    expect(
+      specialAbilitiesSchema.safeParse({ bloodlineIds: ids }).success
+    ).toBe(false)
+  })
+
+  it("rejects an id selected in more than one field (cross-field overlap)", () => {
+    const parsed = specialAbilitiesSchema.safeParse({
+      blessingId: "bless-1",
+      bloodlineIds: ["bless-1"],
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a duplicate id within a single array", () => {
+    const parsed = specialAbilitiesSchema.safeParse({
+      bloodlineIds: ["blood-1", "blood-1"],
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects an empty-string id inside an array", () => {
+    expect(
+      specialAbilitiesSchema.safeParse({ transcendentSkillIds: [""] }).success
+    ).toBe(false)
   })
 })

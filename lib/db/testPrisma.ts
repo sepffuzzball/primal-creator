@@ -1139,6 +1139,7 @@ export function createTestPrisma(): TestPrismaInstance {
     const offerSnapshot = skillOffers.map((o) => ({ ...o }))
     const optionSnapshot = skillOfferOptions.map((o) => ({ ...o }))
     const charSnapshot = new Map([...characters].map(([k, v]) => [k, { ...v }]))
+    const catalogSnapshot = new Map([...catalog].map(([k, v]) => [k, { ...v }]))
     const draftSnapshot = new Map([...drafts].map(([k, v]) => [k, { ...v }]))
     const userSnapshot = new Map([...users].map(([k, v]) => [k, { ...v }]))
     const houseRulesSnapshot = new Map(
@@ -1151,6 +1152,7 @@ export function createTestPrisma(): TestPrismaInstance {
       offerSnapshot,
       optionSnapshot,
       charSnapshot,
+      catalogSnapshot,
       draftSnapshot,
       userSnapshot,
       houseRulesSnapshot,
@@ -1169,6 +1171,8 @@ export function createTestPrisma(): TestPrismaInstance {
     )
     characters.clear()
     for (const [k, v] of snap.charSnapshot) characters.set(k, v)
+    catalog.clear()
+    for (const [k, v] of snap.catalogSnapshot) catalog.set(k, v)
     drafts.clear()
     for (const [k, v] of snap.draftSnapshot) drafts.set(k, v)
     users.clear()

@@ -974,6 +974,160 @@ function ownedWhere(user: SessionUser) {
 // Character persistence
 // ------------------------------------------------------------------ //
 
+/** A catalog definition snapshot for the create journal's special-abilities block. */
+function specialAbilitySnapshot(def: {
+  id: string
+  name: string
+  stableId: string
+  provenance: string
+}): Record<string, unknown> {
+  return {
+    id: def.id,
+    name: def.name,
+    stableId: def.stableId,
+    provenance: def.provenance,
+  }
+}
+
+type SpecialAbilitiesSelection = {
+  blessingId?: string | null
+  bloodlineIds?: string[]
+  transcendentSkillIds?: string[]
+}
+
+type ResolvedSpecialAbilities = {
+  associations: Array<{
+    definitionId: string
+    kind: "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
+  }>
+  journal: Record<string, unknown> | null
+}
+
+/**
+ * Resolve the explicit special-ability selections against the catalog and
+ * validate their invariants, all inside the create transaction so any failure
+ * 400s/409s with NO character, event, links or draft deletion.
+ *
+ * - Every id must resolve to an existing catalog definition of the CORRESPONDING
+ *   kind (`blessings` / `bloodlines` / `transcendent_skills`), and that
+ *   definition must be unarchived (an archived entry is inert and cannot be
+ *   newly linked).
+ * - A blessing is limited to one by the single `blessingId` field.
+ * - Two selected bloodlines may not share the same nonempty `upgradeGroup`
+ *   (group replacement semantics would silently collapse them).
+ * - Transcendent skills are distinct; no id may appear in more than one field.
+ */
+async function resolveSpecialAbilities(
+  tx: DbClient,
+  selection: SpecialAbilitiesSelection | undefined
+): Promise<ResolvedSpecialAbilities> {
+  if (!selection) return { associations: [], journal: null }
+
+  const associations: ResolvedSpecialAbilities["associations"] = []
+  const seen = new Map<string, string>()
+  const register = (id: string, label: string): void => {
+    const prior = seen.get(id)
+    if (prior != null) {
+      throw badRequest(
+        "duplicate",
+        `"${id}" is selected both as ${prior} and ${label}`
+      )
+    }
+    seen.set(id, label)
+  }
+
+  const resolve = async (
+    id: string,
+    expectedKind: string,
+    label: string
+  ): Promise<{
+    id: string
+    name: string
+    stableId: string
+    provenance: string
+    config: Record<string, unknown>
+  }> => {
+    const def = await tx.catalogDefinition.findUnique({ where: { id } })
+    if (!def) {
+      throw badRequest(
+        "catalog_not_found",
+        `${label} "${id}" is not in the catalog`
+      )
+    }
+    if (def.kind !== expectedKind) {
+      throw badRequest(
+        "wrong_kind",
+        `${label} id "${id}" is kind "${def.kind}", expected "${expectedKind}"`
+      )
+    }
+    if (def.archived) {
+      throw badRequest(
+        "catalog_archived",
+        `${label} "${def.name}" is archived; re-enable it in the catalog to create the character`
+      )
+    }
+    register(def.id, label)
+    return {
+      id: def.id,
+      name: def.name,
+      stableId: def.stableId,
+      provenance: def.provenance,
+      config: (def.config ?? {}) as Record<string, unknown>,
+    }
+  }
+
+  const journal: Record<string, unknown> = {}
+
+  // Blessing - single field, so at most one may be selected.
+  const blessing =
+    selection.blessingId != null
+      ? await resolve(selection.blessingId, "blessings", "Blessing")
+      : null
+  journal.blessing = blessing ? specialAbilitySnapshot(blessing) : null
+  if (blessing) {
+    associations.push({ definitionId: blessing.id, kind: "BLESSING" })
+  }
+
+  // Bloodlines - distinct and never sharing a nonempty upgradeGroup.
+  const bloodlineGroups = new Map<string, string>()
+  const bloodlines: Array<Record<string, unknown>> = []
+  for (const id of selection.bloodlineIds ?? []) {
+    const def = await resolve(id, "bloodlines", "Bloodline")
+    const config = parseCatalogConfig("bloodlines", def.config)
+    const upgradeGroup =
+      typeof config.upgradeGroup === "string" && config.upgradeGroup.length > 0
+        ? config.upgradeGroup
+        : undefined
+    if (upgradeGroup != null) {
+      const existing = bloodlineGroups.get(upgradeGroup)
+      if (existing != null) {
+        throw badRequest(
+          "link_collision",
+          `Bloodlines "${existing}" and "${def.name}" both occupy upgrade group "${upgradeGroup}"; select only one per group`
+        )
+      }
+      bloodlineGroups.set(upgradeGroup, def.name)
+    }
+    associations.push({ definitionId: def.id, kind: "BLOODLINE" })
+    bloodlines.push({
+      ...specialAbilitySnapshot(def),
+      upgradeGroup: upgradeGroup ?? null,
+    })
+  }
+  journal.bloodlines = bloodlines
+
+  // Transcendent skills - distinct, coexisting with no singleton or group rule.
+  const transcendents: Array<Record<string, unknown>> = []
+  for (const id of selection.transcendentSkillIds ?? []) {
+    const def = await resolve(id, "transcendent_skills", "Transcendent skill")
+    associations.push({ definitionId: def.id, kind: "TRANSCENDENT" })
+    transcendents.push(specialAbilitySnapshot(def))
+  }
+  journal.transcendentSkills = transcendents
+
+  return { associations, journal }
+}
+
 export async function listCharacters(
   user: SessionUser,
   opts?: { withStatus?: boolean; includeArchived?: boolean }
@@ -1029,6 +1183,15 @@ export async function createCharacter(
     raceId: string
     classId: string
     professionId?: string
+    // Explicit special-ability selections. When supplied, the referenced
+    // blessing/bloodline/transcendent-skill catalog definitions are resolved by
+    // kind, validated (unarchived, no collision) and linked atomically with the
+    // create. Omitted/empty grants no ability.
+    specialAbilities?: {
+      blessingId?: string | null
+      bloodlineIds?: string[]
+      transcendentSkillIds?: string[]
+    }
     // Wizard draft-consume token. When supplied, the matching draft is deleted
     // atomically with character creation; a stale/absent version 409s and rolls
     // back the whole create + event. When absent, no draft is touched.
@@ -1085,6 +1248,12 @@ export async function createCharacter(
   return prisma.$transaction(async (tx) => {
     // Load the house rules ONCE for this mutation, through the SAME tx client.
     const houseRules = await loadHouseRules(tx)
+    // Resolve the explicit special-ability selections INSIDE the transaction so a
+    // wrong-kind / archived / collision / missing failure rolls back the whole
+    // create (no character, no event, no links, no draft deletion). Omitted or
+    // empty grants nothing (no inferred power from a legacy `special` bool).
+    const special = await resolveSpecialAbilities(tx, input.specialAbilities)
+
     const created = await tx.character.create({
       data: {
         ownerId: user.id,
@@ -1109,9 +1278,25 @@ export async function createCharacter(
           raceId: race.id,
           classId: cls.id,
           professionId: profession?.id ?? null,
+          // Selection snapshots + provenance, present only when the caller supplied
+          // a non-empty special-ability selection.
+          ...(special.journal ? { specialAbilities: special.journal } : {}),
         } as Prisma.InputJsonValue,
       },
     })
+
+    // Insert the resolved associations atomically with the create + event. Each
+    // link is persisted with the exact catalog kind, so a stored BLESSING /
+    // BLOODLINE / TRANSCENDENT link is never mislabelled by a later read.
+    for (const assoc of special.associations) {
+      await tx.characterAssociation.create({
+        data: {
+          characterId: created.id,
+          definitionId: assoc.definitionId,
+          kind: assoc.kind,
+        },
+      })
+    }
 
     // The wizard's final create step consumes the matching draft atomically: the
     // draft delete is committed or rolled back with the character + event. A
@@ -1131,7 +1316,14 @@ export async function createCharacter(
       }
     }
 
-    return detailFor(created, houseRules)
+    // Re-fetch AFTER inserting associations so the returned detail exposes the
+    // linked blessing / bloodline / transcendent (and their synthesized live
+    // effects), not the empty snapshot returned by `character.create`.
+    const withAssociations = (await tx.character.findUnique({
+      where: { id: created.id },
+      include: characterInclude,
+    }))!
+    return detailFor(withAssociations, houseRules)
   })
 }
 

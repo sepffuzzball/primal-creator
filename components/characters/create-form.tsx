@@ -15,6 +15,7 @@ import {
   type DraftResponse,
   type PortraitView,
   type SaveDraftRequest,
+  type SpecialAbilitiesSelection,
 } from "@/lib/api"
 import { Alert } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -73,8 +74,10 @@ const ALLOWED_PORTRAIT_TYPES = ["image/png", "image/jpeg", "image/webp"]
 // payload uses a numeric step, a boolean `special` and a string[] `equipment`, so
 // these are mapped when crossing the API boundary. `equipment` is always empty
 // here: the wizard has no equipment picker yet, so nothing is recorded until
-// after the character is created. `special` is always written as `false`: special
-// abilities are a deferred feature, so the wizard never submits `special=true`.
+// after the character is created. `special` is always written as `false`: the
+// legacy "has special abilities" yes/no flag is no longer captured (abilities
+// are now linked explicitly via `specialAbilities`), so the wizard never submits
+// `special=true`.
 interface Draft {
   step: string
   name: string
@@ -94,6 +97,11 @@ interface Draft {
   appearance: string | null
   biography: string | null
   notes: string | null
+  specialAbilities: {
+    blessingId: string | null
+    bloodlineIds: string[]
+    transcendentSkillIds: string[]
+  }
 }
 
 const EMPTY_DRAFT: Draft = {
@@ -112,6 +120,45 @@ const EMPTY_DRAFT: Draft = {
   appearance: null,
   biography: null,
   notes: null,
+  specialAbilities: {
+    blessingId: null,
+    bloodlineIds: [],
+    transcendentSkillIds: [],
+  },
+}
+
+/**
+ * Coerce a possibly-malformed stored `specialAbilities` value into the
+ * well-formed shape the wizard relies on. Legacy drafts may record the field as
+ * null, a partial object, or with non-string ids / non-array lists; each case is
+ * normalized to a safe default so `hasContent`, `draftsDiffer` and
+ * `toServerData` never dereference undefined. Only the `specialAbilities` field
+ * is touched - every other draft field is preserved unchanged.
+ */
+function normalizeSpecialAbilities(raw: unknown): Draft["specialAbilities"] {
+  const src =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {}
+  const blessingId = typeof src.blessingId === "string" ? src.blessingId : null
+  const bloodlineIds = Array.isArray(src.bloodlineIds)
+    ? src.bloodlineIds.filter((x): x is string => typeof x === "string")
+    : []
+  const transcendentSkillIds = Array.isArray(src.transcendentSkillIds)
+    ? src.transcendentSkillIds.filter((x): x is string => typeof x === "string")
+    : []
+  return { blessingId, bloodlineIds, transcendentSkillIds }
+}
+
+/**
+ * Merge a partial (possibly untrusted/localStorage) draft onto the default shape
+ * and normalize the `specialAbilities` field so the rest of the wizard can assume
+ * it is always a well-formed object.
+ */
+function normalizeDraft(partial: Partial<Draft>): Draft {
+  const merged: Draft = { ...EMPTY_DRAFT, ...partial }
+  merged.specialAbilities = normalizeSpecialAbilities(merged.specialAbilities)
+  return merged
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error" | "conflict"
@@ -139,10 +186,18 @@ function toServerData(draft: Draft): DraftData {
   if (draft.classId) data.classId = draft.classId
   data.professionId = draft.professionId || null
   // The wizard no longer captures a "has special abilities" choice. Always
-  // submit `special: false` so the UI never persists `special=true`: special
-  // abilities are a deferred feature, and a legacy draft that recorded the flag
-  // is normalized on the next save rather than carried as a character feature.
+  // submit `special: false` so the UI never persists `special=true`: abilities
+  // are now linked explicitly via `specialAbilities`, and a legacy draft that
+  // recorded the flag is normalized on the next save rather than carried as a
+  // character feature.
   data.special = false
+  data.specialAbilities = {
+    blessingId: draft.specialAbilities.blessingId ?? null,
+    bloodlineIds: [...(draft.specialAbilities.bloodlineIds ?? [])].sort(),
+    transcendentSkillIds: [
+      ...(draft.specialAbilities.transcendentSkillIds ?? []),
+    ].sort(),
+  }
   // Equipment is configured after the character is created - the wizard has no
   // equipment picker yet, so there are no IDs to record. Send an empty list
   // rather than a fake token, so the draft never claims a recorded choice.
@@ -168,6 +223,12 @@ function fromServerData(data: DraftData): Partial<Draft> {
   if (typeof data.professionId === "string") d.professionId = data.professionId
   if (typeof data.special === "boolean")
     d.special = data.special ? "yes" : "none"
+  if (data.specialAbilities)
+    d.specialAbilities = {
+      blessingId: data.specialAbilities.blessingId ?? null,
+      bloodlineIds: data.specialAbilities.bloodlineIds ?? [],
+      transcendentSkillIds: data.specialAbilities.transcendentSkillIds ?? [],
+    }
   if (Array.isArray(data.equipment)) {
     d.equipment = data.equipment.length > 0 ? "yes" : "none"
   }
@@ -186,7 +247,9 @@ function loadDraft(): Draft {
     const raw = window.localStorage.getItem(STORAGE_KEY)
     if (!raw) return EMPTY_DRAFT
     const parsed = JSON.parse(raw) as Partial<Draft>
-    return { ...EMPTY_DRAFT, ...parsed }
+    // Legacy drafts may carry a malformed or missing `specialAbilities` nested
+    // object; normalize so the wizard's helpers never dereference undefined.
+    return normalizeDraft(parsed)
   } catch {
     return EMPTY_DRAFT
   }
@@ -199,9 +262,18 @@ function loadRecoveryDraft(): Draft | null {
     const raw = window.localStorage.getItem(RECOVERY_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<Draft>
-    return { ...EMPTY_DRAFT, ...parsed }
+    return normalizeDraft(parsed)
   } catch {
     return null
+  }
+}
+
+/** Persist the live draft under the primary storage key. */
+function saveLocalDraft(draft: Draft): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(draft))
+  } catch {
+    // Ignore storage availability errors.
   }
 }
 
@@ -242,6 +314,9 @@ function hasContent(draft: Draft): boolean {
     draft.raceId.length > 0 ||
     draft.classId.length > 0 ||
     draft.professionId.length > 0 ||
+    !!draft.specialAbilities.blessingId ||
+    draft.specialAbilities.bloodlineIds.length > 0 ||
+    draft.specialAbilities.transcendentSkillIds.length > 0 ||
     draft.special === "yes" ||
     draft.equipment === "yes" ||
     draft.nickname != null ||
@@ -268,6 +343,11 @@ function draftsDiffer(a: Draft, b: Draft): boolean {
     a.raceId !== b.raceId ||
     a.classId !== b.classId ||
     a.professionId !== b.professionId ||
+    a.specialAbilities.blessingId !== b.specialAbilities.blessingId ||
+    JSON.stringify([...a.specialAbilities.bloodlineIds].sort()) !==
+      JSON.stringify([...b.specialAbilities.bloodlineIds].sort()) ||
+    JSON.stringify([...a.specialAbilities.transcendentSkillIds].sort()) !==
+      JSON.stringify([...b.specialAbilities.transcendentSkillIds].sort()) ||
     a.special !== b.special ||
     a.equipment !== b.equipment ||
     a.nickname !== b.nickname ||
@@ -279,6 +359,90 @@ function draftsDiffer(a: Draft, b: Draft): boolean {
   )
 }
 
+/**
+ * Validate the special-abilities selection against the loaded ability catalogs.
+ * Returns an actionable error message, or null when the selection is valid.
+ *
+ * A selection (any selected blessing / bloodline / transcendent-skill id) is
+ * valid only when all three ability catalogs loaded, every selected id resolves
+ * to an UNARCHIVED definition of the matching list (an archived entry is inert
+ * and cannot be newly linked), and no two selected bloodlines share the same
+ * nonempty `upgradeGroup` (group-replacement semantics would silently collapse
+ * one). A missing/archived id and a group collision are surfaced so the user can
+ * fix the draft rather than submitting an association the server 400s.
+ *
+ * No selection is always valid: an empty selection grants nothing, so a catalog
+ * failure must never block submission of a draft that chose no abilities.
+ */
+function specialValidationError(
+  draft: Draft,
+  blessings: CatalogItem[] | null,
+  bloodlines: CatalogItem[] | null,
+  transcendentSkills: CatalogItem[] | null
+): string | null {
+  const { blessingId, bloodlineIds, transcendentSkillIds } =
+    draft.specialAbilities
+  const anySelection =
+    !!blessingId || bloodlineIds.length > 0 || transcendentSkillIds.length > 0
+  // No selection: nothing to validate, so submission can proceed even when the
+  // ability catalogs failed (the base catalogs gate the required race/class items).
+  if (!anySelection) return null
+
+  if (!blessings || !bloodlines || !transcendentSkills) {
+    return "Ability catalogs could not be loaded. Retry to validate the selected abilities."
+  }
+
+  if (blessingId) {
+    const blessing = blessings.find((b) => b.id === blessingId)
+    if (!blessing) {
+      return `The selected blessing "${blessingId}" is no longer in the catalog. Re-select a blessing or choose None.`
+    }
+    if (blessing.archived) {
+      return `The selected blessing "${blessing.name}" is archived and cannot be linked. Re-select an available blessing or choose None.`
+    }
+  }
+
+  const selectedBloodlines = bloodlineIds.map((id) =>
+    bloodlines.find((b) => b.id === id)
+  )
+  for (let i = 0; i < bloodlineIds.length; i++) {
+    const id = bloodlineIds[i]
+    const def = selectedBloodlines[i]
+    if (!def) {
+      return `The selected bloodline "${id}" is no longer in the catalog. Remove it or select an available bloodline.`
+    }
+    if (def.archived) {
+      return `The selected bloodline "${def.name}" is archived and cannot be linked. Remove it or select an available bloodline.`
+    }
+  }
+  const upgradeGroups = new Map<string, string>()
+  for (const def of selectedBloodlines) {
+    // All selected ids were resolved above, but `def` is still typed as possibly
+    // undefined; skip defensively (the prior loop already returned on a miss).
+    if (!def) continue
+    const group = def.config?.upgradeGroup
+    if (typeof group === "string" && group.length > 0) {
+      const prior = upgradeGroups.get(group)
+      if (prior != null) {
+        return `Bloodlines "${prior}" and "${def.name}" both occupy upgrade group "${group}". Select only one bloodline per upgrade group.`
+      }
+      upgradeGroups.set(group, def.name)
+    }
+  }
+
+  for (const id of transcendentSkillIds) {
+    const def = transcendentSkills.find((t) => t.id === id)
+    if (!def) {
+      return `The selected transcendent skill "${id}" is no longer in the catalog. Remove it or select an available transcendent skill.`
+    }
+    if (def.archived) {
+      return `The selected transcendent skill "${def.name}" is archived and cannot be linked. Remove it or select an available transcendent skill.`
+    }
+  }
+
+  return null
+}
+
 export function CreateCharacterForm() {
   const router = useRouter()
   const [draft, setDraft] = React.useState<Draft>(() => loadDraft())
@@ -287,8 +451,20 @@ export function CreateCharacterForm() {
   const [professions, setProfessions] = React.useState<CatalogItem[] | null>(
     null
   )
+  const [blessings, setBlessings] = React.useState<CatalogItem[] | null>(null)
+  const [bloodlines, setBloodlines] = React.useState<CatalogItem[] | null>(null)
+  const [transcendentSkills, setTranscendentSkills] = React.useState<
+    CatalogItem[] | null
+  >(null)
   const [catalogError, setCatalogError] = React.useState<string | null>(null)
   const [catalogLoading, setCatalogLoading] = React.useState(true)
+  // Ability catalogs (blessings / bloodlines / transcendent skills) load and fail
+  // independently of the base catalogs. A failure here must not prevent the base
+  // catalogs from loading, so a no-selection draft can still be created, but it
+  // MUST block submission once a selection exists (see `specialValidationError`).
+  const [abilityCatalogError, setAbilityCatalogError] = React.useState<
+    string | null
+  >(null)
   const [submitting, setSubmitting] = React.useState(false)
 
   // Server draft sync state.
@@ -349,7 +525,7 @@ export function CreateCharacterForm() {
       if (res.draft) {
         versionRef.current = res.draft.version
         serverPresentRef.current = true
-        const next = { ...EMPTY_DRAFT, ...fromServerData(res.draft.data) }
+        const next = normalizeDraft(fromServerData(res.draft.data))
         // Server is authoritative by default. Offer recovery only when the local
         // draft has real content that diverges from the server AND no recovery
         // choice is already pending. The recovery copy is persisted under its own
@@ -367,12 +543,34 @@ export function CreateCharacterForm() {
       } else {
         versionRef.current = null
         serverPresentRef.current = false
-        // No server draft exists, so there is no local vs server conflict to
-        // resolve: the device draft stands. Any lingering recovery copy from a
-        // previous session is resolved and cleared so Save/Create re-enable.
-        clearRecoveryKey()
-        setLocalRecoverDraft(null)
-        setShowRecoverLocal(false)
+        // No server draft exists, so there is no live conflict to resolve, but a
+        // recovery snapshot left by a previous session must not be discarded.
+        // Restore it as the device draft (it is the most recent real local
+        // content) unless the current live draft carries its own content that
+        // differs, in which case surface the explicit recovery choice so nothing
+        // is silently clobbered. The restored snapshot is persisted under
+        // STORAGE_KEY before RECOVERY_KEY is cleared so a refresh cannot lose it,
+        // and the initial autosave create then saves it.
+        const recovery = loadRecoveryDraft()
+        const current = draftRef.current
+        if (
+          recovery &&
+          hasContent(current) &&
+          draftsDiffer(current, recovery)
+        ) {
+          setLocalRecoverDraft(recovery)
+          setShowRecoverLocal(true)
+        } else if (recovery) {
+          applyDraft(recovery)
+          saveLocalDraft(recovery)
+          clearRecoveryKey()
+          setLocalRecoverDraft(null)
+          setShowRecoverLocal(false)
+        } else {
+          clearRecoveryKey()
+          setLocalRecoverDraft(null)
+          setShowRecoverLocal(false)
+        }
       }
       setReady(true)
     },
@@ -390,9 +588,33 @@ export function CreateCharacterForm() {
     }
   }, [applyServerDraft])
 
+  // Fetch only the ability catalogs. Reused by both the initial mount load and the
+  // special-step Retry action so a catalog failure can be retried WITHOUT a full
+  // page reload (the in-memory draft and the current step are preserved). Returns
+  // whether the reload succeeded, so callers can decide how to surface it.
+  const loadAbilityCatalogs = React.useCallback(async (): Promise<boolean> => {
+    try {
+      const [blessingRes, bloodlineRes, skillRes] = await Promise.all([
+        apiFetch<CatalogListResponse>("/api/catalog/blessings"),
+        apiFetch<CatalogListResponse>("/api/catalog/bloodlines"),
+        apiFetch<CatalogListResponse>("/api/catalog/transcendent_skills"),
+      ])
+      setBlessings(blessingRes.items)
+      setBloodlines(bloodlineRes.items)
+      setTranscendentSkills(skillRes.items)
+      setAbilityCatalogError(null)
+      return true
+    } catch (err) {
+      setAbilityCatalogError(
+        err instanceof Error ? err.message : "Failed to load ability catalogs."
+      )
+      return false
+    }
+  }, [])
+
   React.useEffect(() => {
     let active = true
-    async function load() {
+    async function loadBaseCatalogs() {
       setCatalogLoading(true)
       setCatalogError(null)
       try {
@@ -415,11 +637,18 @@ export function CreateCharacterForm() {
         if (active) setCatalogLoading(false)
       }
     }
-    load()
+    // The base and ability catalogs load independently: a failure in the ability
+    // catalogs must not prevent the base catalogs from loading, so a draft with
+    // no ability selection can still be created once race/class are chosen. The
+    // ability load reuses the same `loadAbilityCatalogs` used by the Retry action.
+    void loadBaseCatalogs()
+    // Defer the ability load off the synchronous effect body so no setState runs
+    // inline before the awaited catalog fetches resolve.
+    Promise.resolve().then(() => void loadAbilityCatalogs())
     return () => {
       active = false
     }
-  }, [])
+  }, [loadAbilityCatalogs])
 
   // A recovery copy persisted by a previous session means a local vs server draft
   // choice is still unresolved, so `localRecoverDraft` / `showRecoverLocal` are
@@ -508,6 +737,14 @@ export function CreateCharacterForm() {
   // recovery choice is unresolved.
   React.useEffect(() => {
     if (!ready) return
+    // While a local vs server recovery choice is pending, autosave must not run
+    // at all - not even the first-save create. This check comes BEFORE the
+    // skipFirstSaveRef branch so a pending choice never writes the device's
+    // current (live) draft to the server: only the explicit overwrite/keep
+    // action persists, so the chosen snapshot is never clobbered by the live
+    // draft. `skipFirstSaveRef` stays true here and is handled by the explicit
+    // resolution handler, which persists the chosen snapshot exactly once.
+    if (showRecoverLocal) return
     if (skipFirstSaveRef.current) {
       skipFirstSaveRef.current = false
       // The server GET resolved to no draft while this device carries real
@@ -528,7 +765,6 @@ export function CreateCharacterForm() {
       return
     }
     if (saveStateRef.current === "conflict") return
-    if (showRecoverLocal) return
     const timer = setTimeout(() => {
       dirtyRef.current = true
       void saveLoop()
@@ -554,7 +790,7 @@ export function CreateCharacterForm() {
       if (res.draft) {
         versionRef.current = res.draft.version
         serverPresentRef.current = true
-        applyDraft({ ...EMPTY_DRAFT, ...fromServerData(res.draft.data) })
+        applyDraft(normalizeDraft(fromServerData(res.draft.data)))
       } else {
         versionRef.current = null
         serverPresentRef.current = false
@@ -601,7 +837,7 @@ export function CreateCharacterForm() {
       if (res.draft) {
         versionRef.current = res.draft.version
         serverPresentRef.current = true
-        applyDraft({ ...EMPTY_DRAFT, ...fromServerData(res.draft.data) })
+        applyDraft(normalizeDraft(fromServerData(res.draft.data)))
       } else {
         versionRef.current = null
         serverPresentRef.current = false
@@ -611,6 +847,11 @@ export function CreateCharacterForm() {
       setLocalRecoverDraft(null)
       setShowRecoverLocal(false)
       setSaveState("idle")
+      // The server draft (or empty state) is now authoritative, so the queued
+      // first-save create must not rewrite it. The chosen snapshot was already
+      // resolved explicitly; mark the first save as handled so autosave resumes
+      // cleanly for subsequent edits without a second write.
+      skipFirstSaveRef.current = false
       skipNextSaveRef.current = true
     } catch (err) {
       setSaveError(
@@ -644,6 +885,12 @@ export function CreateCharacterForm() {
       clearRecoveryKey()
       setLocalRecoverDraft(null)
       setShowRecoverLocal(false)
+      // The chosen (device) snapshot was just persisted by `performSave`. Mark
+      // the first-save create as handled so the autosave effect does not issue a
+      // second, duplicate PUT of the same snapshot (a pending choice must never
+      // result in two writes), and skip the immediate next save so the snapshot
+      // we just wrote is not re-saved.
+      skipFirstSaveRef.current = false
       skipNextSaveRef.current = true
     } catch (err) {
       setSaveError(
@@ -657,7 +904,7 @@ export function CreateCharacterForm() {
 
   const handleSaveClick = React.useCallback(() => {
     // While a local vs server recovery choice is unresolved, a manual Save must
-    // not PUT - only the explicit 'Overwrite server draft' action may.
+    // not PUT - only the explicit 'Use device draft' action may.
     if (showRecoverLocal) return
     dirtyRef.current = true
     void saveLoop()
@@ -668,7 +915,7 @@ export function CreateCharacterForm() {
   // hang: a failed save resolves to false and onSubmit aborts.
   const flushSave = React.useCallback(async (): Promise<boolean> => {
     // While a local vs server recovery choice is unresolved, neither save nor
-    // create may touch the server - only the explicit 'Overwrite server draft'
+    // create may touch the server - only the explicit 'Use device draft'
     // action may. Report false so onSubmit aborts the create without POSTing.
     if (showRecoverLocal) return false
     // The server GET has not resolved (still in flight or failed), so the
@@ -720,6 +967,29 @@ export function CreateCharacterForm() {
   const professionName =
     professions?.find((p) => p.id === professionId)?.name ?? null
 
+  // The special-abilities selection is valid only when the ability catalogs
+  // loaded and every selected id resolves to an unarchived definition (and no
+  // bloodline upgrade-group collision). Used to disable the submit button and to
+  // abort before flushSave/POST so an invalid selection is never silently
+  // dropped. With no selection the error is always null (see the helper).
+  const specialError = specialValidationError(
+    draft,
+    blessings,
+    bloodlines,
+    transcendentSkills
+  )
+
+  // Stored ids that are no longer in the loaded ability catalog. They are still
+  // rendered (checked) so the user can remove them, rather than being invisible
+  // and unresolvable.
+  const orphanBloodlineIds = draft.specialAbilities.bloodlineIds.filter(
+    (id) => !bloodlines?.some((b) => b.id === id)
+  )
+  const orphanTranscendentSkillIds =
+    draft.specialAbilities.transcendentSkillIds.filter(
+      (id) => !transcendentSkills?.some((t) => t.id === id)
+    )
+
   function onPortraitFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
     if (!file) return
@@ -738,12 +1008,18 @@ export function CreateCharacterForm() {
     async (event: React.FormEvent<HTMLFormElement>) => {
       event.preventDefault()
       // Do not POST while a local vs server recovery choice is unresolved (the
-      // user must deliberately resolve via 'Overwrite server draft' / 'Keep
-      // server draft' first) or until the server GET succeeds (otherwise the
+      // user must deliberately resolve via 'Use device draft' / 'Use server
+      // draft' first) or until the server GET succeeds (otherwise the
       // draft version is unknown and creation would proceed without touching the
       // draft, or flushSave would refuse). The submit button is disabled for the
       // same reasons; this guard is defense in depth.
       if (showRecoverLocal || !ready) return
+      // An invalid special-abilities selection must abort BEFORE the flushSave
+      // (and thus before the POST): the draft stays intact and nothing is
+      // silently dropped. The error is surfaced inline on the special and review
+      // steps. The submit button is disabled for the same reason; this guard is
+      // defense in depth (e.g. a form submit via Enter).
+      if (specialError) return
       setSubmitting(true)
       try {
         // Flush any pending autosave so the create uses the current draft
@@ -759,11 +1035,13 @@ export function CreateCharacterForm() {
           classId: string
           professionId?: string
           draftVersion?: number
+          specialAbilities: SpecialAbilitiesSelection
         } = {
           name: draft.name,
           origin: draft.origin as "integrated" | "born",
           raceId,
           classId,
+          specialAbilities: toServerData(draft).specialAbilities!,
           ...(professionId ? { professionId } : {}),
         }
         if (draft.description) body.description = draft.description
@@ -813,6 +1091,7 @@ export function CreateCharacterForm() {
       portraitFile,
       showRecoverLocal,
       ready,
+      specialError,
     ]
   )
 
@@ -850,7 +1129,7 @@ export function CreateCharacterForm() {
         <Alert variant="destructive">
           <div className="flex flex-col gap-1">
             <span>
-              A saved draft on this device differs from the server draft.
+              A saved draft on this device differs from the draft on the server.
               Autosave is paused. Choose which draft to keep.
             </span>
             <div className="flex flex-wrap gap-1.5">
@@ -860,7 +1139,7 @@ export function CreateCharacterForm() {
                 className="w-fit"
                 onClick={() => void recoverLocal()}
               >
-                Overwrite server draft
+                Use device draft
               </Button>
               <Button
                 variant="outline"
@@ -868,7 +1147,7 @@ export function CreateCharacterForm() {
                 className="w-fit"
                 onClick={() => void keepServerDraft()}
               >
-                Keep server draft
+                Use server draft
               </Button>
             </div>
           </div>
@@ -929,7 +1208,7 @@ export function CreateCharacterForm() {
 
       {/* While a local vs server recovery choice is pending, the wizard shows
           the applied server draft, so freeze its fields: edits would otherwise
-          diverge from the recovery snapshot and 'Overwrite server draft' would
+          diverge from the recovery snapshot and 'Use device draft' would
           restore something other than what is displayed. Disabling the whole
           wizard also blocks step navigation during the unresolved choice. */}
       <fieldset disabled={showRecoverLocal} className="contents">
@@ -1114,32 +1393,279 @@ export function CreateCharacterForm() {
           <QuestionnaireItem name="special">
             <QuestionnaireTitle>Special abilities</QuestionnaireTitle>
             <QuestionnaireDescription>
-              Blessings and bloodlines can be attached after character creation.
-              They are not assigned during creation. Nothing is recorded here,
-              so no numbers are affected.
+              Select optional catalog entries. No eligibility or effects are
+              inferred here.
             </QuestionnaireDescription>
             {draft.special === "yes" ? (
               <p className="text-xs text-muted-foreground">
-                This draft records your answer only. Attach blessings or
-                bloodlines after creating the character.
+                This legacy draft had a special-abilities flag, not a catalog
+                selection. Choose entries again if desired.
               </p>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                Not assigned during creation. Attach blessings or bloodlines
-                after creating the character.
-              </p>
-            )}
-            {/* The questionnaire only advances past an item that reports an
-                answer. This step has nothing to record, so a default-checked
-                continuation choice registers the step as answered and lets the
-                wizard move on (and lets the final submit validate). It is
-                visually hidden so the step still renders as a plain
-                informational panel. */}
-            <QuestionnaireChoices className="hidden">
-              <QuestionnaireChoice value="none" defaultChecked>
-                Continue
+            ) : null}
+            {specialError ? (
+              <Alert variant="destructive">{specialError}</Alert>
+            ) : null}
+            {!blessings || !bloodlines || !transcendentSkills ? (
+              <div className="flex flex-col gap-2 text-xs text-muted-foreground">
+                <span>
+                  {abilityCatalogError
+                    ? `Catalog unavailable: ${abilityCatalogError}`
+                    : "Loading ability catalogs..."}
+                </span>
+                {abilityCatalogError ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void loadAbilityCatalogs()}
+                  >
+                    Retry
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+            {/* The "None" blessing choice is rendered unconditionally so the
+                special step always carries a real answered QuestionnaireChoice
+                and can be navigated past even when the ability catalogs fail (a
+                no-selection draft gains nothing that needs validating). The
+                catalog-loaded blessing choices are kept in the same group. */}
+            <QuestionnaireChoices>
+              <QuestionnaireChoice
+                value=""
+                checked={!draft.specialAbilities.blessingId}
+                onChange={() =>
+                  setDraft((d) => ({
+                    ...d,
+                    specialAbilities: {
+                      ...d.specialAbilities,
+                      blessingId: null,
+                    },
+                  }))
+                }
+              >
+                None
               </QuestionnaireChoice>
+              {blessings
+                ?.filter(
+                  (x) =>
+                    !x.archived || x.id === draft.specialAbilities.blessingId
+                )
+                .map((x) => (
+                  <QuestionnaireChoice
+                    key={x.id}
+                    value={x.id}
+                    checked={draft.specialAbilities.blessingId === x.id}
+                    onChange={() =>
+                      setDraft((d) => ({
+                        ...d,
+                        specialAbilities: {
+                          ...d.specialAbilities,
+                          blessingId: x.id,
+                        },
+                      }))
+                    }
+                  >
+                    {x.name}
+                    {x.archived ? " (Unavailable - re-select required)" : null}
+                    <QuestionnaireChoiceDescription>
+                      {[x.provenance, x.grade, x.description]
+                        .filter(Boolean)
+                        .join(" - ")}
+                    </QuestionnaireChoiceDescription>
+                  </QuestionnaireChoice>
+                ))}
             </QuestionnaireChoices>
+            {blessings && bloodlines && transcendentSkills ? (
+              <>
+                <p className="text-xs font-medium">Bloodlines (up to 8)</p>
+                {bloodlines
+                  .filter(
+                    (x) =>
+                      !x.archived ||
+                      draft.specialAbilities.bloodlineIds.includes(x.id)
+                  )
+                  .map((x) => {
+                    const group = x.config.upgradeGroup
+                    const conflict =
+                      !!group &&
+                      draft.specialAbilities.bloodlineIds.some(
+                        (id) =>
+                          id !== x.id &&
+                          bloodlines.find((b) => b.id === id)?.config
+                            .upgradeGroup === group
+                      )
+                    const checked =
+                      draft.specialAbilities.bloodlineIds.includes(x.id)
+                    return (
+                      <label
+                        key={x.id}
+                        className="flex gap-2 rounded-md border p-2 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          disabled={
+                            !checked &&
+                            (conflict ||
+                              draft.specialAbilities.bloodlineIds.length >= 8 ||
+                              x.archived)
+                          }
+                          onChange={(e) =>
+                            setDraft((d) => ({
+                              ...d,
+                              specialAbilities: {
+                                ...d.specialAbilities,
+                                bloodlineIds: e.target.checked
+                                  ? [...d.specialAbilities.bloodlineIds, x.id]
+                                  : d.specialAbilities.bloodlineIds.filter(
+                                      (id) => id !== x.id
+                                    ),
+                              },
+                            }))
+                          }
+                        />
+                        <span>
+                          {x.name}
+                          {x.archived
+                            ? " (Unavailable - re-select required)"
+                            : null}
+                          <small className="block text-muted-foreground">
+                            {[
+                              x.provenance,
+                              x.grade,
+                              x.description,
+                              conflict
+                                ? "Conflicts with a selected bloodline upgrade group"
+                                : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" - ")}
+                          </small>
+                        </span>
+                      </label>
+                    )
+                  })}
+                {orphanBloodlineIds.map((id) => (
+                  <label
+                    key={`orphan-bloodline-${id}`}
+                    className="flex gap-2 rounded-md border p-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={draft.specialAbilities.bloodlineIds.includes(id)}
+                      onChange={(e) =>
+                        setDraft((d) => ({
+                          ...d,
+                          specialAbilities: {
+                            ...d.specialAbilities,
+                            bloodlineIds: e.target.checked
+                              ? [...d.specialAbilities.bloodlineIds, id]
+                              : d.specialAbilities.bloodlineIds.filter(
+                                  (bid) => bid !== id
+                                ),
+                          },
+                        }))
+                      }
+                    />
+                    <span>
+                      {id}
+                      <small className="block text-muted-foreground">
+                        (Unavailable)
+                      </small>
+                    </span>
+                  </label>
+                ))}
+                <p className="text-xs font-medium">
+                  Transcendent skills (up to 8)
+                </p>
+                {transcendentSkills
+                  .filter(
+                    (x) =>
+                      !x.archived ||
+                      draft.specialAbilities.transcendentSkillIds.includes(x.id)
+                  )
+                  .map((x) => (
+                    <label
+                      key={x.id}
+                      className="flex gap-2 rounded-md border p-2 text-sm"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={draft.specialAbilities.transcendentSkillIds.includes(
+                          x.id
+                        )}
+                        disabled={
+                          !draft.specialAbilities.transcendentSkillIds.includes(
+                            x.id
+                          ) &&
+                          (draft.specialAbilities.transcendentSkillIds.length >=
+                            8 ||
+                            x.archived)
+                        }
+                        onChange={(e) =>
+                          setDraft((d) => ({
+                            ...d,
+                            specialAbilities: {
+                              ...d.specialAbilities,
+                              transcendentSkillIds: e.target.checked
+                                ? [
+                                    ...d.specialAbilities.transcendentSkillIds,
+                                    x.id,
+                                  ]
+                                : d.specialAbilities.transcendentSkillIds.filter(
+                                    (id) => id !== x.id
+                                  ),
+                            },
+                          }))
+                        }
+                      />
+                      <span>
+                        {x.name}
+                        {x.archived
+                          ? " (Unavailable - re-select required)"
+                          : null}
+                        <small className="block text-muted-foreground">
+                          {[x.provenance, x.grade, x.description]
+                            .filter(Boolean)
+                            .join(" - ")}
+                        </small>
+                      </span>
+                    </label>
+                  ))}
+                {orphanTranscendentSkillIds.map((id) => (
+                  <label
+                    key={`orphan-transcendent-${id}`}
+                    className="flex gap-2 rounded-md border p-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={draft.specialAbilities.transcendentSkillIds.includes(
+                        id
+                      )}
+                      onChange={(e) =>
+                        setDraft((d) => ({
+                          ...d,
+                          specialAbilities: {
+                            ...d.specialAbilities,
+                            transcendentSkillIds: e.target.checked
+                              ? [...d.specialAbilities.transcendentSkillIds, id]
+                              : d.specialAbilities.transcendentSkillIds.filter(
+                                  (tid) => tid !== id
+                                ),
+                          },
+                        }))
+                      }
+                    />
+                    <span>
+                      {id}
+                      <small className="block text-muted-foreground">
+                        (Unavailable)
+                      </small>
+                    </span>
+                  </label>
+                ))}
+              </>
+            ) : null}
           </QuestionnaireItem>
 
           <QuestionnaireItem name="equipment">
@@ -1196,7 +1722,24 @@ export function CreateCharacterForm() {
                 <span className="text-muted-foreground">
                   Special abilities:{" "}
                 </span>
-                Not assigned
+                {[
+                  draft.specialAbilities.blessingId &&
+                    blessings?.find(
+                      (x) => x.id === draft.specialAbilities.blessingId
+                    )?.name,
+                  ...draft.specialAbilities.bloodlineIds.map(
+                    (id) =>
+                      bloodlines?.find((x) => x.id === id)?.name ??
+                      `${id} (Unavailable)`
+                  ),
+                  ...draft.specialAbilities.transcendentSkillIds.map(
+                    (id) =>
+                      transcendentSkills?.find((x) => x.id === id)?.name ??
+                      `${id} (Unavailable)`
+                  ),
+                ]
+                  .filter(Boolean)
+                  .join(", ") || "None"}
               </div>
               <div>
                 <span className="text-muted-foreground">Equipment: </span>
@@ -1204,10 +1747,13 @@ export function CreateCharacterForm() {
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              Blessings and bloodlines can be configured after creation.
-              Transcendent skills can also be attached after creation, but are
-              not auto-awarded by this questionnaire.
+              Ability selections are linked atomically with character creation.
+              Portrait upload, if chosen, happens after creation and is not
+              atomic.
             </p>
+            {specialError ? (
+              <Alert variant="destructive">{specialError}</Alert>
+            ) : null}
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="create-portrait">Portrait (optional)</Label>
               <Input
@@ -1236,7 +1782,9 @@ export function CreateCharacterForm() {
             <QuestionnairePrevious>Back</QuestionnairePrevious>
             <QuestionnaireNext>Next</QuestionnaireNext>
             <QuestionnaireSubmit
-              disabled={submitting || showRecoverLocal || !ready}
+              disabled={
+                submitting || showRecoverLocal || !ready || !!specialError
+              }
             >
               {submitting ? "Creating..." : "Create character"}
             </QuestionnaireSubmit>

@@ -12,6 +12,7 @@
  */
 
 import { z } from "zod"
+import { specialAbilitiesSchema } from "@/lib/server/schemas"
 
 /** Hard cap on the serialized `data` payload (20 KB). */
 export const DRAFT_DATA_MAX_BYTES = 20 * 1024
@@ -29,10 +30,13 @@ const boundedString = (max: number, opts?: { nullable?: boolean }) => {
  * deliberately not enforced here (the client owns step progression).
  *
  * `equipment` is a list of selected catalog stableIds/ids, `special` is the
- * "has special abilities" flag, and `origin`/`raceId`/`classId`/`professionId`
- * mirror the final Character creation fields. The textual fields map to the
- * nullable `description`, `nickname`, `pronouns`, `ageDescription`, `appearance`,
- * `biography` and `notes` columns of the final creation step.
+ * "has special abilities" flag, and `specialAbilities` is the explicit
+ * blessing/bloodline/transcendent selection (validated to the same bounds as the
+ * final create) that a legacy `special: true` draft does NOT imply - the server
+ * never grants a power from the boolean alone. `origin`/`raceId`/`classId`/
+ * `professionId` mirror the final Character creation fields. The textual fields
+ * map to the nullable `description`, `nickname`, `pronouns`, `ageDescription`,
+ * `appearance`, `biography` and `notes` columns of the final creation step.
  */
 export const draftDataSchema = z
   .object({
@@ -44,6 +48,7 @@ export const draftDataSchema = z
     classId: z.string().max(128).optional(),
     professionId: z.string().max(128).nullable().optional(),
     special: z.boolean().optional(),
+    specialAbilities: specialAbilitiesSchema.optional(),
     equipment: z.array(z.string().max(128)).max(128).optional(),
     nickname: boundedString(200, { nullable: true }),
     pronouns: boundedString(100, { nullable: true }),

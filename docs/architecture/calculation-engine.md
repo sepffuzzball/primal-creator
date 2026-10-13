@@ -178,11 +178,16 @@ deliberately **not** authoritative character state. The contract is:
   unauthenticated reads/writes.
 - **What it stores.** Only consumer-authored draft `data` validated against a
   whitelist (`step`, `name`, `description`, `origin`, `raceId`, `classId`,
-  `professionId`, `special`, `equipment`, plus optional `nickname`, `pronouns`,
-  `ageDescription`, `appearance`, `biography`, `notes`). Each string is bounded and
-  the whole payload is capped at 20KB. It never stores uploaded binaries and never
-  stores stat vectors, awards or effects - those belong to the engine, not the
-  draft. It does not derive any numbers.
+  `professionId`, `special`, `specialAbilities`, `equipment`, plus optional
+  `nickname`, `pronouns`, `ageDescription`, `appearance`, `biography`, `notes`).
+  Each string is bounded and the whole payload is capped at 20KB. It never stores
+  uploaded binaries and never stores stat vectors, awards or effects - those
+  belong to the engine, not the draft. It does not derive any numbers.
+  `specialAbilities` carries the explicit blessing `blessingId` and
+  `bloodlineIds`/`transcendentSkillIds` arrays (each at most 8 unique nonempty
+  ids, no id overlap) as resumable state only; the legacy `special` boolean stays
+  readable but has no award semantics - a `special: true` draft never grants a
+  power unless an explicit `specialAbilities` selection is submitted at create.
 - **Concurrency.** The draft row carries an optimistic-concurrency `version`.
   Mutating an **existing** draft requires the exact current `version`; a mismatched
   `version` is a 409 conflict, and omitting `version` on an existing draft is a
@@ -209,6 +214,24 @@ deliberately **not** authoritative character state. The contract is:
   validated by `characterCreateSchema`. When `draftVersion` is omitted (a
   non-wizard API client, or create-from-scratch), the draft is left untouched and
   the create proceeds as before.
+- **Explicit special-ability selections are part of atomic create.** `POST
+/api/characters` (and the resumable draft `data`) accept an optional
+  `specialAbilities` object (`blessingId`, `bloodlineIds`,
+  `transcendentSkillIds`). When supplied, `createCharacter` resolves each id by
+  its corresponding catalog kind (`blessings` / `bloodlines` /
+  `transcendent_skills`), requires the definition to be unarchived, enforces the
+  invariants (at most one blessing; no two selected bloodlines sharing the same
+  nonempty `upgradeGroup`; transcendent skills distinct and never
+  duplicate/overlapping), and inserts the `BLESSING` / `BLOODLINE` /
+  `TRANSCENDENT` CharacterAssociations atomically inside the SAME transaction as
+  the character row, the `create` event, and the draft delete. A wrong-kind,
+  archived, missing, duplicate or upgrade-group-collision selection rejects the
+  whole create with a 400 and a stale `draftVersion` rejects with a 409 - either
+  way no character, event, link or draft deletion is committed. The `create`
+  journal records a snapshot and `provenance` of each selected definition. No
+  ability is ever auto-selected and no numeric bonus is fabricated: a link only
+  synthesizes effects declared in the catalog, and the legacy `special` boolean
+  never grants a power on its own.
 
 ## Trusted-backup character export / import (contract)
 

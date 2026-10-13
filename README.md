@@ -48,29 +48,37 @@ evolution_choice_required`).
 - **Resumable creation drafts**: the questionnaire is persisted per user as an
   authenticated, owner-scoped draft (one per user) so work is never lost. A draft
   stores only validated, whitelisted fields (`step`, name/description, origin,
-  race/class/profession, a special-abilities flag kept for backward
-  compatibility with legacy drafts (always `false` from the wizard - the feature
-  is deferred) and an equipment list, plus optional narrative fields), bounded
-  and capped at 20KB - no uploaded binaries and no
-  stat/award/effect fields. Drafts are optimistic-concurrency versioned (a stale
-  write 409s) and are **not authoritative character state**: final creation of a
-  `Character` (and its engine state) is a separate, still-transactional operation.
-  The wizard's final create step accepts an optional `draftVersion`; when supplied
-  the matching draft is deleted atomically inside the same transaction as the
-  character row and its `create` journal event, and a stale version 409s
-  `draft_conflict` and rolls back the whole create (no second best-effort DELETE).
-  When `draftVersion` is omitted (non-wizard clients) the draft is never touched.
-  The wizard only sends `name`, `description`, `origin`, `raceId`, `classId`,
-  `professionId` (and `draftVersion`) to create - the `special`/`equipment`
-  flags and the optional narrative fields are draft-only and never persisted to
-  the character as fake powers. The wizard always persists `special: false` (it
-  never submits `special: true`), so a legacy draft that carried the flag is
-  normalized rather than treated as character state. An optional portrait chosen
-  at creation is **not** part of this atomic create: it is uploaded after the
-  character exists,
-  so a failed upload never rolls back the character (the attachment is not
-  atomic). Other draft metadata (nickname, pronouns, age, appearance, biography,
-  notes) is preserved in the draft but not yet sent to the character.
+  race/class/profession, an explicit `specialAbilities` selection of catalog ids -
+  at most one blessing, up to 8 bloodlines and up to 8 transcendent skills - plus
+  a legacy `special` boolean kept read-only (always normalized to `false` from the
+  wizard) and an equipment list, plus optional narrative fields), bounded and
+  capped at 20KB - no uploaded binaries and no stat/award/effect fields. Drafts
+  are optimistic-concurrency versioned (a stale write 409s) and are **not
+  authoritative character state**: final creation of a `Character` (and its engine
+  state) is a separate, still-transactional operation. The wizard's final create
+  step accepts an optional `draftVersion`; when supplied the matching draft is
+  deleted atomically inside the same transaction as the character row and its
+  `create` journal event, and a stale version 409s `draft_conflict` and rolls back
+  the whole create (no second best-effort DELETE). When `draftVersion` is omitted
+  (non-wizard clients) the draft is never touched. The wizard sends `name`,
+  `description`, `origin`, `raceId`, `classId`, `professionId` (as applicable),
+  `specialAbilities` and `draftVersion` to create; the `special`/`equipment` flags
+  and the optional narrative fields are draft-only and never persisted to the
+  character as fake powers. Each selected `specialAbilities` id is resolved by its
+  catalog kind, required to be unarchived (active) and the right kind, and checked
+  for overlap/collision (one blessing, no two bloodlines sharing a nonempty
+  `upgradeGroup`, distinct transcendents), and the resulting `BLESSING` /
+  `BLOODLINE` / `TRANSCENDENT` associations are inserted atomically inside the
+  same transaction as the character row, the `create` event and the optional draft
+  delete - a missing/archived/wrong-kind/duplicate/collision selection rejects the
+  whole create, and the legacy `special` boolean never grants a power on its own.
+  The wizard always persists `special: false` (it never submits `special: true`),
+  so a legacy draft that carried the flag is normalized rather than treated as
+  character state. An optional portrait chosen at creation is **not** part of this
+  atomic create: it is uploaded after the character exists, so a failed upload
+  never rolls back the character (the attachment is not atomic). Other draft
+  metadata (nickname, pronouns, age, appearance, biography, notes) is preserved in
+  the draft but not yet sent to the character.
 - **Character portraits**: an authenticated owner/admin can upload, view and
   remove a character's portrait. Uploads are bounded to 4 MiB, validated
   content-based (PNG/JPEG/WebP via sharp), re-encoded to WebP and stored as an
@@ -102,6 +110,14 @@ evolution_choice_required`).
   Admins can create and edit entries, set a `verified` / `inferred` / `house`
   provenance, attach a source URL, and store per-kind `config`. With
   `CATALOG_PUBLIC` unset, catalog reads require a session.
+- **Admin opt-in catalog import (reviewed manifest)**: an admin can apply a
+  manually reviewed, version-controlled manifest
+  (`prisma/catalog/wiki-reviewed.ts`) with `GET` / `POST /api/admin/catalog-import`.
+  The `GET` preview is read-only; the `POST` apply inserts every missing row in one
+  atomic `SERIALIZABLE` transaction and never overwrites an existing row (the
+  entry is skipped instead). It is never run by `db:seed` or app startup. See
+  `docs/catalog/wiki-reviewed.md` for source provenance, exact per-entry URLs and
+  the "no fabricated numeric bonus" policy.
 - **Title & equipment linking**: a character can attach real catalog titles and
   equip catalog equipment. Effects and equipment bonuses are synthesized live
   from the **current**, unarchived catalog config at read time; the stored
@@ -187,14 +203,12 @@ evolution_choice_required`).
 
 The engine and schema already account for these, but they are not fully wired up:
 
-- **Wizard "has special abilities" flag**: the creation wizard does not record a
-  "has special abilities" answer; it shows the special category as "Not assigned"
-  and never treats it as character state. Blessings, bloodlines and transcendents
-  are attached after creation (transcendents are shipped as a character
-  association kind, see the Shipped section).
-- **Catalog import**: the catalog is populated by `db:seed`; there is no bulk
-  import from the wiki, CSV or JSON (character backups are imported, but catalog
-  content is resolved against existing entries, never auto-created).
+- **Catalog import**: the catalog is populated by `db:seed`. A reviewed,
+  version-controlled manifest (`prisma/catalog/wiki-reviewed.ts`) can be applied
+  by an admin as an explicit opt-in (`POST /api/admin/catalog-import`) - see
+  `docs/catalog/wiki-reviewed.md`. Bulk import from CSV or JSON is still deferred
+  (character backups are imported, but external catalog content is never
+  auto-created at startup or seed).
 
 ## Fan project disclaimer & attribution
 

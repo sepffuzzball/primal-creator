@@ -132,6 +132,58 @@ describe("draft data schema (whitelist / bounds)", () => {
     const parsed = draftPutSchema.safeParse({ data: DATA })
     expect(parsed.success).toBe(true)
   })
+
+  it("accepts a draft with an explicit specialAbilities selection", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 4,
+      name: "Kael",
+      special: true,
+      specialAbilities: {
+        blessingId: "bless-1",
+        bloodlineIds: ["blood-1", "blood-2"],
+        transcendentSkillIds: ["trans-1"],
+      },
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a legacy draft with special:true and no explicit specialAbilities", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 4,
+      name: "Kael",
+      special: true,
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects a draft whose specialAbilities arrays exceed the 8-id cap", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 4,
+      specialAbilities: {
+        bloodlineIds: Array.from({ length: 9 }, (_, i) => `blood-${i}`),
+      },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a draft that selects the same id in more than one field (overlap)", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 4,
+      specialAbilities: {
+        blessingId: "bless-1",
+        bloodlineIds: ["bless-1"],
+      },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects an empty-string id in a specialAbilities array", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 4,
+      specialAbilities: { bloodlineIds: [""] },
+    })
+    expect(parsed.success).toBe(false)
+  })
 })
 
 describe("draft service (persistence + CAS)", () => {

@@ -11,6 +11,7 @@ import {
 } from "lucide-react"
 
 import {
+  ApiError,
   apiFetch,
   jsonInit,
   type CatalogItem,
@@ -19,6 +20,7 @@ import {
 import { useAppShell } from "@/components/app-shell"
 import { Alert } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
@@ -70,6 +72,27 @@ const EMPTY_FORM: FormState = {
   configText: "{}",
 }
 
+interface ImportPreview {
+  source: "wiki-reviewed"
+  entries: Array<{
+    kind: string
+    stableId: string
+    name: string
+    sourceUrl: string
+    provenance: string
+    status: "create" | "skip_existing"
+    existing?: {
+      id: string
+      name: string
+      sourceUrl: string | null
+      provenance: string
+      archived: boolean
+    }
+  }>
+  createCount: number
+  skipCount: number
+}
+
 function toForm(item: CatalogItem): FormState {
   return {
     name: item.name,
@@ -118,7 +141,82 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [unarchiveError, setUnarchiveError] = React.useState<string | null>(
     null
   )
+  const [importOpen, setImportOpen] = React.useState(false)
+  const [importPreview, setImportPreview] =
+    React.useState<ImportPreview | null>(null)
+  const [importLoading, setImportLoading] = React.useState(false)
+  const [importApplying, setImportApplying] = React.useState(false)
+  const [importError, setImportError] = React.useState<string | null>(null)
+  const [importResult, setImportResult] = React.useState<string | null>(null)
   const catalogUrl = `/api/catalog/${kind}${isAdmin && showArchived ? "?includeArchived=1" : ""}`
+
+  async function openImport() {
+    if (!isAdmin) return
+    setImportOpen(true)
+    setImportLoading(true)
+    setImportError(null)
+    setImportResult(null)
+    // Clear any previously shown preview up front so a failed fetch cannot leave
+    // a stale preview that the user could still apply.
+    setImportPreview(null)
+    try {
+      setImportPreview(
+        await apiFetch<ImportPreview>("/api/admin/catalog-import")
+      )
+    } catch (err) {
+      setImportError(
+        err instanceof Error ? err.message : "Could not load preview."
+      )
+    } finally {
+      setImportLoading(false)
+    }
+  }
+
+  async function applyImport() {
+    if (!isAdmin || !importPreview || importPreview.createCount === 0) return
+    if (
+      !window.confirm(
+        `Import ${importPreview.createCount} reviewed wiki entries?`
+      )
+    )
+      return
+    setImportApplying(true)
+    setImportError(null)
+    setImportResult(null)
+    try {
+      const result = await apiFetch<ImportPreview & { createdIds: string[] }>(
+        "/api/admin/catalog-import",
+        { ...jsonInit("POST", {}) }
+      )
+      setImportResult(
+        `Created ${result.createdIds.length}; skipped ${result.skipCount}.`
+      )
+      // Re-fetch the preview so the just-imported entries show as `skip_existing`
+      // with updated counts, while keeping the created/skipped result message
+      // clear and separate from the preview counts.
+      try {
+        setImportPreview(
+          await apiFetch<ImportPreview>("/api/admin/catalog-import")
+        )
+      } catch (refreshErr) {
+        setImportError(
+          refreshErr instanceof Error
+            ? refreshErr.message
+            : "Could not refresh preview."
+        )
+      }
+      await load()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Import failed."
+      setImportError(
+        err instanceof ApiError && err.status === 409
+          ? `${message} Refresh the preview and retry.`
+          : message
+      )
+    } finally {
+      setImportApplying(false)
+    }
+  }
 
   const load = React.useCallback(async () => {
     try {
@@ -293,6 +391,9 @@ export function CatalogManager({ kind }: { kind: string }) {
             <Button className="gap-1" onClick={openCreate}>
               <PlusIcon />
               New entry
+            </Button>
+            <Button variant="outline" onClick={openImport}>
+              Import reviewed wiki entries
             </Button>
           </div>
         ) : null}
@@ -530,6 +631,120 @@ export function CatalogManager({ kind }: { kind: string }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {isAdmin ? (
+        <Dialog open={importOpen} onOpenChange={setImportOpen}>
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Import reviewed wiki entries</DialogTitle>
+              <DialogDescription>
+                Preview the fixed reviewed manifest. No files are uploaded and
+                no wiki is fetched.
+              </DialogDescription>
+            </DialogHeader>
+            <Alert>
+              No existing entry is overwritten; no automatic character grants;
+              wiki-derived, review before use.
+            </Alert>
+            {importLoading ? <p role="status">Loading preview...</p> : null}
+            {importPreview ? (
+              <>
+                <p>
+                  {importPreview.createCount} to create;{" "}
+                  {importPreview.skipCount} to skip existing.
+                </p>
+                <div className="max-h-72 overflow-y-auto rounded-md border">
+                  <ul className="divide-y">
+                    {importPreview.entries.map((entry) => (
+                      <li
+                        key={`${entry.kind}:${entry.stableId}`}
+                        className="flex flex-col gap-1 p-3 text-sm"
+                      >
+                        <span className="font-medium">
+                          {entry.name}{" "}
+                          <span className="text-muted-foreground">
+                            ({entry.kind})
+                          </span>
+                          <Badge variant="secondary">Proposed</Badge>
+                        </span>
+                        <span className="font-mono text-xs">
+                          {entry.stableId}
+                        </span>
+                        <a
+                          className="break-all text-primary underline"
+                          href={entry.sourceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {entry.sourceUrl}
+                        </a>
+                        <span className="flex flex-wrap gap-2">
+                          <Badge>
+                            {entry.status === "create"
+                              ? "Create"
+                              : "Skip existing"}
+                          </Badge>
+                          {entry.provenance === "inferred" ? (
+                            <Badge variant="secondary">Inferred</Badge>
+                          ) : (
+                            <Badge variant="secondary">
+                              {entry.provenance}
+                            </Badge>
+                          )}
+                        </span>
+                        {entry.status === "skip_existing" && entry.existing ? (
+                          <span className="flex flex-col gap-1 text-xs text-muted-foreground">
+                            <span>
+                              {`Existing preserved: ${entry.existing.name} (${entry.existing.provenance})`}
+                              {entry.existing.archived ? " - Archived" : ""}
+                            </span>
+                            {entry.existing.sourceUrl ? (
+                              <a
+                                className="break-all text-primary underline"
+                                href={entry.existing.sourceUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                {entry.existing.sourceUrl}
+                              </a>
+                            ) : (
+                              <span>No source URL</span>
+                            )}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </>
+            ) : null}
+            {importError ? (
+              <Alert variant="destructive">{importError}</Alert>
+            ) : null}
+            {importResult ? <Alert>{importResult}</Alert> : null}
+            <DialogFooter showCloseButton>
+              <Button
+                variant="outline"
+                onClick={openImport}
+                disabled={importLoading || importApplying}
+              >
+                Refresh preview
+              </Button>
+              <Button
+                onClick={applyImport}
+                disabled={
+                  importLoading ||
+                  importApplying ||
+                  !!importError ||
+                  !importPreview ||
+                  importPreview.createCount === 0
+                }
+              >
+                {importApplying ? "Applying..." : "Apply import"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
     </div>
   )
 }

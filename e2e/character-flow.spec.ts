@@ -143,6 +143,121 @@ test.describe("character lifecycle", () => {
       page.getByText("No characters match your filters.")
     ).toBeVisible()
 
+    // ------------------------------------------------------------------ //
+    // Import the reviewed wiki manifest (admin-only, idempotent).
+    //
+    // The seed creates no blessings / bloodlines / transcendent skills, so the
+    // wizard's special-abilities step would have nothing to select until this
+    // import runs. The import never deletes or overwrites existing catalog rows
+    // (a repeated run skips every already-present entry), so it is safe to run
+    // against the same isolated test DB more than once: the first run creates
+    // the entries and a second run observes createCount=0 and takes the
+    // idempotent skip path.
+    // ------------------------------------------------------------------ //
+    await page.goto("/catalog/blessings")
+    await waitForHydrated(page)
+
+    // Preview to decide whether to apply. The preview endpoint is admin-only
+    // and we are logged in as the test admin, so a 401/403 would fail loudly.
+    const previewRes = await page.request.get("/api/admin/catalog-import")
+    expect(previewRes.ok()).toBeTruthy()
+    const preview = (await previewRes.json()) as {
+      source: string
+      createCount: number
+      skipCount: number
+      entries: Array<{
+        kind: string
+        stableId: string
+        status: "create" | "skip_existing"
+      }>
+    }
+    expect(preview.source).toBe("wiki-reviewed")
+
+    // Exercise the UI entry point: open the import dialog so the admin sees the
+    // preview and the Apply button, rather than only calling the API.
+    const importDialog = page
+      .locator("[role=dialog]")
+      .filter({ hasText: "Import reviewed wiki entries" })
+    await page
+      .getByRole("button", { name: "Import reviewed wiki entries" })
+      .click()
+    await expect(
+      importDialog.getByText(
+        new RegExp(
+          `${preview.createCount} to create; ${preview.skipCount} to skip existing\\.`
+        )
+      )
+    ).toBeVisible()
+
+    if (preview.createCount > 0) {
+      // Apply, accepting the browser confirmation dialog.
+      page.once("dialog", (dialog) => dialog.accept())
+      await importDialog.getByRole("button", { name: "Apply import" }).click()
+      await expect(
+        importDialog.getByText(new RegExp(/Created \d+; skipped \d+\./))
+      ).toBeVisible()
+    } else {
+      // Idempotent: nothing to create this run. Every manifest entry is
+      // skip_existing (existing rows are never overwritten) and the Apply
+      // button is disabled when there is nothing to create.
+      expect(preview.skipCount).toBeGreaterThan(0)
+      expect(
+        preview.entries.every((e) => e.status === "skip_existing")
+      ).toBeTruthy()
+      await expect(
+        importDialog.getByRole("button", { name: "Apply import" })
+      ).toBeDisabled()
+    }
+
+    // Close the import dialog and assert the imported catalogs are now reachable
+    // via authenticated GET, so the wizard can offer the blessing + bloodline on
+    // the special-abilities step.
+    await page.keyboard.press("Escape")
+    await expect(
+      page.getByRole("button", { name: "Import reviewed wiki entries" })
+    ).toBeVisible()
+
+    const blessingCatalog = await page.request.get("/api/catalog/blessings")
+    expect(blessingCatalog.ok()).toBeTruthy()
+    const blessings = (await blessingCatalog.json()) as {
+      kind: string
+      items: Array<{ name: string }>
+    }
+    expect(blessings.kind).toBe("blessings")
+    expect(
+      blessings.items.some(
+        (b) => b.name === "True Blessing of the Malefic Viper"
+      )
+    ).toBeTruthy()
+
+    const bloodlineCatalog = await page.request.get("/api/catalog/bloodlines")
+    expect(bloodlineCatalog.ok()).toBeTruthy()
+    const bloodlines = (await bloodlineCatalog.json()) as {
+      kind: string
+      items: Array<{ name: string }>
+    }
+    expect(bloodlines.kind).toBe("bloodlines")
+    expect(
+      bloodlines.items.some((b) => b.name === "Bloodline of the Primal Hunter")
+    ).toBeTruthy()
+
+    const transcendentCatalog = await page.request.get(
+      "/api/catalog/transcendent_skills"
+    )
+    expect(transcendentCatalog.ok()).toBeTruthy()
+    const transcendents = (await transcendentCatalog.json()) as {
+      kind: string
+      items: unknown[]
+    }
+    expect(transcendents.kind).toBe("transcendent_skills")
+    // The curated manifest ships no transcendent skill, so this catalog is
+    // present (endpoint reachable, items array returned) but empty.
+    expect(Array.isArray(transcendents.items)).toBeTruthy()
+
+    // Return to the dashboard to start the character wizard.
+    await page.goto("/")
+    await waitForHydrated(page)
+
     // Unique name so a repeated run can never collide with a leftover archived
     // character or other data (the dashboard excludes archived by default).
     const name = `E2E-${Date.now()}`
@@ -175,8 +290,20 @@ test.describe("character lifecycle", () => {
     await choose(page, /^None\b/i)
     await next(page)
 
-    // Step 6 - special abilities (nothing to choose; the wizard has no Next
-    // button on the final review step, so this is the last Next click).
+    // Step 6 - special abilities. The curated wiki manifest ships a blessing
+    // (True Blessing of the Malefic Viper) and a bloodline (Bloodline of the
+    // Primal Hunter) but no transcendent skill, so select the blessing +
+    // bloodline and leave the transcendent section unselected.
+    await expect(
+      page.getByRole("radio", { name: /True Blessing of the Malefic Viper/ })
+    ).toBeVisible()
+    await choose(page, /True Blessing of the Malefic Viper/)
+    await expect(
+      page.getByRole("checkbox", { name: /Bloodline of the Primal Hunter/ })
+    ).toBeVisible()
+    await page
+      .getByRole("checkbox", { name: /Bloodline of the Primal Hunter/ })
+      .check()
     await next(page)
 
     // Step 7 - equipment (nothing to choose).
@@ -192,6 +319,76 @@ test.describe("character lifecycle", () => {
 
     // The character detail page shows the created name.
     await expect(page.getByRole("heading", { name })).toBeVisible()
+
+    // ------------------------------------------------------------------ //
+    // The special-ability selections persisted: the Powers tab shows the
+    // linked blessing + bloodline, the detail API returns the associations,
+    // the resumable draft was consumed atomically, and the atomic create
+    // progression event recorded the selection snapshot.
+    // ------------------------------------------------------------------ //
+    await page.getByRole("tab", { name: "Powers" }).click()
+    const powers = page
+      .locator("[role=tabpanel]")
+      .filter({ hasText: "Blessings and bloodlines" })
+    await expect(
+      powers.getByText("True Blessing of the Malefic Viper")
+    ).toBeVisible()
+    await expect(
+      powers.getByText("Bloodline of the Primal Hunter")
+    ).toBeVisible()
+    // The curated manifest ships no transcendent skill, so none is linked and
+    // the section reports an empty state (never a fabricated link).
+    await expect(
+      powers.getByText("No linked transcendent skills.")
+    ).toBeVisible()
+
+    const characterId = new URL(characterUrl).pathname.split("/").pop()!
+    expect(characterId).toBeTruthy()
+
+    const detailRes = await page.request.get(`/api/characters/${characterId}`)
+    expect(detailRes.ok()).toBeTruthy()
+    const detail = (await detailRes.json()) as {
+      character: {
+        associations: Array<{ kind: string; name: string }>
+      }
+    }
+    const assocKeys = detail.character.associations.map(
+      (a) => `${a.kind}:${a.name}`
+    )
+    expect(assocKeys).toContain("blessing:True Blessing of the Malefic Viper")
+    expect(assocKeys).toContain("bloodline:Bloodline of the Primal Hunter")
+
+    // The wizard's final create step atomically consumes the resumable draft,
+    // so no draft remains after creation.
+    const draftAfterRes = await page.request.get("/api/drafts")
+    expect(draftAfterRes.ok()).toBeTruthy()
+    const draftAfter = (await draftAfterRes.json()) as { draft: unknown }
+    expect(draftAfter.draft).toBeNull()
+
+    // The atomic create progression event recorded the special-ability
+    // selection snapshot (blessing + bloodline), never an empty selection.
+    const exportRes = await page.request.get(
+      `/api/characters/${characterId}/export`
+    )
+    expect(exportRes.ok()).toBeTruthy()
+    const exportBody = (await exportRes.json()) as {
+      events: Array<{ kind: string; payload: Record<string, unknown> }>
+    }
+    const createEvent = exportBody.events.find((e) => e.kind === "create")
+    expect(createEvent).toBeTruthy()
+    const special = createEvent?.payload.specialAbilities as
+      | {
+          blessing: { name: string } | null
+          bloodlines: Array<{ name: string }>
+        }
+      | undefined
+    expect(special).toBeTruthy()
+    expect(special?.blessing?.name).toBe("True Blessing of the Malefic Viper")
+    expect(
+      special?.bloodlines.some(
+        (b) => b.name === "Bloodline of the Primal Hunter"
+      )
+    ).toBe(true)
 
     // ------------------------------------------------------------------ //
     // Progress: advance the class track four quarters (level 0 -> level 1).

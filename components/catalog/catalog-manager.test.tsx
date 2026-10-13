@@ -3,7 +3,7 @@ import * as React from "react"
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { apiFetch } from "@/lib/api"
+import { ApiError, apiFetch } from "@/lib/api"
 import { CatalogManager } from "@/components/catalog/catalog-manager"
 
 // --- Module mocks --------------------------------------------------------- //
@@ -41,6 +41,12 @@ vi.mock("@/lib/api", () => {
 vi.mock("@/components/ui/button", () => ({
   Button: ({ children, ...props }: React.ComponentProps<"button">) => (
     <button {...props}>{children}</button>
+  ),
+}))
+
+vi.mock("@/components/ui/badge", () => ({
+  Badge: ({ children }: React.ComponentProps<"span">) => (
+    <span>{children}</span>
   ),
 }))
 
@@ -135,12 +141,32 @@ const item = {
   updatedAt: "2026-01-01T00:00:00.000Z",
 }
 
+const preview = {
+  source: "wiki-reviewed",
+  entries: [
+    {
+      kind: "blessings",
+      stableId: "wiki-one",
+      name: "Wiki One",
+      sourceUrl: "https://wiki.example/one",
+      provenance: "inferred",
+      status: "create" as const,
+    },
+  ],
+  createCount: 1,
+  skipCount: 0,
+}
+
 // --- Helpers -------------------------------------------------------------- //
 
 function setupMock() {
   const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
   mock.mockReset()
   mock.mockImplementation(async (url: string, init?: RequestInit) => {
+    if (url === "/api/admin/catalog-import") {
+      if (init?.method === "POST") return { ...preview, createdIds: ["new-1"] }
+      return preview
+    }
     if (init?.method === "PATCH") {
       return { item }
     }
@@ -329,5 +355,339 @@ describe("CatalogManager config omission on edit", () => {
       screen.getByText(/Could not unarchive.*Permission denied/)
     ).toBeTruthy()
     vi.unstubAllGlobals()
+  })
+
+  it("previews without posting until confirmed, then applies and refreshes", async () => {
+    const mock = setupMock()
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import reviewed wiki entries" })
+    )
+    await flush()
+    expect(screen.getByText("Wiki One")).toBeTruthy()
+    expect(
+      mock.mock.calls.some(
+        ([url, init]) =>
+          url === "/api/admin/catalog-import" &&
+          (init as RequestInit | undefined)?.method === "POST"
+      )
+    ).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    expect(screen.getByText("Created 1; skipped 0.")).toBeTruthy()
+    expect(
+      mock.mock.calls.some(
+        ([url, init]) =>
+          url === "/api/admin/catalog-import" &&
+          (init as RequestInit | undefined)?.method === "POST"
+      )
+    ).toBe(true)
+    expect(
+      mock.mock.calls.filter(([url]) => url === "/api/catalog/blessings").length
+    ).toBeGreaterThan(1)
+    vi.unstubAllGlobals()
+  })
+
+  it("does not expose importer to non-admins", async () => {
+    mockIsAdmin = false
+    const mock = setupMock()
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    expect(
+      screen.queryByRole("button", { name: "Import reviewed wiki entries" })
+    ).toBeNull()
+    expect(
+      mock.mock.calls.every(([url]) => url !== "/api/admin/catalog-import")
+    ).toBe(true)
+  })
+
+  it("shows preview API failures", async () => {
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string) => {
+      if (url === "/api/admin/catalog-import")
+        throw new Error("Preview unavailable")
+      return { kind: "blessings", items: [item] }
+    })
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import reviewed wiki entries" })
+    )
+    await flush()
+    expect(screen.getByText("Preview unavailable")).toBeTruthy()
+  })
+})
+
+describe("CatalogManager import preview staleness", () => {
+  afterEach(() => {
+    mockIsAdmin = true
+    vi.unstubAllGlobals()
+    cleanup()
+  })
+
+  const afterPreview = {
+    source: "wiki-reviewed" as const,
+    entries: [
+      {
+        kind: "blessings",
+        stableId: "wiki-one",
+        name: "Wiki One",
+        sourceUrl: "https://wiki.example/one",
+        provenance: "inferred",
+        status: "skip_existing" as const,
+      },
+    ],
+    createCount: 0,
+    skipCount: 1,
+  }
+
+  it("disables Apply when a preview refresh fails after a prior success", async () => {
+    const mock = setupMock()
+    let failPreview = false
+    mock.mockImplementation(async (url: string) => {
+      if (url === "/api/admin/catalog-import") {
+        if (failPreview) throw new Error("Preview unavailable")
+        return preview
+      }
+      if (url === "/api/catalog/blessings") {
+        return { kind: "blessings", items: [item] }
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import reviewed wiki entries" })
+    )
+    await flush()
+    // A successful preview with a creatable entry leaves Apply enabled.
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(false)
+    // The next refresh fails, so the stale preview must be cleared and Apply
+    // disabled rather than pointing at an unrefreshable preview.
+    failPreview = true
+    fireEvent.click(screen.getByRole("button", { name: "Refresh preview" }))
+    await flush()
+    expect(screen.getByText("Preview unavailable")).toBeTruthy()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("shows an all-skipped result and refreshes the preview to zero creates", async () => {
+    const mock = setupMock()
+    let applied = false
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/admin/catalog-import") {
+        if (init?.method === "POST") {
+          applied = true
+          return { ...afterPreview, createdIds: [] }
+        }
+        return applied ? afterPreview : preview
+      }
+      if (url === "/api/catalog/blessings") {
+        return { kind: "blessings", items: [item] }
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import reviewed wiki entries" })
+    )
+    await flush()
+    expect(screen.getByText("1 to create; 0 to skip existing.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    // Nothing was created; the result reports the skip count clearly.
+    expect(screen.getByText("Created 0; skipped 1.")).toBeTruthy()
+    // The refreshed preview now shows everything as skip_existing, so Apply is
+    // disabled (zero creates) instead of being controllable against stale data.
+    expect(screen.getByText("0 to create; 1 to skip existing.")).toBeTruthy()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("keeps the dialog open with an actionable error and no success on a 409 apply", async () => {
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/admin/catalog-import") {
+        if (init?.method === "POST")
+          throw new ApiError(
+            409,
+            "conflict",
+            "Manifest changed; preview is stale."
+          )
+        return preview
+      }
+      if (url === "/api/catalog/blessings") {
+        return { kind: "blessings", items: [item] }
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import reviewed wiki entries" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    // The dialog is preserved after the failure.
+    expect(screen.getByRole("button", { name: "Apply import" })).toBeTruthy()
+    // No fabricated success message.
+    expect(screen.queryByText(/^Created/)).toBeNull()
+    // The error is actionable and points at refreshing the preview to retry.
+    expect(screen.getByText(/Refresh the preview and retry/)).toBeTruthy()
+    // Apply is disabled while the preview is known-stale from the conflict.
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    // The existing catalog view is not reloaded/overwritten on failure: only the
+    // initial load fetch was issued.
+    const catalogFetches = mock.mock.calls.filter(
+      ([url]) => url === "/api/catalog/blessings"
+    )
+    expect(catalogFetches).toHaveLength(1)
+  })
+})
+
+describe("CatalogManager import preview existing metadata", () => {
+  afterEach(() => {
+    mockIsAdmin = true
+    vi.unstubAllGlobals()
+    cleanup()
+  })
+
+  const skipPreview = (existing: {
+    id: string
+    name: string
+    sourceUrl: string | null
+    provenance: string
+    archived: boolean
+  }) => ({
+    source: "wiki-reviewed" as const,
+    entries: [
+      {
+        kind: "titles",
+        stableId: "legendary-prodigy",
+        name: "Legendary Prodigy",
+        sourceUrl:
+          "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy",
+        provenance: "inferred",
+        status: "skip_existing" as const,
+        existing,
+      },
+    ],
+    createCount: 0,
+    skipCount: 1,
+  })
+
+  function seedSkipMock(existing: {
+    id: string
+    name: string
+    sourceUrl: string | null
+    provenance: string
+    archived: boolean
+  }) {
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string) => {
+      if (url === "/api/admin/catalog-import") return skipPreview(existing)
+      if (url === "/api/catalog/blessings") {
+        return { kind: "blessings", items: [item] }
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    return mock
+  }
+
+  async function openImportPreview() {
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import reviewed wiki entries" })
+    )
+    await flush()
+  }
+
+  it("displays the proposed manifest source and the preserved existing row for a skip", async () => {
+    seedSkipMock({
+      id: "house-title",
+      name: "Old House Title",
+      sourceUrl: "https://house.example/old",
+      provenance: "house",
+      archived: true,
+    })
+    await openImportPreview()
+    // The proposed manifest source is still shown (name, wiki URL, Inferred).
+    expect(screen.getByText("Legendary Prodigy")).toBeTruthy()
+    expect(
+      screen.getByText(
+        "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy"
+      )
+    ).toBeTruthy()
+    expect(screen.getByText("Inferred")).toBeTruthy()
+    // The preserved existing house row is shown with its ACTUAL provenance and
+    // URL, never labelled Inferred.
+    expect(
+      screen.getByText(
+        /Existing preserved: Old House Title \(house\) - Archived/
+      )
+    ).toBeTruthy()
+    expect(screen.getByText("https://house.example/old")).toBeTruthy()
+    // The row is clearly marked as a skip, not a create.
+    expect(screen.getByText("Skip existing")).toBeTruthy()
+    expect(screen.queryByText("Create")).toBeNull()
+  })
+
+  it("shows the actual preserved metadata even when the existing row has no source URL", async () => {
+    seedSkipMock({
+      id: "house-title",
+      name: "Old House Title",
+      sourceUrl: null,
+      provenance: "house",
+      archived: false,
+    })
+    await openImportPreview()
+    expect(
+      screen.getByText("Existing preserved: Old House Title (house)")
+    ).toBeTruthy()
+    expect(screen.getByText("No source URL")).toBeTruthy()
+    expect(
+      screen.queryByText(
+        "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy"
+      )
+    ).toBeTruthy()
   })
 })

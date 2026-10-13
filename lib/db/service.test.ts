@@ -713,6 +713,335 @@ describe("optimistic concurrency (CAS)", () => {
   })
 })
 
+describe("createCharacter special abilities (atomic selection)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  // A minimal valid race + class so `createCharacter` only needs a
+  // `specialAbilities` selection to exercise the new path.
+  function seedCreateBase() {
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  function seedBlessing(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "blessings",
+      stableId: id,
+      name: `Blessing ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedBloodline(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "bloodlines",
+      stableId: id,
+      name: `Bloodline ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedTranscendent(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "transcendent_skills",
+      stableId: id,
+      name: `Transcendent ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function flatDelta(status: unknown, name: string): number | undefined {
+    const phases = (
+      status as {
+        traces?: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces?.find((t) => t.attribute === name)?.phases
+    return phases?.find((p) => p.phase === "flat")?.delta
+  }
+
+  it("links a blessing, bloodline and transcendent skill atomically and synthesizes their declared effects", async () => {
+    seedCreateBase()
+    seedBlessing("bless-1", {
+      tier: "Minor",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedBloodline("blood-1", {
+      effects: [{ phase: "flat", amount: { agility: 3 } }],
+    })
+    seedTranscendent("trans-1", {
+      passiveEffects: [{ phase: "flat", amount: { perception: 4 } }],
+    })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        specialAbilities: {
+          blessingId: "bless-1",
+          bloodlineIds: ["blood-1"],
+          transcendentSkillIds: ["trans-1"],
+        },
+      },
+      user
+    )
+    // All three links are persisted with their catalog kind.
+    expect(detail.associations.map((a) => a.kind).sort()).toEqual([
+      "blessing",
+      "bloodline",
+      "transcendent",
+    ])
+    expect(detail.isTranscendent).toBe(true)
+    // Each declared effect is synthesized live into status.
+    expect(flatDelta(detail.status, "strength")).toBe(5)
+    expect(flatDelta(detail.status, "agility")).toBe(3)
+    expect(flatDelta(detail.status, "perception")).toBe(4)
+    // The stored `state` stays immutable - effects live only in the live merge.
+    expect(
+      (detail.state as { activeEffects: unknown[] }).activeEffects
+    ).toEqual([])
+    // The create journal records a snapshot + provenance of each selection.
+    const payload = dbMock.store.events[0].payload as {
+      specialAbilities: {
+        blessing: { id: string; provenance: string }
+        bloodlines: Array<{ id: string; provenance: string }>
+        transcendentSkills: Array<{ id: string; provenance: string }>
+      }
+    }
+    expect(dbMock.store.events[0].kind).toBe("create")
+    expect(payload.specialAbilities.blessing).toMatchObject({
+      id: "bless-1",
+      provenance: "house",
+    })
+    expect(payload.specialAbilities.bloodlines[0]).toMatchObject({
+      id: "blood-1",
+      provenance: "house",
+    })
+    expect(payload.specialAbilities.transcendentSkills[0]).toMatchObject({
+      id: "trans-1",
+      provenance: "house",
+    })
+    expect(dbMock.store.associations).toHaveLength(3)
+  })
+
+  it("rejects a missing special-ability id and rolls back (no character/event/link)", async () => {
+    seedCreateBase()
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: { blessingId: "missing-bless" },
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "catalog_not_found" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects a special-ability id of the wrong catalog kind", async () => {
+    seedCreateBase()
+    // A bloodline requested as a blessing is the wrong kind.
+    seedBloodline("blood-1", { effects: [] })
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: { blessingId: "blood-1" },
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "wrong_kind" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects an archived special-ability definition and rolls back", async () => {
+    seedCreateBase()
+    seedBlessing("bless-1", { effects: [] }, { archived: true })
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: { blessingId: "bless-1" },
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects an id selected more than once in a single array (duplicate)", async () => {
+    seedCreateBase()
+    seedBloodline("blood-1", { effects: [] })
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: { bloodlineIds: ["blood-1", "blood-1"] },
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "duplicate" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects two selected bloodlines sharing a nonempty upgrade group", async () => {
+    seedCreateBase()
+    seedBloodline("blood-1", { effects: [], upgradeGroup: "primal" })
+    seedBloodline("blood-2", { effects: [], upgradeGroup: "primal" })
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: { bloodlineIds: ["blood-1", "blood-2"] },
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "link_collision" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rolls back links, character and event on a stale draftVersion", async () => {
+    seedCreateBase()
+    seedBlessing("bless-1", { effects: [] })
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael" },
+      version: 5,
+    })
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: { blessingId: "bless-1" },
+          draftVersion: 3,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "draft_conflict" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+    // The draft is preserved - the stale consume never committed.
+    expect(dbMock.store.drafts.size).toBe(1)
+  })
+
+  it("creates a character with no abilities when specialAbilities is omitted", async () => {
+    seedCreateBase()
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+      },
+      user
+    )
+    expect(detail.associations).toHaveLength(0)
+    expect(detail.isTranscendent).toBe(false)
+    expect(dbMock.store.associations).toHaveLength(0)
+    expect(flatDelta(detail.status, "strength")).toBe(0)
+    // No specialAbilities block is written to the journal when nothing is selected.
+    const payload = dbMock.store.events[0].payload as Record<string, unknown>
+    expect("specialAbilities" in payload).toBe(false)
+  })
+
+  it("does not grant a power from a legacy draft special:true without an explicit selection", async () => {
+    seedCreateBase()
+    // The draft carries the legacy `special` flag but no `specialAbilities`.
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael", special: true },
+      version: 4,
+    })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        draftVersion: 4,
+      },
+      user
+    )
+    expect(detail.associations).toHaveLength(0)
+    expect(detail.isTranscendent).toBe(false)
+    expect(dbMock.store.associations).toHaveLength(0)
+    expect(flatDelta(detail.status, "strength")).toBe(0)
+    expect(dbMock.store.events).toHaveLength(1)
+    const payload = dbMock.store.events[0].payload as Record<string, unknown>
+    expect("specialAbilities" in payload).toBe(false)
+    // The draft was consumed because the create succeeded.
+    expect(dbMock.store.drafts.size).toBe(0)
+  })
+})
+
 describe("associateCharacter (titles / equipment)", () => {
   beforeEach(() => {
     dbMock.store.reset()

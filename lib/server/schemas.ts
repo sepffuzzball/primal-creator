@@ -267,6 +267,48 @@ export const adminUserPatchSchema = z
 // Characters
 // ------------------------------------------------------------------ //
 
+/**
+ * Explicit special-ability selections carried by final character creation (and
+ * mirrored, with identical bounds, by the resumable draft payload).
+ *
+ * Every field is optional so an omitted/empty selection is valid; the server
+ * never infers a special ability or auto-selects one. Bounds:
+ *   - `blessingId` is a single optional `string | null` (at most one blessing).
+ *   - `bloodlineIds` / `transcendentSkillIds` are optional arrays of at most 8
+ *     nonempty, unique ids.
+ *   - No id may appear in more than one field (no overlap across kinds), and
+ *     each array must itself be internally unique.
+ */
+export const specialAbilitiesSchema = z
+  .object({
+    blessingId: z.string().min(1).nullable().optional(),
+    bloodlineIds: z.array(z.string().min(1)).max(8).optional(),
+    transcendentSkillIds: z.array(z.string().min(1)).max(8).optional(),
+  })
+  .superRefine((data, ctx) => {
+    // Internal uniqueness + cross-field no-overlap. Every selected id is tracked;
+    // selecting the same id twice (within one array, or across blessing /
+    // bloodline / transcendent) is rejected, since each id resolves to exactly
+    // one catalog definition.
+    const seen = new Map<string, string>()
+    const register = (id: string, field: string) => {
+      const prior = seen.get(id)
+      if (prior != null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `"${id}" is selected more than once (${prior}, ${field})`,
+          path: [field],
+        })
+      } else {
+        seen.set(id, field)
+      }
+    }
+    for (const id of data.bloodlineIds ?? []) register(id, "bloodlineIds")
+    for (const id of data.transcendentSkillIds ?? [])
+      register(id, "transcendentSkillIds")
+    if (data.blessingId != null) register(data.blessingId, "blessingId")
+  })
+
 export const characterCreateSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
@@ -274,6 +316,12 @@ export const characterCreateSchema = z.object({
   raceId: z.string().min(1),
   classId: z.string().min(1),
   professionId: z.string().optional(),
+  // Explicit special-ability selections. When supplied, the corresponding
+  // blessing/bloodline/transcendent-skill catalog definitions are resolved by
+  // kind and linked as CharacterAssociations atomically with the create. When
+  // omitted/empty, no ability is granted (legacy `special` bool is informational
+  // only). See `specialAbilitiesSchema`.
+  specialAbilities: specialAbilitiesSchema.optional(),
   // When supplied (the wizard's final "create" step), the matching draft is
   // consumed atomically with character creation: a stale/missing version 409s
   // `draft_conflict` and rolls back the whole create. When absent (a non-wizard

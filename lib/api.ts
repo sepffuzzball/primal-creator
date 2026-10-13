@@ -444,6 +444,30 @@ export interface CharacterResponse {
   character: CharacterDetail
 }
 
+/**
+ * Explicit special-ability selections accepted by the final character create
+ * (and mirrored by the resumable draft). Every field is optional; an omitted or
+ * empty selection grants nothing. `bloodlineIds` / `transcendentSkillIds` are
+ * at most 8 unique nonempty ids, and no id may appear in more than one field.
+ */
+export interface SpecialAbilitiesSelection {
+  blessingId?: string | null
+  bloodlineIds?: string[]
+  transcendentSkillIds?: string[]
+}
+
+/** Request body for POST /api/characters (atomic create + optional draft consume). */
+export interface CharacterCreateRequest {
+  name: string
+  description?: string
+  origin: "integrated" | "born"
+  raceId: string
+  classId: string
+  professionId?: string
+  specialAbilities?: SpecialAbilitiesSelection
+  draftVersion?: number
+}
+
 export interface JournalDelta {
   track: string
   levelBefore: number
@@ -710,6 +734,12 @@ export interface DraftData {
   professionId?: string | null
   /** "Has special abilities" informational flag - draft data only. */
   special?: boolean
+  /**
+   * Explicit blessing / bloodline / transcendent-skill selections for the final
+   * create. Draft data only for resumability - the legacy `special` boolean does
+   * NOT imply a power, so an absent `specialAbilities` grants nothing.
+   */
+  specialAbilities?: SpecialAbilitiesSelection
   /** Selected catalog stableIds/ids for equipment - draft data only. */
   equipment?: string[]
   nickname?: string | null

@@ -3,7 +3,7 @@ import * as React from "react"
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { ApiError, apiFetch } from "@/lib/api"
+import { ApiError, apiFetch, type CatalogItem } from "@/lib/api"
 import { CreateCharacterForm } from "@/components/characters/create-form"
 
 const STORAGE_KEY = "primal-create-draft"
@@ -23,6 +23,9 @@ vi.mock("@/components/ui/button", () => ({
   Button: ({ children, ...props }: React.ComponentProps<"button">) => (
     <button {...props}>{children}</button>
   ),
+  // The real questionnaire components style Previous/Next/Submit via
+  // `buttonVariants`; provide a no-op class string so they render as buttons.
+  buttonVariants: () => "",
 }))
 
 vi.mock("@/components/ui/alert", () => ({
@@ -168,6 +171,66 @@ type Options = {
   /** Thrown when GET /api/drafts is called (the initial sync fails). */
   getError?: unknown
   createError?: unknown
+  /**
+   * Catalog items per kind returned by the catalog GETs. Any kind omitted
+   * defaults to an empty list. Used to inject ability selections (blessings /
+   * bloodlines / transcendent skills) and base options for tests.
+   */
+  catalog?: Partial<Record<CatalogKind, CatalogItem[]>>
+  /** Thrown when ANY ability catalog GET (blessings / bloodlines / transcendent_skills) is called. */
+  abilityCatalogError?: unknown
+  /** Thrown when ANY base catalog GET (races / classes / professions) is called. */
+  baseCatalogError?: unknown
+}
+
+type CatalogKind =
+  | "races"
+  | "classes"
+  | "professions"
+  | "blessings"
+  | "bloodlines"
+  | "transcendentSkills"
+
+/** Build a valid CatalogItem for tests; defaults can be overridden. */
+function makeItem(
+  id: string,
+  overrides: Partial<CatalogItem> = {}
+): CatalogItem {
+  return {
+    id,
+    kind: "catalog",
+    stableId: `stable-${id}`,
+    name: `Name ${id}`,
+    description: null,
+    grade: null,
+    provenance: "verified",
+    sourceUrl: null,
+    archived: false,
+    config: {},
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  }
+}
+
+const BASE_CATALOG_URLS = new Set([
+  "/api/catalog/races",
+  "/api/catalog/classes",
+  "/api/catalog/professions",
+])
+const ABILITY_CATALOG_URLS = new Set([
+  "/api/catalog/blessings",
+  "/api/catalog/bloodlines",
+  "/api/catalog/transcendent_skills",
+])
+
+const CATALOG_URL_TO_KIND: Record<string, CatalogKind> = {
+  "/api/catalog/races": "races",
+  "/api/catalog/classes": "classes",
+  "/api/catalog/professions": "professions",
+  "/api/catalog/blessings": "blessings",
+  "/api/catalog/bloodlines": "bloodlines",
+  "/api/catalog/transcendent_skills": "transcendentSkills",
 }
 
 let serverDraft: ServerDraft | null = null
@@ -176,6 +239,16 @@ let putResult: ServerDraft | null = null
 let getError: unknown = null
 let createError: unknown = null
 let createCalls = 0
+let catalog: Record<CatalogKind, CatalogItem[]> = {
+  races: [],
+  classes: [],
+  professions: [],
+  blessings: [],
+  bloodlines: [],
+  transcendentSkills: [],
+}
+let abilityCatalogError: unknown = null
+let baseCatalogError: unknown = null
 
 function setupMock(options: Options) {
   serverDraft = options.serverDraft ?? null
@@ -184,17 +257,34 @@ function setupMock(options: Options) {
   getError = options.getError ?? null
   createError = options.createError ?? null
   createCalls = 0
+  catalog = {
+    races: options.catalog?.races ?? [],
+    classes: options.catalog?.classes ?? [],
+    professions: options.catalog?.professions ?? [],
+    blessings: options.catalog?.blessings ?? [],
+    bloodlines: options.catalog?.bloodlines ?? [],
+    transcendentSkills: options.catalog?.transcendentSkills ?? [],
+  }
+  abilityCatalogError = options.abilityCatalogError ?? null
+  baseCatalogError = options.baseCatalogError ?? null
 
   const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
   mock.mockReset()
   mock.mockImplementation(async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET"
-    if (
-      url === "/api/catalog/races" ||
-      url === "/api/catalog/classes" ||
-      url === "/api/catalog/professions"
-    ) {
-      return { kind: "catalog", items: [] }
+    if (url.startsWith("/api/catalog/")) {
+      if (ABILITY_CATALOG_URLS.has(url) && abilityCatalogError) {
+        throw abilityCatalogError
+      }
+      if (BASE_CATALOG_URLS.has(url) && baseCatalogError) {
+        throw baseCatalogError
+      }
+      return {
+        kind: "catalog",
+        items: CATALOG_URL_TO_KIND[url]
+          ? catalog[CATALOG_URL_TO_KIND[url]]
+          : [],
+      }
     }
     if (url === "/api/drafts") {
       if (method === "PUT") {
@@ -231,6 +321,45 @@ function putCalls(): string[] {
   return mock.mock.calls
     .filter(([, init]) => (init as RequestInit | undefined)?.method === "PUT")
     .map(([url]) => url as string)
+}
+
+/** Parsed POST /api/characters request bodies, in call order. */
+function createPostBodies(): Array<{
+  name: string
+  specialAbilities?: {
+    blessingId?: string | null
+    bloodlineIds?: string[]
+    transcendentSkillIds?: string[]
+  }
+  draftVersion?: number
+}> {
+  const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+  return mock.mock.calls
+    .filter(
+      ([url, init]) =>
+        url === "/api/characters" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    .map(([, init]) => JSON.parse((init as RequestInit).body as string))
+}
+
+/** Find the most recent PUT /api/drafts body, if any. */
+function lastDraftPutBody(): Array<{
+  data?: {
+    name?: string
+    raceId?: string
+    special?: boolean
+    specialAbilities?: unknown
+  }
+}> {
+  const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+  return mock.mock.calls
+    .filter(
+      ([url, init]) =>
+        url === "/api/drafts" &&
+        (init as RequestInit | undefined)?.method === "PUT"
+    )
+    .map(([, init]) => JSON.parse((init as RequestInit).body as string))
 }
 
 beforeEach(() => {
@@ -443,8 +572,8 @@ describe("CreateCharacterForm local recovery", () => {
     expect(JSON.parse(raw as string).name).toBe("Local")
 
     // The user is offered an explicit choice; the banner shows both actions.
-    expect(screen.getByText(/Overwrite server draft/)).toBeTruthy()
-    expect(screen.getByText(/Keep server draft/)).toBeTruthy()
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    expect(screen.getByText(/Use server draft/)).toBeTruthy()
 
     // Autosave is paused while the choice is unresolved: editing must not PUT.
     fireEvent.change(screen.getByPlaceholderText("Character name"), {
@@ -456,7 +585,7 @@ describe("CreateCharacterForm local recovery", () => {
     expect(putCalls()).toEqual([])
   })
 
-  it("overwrite server draft GETs the current version then PUTs the local draft", async () => {
+  it("use device draft GETs the current version then PUTs the device's draft", async () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(localDraft({ name: "Local", raceId: "r1" }))
@@ -471,7 +600,7 @@ describe("CreateCharacterForm local recovery", () => {
       await new Promise((r) => setTimeout(r, 0))
     })
 
-    fireEvent.click(screen.getByText(/Overwrite server draft/))
+    fireEvent.click(screen.getByText(/Use device draft/))
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0))
     })
@@ -480,10 +609,10 @@ describe("CreateCharacterForm local recovery", () => {
     // carry the local draft data.
     expect(putCalls()).toEqual(["/api/drafts"])
     expect(window.localStorage.getItem(RECOVERY_KEY)).toBeNull()
-    expect(screen.queryByText(/Overwrite server draft/)).toBeNull()
+    expect(screen.queryByText(/Use device draft/)).toBeNull()
   })
 
-  it("keep server draft discards the local draft and resumes", async () => {
+  it("use server draft discards the local draft and resumes", async () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(localDraft({ name: "Local", raceId: "r1" }))
@@ -498,13 +627,13 @@ describe("CreateCharacterForm local recovery", () => {
       await new Promise((r) => setTimeout(r, 0))
     })
 
-    fireEvent.click(screen.getByText(/Keep server draft/))
+    fireEvent.click(screen.getByText(/Use server draft/))
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0))
     })
 
     expect(window.localStorage.getItem(RECOVERY_KEY)).toBeNull()
-    expect(screen.queryByText(/Keep server draft/)).toBeNull()
+    expect(screen.queryByText(/Use server draft/)).toBeNull()
     // No overwrite PUT occurred; the server draft was kept.
     expect(putCalls()).toEqual([])
   })
@@ -524,6 +653,18 @@ describe("CreateCharacterForm local recovery", () => {
     })
 
     await renderForm()
+    await flush()
+
+    // No server draft exists while both the live draft and the recovery snapshot
+    // carry content: the explicit recovery choice is surfaced so nothing is
+    // silently clobbered, and GET null must not erase the recovery snapshot.
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    expect(window.localStorage.getItem(RECOVERY_KEY)).not.toBeNull()
+
+    // Resolve the recovery choice by keeping the device content, then create.
+    // The overwrite persists the recovery snapshot, so submission POSTs with a
+    // known draft version.
+    fireEvent.click(screen.getByText(/Use device draft/))
     await flush()
 
     fireEvent.submit(screen.getByTestId("questionnaire"))
@@ -552,12 +693,12 @@ describe("CreateCharacterForm local recovery", () => {
     await flush()
 
     // Recovery banner is up and Save draft is disabled while it is unresolved.
-    expect(screen.getByText(/Overwrite server draft/)).toBeTruthy()
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
     const saveBtn = screen.getByText("Save draft").closest("button")
     expect(saveBtn?.disabled).toBe(true)
 
     // Clicking the disabled Save draft must not issue a PUT (no overwrite):
-    // only the explicit 'Overwrite server draft' action may.
+    // only the explicit 'Use device draft' action may.
     fireEvent.click(screen.getByText("Save draft"))
     await flush()
     expect(putCalls()).toEqual([])
@@ -606,7 +747,7 @@ describe("CreateCharacterForm local recovery", () => {
 
     // The divergence is metadata-only - no name/race/special content - yet the
     // device copy must not be silently overwritten by the server draft.
-    expect(screen.getByText(/Overwrite server draft/)).toBeTruthy()
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
     const raw = window.localStorage.getItem(RECOVERY_KEY)
     expect(raw).not.toBeNull()
     expect(JSON.parse(raw as string).nickname).toBe("Kit")
@@ -631,11 +772,11 @@ describe("CreateCharacterForm local recovery", () => {
     expect(fieldset?.disabled).toBe(true)
 
     // Resolve by keeping the server draft.
-    fireEvent.click(screen.getByText(/Keep server draft/))
+    fireEvent.click(screen.getByText(/Use server draft/))
     await flush()
 
     // Recovery is cleared and the wizard is editable again.
-    expect(screen.queryByText(/Keep server draft/)).toBeNull()
+    expect(screen.queryByText(/Use server draft/)).toBeNull()
     expect(fieldset.disabled).toBe(false)
 
     // Editing now resumes the debounced autosave and PUTs the change.
@@ -648,10 +789,105 @@ describe("CreateCharacterForm local recovery", () => {
     })
     expect(putCalls()).toEqual(["/api/drafts"])
   })
+
+  it("does not PUT while a no-server recovery choice is pending, across timer and refresh", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Live", raceId: "r1" }))
+    )
+    window.localStorage.setItem(
+      RECOVERY_KEY,
+      JSON.stringify(localDraft({ name: "RecoverMe" }))
+    )
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "RecoverMe" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // A no-server GET with divergent live and recovery drafts surfaces the
+    // explicit choice and must not create a server draft: the first-save
+    // autosave is blocked while the choice is pending.
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    expect(putCalls()).toEqual([])
+
+    // The debounce timer passes with no choice made: still no PUT/overwrite.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 900))
+    })
+    expect(putCalls()).toEqual([])
+
+    // A refresh remounts from the persisted recovery key; the choice is still
+    // pending and no PUT is issued across the reload either.
+    cleanup()
+    await renderForm()
+    await flush()
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    expect(putCalls()).toEqual([])
+  })
+
+  it("persists the chosen device snapshot exactly once (no clobber) after a no-server recovery choice", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Live", raceId: "r1" }))
+    )
+    window.localStorage.setItem(
+      RECOVERY_KEY,
+      JSON.stringify(localDraft({ name: "RecoverMe", raceId: "r1" }))
+    )
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "RecoverMe" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.click(screen.getByText(/Use device draft/))
+    await flush()
+
+    // Exactly one PUT, carrying the chosen recovery snapshot - the live draft is
+    // never written to the server while the choice was pending, so the chosen
+    // snapshot is not clobbered by a stale autosave.
+    const putBodies = lastDraftPutBody()
+    expect(putBodies).toHaveLength(1)
+    expect(putBodies[0].data?.name).toBe("RecoverMe")
+    expect(putBodies[0].data?.raceId).toBe("r1")
+    // The chosen snapshot is preserved locally (no data loss) and the recovery
+    // key is cleared only after the snapshot was persisted.
+    expect(window.localStorage.getItem(RECOVERY_KEY)).toBeNull()
+    const stored = JSON.parse(
+      window.localStorage.getItem(STORAGE_KEY) as string
+    )
+    expect(stored.name).toBe("RecoverMe")
+  })
+
+  it("still autosaves a no-server local draft when there is no recovery conflict", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Kael", raceId: "r1" }))
+    )
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // No recovery key and no server draft: the first-save create still persists
+    // the device draft, so the no-conflict autosave path is unaffected.
+    expect(putCalls()).toEqual(["/api/drafts"])
+    const body = lastDraftPutBody()[0]
+    expect(body.data?.name).toBe("Kael")
+    expect(body.data?.raceId).toBe("r1")
+  })
 })
 
 describe("CreateCharacterForm special abilities", () => {
-  it("does not offer a yes/no special-abilities choice and shows it as not assigned", async () => {
+  it("shows the catalog picker and does not offer a yes/no special-abilities choice", async () => {
     setupMock({
       serverDraft: { data: serverData({ name: "Server" }), version: 3 },
     })
@@ -659,35 +895,24 @@ describe("CreateCharacterForm special abilities", () => {
     await renderForm()
     await flush()
 
-    // The "Has special abilities" yes/no selection and any "Recorded" wording are
-    // gone; the step no longer asks the user to record a flag.
+    // The legacy "Has special abilities" yes/no flag is gone; the step is now a
+    // catalog picker that never asks the user to record a flag.
     expect(screen.queryByText(/Has special abilities/)).toBeNull()
     expect(screen.queryByText(/Recorded \(not calculated\)/)).toBeNull()
     expect(screen.queryByText(/Recorded, but not yet calculated/)).toBeNull()
+    expect(screen.queryByText(/Not assigned during creation/)).toBeNull()
 
-    // The step now explains the deferred feature accurately: nothing is assigned
-    // during creation - blessings/bloodlines attach AFTER creation - and
-    // transcendents remain unavailable (defined in the encyclopedia but not yet
-    // attached to a character).
+    // The step documents the explicit selection. An empty ability catalog still
+    // renders the blessing "None" choice and the section headings.
     expect(
-      screen.getAllByText(/Not assigned during creation/).length
+      screen.getAllByText(/Select optional catalog entries/).length
     ).toBeGreaterThan(0)
-    expect(
-      screen.getAllByText(
-        /Attach blessings or bloodlines after creating the character/
-      ).length
-    ).toBeGreaterThan(0)
-    expect(
-      screen.getByText(
-        /transcendent skills can also be attached after creation, but are not auto-awarded/i
-      )
-    ).toBeTruthy()
+    expect(screen.getAllByText("None").length).toBeGreaterThan(0)
+    expect(screen.getByText("Bloodlines (up to 8)")).toBeTruthy()
+    expect(screen.getByText("Transcendent skills (up to 8)")).toBeTruthy()
   })
 
   it("warns about a legacy special-abilities flag and never submits special=true", async () => {
-    // A draft saved before the change carried `special: yes`/`special: true`. It
-    // must not be hidden silently - an informative warning is shown - and a save
-    // must never PUT special=true.
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(localDraft({ origin: "integrated", special: "yes" }))
@@ -701,14 +926,11 @@ describe("CreateCharacterForm special abilities", () => {
     await flush()
 
     // The legacy flag surfaces as an informative warning, not a silent feature.
-    // The special step now says that a legacy draft only records the yes/no
-    // answer and that blessings/bloodlines are attached after creation.
-    expect(screen.getByText(/records your answer only/i)).toBeTruthy()
     expect(
-      screen.getAllByText(
-        /Attach blessings or bloodlines after creating the character/
-      ).length
-    ).toBeGreaterThan(0)
+      screen.getByText(
+        /This legacy draft had a special-abilities flag, not a catalog selection\. Choose entries again if desired\./
+      )
+    ).toBeTruthy()
 
     // Editing marks the draft dirty and triggers the debounced autosave.
     fireEvent.change(screen.getByPlaceholderText("Character name"), {
@@ -718,15 +940,700 @@ describe("CreateCharacterForm special abilities", () => {
       await new Promise((r) => setTimeout(r, 900))
     })
 
-    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
-    const put = mock.mock.calls.find(
-      ([, init]) => (init as RequestInit | undefined)?.method === "PUT"
-    )
-    expect(put).toBeTruthy()
-    const body = JSON.parse((put![1] as RequestInit).body as string) as {
-      data: { special?: boolean }
-    }
+    const body = lastDraftPutBody()[0]
     // The UI never persists special=true: special abilities are deferred.
-    expect(body.data.special).toBe(false)
+    expect(body.data?.special).toBe(false)
+    // A legacy boolean never implies a power: the explicit selection is empty.
+    expect(body.data?.specialAbilities).toEqual({
+      blessingId: null,
+      bloodlineIds: [],
+      transcendentSkillIds: [],
+    })
+  })
+
+  it("round-trips selected abilities through the draft PUT", async () => {
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        bloodlines: [
+          makeItem("blood-1", { name: "Bloodline One" }),
+          makeItem("blood-2", { name: "Bloodline Two" }),
+        ],
+        transcendentSkills: [makeItem("trans-1", { name: "Transcendent One" })],
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // Select via the raw checkboxes (the blessing uses a choice control which
+    // the mock renders as a span, so it is exercised via the stored draft).
+    fireEvent.click(screen.getByLabelText(/Bloodline One/))
+    fireEvent.click(screen.getByLabelText(/Transcendent One/))
+    // The draft is now non-empty, so a debounced autosave PUT is scheduled.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 900))
+    })
+
+    const body = lastDraftPutBody()[0]
+    expect(body.data?.specialAbilities).toEqual({
+      blessingId: null,
+      bloodlineIds: ["blood-1"],
+      transcendentSkillIds: ["trans-1"],
+    })
+  })
+
+  it("restores a stored server draft's special-ability selections", async () => {
+    setupMock({
+      serverDraft: {
+        data: serverData({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: ["blood-1"],
+            transcendentSkillIds: ["trans-1"],
+          },
+        }),
+        version: 5,
+      },
+      catalog: {
+        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        bloodlines: [makeItem("blood-1", { name: "Bloodline One" })],
+        transcendentSkills: [makeItem("trans-1", { name: "Transcendent One" })],
+      },
+    })
+
+    await renderForm()
+    await flush()
+
+    // Stored selections are restored into the wizard's controls.
+    expect(
+      (screen.getByLabelText(/Bloodline One/) as HTMLInputElement).checked
+    ).toBe(true)
+    expect(
+      (screen.getByLabelText(/Transcendent One/) as HTMLInputElement).checked
+    ).toBe(true)
+    // The review summary surfaces the restored names (matches the choice rows
+    // as well as the review line, so assert via getAllByText).
+    expect(screen.getAllByText(/Blessing One/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/Bloodline One/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/Transcendent One/).length).toBeGreaterThan(0)
+  })
+
+  it("POSTs the selected association ids with the create request", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          origin: "integrated",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: ["blood-1", "blood-2"],
+            transcendentSkillIds: ["trans-1"],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        bloodlines: [
+          makeItem("blood-1", { name: "Bloodline One" }),
+          makeItem("blood-2", { name: "Bloodline Two" }),
+        ],
+        transcendentSkills: [makeItem("trans-1", { name: "Transcendent One" })],
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 2 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+
+    expect(createCalls).toBe(1)
+    const post = createPostBodies()[0]
+    expect(post.specialAbilities).toEqual({
+      blessingId: "bless-1",
+      bloodlineIds: ["blood-1", "blood-2"],
+      transcendentSkillIds: ["trans-1"],
+    })
+  })
+
+  it("blocks submission when a selected ability is archived", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: [],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        blessings: [
+          makeItem("bless-1", { name: "Blessing One", archived: true }),
+        ],
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    expect(
+      screen.getAllByText(/is archived and cannot be linked/i).length
+    ).toBeGreaterThan(0)
+    const submitBtn = screen.getByText("Create character").closest("button")
+    expect(submitBtn?.disabled).toBe(true)
+
+    // Form submit is blocked (defense in depth): no POST is issued.
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(0)
+  })
+
+  it("blocks submission when two selected bloodlines share an upgrade group", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: ["blood-1", "blood-2"],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        bloodlines: [
+          makeItem("blood-1", {
+            name: "Bloodline One",
+            config: { upgradeGroup: "g1" },
+          }),
+          makeItem("blood-2", {
+            name: "Bloodline Two",
+            config: { upgradeGroup: "g1" },
+          }),
+        ],
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    expect(
+      screen.getAllByText(/both occupy upgrade group "g1"/).length
+    ).toBeGreaterThan(0)
+    const submitBtn = screen.getByText("Create character").closest("button")
+    expect(submitBtn?.disabled).toBe(true)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(0)
+  })
+
+  it("blocks submission on an unavailable stored ability id and recovers once removed", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: ["orphan-1"],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        bloodlines: [makeItem("blood-1", { name: "Bloodline One" })],
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // The stale id is surfaced as an orphan row and blocks submission.
+    expect(
+      screen.getAllByText(/no longer in the catalog/).length
+    ).toBeGreaterThan(0)
+    const orphan = screen.getByLabelText(/orphan-1/) as HTMLInputElement
+    expect(orphan.checked).toBe(true)
+    const submitBtn = screen.getByText("Create character").closest("button")
+    expect(submitBtn?.disabled).toBe(true)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(0)
+
+    // Removing the stale id clears the error and unblocks the create.
+    fireEvent.click(orphan)
+    await flush()
+    expect(screen.queryAllByText(/no longer in the catalog/).length).toBe(0)
+    const submitBtn2 = screen.getByText("Create character").closest("button")
+    expect(submitBtn2?.disabled).toBe(false)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(1)
+  })
+
+  it("disables selection of a 9th bloodline once 8 are selected", async () => {
+    const selected = Array.from({ length: 8 }, (_, i) => `blood-${i}`)
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: selected,
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        bloodlines: Array.from({ length: 9 }, (_, i) =>
+          makeItem(`blood-${i}`, { name: `Bloodline ${i}` })
+        ),
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // The 9th (unselected) bloodline is disabled; the selection cannot exceed 8.
+    const ninth = screen.getByLabelText(/Bloodline 8/) as HTMLInputElement
+    expect(ninth.checked).toBe(false)
+    expect(ninth.disabled).toBe(true)
+    // The 8 stored selections remain checked.
+    expect(
+      (screen.getByLabelText(/Bloodline 0/) as HTMLInputElement).checked
+    ).toBe(true)
+  })
+
+  it("blocks submission when ability catalogs fail and recovers via Retry without a reload", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: [],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+      },
+      abilityCatalogError: new Error("network down"),
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // The selected blessing cannot be validated - submission is blocked and an
+    // actionable error plus a Retry action is offered (no page reload).
+    expect(
+      screen.getAllByText(/Ability catalogs could not be loaded/).length
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(/Retry/).length).toBeGreaterThan(0)
+    const submitBtn = screen.getByText("Create character").closest("button")
+    expect(submitBtn?.disabled).toBe(true)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(0)
+
+    // The draft is preserved (no full-page reload): the name is still present.
+    expect(
+      (screen.getByPlaceholderText("Character name") as HTMLInputElement).value
+    ).toBe("Kael")
+
+    // Network recovers; Retry re-fetches only the ability lists.
+    abilityCatalogError = null
+    fireEvent.click(screen.getAllByText("Retry")[0])
+    await flush()
+
+    expect(
+      screen.queryAllByText(/Ability catalogs could not be loaded/).length
+    ).toBe(0)
+    const submitBtn2 = screen.getByText("Create character").closest("button")
+    expect(submitBtn2?.disabled).toBe(false)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(1)
+  })
+
+  it("proceeds with a legacy special=true draft that selected no abilities", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({ name: "Kael", origin: "integrated", special: "yes" })
+      )
+    )
+    setupMock({
+      serverDraft: {
+        data: serverData({ name: "Kael", origin: "integrated", special: true }),
+        version: 3,
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 4 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // No ability selection, so a legacy flag or catalog failure never blocks.
+    const submitBtn = screen.getByText("Create character").closest("button")
+    expect(submitBtn?.disabled).toBe(false)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(1)
+    const post = createPostBodies()[0]
+    expect(post.specialAbilities).toEqual({
+      blessingId: null,
+      bloodlineIds: [],
+      transcendentSkillIds: [],
+    })
+  })
+
+  it("offers recovery when only the special-ability selection diverges from the server draft", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: [],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: {
+        data: serverData({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: [],
+            transcendentSkillIds: [],
+          },
+        }),
+        version: 3,
+      },
+    })
+
+    await renderForm()
+    await flush()
+
+    // The device copy diverges only on the ability selection, yet it must not be
+    // silently overwritten by the server draft.
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    const raw = window.localStorage.getItem(RECOVERY_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw as string).specialAbilities.blessingId).toBe(
+      "bless-1"
+    )
+  })
+})
+
+describe("CreateCharacterForm legacy draft normalization", () => {
+  it("normalizes a malformed legacy specialAbilities draft without dropping other fields", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          nickname: "Kit",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: "not-an-array",
+            transcendentSkillIds: null,
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // An unrelated draft field survives the normalization untouched.
+    expect(
+      (screen.getByPlaceholderText("Character name") as HTMLInputElement).value
+    ).toBe("Kael")
+
+    // The malformed specialAbilities is coerced to a well-formed empty selection,
+    // so hasContent / draftsDiffer / toServerData never dereference undefined and
+    // the create POST carries a clean selection.
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+
+    expect(createCalls).toBe(1)
+    expect(createPostBodies()[0].specialAbilities).toEqual({
+      blessingId: null,
+      bloodlineIds: [],
+      transcendentSkillIds: [],
+    })
+  })
+
+  it("restores the recovery snapshot and normalizes its abilities after GET null", async () => {
+    // The live draft (STORAGE_KEY) is empty and the server draft has disappeared,
+    // so the recovery snapshot becomes the device draft again. Its malformed
+    // abilities must be normalized - not carried as raw values.
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(localDraft({})))
+    window.localStorage.setItem(
+      RECOVERY_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Kael",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: ["blood-1", 42, null],
+            transcendentSkillIds: null,
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        blessings: [makeItem("bless-1")],
+        bloodlines: [makeItem("blood-1")],
+      },
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // No banner: the empty live draft is restored from the recovery snapshot.
+    expect(screen.queryByText(/Use device draft/)).toBeNull()
+    expect(
+      (screen.getByPlaceholderText("Character name") as HTMLInputElement).value
+    ).toBe("Kael")
+    // RECOVERY_KEY is cleared only after the snapshot was persisted.
+    expect(window.localStorage.getItem(RECOVERY_KEY)).toBeNull()
+    const stored = JSON.parse(
+      window.localStorage.getItem(STORAGE_KEY) as string
+    )
+    expect(stored.specialAbilities.bloodlineIds).toEqual(["blood-1"])
+
+    // The autosave initial create persists the restored snapshot to the server
+    // with the malformed array values normalized to strings only.
+    expect(putCalls()).toEqual(["/api/drafts"])
+    const putBody = lastDraftPutBody()[0]
+    expect(putBody.data?.specialAbilities).toEqual({
+      blessingId: "bless-1",
+      bloodlineIds: ["blood-1"],
+      transcendentSkillIds: [],
+    })
+  })
+
+  it("surfaces an explicit recovery choice when the live draft also carries content after GET null", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Live", raceId: "r1" }))
+    )
+    window.localStorage.setItem(
+      RECOVERY_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "RecoverMe",
+          specialAbilities: {
+            blessingId: "bless-1",
+            bloodlineIds: [],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [makeItem("r1")],
+        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+      },
+      putResult: { data: serverData({ name: "RecoverMe" }), version: 2 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // Both the live draft and the recovery snapshot carry content and differ, so
+    // the explicit choice is surfaced and GET null must not erase the snapshot.
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    expect(window.localStorage.getItem(RECOVERY_KEY)).not.toBeNull()
+
+    // Keeping the device content restores the recovery snapshot; the chosen
+    // selection survives the null GET and is normalized. Because the recovery
+    // choice now blocks autosave while pending, no earlier autosave persists the
+    // live draft - the overwrite PUT carries the recovery snapshot exactly once.
+    fireEvent.click(screen.getByText(/Use device draft/))
+    await flush()
+
+    const bodies = lastDraftPutBody()
+    const putBody = bodies[bodies.length - 1]
+    expect(putBody.data?.specialAbilities).toEqual({
+      blessingId: "bless-1",
+      bloodlineIds: [],
+      transcendentSkillIds: [],
+    })
+    // Exactly one PUT (the overwrite) - no duplicate autosave of the snapshot.
+    expect(bodies).toHaveLength(1)
+    expect(window.localStorage.getItem(RECOVERY_KEY)).toBeNull()
+  })
+})
+
+describe("CreateCharacterForm special step None choice", () => {
+  it("renders the blessing None choice even when the ability catalogs fail", async () => {
+    setupMock({
+      serverDraft: null,
+      abilityCatalogError: new Error("network down"),
+      putResult: { data: serverData({}), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    // A catalog failure must not strip the special step of its real None answer:
+    // the retry UI is offered alongside the None choice, so a no-selection draft
+    // is never trapped on the step (a selection would still surface specialError).
+    expect(screen.getAllByText(/Catalog unavailable/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText("None").length).toBeGreaterThan(0)
+  })
+})
+
+describe("CreateCharacterForm special step navigation (real questionnaire)", () => {
+  // The questionnaire is mocked to a plain form for most tests. This block uses
+  // the actual QuestionnairePrimitive (via importActual) to verify that the real
+  // answered None choice lets a no-selection special step advance to review, and
+  // that removing that choice would trap the user. The primitive is the real one,
+  // so it enforces the "answered" requirement the wizard depends on.
+  it("lets a no-selection special step advance to review when ability catalogs fail", async () => {
+    const real = await vi.importActual<
+      typeof import("@/components/ui/questionnaire")
+    >("@/components/ui/questionnaire")
+
+    function Harness() {
+      const [step, setStep] = React.useState("special")
+      return (
+        <real.Questionnaire
+          items={[
+            { name: "special", required: false },
+            { name: "review", required: false },
+          ]}
+          item={step}
+          onItemChange={(name) => setStep(name)}
+        >
+          <real.QuestionnaireProgress />
+          <real.QuestionnaireItem name="special">
+            <real.QuestionnaireTitle>Special abilities</real.QuestionnaireTitle>
+            <span>Catalog unavailable: network down</span>
+            <real.QuestionnaireChoices>
+              <real.QuestionnaireChoice value="" checked onChange={() => {}}>
+                None
+              </real.QuestionnaireChoice>
+            </real.QuestionnaireChoices>
+          </real.QuestionnaireItem>
+          <real.QuestionnaireItem name="review">
+            <real.QuestionnaireTitle>Review</real.QuestionnaireTitle>
+            <p>Confirm your choices.</p>
+          </real.QuestionnaireItem>
+          <real.QuestionnaireActions>
+            <real.QuestionnaireNext>Next</real.QuestionnaireNext>
+          </real.QuestionnaireActions>
+        </real.Questionnaire>
+      )
+    }
+
+    render(<Harness />)
+
+    // The special step carries a real checked None answer, so the step is
+    // "answered" and Next advances to review rather than trapping the user.
+    const nextBtn = screen.getByRole("button", { name: "Next" })
+    expect(nextBtn).toBeTruthy()
+    await act(async () => {
+      fireEvent.click(nextBtn)
+    })
+    const active = document.querySelector("[data-active]")
+    expect(active?.textContent).toMatch(/Review/)
+  })
+
+  it("traps the special step when no answered choice is rendered", async () => {
+    const real = await vi.importActual<
+      typeof import("@/components/ui/questionnaire")
+    >("@/components/ui/questionnaire")
+
+    function Harness() {
+      const [step, setStep] = React.useState("special")
+      return (
+        <real.Questionnaire
+          items={[
+            { name: "special", required: false },
+            { name: "review", required: false },
+          ]}
+          item={step}
+          onItemChange={(name) => setStep(name)}
+        >
+          <real.QuestionnaireProgress />
+          <real.QuestionnaireItem name="special">
+            <real.QuestionnaireTitle>Special abilities</real.QuestionnaireTitle>
+            <span>Catalog unavailable: network down</span>
+          </real.QuestionnaireItem>
+          <real.QuestionnaireItem name="review">
+            <real.QuestionnaireTitle>Review</real.QuestionnaireTitle>
+            <p>Confirm your choices.</p>
+          </real.QuestionnaireItem>
+          <real.QuestionnaireActions>
+            <real.QuestionnaireNext>Next</real.QuestionnaireNext>
+          </real.QuestionnaireActions>
+        </real.Questionnaire>
+      )
+    }
+
+    render(<Harness />)
+
+    // Without any rendered choice the special step stays unanswered, so Next
+    // cannot advance to review (this is the bug the unconditional None choice
+    // fixes).
+    const nextBtn = screen.getByRole("button", { name: "Next" })
+    await act(async () => {
+      fireEvent.click(nextBtn)
+    })
+    const active = document.querySelector("[data-active]")
+    expect(active?.textContent).toMatch(/Special abilities/)
   })
 })

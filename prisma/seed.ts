@@ -10,6 +10,10 @@
  *      F-grade Archer class as a clearly-labeled house placeholder (the wiki does
  *      not document Archer's exact per-level gains).
  *
+ * The reviewed wiki-derived manifest (`prisma/catalog/wiki-reviewed.ts`) is NOT
+ * imported here - it is an explicit, admin-opt-in operation via
+ * `POST /api/admin/catalog-import` (see `lib/db/catalog-import.ts`).
+ *
  * It deliberately creates NO sample characters - characters are user-created.
  */
 
