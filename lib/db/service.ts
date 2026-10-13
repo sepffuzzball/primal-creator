@@ -68,6 +68,8 @@ import {
 } from "@/lib/server/schemas"
 import {
   IMPORT_RULESET_VERSION,
+  IMPORT_SCHEMA_V4,
+  MAX_IMPORT_INVENTORY,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
 import { badRequest, conflict, forbidden, notFound } from "@/lib/server/errors"
@@ -82,6 +84,7 @@ const characterInclude = {
   class: true,
   profession: true,
   associations: { include: { definition: true } },
+  inventory: { include: { definition: true } },
   skillOffers: {
     include: { options: { include: { definition: true } } },
   },
@@ -107,6 +110,27 @@ export interface CharacterAssociationView {
   provenance?: string
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
+}
+
+/**
+ * A read-only view of an owned inventory row. Ownership is per-definition house
+ * bookkeeping (no item instances or capacity): only the integer `quantity` and
+ * the linked definition's identity/metadata are exposed. `kind` is the catalog
+ * kind of the linked definition - always `"equipment"` or `"consumables"`, since
+ * no other kind can be added to inventory.
+ */
+export interface CharacterInventoryItemView {
+  id: string
+  definitionId: string
+  name: string
+  kind: "equipment" | "consumables"
+  quantity: number
+  /** Whether the linked catalog definition is currently archived. */
+  archived: boolean
+  /** Equipment slot, when the linked definition declares one. */
+  slot?: string
+  /** Provenance label of the linked definition. */
+  provenance: string
 }
 
 export interface SkillOfferOptionView {
@@ -155,6 +179,11 @@ export interface CharacterDetail {
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
+  /**
+   * Owned inventory quantities (equipment + consumables), including archived
+   * catalog stock. Absent = zero owned stock of that definition.
+   */
+  inventory: CharacterInventoryItemView[]
   /** Pending + selected skill offers (milestone choices) for this character. */
   skillOffers: SkillOfferView[]
   status?: StatusResult
@@ -823,6 +852,34 @@ function isTranscendentFor(character: CharacterWithCatalog): boolean {
   )
 }
 
+/**
+ * Build the read-time inventory view for an owned inventory row. `kind` is always
+ * the linked definition's catalog kind (equipment or consumables); the slot is
+ * surfaced only for equipment definitions that declare one. Archived linked
+ * definitions are still shown (inventory stock is the user's record, including
+ * archived items they may not be able to newly add but still own).
+ */
+function inventoryView(
+  item: CharacterWithCatalog["inventory"][number]
+): CharacterInventoryItemView {
+  const def = item.definition
+  const config = parseCatalogConfig(def.kind, def.config ?? {})
+  const view: CharacterInventoryItemView = {
+    id: item.id,
+    definitionId: item.definitionId,
+    name: def.name,
+    kind: def.kind === "consumables" ? "consumables" : "equipment",
+    quantity: item.quantity,
+    archived: def.archived,
+    provenance: def.provenance,
+  }
+  if (def.kind === "equipment") {
+    const slot = config.slot as string | undefined
+    if (slot) view.slot = slot
+  }
+  return view
+}
+
 function toDetail(
   character: CharacterWithCatalog,
   withStatus: boolean,
@@ -849,6 +906,7 @@ function toDetail(
     createdAt: character.createdAt.toISOString(),
     updatedAt: character.updatedAt.toISOString(),
     associations: character.associations.map(associationView),
+    inventory: character.inventory.map(inventoryView),
     skillOffers: character.skillOffers.map(skillOfferView),
     status: withStatus ? statusFor(character, config) : undefined,
     permanentConsumableCap: consumableInfo.cap,
@@ -2838,8 +2896,8 @@ async function evolveTrackCharacter(
  * The mutation runs in a transaction that CASes the client-supplied `version`
  * (a stale value 409s and rolls back the state write and the journal entry), then
  * persists the new state, logs a `consume` progression event carrying a definition
- * snapshot plus applied/requested/capRemainingAfter and a timestamp, and returns
- * the updated character, its live status, and the event.
+ * snapshot plus applied/requested/capRemainingAfter, the acting user id, and a
+ * timestamp, and returns the updated character, its live status, and the event.
  */
 export async function consumeCharacter(
   id: string,
@@ -2850,175 +2908,486 @@ export async function consumeCharacter(
   status: StatusResult
   event: unknown
 }> {
-  return prisma.$transaction(async (tx) => {
-    const row = await assertOwner(tx, id, user)
-    const houseRules = await loadHouseRules(tx)
-    // A consumed item mutates the character, so an archived character is inert.
-    if (row.archived) {
-      throw badRequest(
-        "character_archived",
-        "Archived character cannot consume a consumable"
-      )
-    }
+  return prisma
+    .$transaction(
+      async (tx) => {
+        const row = await assertOwner(tx, id, user)
+        const houseRules = await loadHouseRules(tx)
+        // A consumed item mutates the character, so an archived character is inert.
+        if (row.archived) {
+          throw badRequest(
+            "character_archived",
+            "Archived character cannot consume a consumable"
+          )
+        }
 
-    const definition = await tx.catalogDefinition.findUnique({
-      where: { id: body.definitionId },
-    })
-    if (!definition) {
-      throw notFound("catalog_not_found", "Catalog entry not found")
-    }
-    if (definition.kind !== "consumables") {
-      throw badRequest(
-        "wrong_kind",
-        `Catalog entry has wrong kind (expected "consumables")`
-      )
-    }
-    if (definition.archived) {
-      throw badRequest(
-        "catalog_archived",
-        "Catalog entry is archived and cannot be consumed"
-      )
-    }
+        const definition = await tx.catalogDefinition.findUnique({
+          where: { id: body.definitionId },
+        })
+        if (!definition) {
+          throw notFound("catalog_not_found", "Catalog entry not found")
+        }
+        if (definition.kind !== "consumables") {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind (expected "consumables")`
+          )
+        }
+        if (definition.archived) {
+          throw badRequest(
+            "catalog_archived",
+            "Catalog entry is archived and cannot be consumed"
+          )
+        }
 
-    const config = parseCatalogConfig(definition.kind, definition.config ?? {})
-    const state = deserializeState(row.state)
-    const rulesConfig = configFor(row, houseRules.config)
-
-    // The engine never guesses provenance from the grade: origin is always
-    // reconstructed from the authoritative Character.origin column before any
-    // apply, and the mutation persists it so the ledger state becomes
-    // self-describing. This both fixes legacy states that predate origin
-    // tracking and guards against any drift between the state and the row.
-    const stateWithOrigin: CharacterState = {
-      ...state,
-      race: { ...state.race, origin: row.origin },
-    }
-
-    // A legacy catalog consumable config carries no usable type/amount and is
-    // metadata-only. It stays editable but must be rejected here with an
-    // actionable 400 rather than silently granted a fabricated default amount
-    // (an empty vector would otherwise be misreported as an over-cap error) or
-    // blow up as a 500 during config parsing.
-    if (definition.kind === "consumables" && isLegacyConsumableConfig(config)) {
-      throw badRequest(
-        "legacy_consumable_config",
-        `Consumable "${definition.name}" has no usable "type"/"amount" in its catalog config; add both to consume it`
-      )
-    }
-
-    const type = config.type === "temporary" ? "temporary" : "permanent"
-    const amount = (config.amount ?? {}) as PartialVector
-    const snapshot = {
-      id: definition.id,
-      name: definition.name,
-      stableId: definition.stableId,
-      kind: definition.kind,
-      config: (definition.config ?? {}) as Record<string, unknown>,
-      provenance: definition.provenance,
-      grade: definition.grade,
-      archived: definition.archived,
-    }
-
-    let nextState: CharacterState
-    let eventPayload: Record<string, unknown>
-
-    if (type === "permanent") {
-      const result = applyPermanentConsumable(
-        stateWithOrigin,
-        definition.name,
-        amount,
-        rulesConfig
-      )
-      if (!result.ok || !result.entry) {
-        throw badRequest(
-          "consumable_cap_exceeded",
-          result.errors.join("; ") || "Permanent consumable exceeds its cap"
+        const config = parseCatalogConfig(
+          definition.kind,
+          definition.config ?? {}
         )
-      }
-      nextState = result.state
-      eventPayload = {
-        definitionId: definition.id,
-        definition: snapshot,
-        type: "permanent",
-        amount,
-        applied: result.entry.vector,
-        requested: result.entry.requested ?? result.entry.vector,
-        capRemainingAfter: result.entry.capRemainingAfter ?? {},
-        appliedAt: new Date().toISOString(),
-      }
-    } else {
-      const durationQuarters = config.durationQuarters as number | undefined
-      if (durationQuarters == null) {
-        throw badRequest(
-          "validation",
-          "Temporary consumable requires durationQuarters"
-        )
-      }
-      // A unique effect id per consumption so repeated applications never collide.
-      const effectId = `${definition.id}:cons-${stateWithOrigin.turn}-${stateWithOrigin.activeEffects.length}`
-      const effect = consumableToEffect(
-        {
-          id: effectId,
+        const state = deserializeState(row.state)
+        const rulesConfig = configFor(row, houseRules.config)
+
+        // The engine never guesses provenance from the grade: origin is always
+        // reconstructed from the authoritative Character.origin column before any
+        // apply, and the mutation persists it so the ledger state becomes
+        // self-describing. This both fixes legacy states that predate origin
+        // tracking and guards against any drift between the state and the row.
+        const stateWithOrigin: CharacterState = {
+          ...state,
+          race: { ...state.race, origin: row.origin },
+        }
+
+        // A legacy catalog consumable config carries no usable type/amount and is
+        // metadata-only. It stays editable but must be rejected here with an
+        // actionable 400 rather than silently granted a fabricated default amount
+        // (an empty vector would otherwise be misreported as an over-cap error) or
+        // blow up as a 500 during config parsing.
+        if (
+          definition.kind === "consumables" &&
+          isLegacyConsumableConfig(config)
+        ) {
+          throw badRequest(
+            "legacy_consumable_config",
+            `Consumable "${definition.name}" has no usable "type"/"amount" in its catalog config; add both to consume it`
+          )
+        }
+
+        // Consuming requires OWNED stock, checked and decremented/removed INSIDE the
+        // same transaction as the cap/duration validation, CAS, and journal: a failed
+        // cap, duration, or stale version rolls back the stock change, the state and
+        // the event together. An absent row (or a quantity below 1) means zero stock.
+        const stockRow = await tx.characterInventoryItem.findUnique({
+          where: {
+            characterId_definitionId: {
+              characterId: id,
+              definitionId: definition.id,
+            },
+          },
+        })
+        const stockPrior = stockRow?.quantity ?? 0
+        if (stockPrior < 1) {
+          throw badRequest(
+            "inventory_insufficient",
+            `You own no "${definition.name}" to consume; add it to your inventory first`
+          )
+        }
+
+        const type = config.type === "temporary" ? "temporary" : "permanent"
+        const amount = (config.amount ?? {}) as PartialVector
+        const snapshot = {
+          id: definition.id,
           name: definition.name,
-          group: (config.group as string | undefined) ?? "",
-          amount,
-          durationQuarters,
-          ...(definition.grade ? { grade: definition.grade as Grade } : {}),
-        },
-        stateWithOrigin
-      )
-      nextState = {
-        ...stateWithOrigin,
-        activeEffects: [...stateWithOrigin.activeEffects, effect],
-      }
-      eventPayload = {
-        definitionId: definition.id,
-        definition: snapshot,
-        type: "temporary",
-        amount,
-        applied: amount,
-        requested: amount,
-        effectId,
-        durationQuarters,
-        expiresAt: effect.expiresAt,
-        capRemainingAfter: {},
-        appliedAt: new Date().toISOString(),
-      }
-    }
+          stableId: definition.stableId,
+          kind: definition.kind,
+          config: (definition.config ?? {}) as Record<string, unknown>,
+          provenance: definition.provenance,
+          grade: definition.grade,
+          archived: definition.archived,
+        }
 
-    const serialized = serializeState(nextState)
-    const updatedMany = await tx.character.updateMany({
-      where: { id, version: body.version },
-      data: {
-        state: serialized as Prisma.InputJsonValue,
-        version: { increment: 1 },
+        let nextState: CharacterState
+        let eventPayload: Record<string, unknown>
+
+        if (type === "permanent") {
+          const result = applyPermanentConsumable(
+            stateWithOrigin,
+            definition.name,
+            amount,
+            rulesConfig
+          )
+          if (!result.ok || !result.entry) {
+            throw badRequest(
+              "consumable_cap_exceeded",
+              result.errors.join("; ") || "Permanent consumable exceeds its cap"
+            )
+          }
+          nextState = result.state
+          eventPayload = {
+            definitionId: definition.id,
+            definition: snapshot,
+            type: "permanent",
+            amount,
+            applied: result.entry.vector,
+            requested: result.entry.requested ?? result.entry.vector,
+            capRemainingAfter: result.entry.capRemainingAfter ?? {},
+            stockPrior,
+            stockAfter: stockPrior - 1,
+            appliedAt: new Date().toISOString(),
+            actorId: user.id,
+          }
+        } else {
+          const durationQuarters = config.durationQuarters as number | undefined
+          if (durationQuarters == null) {
+            throw badRequest(
+              "validation",
+              "Temporary consumable requires durationQuarters"
+            )
+          }
+          // A unique effect id per consumption so repeated applications never collide.
+          const effectId = `${definition.id}:cons-${stateWithOrigin.turn}-${stateWithOrigin.activeEffects.length}`
+          const effect = consumableToEffect(
+            {
+              id: effectId,
+              name: definition.name,
+              group: (config.group as string | undefined) ?? "",
+              amount,
+              durationQuarters,
+              ...(definition.grade ? { grade: definition.grade as Grade } : {}),
+            },
+            stateWithOrigin
+          )
+          nextState = {
+            ...stateWithOrigin,
+            activeEffects: [...stateWithOrigin.activeEffects, effect],
+          }
+          eventPayload = {
+            definitionId: definition.id,
+            definition: snapshot,
+            type: "temporary",
+            amount,
+            applied: amount,
+            requested: amount,
+            effectId,
+            durationQuarters,
+            expiresAt: effect.expiresAt,
+            capRemainingAfter: {},
+            stockPrior,
+            stockAfter: stockPrior - 1,
+            appliedAt: new Date().toISOString(),
+            actorId: user.id,
+          }
+        }
+
+        // Consume exactly ONE owned unit. The final unit removes the whole row (the
+        // CHECK constraint forbids quantity 0), so an absent row again means zero.
+        const stockAfter = stockPrior - 1
+        if (stockAfter === 0) {
+          await tx.characterInventoryItem.deleteMany({
+            where: { characterId: id, definitionId: definition.id },
+          })
+        } else {
+          await tx.characterInventoryItem.updateMany({
+            where: { characterId: id, definitionId: definition.id },
+            data: { quantity: { decrement: 1 } },
+          })
+        }
+
+        const serialized = serializeState(nextState)
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: body.version },
+          data: {
+            state: serialized as Prisma.InputJsonValue,
+            version: { increment: 1 },
+          },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${body.version}, got a newer version`
+          )
+        }
+
+        await tx.progressionEvent.create({
+          data: {
+            characterId: id,
+            kind: "consume",
+            payload: eventPayload as Prisma.InputJsonValue,
+          },
+        })
+
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return {
+          character: toDetail(updated, true, rulesConfig, houseRules.version),
+          status: statusFor(updated, rulesConfig),
+          event: { kind: "consume", payload: eventPayload },
+        }
       },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      // A concurrent consume that cannot serialize (two requests racing on the
+      // same final stock unit / version) surfaces as P2034; map it to a 409
+      // rather than a raw 500 so the client retries.
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "catalog_serialization_conflict",
+          "Concurrent character write conflict; retry the change"
+        )
+      }
+      throw err
     })
-    if (updatedMany.count !== 1) {
-      throw conflict(
-        "version_conflict",
-        `Version mismatch: expected ${body.version}, got a newer version`
-      )
-    }
+}
 
-    await tx.progressionEvent.create({
-      data: {
-        characterId: id,
-        kind: "consume",
-        payload: eventPayload as Prisma.InputJsonValue,
-      },
-    })
+// ------------------------------------------------------------------ //
+// Character inventory
+// ------------------------------------------------------------------ //
 
-    const updated = (await tx.character.findUnique({
-      where: { id },
-      include: characterInclude,
-    }))!
-    return {
-      character: toDetail(updated, true, rulesConfig, houseRules.version),
-      status: statusFor(updated, rulesConfig),
-      event: { kind: "consume", payload: eventPayload },
-    }
+/**
+ * Read a character's owned inventory (equipment + consumables, including
+ * archived stock) together with the current CAS version. A read path: no
+ * mutation, so an archived character's inventory is still readable. Ownership is
+ * the same owner/admin guard used everywhere else (a non-owner is 403).
+ */
+export async function getCharacterInventory(
+  id: string,
+  user: SessionUser
+): Promise<{ inventory: CharacterInventoryItemView[]; version: number }> {
+  const row = await prisma.character.findUnique({
+    where: { id },
+    include: { inventory: { include: { definition: true } } },
   })
+  if (!row) throw notFound("character_not_found", "Character not found")
+  if (!user.isAdmin && row.ownerId !== user.id) {
+    throw forbidden("forbidden", "You do not own this character")
+  }
+  return {
+    inventory: row.inventory.map(inventoryView),
+    version: row.version,
+  }
+}
+
+/**
+ * Add or remove owned inventory quantity for a character.
+ *
+ * This is the user's manual bookkeeping path for acquisition (no acquisition
+ * economy is invented here): the client states how many units were obtained or
+ * spent and a mandatory source note, and the service records the prior/new
+ * quantity in the `inventory_adjust` journal along with a definition snapshot and
+ * the acting user id.
+ *
+ * - Only `equipment` / `consumables` definitions may be inventoried. Adding
+ *   requires an ACTIVE (unarchived) definition; removing is permitted for
+ *   archived definitions (owned stock may be spent even when new stock cannot be
+ *   acquired).
+ * - `quantity` is bounded 1..999999. A remove down to zero deletes the row (an
+ *   absent row means zero stock); a remove beyond owned stock is rejected. A new
+ *   distinct definition can be added only while the character owns fewer than
+ *   MAX_IMPORT_INVENTORY distinct definitions (the trusted-backup roundtrip cap);
+ *   exceeding it is a 409.
+ * - Ownership invariant: a removal that would take an equipped item's stock to
+ *   zero is rejected with a 409 `inventory_equipped` (no auto-unequip). This
+ *   applies to any EQUIPMENT association for the definition (legacyUnowned true
+ *   or false, and including archived linked definitions) that currently owns
+ *   stock; a grandfathered link already at zero stock has no inventory row to
+ *   remove, so it never hits this branch and stays equipped. A removal that
+ *   leaves at least one unit is always allowed.
+ * - The write runs under SERIALIZABLE isolation, CASes the character version, and
+ *   maps a P2034 (cannot-serialize concurrent write) to a 409. A stale version
+ *   409s and rolls back the inventory change and the journal.
+ */
+export async function adjustCharacterInventory(
+  id: string,
+  body: {
+    operation: "add" | "remove"
+    definitionId: string
+    quantity: number
+    version: number
+    sourceNote: string
+  },
+  user: SessionUser
+): Promise<{
+  character: CharacterDetail
+  inventory: CharacterInventoryItemView[]
+  version: number
+}> {
+  return prisma
+    .$transaction(
+      async (tx) => {
+        const row = await assertOwner(tx, id, user)
+        const houseRules = await loadHouseRules(tx)
+        if (row.archived) {
+          throw badRequest(
+            "character_archived",
+            "Archived character cannot adjust inventory"
+          )
+        }
+
+        const definition = await tx.catalogDefinition.findUnique({
+          where: { id: body.definitionId },
+        })
+        if (!definition) {
+          throw notFound("catalog_not_found", "Catalog entry not found")
+        }
+        if (
+          definition.kind !== "equipment" &&
+          definition.kind !== "consumables"
+        ) {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind (expected "equipment" or "consumables")`
+          )
+        }
+        if (body.operation === "add" && definition.archived) {
+          throw badRequest(
+            "catalog_archived",
+            "Catalog entry is archived and cannot be added to inventory"
+          )
+        }
+
+        const existing = await tx.characterInventoryItem.findUnique({
+          where: {
+            characterId_definitionId: {
+              characterId: id,
+              definitionId: definition.id,
+            },
+          },
+        })
+        const prior = existing?.quantity ?? 0
+        let next: number
+        if (body.operation === "add") {
+          next = prior + body.quantity
+          if (next > 999999) {
+            throw badRequest(
+              "inventory_cap_exceeded",
+              `Inventory of "${definition.name}" would exceed the 999999 cap`
+            )
+          }
+        } else {
+          if (prior < body.quantity) {
+            throw badRequest(
+              "inventory_insufficient",
+              `You own only ${prior} of "${definition.name}"`
+            )
+          }
+          next = prior - body.quantity
+        }
+
+        // Ownership invariant: an equipped item must keep owned stock. When a
+        // removal would discard the final owned unit (next === 0) while the
+        // definition is still linked as EQUIPMENT, reject BEFORE deleting the
+        // row and BEFORE bumping the CAS version. This applies to every EQUIPMENT
+        // association (legacyUnowned true or false) that currently owns stock;
+        // a grandfathered link already at zero stock has no inventory row to
+        // remove, so it never reaches this branch and stays equipped. There is
+        // no auto-unequip: the link is left in place for the user to remove.
+        // Archived linked definitions are still matched (owning archived stock
+        // must not silently orphan a still-equipped item).
+        if (next === 0 && body.operation === "remove") {
+          const equipped = row.associations.some(
+            (a) => a.kind === "EQUIPMENT" && a.definitionId === definition.id
+          )
+          if (equipped) {
+            throw conflict(
+              "inventory_equipped",
+              `"${definition.name}" is equipped; unequip it before removing its final owned unit`
+            )
+          }
+        }
+
+        if (next === 0) {
+          await tx.characterInventoryItem.deleteMany({
+            where: { characterId: id, definitionId: definition.id },
+          })
+        } else if (existing) {
+          await tx.characterInventoryItem.updateMany({
+            where: { characterId: id, definitionId: definition.id },
+            data: { quantity: next },
+          })
+        } else {
+          // Creating a distinct stock row. The trusted-backup export/import caps
+          // inventory at MAX_IMPORT_INVENTORY distinct definitions, so a manual add
+          // that would push the count past that cap is rejected with a 409 to keep
+          // an exported character self-roundtrippable.
+          if (row.inventory.length >= MAX_IMPORT_INVENTORY) {
+            throw conflict(
+              "inventory_defs_cap_exceeded",
+              `Inventory would exceed ${MAX_IMPORT_INVENTORY} distinct definitions; the trusted-backup export cannot round-trip more`
+            )
+          }
+          await tx.characterInventoryItem.create({
+            data: {
+              characterId: id,
+              definitionId: definition.id,
+              quantity: next,
+            },
+          })
+        }
+
+        // CAS: the character version must match the expected value. A mismatch
+        // returns 409 and rolls back the inventory change and the journal.
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: body.version },
+          data: { version: { increment: 1 } },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${body.version}, got a newer version`
+          )
+        }
+
+        await tx.progressionEvent.create({
+          data: {
+            characterId: id,
+            kind: "inventory_adjust",
+            payload: {
+              operation: body.operation,
+              definitionId: definition.id,
+              definition: {
+                id: definition.id,
+                name: definition.name,
+                kind: definition.kind,
+                stableId: definition.stableId,
+                grade: definition.grade,
+                provenance: definition.provenance,
+                archived: definition.archived,
+              },
+              quantity: body.quantity,
+              priorQuantity: prior,
+              newQuantity: next,
+              sourceNote: body.sourceNote,
+              actorId: user.id,
+              at: new Date().toISOString(),
+            } as Prisma.InputJsonValue,
+          },
+        })
+
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return {
+          character: detailFor(updated, houseRules),
+          inventory: updated.inventory.map(inventoryView),
+          version: updated.version,
+        }
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      // A concurrent inventory write that cannot serialize surfaces as P2034;
+      // map it to a 409 rather than a raw 500.
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "catalog_serialization_conflict",
+          "Concurrent character inventory write conflict; retry the change"
+        )
+      }
+      throw err
+    })
 }
 
 /** Decode the equipment slot from a catalog definition's parsed config. */
@@ -3256,11 +3625,34 @@ export async function associateCharacter(
             }
           }
 
+          // Equipment is owner-linked: an add requires the character to own at
+          // least one unit of the definition. A grandfathered link (legacyUnowned)
+          // may be removed with zero stock, but a NEW link always needs stock.
+          if (body.kind === "equipment") {
+            const owned = await tx.characterInventoryItem.findUnique({
+              where: {
+                characterId_definitionId: {
+                  characterId: id,
+                  definitionId: definition.id,
+                },
+              },
+            })
+            if (!owned || owned.quantity < 1) {
+              throw badRequest(
+                "inventory_insufficient",
+                `You own no "${definition.name}" to equip; add stock to your inventory first`
+              )
+            }
+          }
+
           await tx.characterAssociation.create({
             data: {
               characterId: id,
               definitionId: definition.id,
               kind: assocKind as never,
+              // Only equipment requiring ownership is grandfathered on existing
+              // links; every newly created association is owned, never ownerless.
+              ...(body.kind === "equipment" ? { legacyUnowned: false } : {}),
             },
           })
         } else {
@@ -3388,6 +3780,9 @@ export async function exportCharacter(
     definitionId: a.definitionId,
     kind: associationViewKind(a.kind),
     createdAt: a.createdAt.toISOString(),
+    // Only equipment links carry the grandfathered marker; non-equipment links
+    // never export the flag (they cannot be grandfathered).
+    ...(a.kind === "EQUIPMENT" ? { legacyUnowned: a.legacyUnowned } : {}),
     definition: {
       id: a.definition.id,
       name: a.definition.name,
@@ -3398,6 +3793,18 @@ export async function exportCharacter(
       stableId: a.definition.stableId,
       updatedAt: a.definition.updatedAt.toISOString(),
     },
+  }))
+  // Export owned inventory as stable identifiers so a re-import on another server
+  // instance can resolve each definition against its own catalog. Only the kinds
+  // that can be inventoried (equipment / consumables) are emitted; the quantity is
+  // the owned count, never 0 (an absent entry means zero owned stock).
+  const inventory = row.inventory.map((item) => ({
+    definition: {
+      kind:
+        item.definition.kind === "consumables" ? "consumables" : "equipment",
+      stableId: item.definition.stableId,
+    },
+    quantity: item.quantity,
   }))
   const identity = {
     name: row.name,
@@ -3429,7 +3836,7 @@ export async function exportCharacter(
     }
   })
   return {
-    schema: "primal-character/3",
+    schema: IMPORT_SCHEMA_V4,
     rulesetVersion: IMPORT_RULESET_VERSION,
     identity,
     character: listItemFor(row, houseRules, true),
@@ -3440,6 +3847,7 @@ export async function exportCharacter(
     // import (the importer recomputes it from the re-linked associations).
     isTranscendent: isTranscendentFor(row),
     associations,
+    inventory,
     events: events.map((e) => ({
       kind: e.kind,
       payload: e.payload,
@@ -3450,18 +3858,27 @@ export async function exportCharacter(
 }
 
 // ------------------------------------------------------------------ //
-// Trusted-backup import (v3)
+// Trusted-backup import (v3 / v4)
 // ------------------------------------------------------------------ //
 //
-// A v3 document is a *trusted backup*, not authoritative server-verified state.
-// Every catalog reference (identity race/class/profession, each association
-// definition, each skill-offer option/selection) is resolved by `kind` +
-// `stableId` to an EXISTING catalog definition; no catalog content is
-// auto-created, and a missing/mismatched/archived required definition is
-// rejected with an actionable 400. `liveState` / `status` in the document are
-// advisory and are ignored - status is recomputed from the imported state. The
-// imported history is stored as `import_history` events (source provenance, not
-// valid live IDs) and an `import` marker event is appended.
+// A trusted-backup document (v3 or v4) is *not* authoritative server-verified
+// state. Every catalog reference (identity race/class/profession, each
+// association definition, each inventory definition, each skill-offer
+// option/selection) is resolved by `kind` + `stableId` to an EXISTING catalog
+// definition; no catalog content is auto-created, and a
+// missing/mismatched/archived required definition is rejected with an actionable
+// 400. `liveState` / `status` in the document are advisory and are ignored -
+// status is recomputed from the imported state. The imported history is stored as
+// `import_history` events (source provenance, not valid live IDs) and an `import`
+// marker event is appended.
+//
+// The v4 document additionally carries owned inventory quantities and a
+// `legacyUnowned` marker on equipment associations. Inventory is validated and
+// resolved transactionally alongside the associations and events; an equipment
+// link that is NOT grandfathered (`legacyUnowned: false`) requires the backup to
+// import at least one owned unit of the matching definition, while a
+// grandfathered link may import with zero stock. A legacy v3 document (no
+// inventory, no marker) imports no stock and grandfathers every equipment link.
 
 type CatalogLookupRow = {
   id: string
@@ -3569,11 +3986,87 @@ type ResolvedAssoc = {
     "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
   definitionId: string
   definition: CatalogLookupRow
+  /**
+   * Grandfathered status persisted on the association. Only meaningful for
+   * EQUIPMENT links: a v4 doc carries the exported marker verbatim, while any
+   * equipment link from a legacy v3 doc (no marker) is grandfathered (true).
+   * Non-equipment links are always false.
+   */
+  legacyUnowned: boolean
+}
+
+/**
+ * A resolved (validated) inventory entry: the referenced catalog definition is
+ * located by local `kind` + `stableId` and the owned quantity is unaltered. The
+ * catalog row may be archived - archived stock is inert but still imported.
+ */
+type ResolvedInventoryItem = {
+  definitionId: string
+  definition: CatalogLookupRow
+  quantity: number
+}
+
+type ResolveAssocOpts = {
+  /** True for a v4 document; false for a legacy v3 doc (no inventory model). */
+  enforceOwnership: boolean
+  /** Resolved owned stock keyed by local catalog definition id (v4 only). */
+  ownedStockByDefId: Map<string, number>
+}
+
+/**
+ * Resolve the v4 `inventory` array against the local catalog. Every reference is
+ * matched by local `kind` + `stableId` to EXISTING catalog definitions (archived
+ * stock is allowed and imported inert); a missing definition or a duplicated
+ * definition reference is rejected before any DB write. The array is already
+ * bounded (<=500) and quantity-validated (1..999999) by the document schema.
+ */
+async function resolveInventoryRefs(
+  db: DbClient,
+  inventory: Extract<
+    CharacterImportDocument,
+    { schema: typeof IMPORT_SCHEMA_V4 }
+  >["inventory"]
+): Promise<ResolvedInventoryItem[]> {
+  const seen = new Set<string>()
+  const resolved: ResolvedInventoryItem[] = []
+  for (const item of inventory) {
+    const def = await findCatalogByStableId(
+      db,
+      item.definition.kind,
+      item.definition.stableId
+    )
+    if (!def) {
+      throw badRequest(
+        "import_stock_missing",
+        `Imported inventory references catalog "${item.definition.stableId}" (${item.definition.kind}) which is not in the catalog`
+      )
+    }
+    if (seen.has(def.id)) {
+      throw badRequest(
+        "import_duplicate_stock",
+        `Catalog "${def.name}" appears more than once in imported inventory`
+      )
+    }
+    seen.add(def.id)
+    resolved.push({
+      definitionId: def.id,
+      definition: def,
+      quantity: item.quantity,
+    })
+  }
+  return resolved
+}
+
+function associationLegacyUnowned(
+  a: CharacterImportDocument["associations"][number]
+): boolean | undefined {
+  return (a as { legacyUnowned?: boolean }).legacyUnowned
 }
 
 async function resolveAssociationRefs(
   db: DbClient,
-  assocs: CharacterImportDocument["associations"]
+  assocs: CharacterImportDocument["associations"],
+  opts: ResolveAssocOpts
 ): Promise<ResolvedAssoc[]> {
   const seen = new Set<string>()
   const resolved: ResolvedAssoc[] = []
@@ -3603,11 +4096,41 @@ async function resolveAssociationRefs(
       )
     }
     seen.add(def.id)
+
+    let legacyUnowned: boolean
+    if (a.kind === "equipment") {
+      // v3 backups have no inventory model and no marker: a grandfathered link may
+      // stay equipped regardless of stock. v4 carries the exported marker verbatim;
+      // only a non-grandfathered (false) link REQUIRES owned stock.
+      legacyUnowned = opts.enforceOwnership
+        ? (associationLegacyUnowned(a) ?? false)
+        : true
+      if (!legacyUnowned) {
+        const owned = opts.ownedStockByDefId.get(def.id) ?? 0
+        if (owned < 1) {
+          throw badRequest(
+            "import_stock_missing",
+            `Equipment "${def.name}" (${def.stableId}) is linked but not grandfathered, and the backup owns no stock of it; add inventory or mark it legacyUnowned:true`
+          )
+        }
+      }
+    } else {
+      // Only equipment links can be grandfathered.
+      if (associationLegacyUnowned(a) === true) {
+        throw badRequest(
+          "import_legacy_unowned_non_equipment",
+          `Association "${a.definition.stableId}" (${a.kind}) carries legacyUnowned:true, but only equipment links may be grandfathered`
+        )
+      }
+      legacyUnowned = false
+    }
+
     resolved.push({
       sourceKind: a.kind,
       dbKind: ASSOC_KIND_TO_DB[a.kind],
       definitionId: def.id,
       definition: def,
+      legacyUnowned,
     })
   }
   return resolved
@@ -4077,7 +4600,28 @@ export async function importCharacter(
       prof
     )
 
-    const resolvedAssocs = await resolveAssociationRefs(tx, input.associations)
+    // A v3 doc has no inventory model; a v4 doc carries owned stock (which is
+    // validated and resolved before any DB write). The resolved stock map is what
+    // the association resolver consults to enforce the ownership invariant on
+    // non-grandfathered equipment links.
+    const isV4 = input.schema === IMPORT_SCHEMA_V4
+    let resolvedInventory: ResolvedInventoryItem[] = []
+    let ownedStockByDefId = new Map<string, number>()
+    if (isV4) {
+      resolvedInventory = await resolveInventoryRefs(tx, input.inventory)
+      ownedStockByDefId = new Map(
+        resolvedInventory.map((i) => [i.definitionId, i.quantity])
+      )
+    }
+
+    const resolvedAssocs = await resolveAssociationRefs(
+      tx,
+      input.associations,
+      {
+        enforceOwnership: isV4,
+        ownedStockByDefId,
+      }
+    )
     assertAssocCollisions(resolvedAssocs)
     const resolvedOffers = await resolveSkillOfferRefs(tx, input.skillOffers)
 
@@ -4104,6 +4648,24 @@ export async function importCharacter(
           characterId: created.id,
           definitionId: a.definitionId,
           kind: a.dbKind as never,
+          // Only equipment links carry the grandfathered marker; non-equipment
+          // links fall back to the schema default (false). Preserved verbatim so a
+          // re-imported grandfathered link stays grandfathered and vice versa.
+          ...(a.sourceKind === "equipment"
+            ? { legacyUnowned: a.legacyUnowned }
+            : {}),
+        },
+      })
+    }
+
+    // Import owned stock. Only reached for a v4 document (v3 imports no stock, so
+    // the array is empty). Archived catalog stock is imported inert.
+    for (const item of resolvedInventory) {
+      await tx.characterInventoryItem.create({
+        data: {
+          characterId: created.id,
+          definitionId: item.definitionId,
+          quantity: item.quantity,
         },
       })
     }
@@ -4153,6 +4715,11 @@ export async function importCharacter(
           classStableId: cls.stableId,
           professionStableId: prof?.stableId ?? null,
           rulesetVersion: IMPORT_RULESET_VERSION,
+          // Record which backup schema produced this import and how many distinct
+          // stock definitions were restored, so the marker is an auditable record
+          // of the backup's origin (never verified source provenance itself).
+          backupSchema: input.schema,
+          inventoryCount: resolvedInventory.length,
           sourceEvents: input.events.length,
         } as Prisma.InputJsonValue,
       },

@@ -163,6 +163,7 @@ model Character {
   events        ProgressionEvent[]
   assets        Asset[]
   associations  CharacterAssociation[]
+  inventory     CharacterInventoryItem[]
   skillOffers   SkillOffer[]
 
   @@index([ownerId])
@@ -224,6 +225,7 @@ model CatalogDefinition {
   classCharacters     Character[] @relation("CharacterClass")
   professionCharacters Character[] @relation("CharacterProfession")
   characterAssociations CharacterAssociation[] @relation("AssociationDefinition")
+  inventoryItems      CharacterInventoryItem[] @relation("InventoryItemDefinition")
   skillOfferOptions   SkillOfferOption[] @relation("SkillOfferOptionDefinition")
   skillOfferSelections SkillOffer[] @relation("SkillOfferSelection")
 
@@ -259,12 +261,57 @@ model CharacterAssociation {
   definitionId String
   definition   CatalogDefinition @relation("AssociationDefinition", fields: [definitionId], references: [id], onDelete: Restrict)
   kind         AssociationKind
+  // True only for equipment links that predate the inventory-ownership model
+  // (backfilled by migration 0010). A grandfathered link may stay equipped and
+  // removable even when the character owns zero stock of that definition; a
+  // newly created link is never grandfathered and requires stock >= 1.
+  // Ownership is per-definition house bookkeeping, not canon - a single item
+  // instance is never tracked (no uniqueness/instance/capacity).
+  legacyUnowned Boolean         @default(false)
   createdAt    DateTime        @default(now())
 
   @@unique([characterId, definitionId])
   @@index([characterId])
   @@index([kind])
   @@map("character_associations")
+}
+
+// ------------------------------------------------------------------ //
+// Character inventory (owner-managed quantities, house bookkeeping)
+// ------------------------------------------------------------------ //
+//
+// A per-character quantity of an EQUIPMENT or CONSUMABLES catalog definition the
+// user owns. This is intentionally NOT item-instance tracking: there is no slot
+// on a stored item, no instance uniqueness, and no capacity/stacking - ownership
+// is expressed only as a per-definition integer count. Adding/removing stock is
+// manual bookkeeping (the acquisition/crafting economy is a later stage), so the
+// journal records the prior/new quantity and the user-supplied source note, never
+// an invented acquisition story.
+//
+// - `quantity` is bounded to 1..999999 by the migration's CHECK constraint; the
+//   add/remove service enforces the same bound so a stale client cannot write a
+//   value the DB rejects.
+// - A quantity of 0 is never stored: removing the final unit deletes the row, so
+//   an absent row means zero owned stock.
+// - Deleting a character cascades to its inventory. A referenced catalog
+//   definition is never deleted while an inventory row points to it (RESTRICT),
+//   mirroring the association link behavior.
+
+model CharacterInventoryItem {
+  id           String   @id @default(cuid())
+  characterId  String
+  character    Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  definitionId String
+  definition   CatalogDefinition @relation("InventoryItemDefinition", fields: [definitionId], references: [id], onDelete: Restrict)
+  // 1..999999 (enforced by the migration CHECK). Never 0 - the final unit removes
+  // the whole row.
+  quantity     Int
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([characterId, definitionId])
+  @@index([characterId])
+  @@map("character_inventory_items")
 }
 
 // ------------------------------------------------------------------ //

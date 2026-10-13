@@ -17,6 +17,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { prisma } from "@/lib/db/client"
 import {
+  adjustCharacterInventory,
   associateCharacter,
   createCatalogItem,
   createCharacter,
@@ -51,6 +52,8 @@ const CATALOG = {
   alchemist: "catalog-alchemist",
   title1: "catalog-title-1",
   gear1: "catalog-gear-1",
+  gear2: "catalog-gear-2",
+  consum1: "catalog-consum-1",
   skill1: "catalog-skill-1",
   pgGod1: "catalog-pg-god-1",
   pgBloodline1: "catalog-pg-bloodline-1",
@@ -148,6 +151,13 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     await seedCatalog(CATALOG.gear1, "equipment", "gear-1", "Helm", {
       slot: "head",
     })
+    await seedCatalog(CATALOG.gear2, "equipment", "gear-2", "Vest", {
+      slot: "body",
+    })
+    await seedCatalog(CATALOG.consum1, "consumables", "consum-1", "Ration", {
+      type: "permanent",
+      amount: { strength: 1 },
+    })
     await seedCatalog(CATALOG.skill1, "skills", "skill-1", "Skill One", {
       effects: [],
     })
@@ -237,13 +247,28 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       },
       ownerUser
     )
+    // Equipment is now owner-linked: an add requires the character to own at
+    // least one unit of the definition, so seed the Helm stock first. Each
+    // mutating service call increments the character version, so the versions
+    // below follow the adjusted sequence.
+    await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: CATALOG.gear1,
+        quantity: 1,
+        version: 1,
+        sourceNote: "seed stock for import round trip",
+      },
+      ownerUser
+    )
     await associateCharacter(
       src.id,
       {
         kind: "equipment",
         definitionId: CATALOG.gear1,
         operation: "add",
-        version: 1,
+        version: 2,
       },
       ownerUser
     )
@@ -252,7 +277,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       {
         operation: "grant",
         definitionId: CATALOG.skill1,
-        version: 2,
+        version: 3,
         reason: "story",
       },
       adminUser
@@ -309,7 +334,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const rawDoc = await exportCharacter(src.id, ownerUser)
     const doc = rawDoc as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/3")
+    expect(doc.schema).toBe("primal-character/4")
     expect(doc.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(doc.identity).toMatchObject({
       name: "Source Hero",
@@ -324,6 +349,20 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     expect((doc as unknown as { isTranscendent: boolean }).isTranscendent).toBe(
       true
     )
+    // v4 carries owned stock and the equipment grandfathering marker.
+    const v4 = doc as unknown as {
+      associations: Array<{ kind: string; legacyUnowned?: boolean }>
+      inventory: Array<{
+        definition: { kind: string; stableId: string }
+        quantity: number
+      }>
+    }
+    expect(v4.inventory).toEqual([
+      { definition: { kind: "equipment", stableId: "gear-1" }, quantity: 1 },
+    ])
+    expect(
+      v4.associations.find((a) => a.kind === "equipment")?.legacyUnowned
+    ).toBe(false)
 
     const imported = await importCharacter(doc, adminUser)
     createdCharacterIds.push(imported.id)
@@ -339,6 +378,14 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     expect(
       (imported as unknown as { isTranscendent: boolean }).isTranscendent
     ).toBe(true)
+    // Owned stock and the equipment marker are restored from the v4 backup.
+    expect(imported.inventory).toHaveLength(1)
+    expect(imported.inventory[0].definitionId).toBe(CATALOG.gear1)
+    expect(imported.inventory[0].quantity).toBe(1)
+    const importedEquip = await prisma.characterAssociation.findFirst({
+      where: { characterId: imported.id, kind: "EQUIPMENT" },
+    })
+    expect(importedEquip?.legacyUnowned).toBe(false)
 
     // The historical selection timestamp is preserved verbatim (not restamped).
     const importedOffer = await prisma.skillOffer.findFirst({
@@ -371,11 +418,256 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     )) as unknown as CharacterImportDocument
     expect(roundtrip.identity).toEqual(doc.identity)
     expect(roundtrip.associations).toHaveLength(6)
+    expect(
+      (roundtrip as unknown as { inventory: unknown[] }).inventory
+    ).toHaveLength(1)
+    expect(
+      (
+        roundtrip as unknown as {
+          associations: Array<{ kind: string; legacyUnowned?: boolean }>
+        }
+      ).associations.find((a) => a.kind === "equipment")?.legacyUnowned
+    ).toBe(false)
     expect(roundtrip.skillOffers).toHaveLength(1)
     expect(roundtrip.skillOffers[0].selectedStableId).toBe("skill-1")
     expect(
       (roundtrip as unknown as { isTranscendent: boolean }).isTranscendent
     ).toBe(true)
+  })
+
+  it("round-trips a v4 backup with a consumable, an equipped item, and a grandfathered zero-stock link", async () => {
+    const src = await createCharacter(
+      {
+        name: "V4 Hero",
+        description: "v4 round trip",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: CATALOG.consum1,
+        quantity: 3,
+        version: 0,
+        sourceNote: "seed consumable for v4 roundtrip",
+      },
+      ownerUser
+    )
+    await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: CATALOG.gear1,
+        quantity: 2,
+        version: 1,
+        sourceNote: "seed gear for v4 roundtrip",
+      },
+      ownerUser
+    )
+    await associateCharacter(
+      src.id,
+      {
+        kind: "equipment",
+        definitionId: CATALOG.gear1,
+        operation: "add",
+        version: 2,
+      },
+      ownerUser
+    )
+    // A grandfathered link predating the inventory model: equipped with ZERO owned
+    // stock (no inventory row), which a v4 backup must round-trip unchanged.
+    await prisma.characterAssociation.create({
+      data: {
+        characterId: src.id,
+        definitionId: CATALOG.gear2,
+        kind: "EQUIPMENT",
+        legacyUnowned: true,
+      },
+    })
+
+    const raw = await exportCharacter(src.id, ownerUser)
+    const doc = raw as unknown as CharacterImportDocument
+    expect(doc.schema).toBe("primal-character/4")
+    const v4 = doc as unknown as {
+      inventory: Array<{
+        definition: { kind: string; stableId: string }
+        quantity: number
+      }>
+      associations: Array<{
+        kind: string
+        legacyUnowned?: boolean
+        definition: { stableId: string }
+      }>
+    }
+    // Order is not contractual (no orderBy on the inventory read), so assert as a
+    // set rather than a positional array.
+    expect(v4.inventory).toHaveLength(2)
+    expect(v4.inventory).toContainEqual({
+      definition: { kind: "equipment", stableId: "gear-1" },
+      quantity: 2,
+    })
+    expect(v4.inventory).toContainEqual({
+      definition: { kind: "consumables", stableId: "consum-1" },
+      quantity: 3,
+    })
+    const eq1 = v4.associations.find(
+      (a) => a.kind === "equipment" && a.definition.stableId === "gear-1"
+    )
+    expect(eq1?.legacyUnowned).toBe(false)
+    const eq2 = v4.associations.find(
+      (a) => a.kind === "equipment" && a.definition.stableId === "gear-2"
+    )
+    expect(eq2?.legacyUnowned).toBe(true)
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    expect(imported.inventory).toHaveLength(2)
+    expect(
+      imported.inventory.find((i) => i.definitionId === CATALOG.gear1)?.quantity
+    ).toBe(2)
+    expect(
+      imported.inventory.find((i) => i.definitionId === CATALOG.consum1)
+        ?.quantity
+    ).toBe(3)
+    const storedEquip = await prisma.characterAssociation.findMany({
+      where: { characterId: imported.id, kind: "EQUIPMENT" },
+    })
+    expect(
+      storedEquip.find((a) => a.definitionId === CATALOG.gear1)?.legacyUnowned
+    ).toBe(false)
+    expect(
+      storedEquip.find((a) => a.definitionId === CATALOG.gear2)?.legacyUnowned
+    ).toBe(true)
+
+    const importEvent = await prisma.progressionEvent.findFirst({
+      where: { characterId: imported.id, kind: "import" },
+    })
+    const payload = importEvent!.payload as Record<string, unknown>
+    expect(payload.backupSchema).toBe("primal-character/4")
+    expect(payload.inventoryCount).toBe(2)
+  })
+
+  it("imports archived owned stock inertly", async () => {
+    const src = await createCharacter(
+      {
+        name: "Arch Stock",
+        description: "archived stock",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+    await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: CATALOG.gear2,
+        quantity: 1,
+        version: 0,
+        sourceNote: "seed then archive",
+      },
+      ownerUser
+    )
+    // Catalog edit AFTER the stock was acquired: the reference stays valid but the
+    // definition is now archived (inert). The backup must still round-trip it.
+    await prisma.catalogDefinition.update({
+      where: { id: CATALOG.gear2 },
+      data: { archived: true },
+    })
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    expect(imported.inventory).toHaveLength(1)
+    expect(imported.inventory[0].definitionId).toBe(CATALOG.gear2)
+    expect(imported.inventory[0].archived).toBe(true)
+  })
+
+  it("rejects a v4 backup with a missing inventory definition (rollback, no rows/events)", async () => {
+    const before = await prisma.character.count({
+      where: { ownerId: adminUser.id },
+    })
+    const eventsBefore = await prisma.progressionEvent.count()
+    const srcRow = await prisma.character.findFirstOrThrow({
+      where: { name: "Source Hero" },
+    })
+    const doc = (await exportCharacter(
+      srcRow.id,
+      adminUser
+    )) as unknown as CharacterImportDocument
+    const broken = {
+      ...doc,
+      inventory: [
+        ...(doc as unknown as { inventory: unknown[] }).inventory,
+        { definition: { kind: "equipment", stableId: "ghost" }, quantity: 1 },
+      ],
+    } as CharacterImportDocument
+    await expectNoCharacterCreated(before, () =>
+      importCharacter(broken, adminUser)
+    )
+    expect(await prisma.progressionEvent.count()).toBe(eventsBefore)
+  })
+
+  it("rejects a v4 backup with duplicate stock references (rollback, no rows/events)", async () => {
+    const before = await prisma.character.count({
+      where: { ownerId: adminUser.id },
+    })
+    const eventsBefore = await prisma.progressionEvent.count()
+    const srcRow = await prisma.character.findFirstOrThrow({
+      where: { name: "Source Hero" },
+    })
+    const doc = (await exportCharacter(
+      srcRow.id,
+      adminUser
+    )) as unknown as CharacterImportDocument
+    const broken = {
+      ...doc,
+      inventory: [
+        { definition: { kind: "equipment", stableId: "gear-1" }, quantity: 1 },
+        { definition: { kind: "equipment", stableId: "gear-1" }, quantity: 2 },
+      ],
+    } as CharacterImportDocument
+    await expectNoCharacterCreated(before, () =>
+      importCharacter(broken, adminUser)
+    )
+    expect(await prisma.progressionEvent.count()).toBe(eventsBefore)
+  })
+
+  it("rejects a v4 backup with a non-grandfathered equipment link and no owned stock (rollback, no rows/events)", async () => {
+    const before = await prisma.character.count({
+      where: { ownerId: adminUser.id },
+    })
+    const eventsBefore = await prisma.progressionEvent.count()
+    const srcRow = await prisma.character.findFirstOrThrow({
+      where: { name: "Source Hero" },
+    })
+    const doc = (await exportCharacter(
+      srcRow.id,
+      adminUser
+    )) as unknown as CharacterImportDocument
+    // Strip all owned stock; the exported equipment link is non-grandfathered, so
+    // the importer must reject it rather than silently drop/unequip the link.
+    const broken = {
+      ...doc,
+      inventory: [],
+    } as CharacterImportDocument
+    await expectNoCharacterCreated(before, () =>
+      importCharacter(broken, adminUser)
+    )
+    expect(await prisma.progressionEvent.count()).toBe(eventsBefore)
   })
 
   it("rejects a backup whose race definition is missing and creates no character", async () => {
@@ -566,5 +858,102 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     // Track the winning blessing so the FK-safe afterAll cleanup can delete it.
     const winner = fulfilled[0] as PromiseFulfilledResult<{ id: string }>
     createdCatalogIds.push(winner.value.id)
+  })
+
+  it("concurrent equip vs remove-last-unit holds the ownership invariant (single winner, 409 loser)", async () => {
+    const char = await createCharacter(
+      {
+        name: "Race Equip",
+        description: "Concurrent equip vs remove",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(char.id)
+    // Seed exactly one owned unit of the equipment definition so both operations
+    // start from the same physical state and the same character version.
+    const seeded = await adjustCharacterInventory(
+      char.id,
+      {
+        operation: "add",
+        definitionId: CATALOG.gear1,
+        quantity: 1,
+        version: char.version,
+        sourceNote: "seed race",
+      },
+      ownerUser
+    )
+    const version = seeded.version
+
+    // Equip the item (associate add) and remove its final owned unit (inventory
+    // remove) concurrently, both authorized and both starting from the SAME
+    // character version. Both operations CAS the character version, so at most one
+    // may commit; the loser must 409 (CAS / serialization / equipped).
+    const results = await Promise.allSettled([
+      associateCharacter(
+        char.id,
+        {
+          kind: "equipment",
+          definitionId: CATALOG.gear1,
+          operation: "add",
+          version,
+        },
+        ownerUser
+      ),
+      adjustCharacterInventory(
+        char.id,
+        {
+          operation: "remove",
+          definitionId: CATALOG.gear1,
+          quantity: 1,
+          version,
+          sourceNote: "spend race",
+        },
+        adminUser
+      ),
+    ])
+    const fulfilled = results.filter((r) => r.status === "fulfilled")
+    const rejected = results.filter((r) => r.status === "rejected")
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    const reason = (rejected[0] as PromiseRejectedResult).reason as {
+      status?: number
+      code?: string
+    }
+    // The loser is a 409 in the intended interleavings (CAS / serialization /
+    // inventory_equipped). In the rare ordering where the equip observes the
+    // already-committed removal it surfaces as a 400 inventory_insufficient
+    // instead; either way exactly one operation wins and the invariant holds.
+    if (reason.status === 409) {
+      expect([
+        "version_conflict",
+        "catalog_serialization_conflict",
+        "inventory_equipped",
+      ]).toContain(reason.code)
+    } else {
+      expect(reason.status).toBe(400)
+      expect(reason.code).toBe("inventory_insufficient")
+    }
+
+    // The ownership invariant must hold regardless of the race outcome: an
+    // equipped item always retains at least one owned unit.
+    const row = await prisma.character.findUnique({
+      where: { id: char.id },
+      include: {
+        associations: { include: { definition: true } },
+        inventory: { include: { definition: true } },
+      },
+    })
+    const equipped = row!.associations.some(
+      (a) => a.kind === "EQUIPMENT" && a.definitionId === CATALOG.gear1
+    )
+    const stock = row!.inventory.find((i) => i.definitionId === CATALOG.gear1)
+    if (equipped) {
+      expect(stock).toBeDefined()
+      expect(stock!.quantity).toBeGreaterThanOrEqual(1)
+    }
   })
 })

@@ -69,6 +69,8 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
+  SelectLabel,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -241,7 +243,7 @@ function consumableDurationFor(item: CatalogItem): number | undefined {
  * Right-hand panel for attaching/removing titles and equipment. It lists the
  * real catalog entries and calls the associations endpoint with the current
  * character version. Equipment is equipped directly onto the character - it is
- * NOT an inventory claim (an inventory system is deferred). The caps noted here
+ * inventory claim by itself. Equipment actions require owned stock. The caps noted here
  * are house assumptions (20% per attribute / 15% overall), documented in
  * docs/rules/assumptions.md.
  */
@@ -292,6 +294,10 @@ function AssociationSheet({
   const equipmentStatusById = new Map(
     (character.status?.equipment.items ?? []).map((item) => [item.id, item])
   )
+  const ownedQuantity = (definitionId: string) =>
+    character.inventory?.find(
+      (row) => row.definitionId === definitionId && !row.archived
+    )?.quantity ?? 0
 
   // Archived linked entries are NOT in the active catalog lists (listCatalog
   // filters archived:false), so they would otherwise disappear and become
@@ -418,7 +424,7 @@ function AssociationSheet({
             disabled={busy}
             onClick={() => onAdd("equipment", item.id)}
           >
-            Equip
+            {ownedQuantity(item.id) > 0 ? "Equip" : "Add stock first"}
           </Button>
         )}
       </div>
@@ -504,7 +510,15 @@ function AssociationSheet({
         <Button
           variant="outline"
           size="sm"
-          disabled={consumeBusy}
+          disabled={
+            consumeBusy ||
+            !character.inventory?.some(
+              (row) =>
+                row.definitionId === item.id &&
+                row.quantity > 0 &&
+                !row.archived
+            )
+          }
           onClick={() => onConsume(item.id)}
         >
           Consume
@@ -552,8 +566,9 @@ function AssociationSheet({
           <SheetDescription>
             Manage titles, equipment, consumables, blessings, and bloodlines
             directly onto this character. This is direct application, not an
-            inventory ownership claim - an inventory system is deferred. Actions
-            are written to the journal.
+            Equipment and consumables require owned stock. Use the Inventory tab
+            to record manual bookkeeping before equipping or consuming. Source
+            notes are not verified loot or crafting records.
           </SheetDescription>
         </SheetHeader>
 
@@ -963,6 +978,17 @@ export function CharacterDetail({
   const [portrait, setPortrait] = React.useState<PortraitView | null>(null)
   const [portraitBusy, setPortraitBusy] = React.useState(false)
   const [removePortraitOpen, setRemovePortraitOpen] = React.useState(false)
+  const [inventoryAddOpen, setInventoryAddOpen] = React.useState(false)
+  const [inventoryRemoveItem, setInventoryRemoveItem] = React.useState<
+    NonNullable<CharacterDetail["inventory"]>[number] | null
+  >(null)
+  const [inventoryDefinitionId, setInventoryDefinitionId] = React.useState("")
+  const [inventoryQuantity, setInventoryQuantity] = React.useState("")
+  const [inventorySourceNote, setInventorySourceNote] = React.useState("")
+  const [inventoryBusy, setInventoryBusy] = React.useState(false)
+  const [inventoryError, setInventoryError] = React.useState<string | null>(
+    null
+  )
 
   // Last character name reported upstream to the breadcrumb. Used to fire
   // onNameChange only when the successfully fetched name actually changes,
@@ -985,6 +1011,38 @@ export function CharacterDetail({
       setLoading(false)
     }
   }, [id])
+
+  const submitInventory = async (
+    operation: "add" | "remove",
+    definitionId: string,
+    quantity: number,
+    sourceNote: string,
+    onSuccess: () => void
+  ) => {
+    if (!character) return
+    setInventoryBusy(true)
+    setInventoryError(null)
+    try {
+      await apiFetch(`/api/characters/${character.id}/inventory`, {
+        ...jsonInit("POST", {
+          operation,
+          definitionId,
+          quantity,
+          version: character.version,
+          sourceNote: sourceNote.trim(),
+        }),
+      })
+      onSuccess()
+      await reload()
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Inventory update failed."
+      setInventoryError(message)
+      toast.error(message)
+    } finally {
+      setInventoryBusy(false)
+    }
+  }
 
   const loadPortrait = React.useCallback(async () => {
     if (!id) return
@@ -1835,7 +1893,17 @@ export function CharacterDetail({
         </Button>
       </div>
 
-      <Tabs value={activeTab} onValueChange={(v) => v && setActiveTab(v)}>
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => {
+          if (!v) return
+          setActiveTab(v)
+          if (v === "inventory") {
+            if (equipmentCatalog.length === 0) void loadCatalog("equipment")
+            if (consumablesCatalog.length === 0) void loadCatalog("consumables")
+          }
+        }}
+      >
         <TabsList variant="line">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="attributes">Attributes</TabsTrigger>
@@ -1845,9 +1913,392 @@ export function CharacterDetail({
           <TabsTrigger value="titles">Titles</TabsTrigger>
           <TabsTrigger value="equipment">Equipment</TabsTrigger>
           <TabsTrigger value="consumables">Consumables</TabsTrigger>
+          <TabsTrigger value="inventory">Inventory</TabsTrigger>
           <TabsTrigger value="history">History</TabsTrigger>
           <TabsTrigger value="notes">Notes</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="inventory" className="pt-3">
+          <Card>
+            <CardContent>
+              <div className="flex flex-col gap-3">
+                <div>
+                  <h3 className="font-medium">Owned inventory</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Manual bookkeeping only. Source notes are not verified loot
+                    or crafting records.
+                  </p>
+                </div>
+                {(["equipment", "consumables"] as const).map((kind) => {
+                  const rows = (character.inventory ?? []).filter(
+                    (item) => item.kind === kind
+                  )
+                  return (
+                    <section
+                      key={kind}
+                      aria-label={
+                        kind === "equipment"
+                          ? "Owned equipment"
+                          : "Owned consumables"
+                      }
+                    >
+                      <h4 className="mb-2 text-sm font-medium capitalize">
+                        {kind}
+                      </h4>
+                      {rows.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">
+                          No owned stock.
+                        </p>
+                      ) : (
+                        <div className="flex flex-col gap-2">
+                          {rows.map((item) => {
+                            const equipped = character.associations.some(
+                              (a) =>
+                                a.kind === "equipment" &&
+                                a.definitionId === item.definitionId
+                            )
+                            return (
+                              <div
+                                key={item.id}
+                                className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"
+                              >
+                                <div>
+                                  <div className="font-medium">
+                                    {item.name}{" "}
+                                    <Badge variant="outline">
+                                      Qty {item.quantity}
+                                    </Badge>{" "}
+                                    {item.archived ? (
+                                      <Badge variant="outline">
+                                        Archived - inert
+                                      </Badge>
+                                    ) : null}
+                                  </div>
+                                  <p className="text-xs text-muted-foreground">
+                                    {item.slot ? `Slot: ${item.slot} - ` : ""}
+                                    Provenance: {item.provenance}
+                                    {equipped ? " - Equipped" : ""}
+                                  </p>
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                  {item.kind === "equipment" ? (
+                                    equipped ? (
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={assocBusy}
+                                        onClick={() =>
+                                          void removeAssociation(
+                                            "equipment",
+                                            item.definitionId
+                                          )
+                                        }
+                                      >
+                                        Unequip
+                                      </Button>
+                                    ) : (
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={
+                                          assocBusy ||
+                                          item.archived ||
+                                          item.quantity < 1
+                                        }
+                                        onClick={() =>
+                                          void addAssociation(
+                                            "equipment",
+                                            item.definitionId
+                                          )
+                                        }
+                                      >
+                                        Equip
+                                      </Button>
+                                    )
+                                  ) : (
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      disabled={
+                                        consumeBusy ||
+                                        item.archived ||
+                                        item.quantity < 1
+                                      }
+                                      onClick={() => {
+                                        const catalogItem =
+                                          consumablesCatalog.find(
+                                            (entry) =>
+                                              entry.id === item.definitionId
+                                          )
+                                        if (catalogItem)
+                                          requestConsume(catalogItem)
+                                      }}
+                                    >
+                                      Consume
+                                    </Button>
+                                  )}
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={
+                                      busy || (equipped && item.quantity <= 1)
+                                    }
+                                    onClick={() => {
+                                      setInventoryRemoveItem(item)
+                                      setInventoryQuantity("")
+                                      setInventorySourceNote("")
+                                      setInventoryError(null)
+                                    }}
+                                  >
+                                    Discard
+                                  </Button>
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  )
+                })}
+                <Button
+                  variant="outline"
+                  className="self-start"
+                  onClick={() => {
+                    setInventoryDefinitionId("")
+                    setInventoryQuantity("")
+                    setInventorySourceNote("")
+                    setInventoryError(null)
+                    setInventoryAddOpen(true)
+                  }}
+                >
+                  Add stock
+                </Button>
+                {inventoryRemoveItem?.quantity === 1 &&
+                character.associations.some(
+                  (a) =>
+                    a.kind === "equipment" &&
+                    a.definitionId === inventoryRemoveItem.definitionId
+                ) ? (
+                  <p className="text-sm text-muted-foreground">
+                    Unequip {inventoryRemoveItem.name} before discarding its
+                    last stock.
+                  </p>
+                ) : null}
+              </div>
+            </CardContent>
+          </Card>
+          <Dialog open={inventoryAddOpen} onOpenChange={setInventoryAddOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Add stock</DialogTitle>
+                <DialogDescription>
+                  Manual bookkeeping only; source notes are not verified loot or
+                  crafting records.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="flex flex-col gap-3">
+                <Label htmlFor="inventory-add-item">Catalog item</Label>
+                <Select
+                  value={inventoryDefinitionId}
+                  onValueChange={(value) =>
+                    setInventoryDefinitionId(value ?? "")
+                  }
+                >
+                  <SelectTrigger id="inventory-add-item">
+                    <SelectValue placeholder="Choose an active item" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectLabel>Equipment</SelectLabel>
+                      {equipmentCatalog
+                        .filter((item) => !item.archived)
+                        .map((item) => (
+                          <SelectItem key={item.id} value={item.id}>
+                            {item.name}
+                          </SelectItem>
+                        ))}
+                    </SelectGroup>
+                    <SelectGroup>
+                      <SelectLabel>Consumables</SelectLabel>
+                      {consumablesCatalog
+                        .filter((item) => !item.archived)
+                        .map((item) => (
+                          <SelectItem key={item.id} value={item.id}>
+                            {item.name}
+                          </SelectItem>
+                        ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <Label htmlFor="inventory-add-quantity">Quantity</Label>
+                <Input
+                  id="inventory-add-quantity"
+                  type="number"
+                  min={1}
+                  max={999999}
+                  required
+                  value={inventoryQuantity}
+                  onChange={(e) => setInventoryQuantity(e.target.value)}
+                />
+                <Label htmlFor="inventory-add-note">Source note</Label>
+                <Input
+                  id="inventory-add-note"
+                  required
+                  maxLength={500}
+                  value={inventorySourceNote}
+                  onChange={(e) => setInventorySourceNote(e.target.value)}
+                />
+                {inventoryError ? (
+                  <p role="alert" className="text-sm text-destructive">
+                    {inventoryError}
+                  </p>
+                ) : null}
+              </div>
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => setInventoryAddOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  disabled={
+                    inventoryBusy ||
+                    !inventoryDefinitionId ||
+                    !Number.isInteger(Number(inventoryQuantity)) ||
+                    Number(inventoryQuantity) < 1 ||
+                    Number(inventoryQuantity) > 999999 ||
+                    !inventorySourceNote.trim() ||
+                    inventorySourceNote.length > 500
+                  }
+                  onClick={() =>
+                    void submitInventory(
+                      "add",
+                      inventoryDefinitionId,
+                      Number(inventoryQuantity),
+                      inventorySourceNote,
+                      () => setInventoryAddOpen(false)
+                    )
+                  }
+                >
+                  Save
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Dialog
+            open={!!inventoryRemoveItem}
+            onOpenChange={(open) => {
+              if (!open) setInventoryRemoveItem(null)
+            }}
+          >
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Discard stock</DialogTitle>
+                <DialogDescription>
+                  Discard stock of {inventoryRemoveItem?.name}.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="flex flex-col gap-3">
+                <Label htmlFor="inventory-remove-quantity">
+                  Quantity (1-
+                  {inventoryRemoveItem
+                    ? Math.min(
+                        inventoryRemoveItem.quantity,
+                        character.associations.some(
+                          (a) =>
+                            a.kind === "equipment" &&
+                            a.definitionId === inventoryRemoveItem.definitionId
+                        )
+                          ? inventoryRemoveItem.quantity - 1
+                          : inventoryRemoveItem.quantity
+                      )
+                    : 1}
+                  )
+                </Label>
+                <Input
+                  id="inventory-remove-quantity"
+                  type="number"
+                  min={1}
+                  max={
+                    inventoryRemoveItem
+                      ? Math.min(
+                          inventoryRemoveItem.quantity,
+                          character.associations.some(
+                            (a) =>
+                              a.kind === "equipment" &&
+                              a.definitionId ===
+                                inventoryRemoveItem.definitionId
+                          )
+                            ? inventoryRemoveItem.quantity - 1
+                            : inventoryRemoveItem.quantity
+                        )
+                      : 1
+                  }
+                  required
+                  value={inventoryQuantity}
+                  onChange={(e) => setInventoryQuantity(e.target.value)}
+                />
+                <Label htmlFor="inventory-remove-note">Source note</Label>
+                <Input
+                  id="inventory-remove-note"
+                  required
+                  maxLength={500}
+                  value={inventorySourceNote}
+                  onChange={(e) => setInventorySourceNote(e.target.value)}
+                />
+                {inventoryError ? (
+                  <p role="alert" className="text-sm text-destructive">
+                    {inventoryError}
+                  </p>
+                ) : null}
+              </div>
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => setInventoryRemoveItem(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  disabled={
+                    inventoryBusy ||
+                    !inventoryRemoveItem ||
+                    !Number.isInteger(Number(inventoryQuantity)) ||
+                    Number(inventoryQuantity) < 1 ||
+                    Number(inventoryQuantity) >
+                      Math.min(
+                        inventoryRemoveItem.quantity,
+                        character.associations.some(
+                          (a) =>
+                            a.kind === "equipment" &&
+                            a.definitionId === inventoryRemoveItem.definitionId
+                        )
+                          ? inventoryRemoveItem.quantity - 1
+                          : inventoryRemoveItem.quantity
+                      ) ||
+                    !inventorySourceNote.trim() ||
+                    inventorySourceNote.length > 500
+                  }
+                  onClick={() =>
+                    inventoryRemoveItem &&
+                    void submitInventory(
+                      "remove",
+                      inventoryRemoveItem.definitionId,
+                      Number(inventoryQuantity),
+                      inventorySourceNote,
+                      () => setInventoryRemoveItem(null)
+                    )
+                  }
+                >
+                  Discard stock
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </TabsContent>
 
         <TabsContent value="overview" className="pt-3">
           <Card>
@@ -2381,8 +2832,7 @@ export function CharacterDetail({
         <TabsContent value="equipment" className="pt-3">
           <div className="flex items-start justify-between gap-3">
             <p className="text-xs text-muted-foreground">
-              Equipment is equipped directly onto this character - not an
-              inventory ownership claim (an inventory system is deferred).
+              Equipment must be owned in Inventory before it can be equipped.
               Bonuses are capped by the house assumption of 20% per attribute
               (aggregate) and 15% overall.
             </p>

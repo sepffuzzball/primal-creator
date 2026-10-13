@@ -344,6 +344,52 @@ export interface SkillOfferView {
   selectedDefinitionId: string | null
 }
 
+/**
+ * An owned inventory row. Ownership is per-definition house bookkeeping (no item
+ * instances, no capacity/stacking): only the integer `quantity` and the linked
+ * definition's identity/metadata are exposed. `kind` is the catalog kind of the
+ * linked definition - always `"equipment"` or `"consumables"`.
+ */
+export interface CharacterInventoryItem {
+  id: string
+  definitionId: string
+  name: string
+  kind: "equipment" | "consumables"
+  quantity: number
+  /** Whether the linked catalog definition is currently archived. */
+  archived: boolean
+  /** Equipment slot, when the linked definition declares one. */
+  slot?: string
+  /** Provenance label of the linked definition. */
+  provenance: string
+}
+
+/** GET /api/characters/[id]/inventory - owned inventory plus the CAS version. */
+export interface CharacterInventoryResponse {
+  inventory: CharacterInventoryItem[]
+  version: number
+}
+
+/**
+ * Manual inventory bookkeeping. `quantity` is bounded 1..999999 (the same bound
+ * the migration CHECK enforces); `sourceNote` is mandatory and at most 500 chars,
+ * recorded into the `inventory_adjust` journal. Acquisition is manual here.
+ */
+export interface InventoryAdjustRequest {
+  operation: "add" | "remove"
+  definitionId: string
+  quantity: number
+  version: number
+  sourceNote: string
+}
+
+/** POST /api/characters/[id]/inventory - refreshed detail plus inventory/version. */
+export interface InventoryAdjustResponse {
+  character: CharacterDetail
+  inventory: CharacterInventoryItem[]
+  version: number
+}
+
 export interface CharacterDetail {
   id: string
   name: string
@@ -368,6 +414,11 @@ export interface CharacterDetail {
   createdAt: string
   updatedAt: string
   associations: CharacterAssociationView[]
+  /**
+   * Owned inventory quantities (equipment + consumables), including archived
+   * catalog stock. Absent = zero owned stock of that definition.
+   */
+  inventory: CharacterInventoryItem[]
   /** Pending + selected skill offers (milestone choices) for this character. */
   skillOffers: SkillOfferView[]
   status?: StatusResult
@@ -563,7 +614,24 @@ export interface ExportAssociation {
   kind:
     "title" | "equipment" | "skill" | "blessing" | "bloodline" | "transcendent"
   createdAt: string
+  /**
+   * Present ONLY on equipment links: true when the link predates the
+   * inventory-ownership model and may stay equipped with zero owned stock. Absent
+   * on non-equipment links (they cannot be grandfathered).
+   */
+  legacyUnowned?: boolean
   definition: ExportDefinitionSnapshot
+}
+
+/**
+ * An exported owned-stock entry. `definition.kind` is always `"equipment"` or
+ * `"consumables"` (the only kinds that can be inventoried); `quantity` is the
+ * owned count, bounded 1..999999. The definition references the LOCAL catalog by
+ * `kind` + `stableId`.
+ */
+export interface ExportInventoryItem {
+  definition: { kind: "equipment" | "consumables"; stableId: string }
+  quantity: number
 }
 
 /** The v3 trusted-backup identity block, using stable catalog identifiers. */
@@ -594,7 +662,7 @@ export interface SkillOfferExport {
 }
 
 export interface ExportResponse {
-  /** "primal-character/3" - the current trusted-backup schema. */
+  /** "primal-character/4" - the current trusted-backup schema. */
   schema: string
   rulesetVersion: string
   identity: CharacterIdentityExport
@@ -614,6 +682,8 @@ export interface ExportResponse {
    */
   isTranscendent: boolean
   associations: ExportAssociation[]
+  /** Owned stock (equipment + consumables) keyed by stable catalog identifier. */
+  inventory: ExportInventoryItem[]
   events: ProgressionEvent[]
   skillOffers: SkillOfferExport[]
 }

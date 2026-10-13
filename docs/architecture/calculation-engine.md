@@ -213,8 +213,12 @@ deliberately **not** authoritative character state. The contract is:
 ## Trusted-backup character export / import (contract)
 
 A saved character can be exported as a **trusted backup** JSON document (schema
-`primal-character/3`) and re-imported into any instance of the app. The document
-is a backup, **not** authoritative server-verified state: the contract is:
+`primal-character/4`) and re-imported into any instance of the app. The document
+is a backup, **not** authoritative server-verified state: the contract is. The
+older `primal-character/3` document is still ACCEPTED on import (so existing
+backups keep working) but is never generated; a v3 backup carries no inventory and
+no grandfathering marker, so importing it restores zero stock and marks every
+equipment link as grandfathered.
 
 - **Stable identifiers, not internal ids.** The document carries `identity`
   (name, description, origin, race/class/profession) and every association /
@@ -247,6 +251,28 @@ is a backup, **not** authoritative server-verified state: the contract is:
 - **Marked as imported.** The created character carries `imported = true`, shown
   in the UI as "Imported - unverified backup", distinguishing untrusted
   user-supplied history from server-verified progression.
+- **v4 inventory + grandfathered markers (v4 only).** The current document adds an
+  `inventory` array (each entry a `definition` reference by `kind` +
+  `stableId`, only `equipment` / `consumables`, with a `quantity` bounded
+  1..999999) and a `legacyUnowned` boolean on equipment associations. On import
+  the inventory array is bounded at 500 distinct definitions, must resolve to
+  EXISTING catalog definitions (archived stock is imported inert), must be unique
+  per definition, and is validated before any DB write. An equipment association
+  that is NOT grandfathered (`legacyUnowned: false`) requires the backup to import
+  at least one owned unit of the matching definition; a grandfathered link
+  (`legacyUnowned: true`) may import with zero stock, so an exported grandfathered
+  character ALWAYS round-trips. `legacyUnowned: true` on a non-equipment link is
+  rejected. The owned-stock rows, association markers, and events are written in
+  the SAME transaction as the character, so any resolution/validation failure
+  rolls the whole import back; the returned detail exposes the imported inventory
+  rows. The `import` marker records `backupSchema` (v3 or v4) and
+  `inventoryCount`. A v3 backup imports no stock and grandfathers every equipment
+  link (preserving the old backup behavior). Distinct inventory definitions are
+  capped at 500 by the inventory adjustment route (a 409), so an exported character
+  is always self-roundtrippable.
+- **No auto-created catalog content.** No identity, association, inventory, or
+  offer-option definition is ever created on import; every reference must already
+  exist.
 
 ## Decisions still needed (escalate if blocking)
 

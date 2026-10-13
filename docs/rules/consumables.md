@@ -42,6 +42,35 @@ be conflated between them:
    **temporary** effect that lasts only its effect duration. Temporary effects are
    bounded by their duration, **not** by the F3 / E5 / D15 / C45 grade rates.
 
+## Inventory ownership (backend notes)
+
+Consumables share the same per-definition owner-managed inventory quantity as
+equipment (`CharacterInventoryItem.quantity`, bounded 1..999999). This is **house
+bookkeeping**, not canon, and there is no item-instance or cap model. Consuming
+requires the character to own at least one unit: `consumeCharacter` checks the
+owned quantity and decrements/removes exactly one inside the SAME transaction as
+the permanent/temporary effect validation, the character version CAS, and the
+event journal. A failed cap, a missing duration, or a stale version rolls back
+the stock change, the state and the journal together. The consume event records
+the owned stock before and after (`stockPrior` / `stockAfter`).
+
+- Manual acquisition is the only acquisition path in this stage (no crafted-drop
+  or economy is invented). `POST /api/characters/[id]/inventory` with
+  `operation: add | remove`, `quantity` 1..999999, a mandatory `sourceNote`
+  (nonempty, <= 500 chars), and the CAS `version`. An `add` only accepts active
+  (unarchived) consumable catalog entries; a `remove` is permitted for archived
+  entries (owned stock may still be spent). The write runs under SERIALIZABLE
+  isolation, CASes the character version, and appends an `inventory_adjust`
+  journal event recording the prior/new quantity, the definition snapshot, the
+  source note, and the acting user id. A P2034 (cannot serialize) or a stale
+  version is a 409 that rolls back the change.
+- Removing the final unit (quantity to 0) deletes the row - an absent row means
+  zero owned stock (the DB CHECK constraint forbids quantity 0). Adding beyond
+  999999 is rejected (`inventory_cap_exceeded`); removing beyond owned stock is
+  rejected (`inventory_insufficient`).
+- Inventory quantity alone never changes a character's live status; only the
+  applied permanent/temporary effect does.
+
 ## Wiki-uncertain
 
 - No source table gives **healing/restoration magnitudes by grade** or any

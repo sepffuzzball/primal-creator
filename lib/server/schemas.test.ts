@@ -4,6 +4,7 @@ import {
   bloodlineConfigSchema,
   evolveSchema,
   godConfigSchema,
+  inventoryPostSchema,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
@@ -181,6 +182,96 @@ describe("blessing / bloodline / god catalog config", () => {
   it("reads a god config that only carries unknown fields", () => {
     const parsed = godConfigSchema.safeParse({ realm: "the void" })
     expect(parsed.success).toBe(true)
+  })
+})
+
+describe("inventoryPostSchema", () => {
+  it("parses a valid add payload", () => {
+    const parsed = inventoryPostSchema.safeParse({
+      operation: "add",
+      definitionId: "gear-1",
+      quantity: 5,
+      version: 0,
+      sourceNote: "bought a few",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toEqual({
+        operation: "add",
+        definitionId: "gear-1",
+        quantity: 5,
+        version: 0,
+        sourceNote: "bought a few",
+      })
+    }
+  })
+
+  it("rejects a remove with a quantity outside 1..999999", () => {
+    for (const quantity of [0, -1, 1000000]) {
+      const parsed = inventoryPostSchema.safeParse({
+        operation: "remove",
+        definitionId: "pot-1",
+        quantity,
+        version: 0,
+        sourceNote: "x",
+      })
+      expect(parsed.success).toBe(false)
+    }
+  })
+
+  it("rejects a non-integer quantity", () => {
+    const parsed = inventoryPostSchema.safeParse({
+      operation: "add",
+      definitionId: "gear-1",
+      quantity: 1.5,
+      version: 0,
+      sourceNote: "x",
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects an empty or over-long sourceNote", () => {
+    expect(
+      inventoryPostSchema.safeParse({
+        operation: "add",
+        definitionId: "gear-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "",
+      }).success
+    ).toBe(false)
+    const long = "x".repeat(501)
+    expect(
+      inventoryPostSchema.safeParse({
+        operation: "add",
+        definitionId: "gear-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: long,
+      }).success
+    ).toBe(false)
+  })
+
+  it("rejects an unknown operation", () => {
+    const parsed = inventoryPostSchema.safeParse({
+      operation: "buy",
+      definitionId: "gear-1",
+      quantity: 1,
+      version: 0,
+      sourceNote: "x",
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a negative version", () => {
+    const parsed = inventoryPostSchema.safeParse({
+      operation: "add",
+      definitionId: "gear-1",
+      quantity: 1,
+      version: -1,
+      sourceNote: "x",
+    })
+    expect(parsed.success).toBe(false)
   })
 })
 

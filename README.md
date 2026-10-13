@@ -85,7 +85,7 @@ evolution_choice_required`).
   consumables, caps, ...), so numbers are transparent rather than opaque.
 - **Immutable history & trusted-backup export/import**: every progression event is
   written to an append-only journal, and a character (state + live status + skill
-  offers + journal) can be exported as a `primal-character/3` JSON backup keyed by
+  offers + journal) can be exported as a `primal-character/4` JSON backup keyed by
   stable catalog identifiers. A backup can be re-imported (`POST
 /api/characters/import`) as a NEW character owned by the current user; it is a
   trusted-but-unverified backup, so it is marked `imported` in the UI and its
@@ -93,7 +93,11 @@ evolution_choice_required`).
   treated as server-verified. The live status is recomputed from the current
   catalog, catalog references are resolved by `kind` + `stableId` (no catalog
   content is auto-created), and any required definition that is missing, archived,
-  or the wrong kind rejects the whole import. No sample characters are created.
+  or the wrong kind rejects the whole import. The v4 backup also carries owned
+  inventory quantities and a `legacyUnowned` marker on equipment associations
+  (grandfathered links may round-trip with zero stock); the legacy
+  `primal-character/3` backup is still accepted and imports no stock, marking every
+  equipment link as grandfathered. No sample characters are created.
 - **Admin-managed catalog**: a polymorphic catalog for all of the kinds above.
   Admins can create and edit entries, set a `verified` / `inferred` / `house`
   provenance, attach a source URL, and store per-kind `config`. With
@@ -102,15 +106,30 @@ evolution_choice_required`).
   equip catalog equipment. Effects and equipment bonuses are synthesized live
   from the **current**, unarchived catalog config at read time; the stored
   `Character.state` and the event journal stay immutable, so editing a catalog
-  entry recalculates status without rewriting history. This is direct equip, not
-  an inventory claim (an inventory system is deferred).
+  entry recalculates status without rewriting history. This is direct equip
+  backed by owned stock, not a free inventory assumption: new equips require an
+  owned equipment quantity of at least 1 (`qty >= 1`). Legacy equipped
+  associations (created before owned stock was enforced) are grandfathered and
+  remain usable and removable at zero stock. A same-slot swap retains the
+  existing stock rather than consuming a new copy. Live effects still recalculate
+  from the current catalog as before.
 - **Consumables on a character**: a character can consume real catalog
-  consumables directly (direct consumption, not an inventory claim - an inventory
-  system is deferred). Permanent consumables grant a permanent external stat gain
+  consumables, and each consumption requires and decrements exactly one owned
+  stock of that consumable in the same compare-and-swap (CAS) transaction as the
+  stat gain/effect and the immutable journal event - there is no free direct
+  consumption. Permanent consumables grant a permanent external stat gain
   capped by the grade-based race-level capacity (F3/E5/D15/C45, a **house**
   assumption pending verification); temporary potions produce a temporary effect
   that expires after a number of quarters. Every consumption mutates the stored
   state and writes an immutable `consume` progression event to the journal.
+- **Manual inventory management UI/API**: an authenticated owner/admin can adjust
+  the owned equipment and consumable stock on an active character from a
+  dedicated inventory UI/API. Adjustments are made in bounded quantities, each
+  requires a source note (recorded, audited), and stock on an archived character
+  is discarded. An equipment's final owned copy cannot be discarded while it is
+  still equipped. There is no economy, stack-cap or instance system - stock is a
+  bounded owned quantity per association, not a market of instances. The v4/v3
+  backup behavior for owned stock is already documented above.
 - **Admin-editable house rules**: the equipment (20% individual / 15% combined)
   and consumable (F3/E5/D15/C45) defaults are NOT hard-coded. They are served from
   a single server-wide `house_rules` row and edited by an admin from the Settings

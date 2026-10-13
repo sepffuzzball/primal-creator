@@ -46,8 +46,22 @@ export interface TestAssociationRow {
   definitionId: string
   kind:
     "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
+  // True only for equipment links that predate the inventory-ownership model.
+  // New associations default to false.
+  legacyUnowned: boolean
   createdAt: Date
   // Relation, only set on the object returned by findUnique/create.
+  definition?: TestCatalogRow | null
+}
+
+export interface TestInventoryRow {
+  id: string
+  characterId: string
+  definitionId: string
+  quantity: number
+  createdAt: Date
+  updatedAt: Date
+  // Relation, only set on the object returned by findUnique/findMany/create.
   definition?: TestCatalogRow | null
 }
 
@@ -95,6 +109,7 @@ export interface TestCharacterRow {
   class?: TestCatalogRow | null
   profession?: TestCatalogRow | null
   associations?: TestAssociationRow[]
+  inventory?: TestInventoryRow[]
   skillOffers?: TestSkillOfferRow[]
 }
 
@@ -274,6 +289,7 @@ export interface TestPrismaInstance {
     characters: Map<string, TestCharacterRow>
     catalog: Map<string, TestCatalogRow>
     associations: TestAssociationRow[]
+    inventory: TestInventoryRow[]
     events: TestEventRow[]
     skillOffers: TestSkillOfferRow[]
     skillOfferOptions: TestSkillOfferOptionRow[]
@@ -302,6 +318,13 @@ export interface TestPrismaInstance {
           | "TRANSCENDENT"
       }
     ): TestAssociationRow
+    addInventoryItem(
+      row: Partial<TestInventoryRow> & {
+        characterId: string
+        definitionId: string
+        quantity: number
+      }
+    ): TestInventoryRow
     reset(): void
   }
 }
@@ -384,6 +407,32 @@ interface Transaction {
       include?: unknown
     }) => Promise<Array<TestAssociationRow & { character?: TestCharacterRow }>>
   }
+  characterInventoryItem: {
+    findUnique: (args: {
+      where:
+        | { id: string }
+        | {
+            characterId_definitionId: {
+              characterId: string
+              definitionId: string
+            }
+          }
+    }) => Promise<TestInventoryRow | null>
+    findMany: (args: {
+      where?: { characterId?: string }
+      include?: unknown
+    }) => Promise<TestInventoryRow[]>
+    create: (args: {
+      data: Record<string, unknown>
+    }) => Promise<TestInventoryRow>
+    updateMany: (args: {
+      where: { characterId: string; definitionId: string }
+      data: Record<string, unknown>
+    }) => Promise<{ count: number }>
+    deleteMany: (args: {
+      where: { characterId: string; definitionId: string }
+    }) => Promise<{ count: number }>
+  }
   progressionEvent: {
     create: (args: { data: Record<string, unknown> }) => Promise<TestEventRow>
     findMany: (args: {
@@ -451,6 +500,7 @@ export function createTestPrisma(): TestPrismaInstance {
   const characters = new Map<string, TestCharacterRow>()
   const catalog = new Map<string, TestCatalogRow>()
   const associations: TestAssociationRow[] = []
+  const inventory: TestInventoryRow[] = []
   const events: TestEventRow[] = []
   const skillOffers: TestSkillOfferRow[] = []
   const skillOfferOptions: TestSkillOfferOptionRow[] = []
@@ -461,6 +511,7 @@ export function createTestPrisma(): TestPrismaInstance {
   let idCounter = 0
   let eventCounter = 0
   let associationCounter = 0
+  let inventoryCounter = 0
   let offerCounter = 0
   let optionCounter = 0
   let draftCounter = 0
@@ -472,6 +523,17 @@ export function createTestPrisma(): TestPrismaInstance {
         ...a,
         definition: a.definitionId
           ? (catalog.get(a.definitionId) ?? null)
+          : null,
+      }))
+  }
+
+  function attachInventory(char: TestCharacterRow): TestInventoryRow[] {
+    return inventory
+      .filter((i) => i.characterId === char.id)
+      .map((i) => ({
+        ...i,
+        definition: i.definitionId
+          ? (catalog.get(i.definitionId) ?? null)
           : null,
       }))
   }
@@ -504,6 +566,7 @@ export function createTestPrisma(): TestPrismaInstance {
         ? (catalog.get(char.professionId) ?? null)
         : null,
       associations: attachAssociations(char),
+      inventory: attachInventory(char),
       skillOffers: attachSkillOffers(char),
     }
   }
@@ -812,6 +875,7 @@ export function createTestPrisma(): TestPrismaInstance {
             | "BLESSING"
             | "BLOODLINE"
             | "TRANSCENDENT",
+          legacyUnowned: (data.legacyUnowned as boolean) ?? false,
           createdAt: new Date(),
           definition: catalog.get(data.definitionId as string) ?? null,
         }
@@ -849,6 +913,90 @@ export function createTestPrisma(): TestPrismaInstance {
           if (char) out.character = char
           return out
         })
+      },
+    },
+    characterInventoryItem: {
+      findUnique: async ({ where }) => {
+        const key = where as {
+          id?: string
+          characterId_definitionId?: {
+            characterId: string
+            definitionId: string
+          }
+        }
+        if (key.id != null) {
+          const row = inventory.find((i) => i.id === key.id)
+          if (!row) return null
+          return { ...row, definition: catalog.get(row.definitionId) ?? null }
+        }
+        const c = key.characterId_definitionId
+        if (c) {
+          const row = inventory.find(
+            (i) =>
+              i.characterId === c.characterId &&
+              i.definitionId === c.definitionId
+          )
+          if (!row) return null
+          return { ...row, definition: catalog.get(row.definitionId) ?? null }
+        }
+        return null
+      },
+      findMany: async ({ where }) => {
+        let results = inventory
+        if (where?.characterId != null)
+          results = results.filter((i) => i.characterId === where.characterId)
+        return results.map((i) => ({
+          ...i,
+          definition: catalog.get(i.definitionId) ?? null,
+        }))
+      },
+      create: async ({ data }) => {
+        const id = (data.id as string) ?? `inv-${++inventoryCounter}`
+        const now = new Date()
+        const row: TestInventoryRow = {
+          id,
+          characterId: data.characterId as string,
+          definitionId: data.definitionId as string,
+          quantity: data.quantity as number,
+          createdAt: now,
+          updatedAt: now,
+          definition: catalog.get(data.definitionId as string) ?? null,
+        }
+        inventory.push(row)
+        return row
+      },
+      updateMany: async ({ where, data }) => {
+        let count = 0
+        for (const i of inventory) {
+          if (
+            i.characterId === where.characterId &&
+            i.definitionId === where.definitionId
+          ) {
+            const qtyOp = data.quantity as
+              number | { decrement?: number } | undefined
+            if (typeof qtyOp === "number") i.quantity = qtyOp
+            else if (qtyOp && typeof qtyOp.decrement === "number") {
+              i.quantity -= qtyOp.decrement
+            }
+            i.updatedAt = new Date()
+            count++
+          }
+        }
+        return { count }
+      },
+      deleteMany: async ({ where }) => {
+        let removed = 0
+        for (let i = inventory.length - 1; i >= 0; i--) {
+          const it = inventory[i]
+          if (
+            it.characterId === where.characterId &&
+            it.definitionId === where.definitionId
+          ) {
+            inventory.splice(i, 1)
+            removed++
+          }
+        }
+        return { count: removed }
       },
     },
     progressionEvent: {
@@ -986,6 +1134,7 @@ export function createTestPrisma(): TestPrismaInstance {
 
   function snapshot() {
     const assocSnapshot = associations.map((a) => ({ ...a }))
+    const inventorySnapshot = inventory.map((i) => ({ ...i }))
     const eventSnapshot = [...events]
     const offerSnapshot = skillOffers.map((o) => ({ ...o }))
     const optionSnapshot = skillOfferOptions.map((o) => ({ ...o }))
@@ -997,6 +1146,7 @@ export function createTestPrisma(): TestPrismaInstance {
     )
     return {
       assocSnapshot,
+      inventorySnapshot,
       eventSnapshot,
       offerSnapshot,
       optionSnapshot,
@@ -1009,6 +1159,7 @@ export function createTestPrisma(): TestPrismaInstance {
 
   function restore(snap: ReturnType<typeof snapshot>) {
     associations.splice(0, associations.length, ...snap.assocSnapshot)
+    inventory.splice(0, inventory.length, ...snap.inventorySnapshot)
     events.splice(0, events.length, ...snap.eventSnapshot)
     skillOffers.splice(0, skillOffers.length, ...snap.offerSnapshot)
     skillOfferOptions.splice(
@@ -1153,6 +1304,7 @@ export function createTestPrisma(): TestPrismaInstance {
     character: tx.character,
     characterDraft: tx.characterDraft,
     characterAssociation: tx.characterAssociation,
+    characterInventoryItem: tx.characterInventoryItem,
     progressionEvent: tx.progressionEvent,
     skillOffer: tx.skillOffer,
     houseRules: tx.houseRules,
@@ -1164,6 +1316,7 @@ export function createTestPrisma(): TestPrismaInstance {
       characters,
       catalog,
       associations,
+      inventory,
       events,
       skillOffers,
       skillOfferOptions,
@@ -1256,16 +1409,33 @@ export function createTestPrisma(): TestPrismaInstance {
           characterId: row.characterId,
           definitionId: row.definitionId,
           kind: row.kind,
+          legacyUnowned: row.legacyUnowned ?? false,
           createdAt: row.createdAt ?? new Date(),
           definition: catalog.get(row.definitionId) ?? null,
         }
         associations.push(full)
         return full
       },
+      addInventoryItem(row) {
+        const id = row.id ?? `inv-${++inventoryCounter}`
+        const now = new Date()
+        const full: TestInventoryRow = {
+          id,
+          characterId: row.characterId,
+          definitionId: row.definitionId,
+          quantity: row.quantity,
+          createdAt: row.createdAt ?? now,
+          updatedAt: row.updatedAt ?? now,
+          definition: catalog.get(row.definitionId) ?? null,
+        }
+        inventory.push(full)
+        return full
+      },
       reset() {
         characters.clear()
         catalog.clear()
         associations.splice(0, associations.length)
+        inventory.splice(0, inventory.length)
         events.splice(0, events.length)
         skillOffers.splice(0, skillOffers.length)
         skillOfferOptions.splice(0, skillOfferOptions.length)
@@ -1276,6 +1446,7 @@ export function createTestPrisma(): TestPrismaInstance {
         idCounter = 0
         eventCounter = 0
         associationCounter = 0
+        inventoryCounter = 0
         offerCounter = 0
         optionCounter = 0
         draftCounter = 0

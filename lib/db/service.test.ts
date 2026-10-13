@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { prisma } from "@/lib/db/client"
 import {
+  adjustCharacterInventory,
   advanceCharacter,
   allocateCharacter,
   applyAdvance,
@@ -17,6 +18,7 @@ import {
   exportCharacter,
   getCatalogItem,
   getCharacter,
+  getCharacterInventory,
   getEvolutionOptions,
   importCharacter,
   listCatalog,
@@ -28,8 +30,9 @@ import {
   updateCharacter,
 } from "@/lib/db/service"
 import {
+  IMPORT_SCHEMA_V3,
+  IMPORT_SCHEMA_V4,
   IMPORT_RULESET_VERSION,
-  IMPORT_SCHEMA,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
 import { DEFAULT_HOUSE_RULES_CONFIG } from "./ruleset"
@@ -768,6 +771,14 @@ describe("associateCharacter (titles / equipment)", () => {
     })
   }
 
+  function seedStock(definitionId: string, quantity = 10) {
+    return dbMock.store.addInventoryItem({
+      characterId: "chr-1",
+      definitionId,
+      quantity,
+    })
+  }
+
   it("adds a title link and synthesizes its flat effect into status", async () => {
     seedCharacterWithBase()
     seedTitle("title-1", { flat: { strength: 5 }, upgradeGroup: "hero" })
@@ -803,6 +814,7 @@ describe("associateCharacter (titles / equipment)", () => {
   it("adds an equipment link and synthesizes its live bonus (capped by base)", async () => {
     seedCharacterWithBase({ strength: 100 })
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
+    seedStock("gear-1")
     const res = await associateCharacter(
       "chr-1",
       {
@@ -832,6 +844,8 @@ describe("associateCharacter (titles / equipment)", () => {
     seedCharacterWithBase({ strength: 100 })
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
     seedEquipment("gear-2", { slot: "head", bonus: { strength: 20 } })
+    seedStock("gear-1")
+    seedStock("gear-2")
     await associateCharacter(
       "chr-1",
       {
@@ -1072,6 +1086,9 @@ describe("associateCharacter (titles / equipment)", () => {
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
     seedEquipment("gear-2", { slot: "head", bonus: { strength: 20 } })
     seedEquipment("gear-3", { slot: "head", bonus: { strength: 30 } })
+    seedStock("gear-1")
+    seedStock("gear-2")
+    seedStock("gear-3")
     // Two items already occupy the same slot on the character (e.g. legacy data).
     dbMock.store.addAssociation({
       characterId: "chr-1",
@@ -2564,6 +2581,14 @@ describe("exportCharacter (associations / live state)", () => {
     })
   }
 
+  function seedStock(definitionId: string, quantity = 10) {
+    return dbMock.store.addInventoryItem({
+      characterId: "chr-1",
+      definitionId,
+      quantity,
+    })
+  }
+
   function seedSkill(
     id: string,
     config: Record<string, unknown>,
@@ -2583,6 +2608,7 @@ describe("exportCharacter (associations / live state)", () => {
     seedCharacterWithBase()
     seedTitle("title-1", { flat: { strength: 5 }, upgradeGroup: "hero" })
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
+    seedStock("gear-1")
     await associateCharacter(
       "chr-1",
       { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
@@ -2599,7 +2625,7 @@ describe("exportCharacter (associations / live state)", () => {
       user
     )
     const portable = await exportCharacter("chr-1", user)
-    expect(portable.schema).toBe("primal-character/3")
+    expect(portable.schema).toBe("primal-character/4")
     expect(portable.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(portable.identity).toMatchObject({
       name: "Test",
@@ -2680,6 +2706,7 @@ describe("exportCharacter (associations / live state)", () => {
     seedCharacterWithBase()
     seedTitle("title-1", { flat: { strength: 5 }, upgradeGroup: "hero" })
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
+    seedStock("gear-1")
     seedSkill("skill-1", {
       effects: [{ phase: "flat", amount: { strength: 7 } }],
     })
@@ -3937,10 +3964,23 @@ describe("importCharacter (trusted backup v3)", () => {
     state?: CharacterState
   }
 
-  function importDoc(partial: ImportDocPartial = {}): CharacterImportDocument {
+  // The unit import tests intentionally build a legacy v3 document: it has no
+  // `inventory` field and no `legacyUnowned` marker, so the importer grandfathers
+  // every equipment link and imports no stock.
+  type ImportV3Document = Extract<
+    CharacterImportDocument,
+    { schema: typeof IMPORT_SCHEMA_V3 }
+  >
+
+  type ImportV4Document = Extract<
+    CharacterImportDocument,
+    { schema: typeof IMPORT_SCHEMA_V4 }
+  >
+
+  function importDoc(partial: ImportDocPartial = {}): ImportV3Document {
     const { state: rawState, ...rest } = partial
     return {
-      schema: IMPORT_SCHEMA,
+      schema: IMPORT_SCHEMA_V3,
       rulesetVersion: IMPORT_RULESET_VERSION,
       identity: {
         name: "Imported",
@@ -3959,7 +3999,35 @@ describe("importCharacter (trusted backup v3)", () => {
       events: [],
       skillOffers: [],
       ...rest,
-    }
+    } as ImportV3Document
+  }
+
+  type V4DocPartial = Partial<ImportV4Document> & { state?: CharacterState }
+
+  function v4Doc(partial: V4DocPartial = {}): ImportV4Document {
+    const { state: rawState, ...rest } = partial
+    return {
+      schema: IMPORT_SCHEMA_V4,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(
+        rawState ?? createInitialState("integrated", null, null)
+      ) as ImportV4Document["state"],
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+      ...rest,
+    } as ImportV4Document
   }
 
   it("imports a valid v3 backup as a new imported character owned by the importer", async () => {
@@ -5078,6 +5146,321 @@ describe("importCharacter (trusted backup v3)", () => {
     expect(dbMock.store.characters.size).toBe(2)
     expect(dbMock.store.characters.get(existing.id)?.name).toBe("Existing")
   })
+  describe("trusted-backup v4 import (inventory + grandfathered marker)", () => {
+    it("imports a v4 backup with owned stock and an equipment association, preserving the marker", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm" }
+      )
+      addImportCatalog(
+        "consumables",
+        "consum-1",
+        { type: "permanent", amount: { strength: 1 } },
+        { name: "Ration" }
+      )
+
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "equipment",
+            definition: { kind: "equipment", stableId: "gear-1" },
+            legacyUnowned: false,
+          },
+        ],
+        inventory: [
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 2,
+          },
+          {
+            definition: { kind: "consumables", stableId: "consum-1" },
+            quantity: 5,
+          },
+        ],
+      })
+      const result = await importCharacter(doc, user)
+      expect(result.imported).toBe(true)
+      expect(result.associations).toHaveLength(1)
+      const storedAssoc = dbMock.store.associations.find(
+        (a) => a.characterId === result.id
+      )
+      expect(storedAssoc?.legacyUnowned).toBe(false)
+      const storedInv = dbMock.store.inventory.filter(
+        (i) => i.characterId === result.id
+      )
+      expect(storedInv).toHaveLength(2)
+      expect(storedInv.find((i) => i.definitionId === "gear-1")?.quantity).toBe(
+        2
+      )
+      expect(
+        storedInv.find((i) => i.definitionId === "consum-1")?.quantity
+      ).toBe(5)
+      // The returned detail exposes imported inventory rows.
+      expect(result.inventory).toHaveLength(2)
+      expect(
+        result.inventory.find((i) => i.definitionId === "gear-1")?.quantity
+      ).toBe(2)
+    })
+
+    it("preserves a grandfathered equipment link that owns zero stock", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm" }
+      )
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "equipment",
+            definition: { kind: "equipment", stableId: "gear-1" },
+            legacyUnowned: true,
+          },
+        ],
+        inventory: [],
+      })
+      const result = await importCharacter(doc, user)
+      expect(result.associations).toHaveLength(1)
+      const storedAssoc = dbMock.store.associations.find(
+        (a) => a.characterId === result.id
+      )
+      expect(storedAssoc?.legacyUnowned).toBe(true)
+      expect(result.inventory).toHaveLength(0)
+    })
+
+    it("rejects a non-grandfathered equipment link that owns no stock", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm" }
+      )
+      const before = dbMock.store.characters.size
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "equipment",
+            definition: { kind: "equipment", stableId: "gear-1" },
+            legacyUnowned: false,
+          },
+        ],
+        inventory: [],
+      })
+      await expect(importCharacter(doc, user)).rejects.toMatchObject({
+        status: 400,
+        code: "import_stock_missing",
+      })
+      // Full rollback: no character row, no provenance events.
+      expect(dbMock.store.characters.size).toBe(before)
+      expect(dbMock.store.events).toHaveLength(0)
+    })
+
+    it("rejects inventory that references a missing catalog definition", async () => {
+      seedRaceClass()
+      const before = dbMock.store.characters.size
+      const doc = v4Doc({
+        inventory: [
+          { definition: { kind: "equipment", stableId: "ghost" }, quantity: 1 },
+        ],
+      })
+      await expect(importCharacter(doc, user)).rejects.toMatchObject({
+        status: 400,
+        code: "import_stock_missing",
+      })
+      expect(dbMock.store.characters.size).toBe(before)
+      expect(dbMock.store.events).toHaveLength(0)
+    })
+
+    it("rejects duplicate inventory references for the same definition", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm" }
+      )
+      const before = dbMock.store.characters.size
+      const doc = v4Doc({
+        inventory: [
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 1,
+          },
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 2,
+          },
+        ],
+      })
+      await expect(importCharacter(doc, user)).rejects.toMatchObject({
+        status: 400,
+        code: "import_duplicate_stock",
+      })
+      expect(dbMock.store.characters.size).toBe(before)
+      expect(dbMock.store.events).toHaveLength(0)
+    })
+
+    it("rejects legacyUnowned:true on a non-equipment association", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "titles",
+        "title-1",
+        { upgradeGroup: "hero" },
+        { name: "Heroic" }
+      )
+      const before = dbMock.store.characters.size
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "title",
+            definition: { kind: "titles", stableId: "title-1" },
+            // TypeScript's v4 non-equipment association only admits false; a `true`
+            // is exercised at runtime to prove the importer rejects it.
+            legacyUnowned: true as false,
+          },
+        ],
+      })
+      await expect(importCharacter(doc, user)).rejects.toMatchObject({
+        status: 400,
+        code: "import_legacy_unowned_non_equipment",
+      })
+      expect(dbMock.store.characters.size).toBe(before)
+      expect(dbMock.store.events).toHaveLength(0)
+    })
+
+    it("allows archived catalog stock to be imported inert", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm", archived: true }
+      )
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "equipment",
+            definition: { kind: "equipment", stableId: "gear-1" },
+            legacyUnowned: false,
+          },
+        ],
+        inventory: [
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 1,
+          },
+        ],
+      })
+      const result = await importCharacter(doc, user)
+      expect(result.associations).toHaveLength(1)
+      expect(result.inventory).toHaveLength(1)
+    })
+
+    it("records the backup schema and stock count in the import marker", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm" }
+      )
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "equipment",
+            definition: { kind: "equipment", stableId: "gear-1" },
+            legacyUnowned: false,
+          },
+        ],
+        inventory: [
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 7,
+          },
+        ],
+      })
+      const result = await importCharacter(doc, user)
+      const importEvent = dbMock.store.events.find(
+        (e) => e.characterId === result.id && e.kind === "import"
+      )
+      const payload = importEvent!.payload as Record<string, unknown>
+      expect(payload.backupSchema).toBe("primal-character/4")
+      expect(payload.inventoryCount).toBe(1)
+    })
+
+    it("round-trips a v4 backup: equipped stock and consumables survive export and re-import", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "gear-1",
+        { slot: "head" },
+        { name: "Helm" }
+      )
+      addImportCatalog(
+        "consumables",
+        "consum-1",
+        { type: "permanent", amount: { strength: 1 } },
+        { name: "Ration" }
+      )
+      const state = createInitialState("integrated", null, null)
+      dbMock.store.addCharacter({
+        id: "chr-r",
+        ownerId: user.id,
+        name: "Round",
+        raceId: "human",
+        classId: "archer",
+        state: serializeState(state),
+      })
+      dbMock.store.addInventoryItem({
+        characterId: "chr-r",
+        definitionId: "gear-1",
+        quantity: 3,
+      })
+      dbMock.store.addInventoryItem({
+        characterId: "chr-r",
+        definitionId: "consum-1",
+        quantity: 4,
+      })
+      dbMock.store.addAssociation({
+        characterId: "chr-r",
+        definitionId: "gear-1",
+        kind: "EQUIPMENT",
+      })
+
+      const portable = (await exportCharacter(
+        "chr-r",
+        user
+      )) as CharacterImportDocument
+      expect(portable.schema).toBe("primal-character/4")
+      const inv = (portable as { inventory: Array<{ quantity: number }> })
+        .inventory
+      expect(inv).toHaveLength(2)
+      const eqAssoc = (
+        portable as {
+          associations: Array<{ kind: string; legacyUnowned?: boolean }>
+        }
+      ).associations.find((a) => a.kind === "equipment")
+      expect(eqAssoc?.legacyUnowned).toBe(false)
+
+      const imported = await importCharacter(portable, user)
+      expect(imported.inventory).toHaveLength(2)
+      expect(
+        imported.inventory.find((i) => i.definitionId === "gear-1")?.quantity
+      ).toBe(3)
+      expect(
+        imported.inventory.find((i) => i.definitionId === "consum-1")?.quantity
+      ).toBe(4)
+      const storedAssoc = dbMock.store.associations.find(
+        (a) => a.characterId === imported.id
+      )
+      expect(storedAssoc?.legacyUnowned).toBe(false)
+    })
+  })
 })
 
 describe("consumeCharacter (consumables)", () => {
@@ -5096,7 +5479,7 @@ describe("consumeCharacter (consumables)", () => {
     config: Record<string, unknown>,
     extra: Partial<{ name: string; archived: boolean }> = {}
   ): unknown {
-    return dbMock.store.addCatalog({
+    const row = dbMock.store.addCatalog({
       id,
       kind: "consumables",
       stableId: id,
@@ -5104,6 +5487,13 @@ describe("consumeCharacter (consumables)", () => {
       config,
       ...(extra.archived != null ? { archived: extra.archived } : {}),
     })
+    // Manual bookkeeping: acquiring stock to consume requires an owned quantity.
+    dbMock.store.addInventoryItem({
+      characterId: "chr-1",
+      definitionId: id,
+      quantity: 5,
+    })
+    return row
   }
 
   function seedChar(
@@ -5233,6 +5623,104 @@ describe("consumeCharacter (consumables)", () => {
       expiresAt: 3,
       capRemainingAfter: {},
     })
+  })
+
+  it("records the acting user id on a permanent consume event while preserving the snapshot and stock fields", async () => {
+    seedChar(bornFState(10), 0, false, "born")
+    seedConsumable("perm-audit", { type: "permanent", amount: { strength: 3 } })
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-audit", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    expect(res.status.attributes.strength).toBe(3)
+    expect(dbMock.store.events).toHaveLength(1)
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("consume")
+    // The acting user is recorded on the consume event.
+    expect(event.payload).toMatchObject({
+      actorId: user.id,
+      definitionId: "perm-audit",
+      type: "permanent",
+      applied: { strength: 3 },
+      requested: { strength: 3 },
+      capRemainingAfter: { strength: 27 },
+      stockPrior: 5,
+      stockAfter: 4,
+    })
+    // History is unchanged: the definition snapshot and timestamp are intact.
+    const payload = event.payload as {
+      definition: {
+        name: string
+        stableId: string
+        kind: string
+        grade: string | null
+      }
+      appliedAt: string
+    }
+    expect(payload.definition.name).toBe("Consumable perm-audit")
+    expect(payload.definition.stableId).toBe("perm-audit")
+    expect(payload.definition.kind).toBe("consumables")
+    expect(typeof payload.appliedAt).toBe("string")
+  })
+
+  it("records the acting user id on a temporary consume event", async () => {
+    seedChar(bornFState(5), 0, false, "born")
+    seedConsumable("temp-audit", {
+      type: "temporary",
+      amount: { strength: 4 },
+      durationQuarters: 3,
+    })
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "temp-audit", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("consume")
+    expect(event.payload).toMatchObject({
+      actorId: user.id,
+      definitionId: "temp-audit",
+      type: "temporary",
+      applied: { strength: 4 },
+      requested: { strength: 4 },
+      durationQuarters: 3,
+      expiresAt: 3,
+      capRemainingAfter: {},
+      stockPrior: 5,
+      stockAfter: 4,
+    })
+  })
+
+  it("records the acting admin id when an admin consumes on another owner's character", async () => {
+    const otherOwnerState = bornFState(10)
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: "owner-other",
+      name: "Another's character",
+      state: otherOwnerState,
+      version: 0,
+      origin: "born",
+    })
+    seedConsumable("perm-admin", { type: "permanent", amount: { strength: 3 } })
+    const admin = { id: "admin-1", email: "a@example.com", isAdmin: true }
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-admin", version: 0 },
+      admin
+    )
+    expect(res.character.version).toBe(1)
+    expect(res.status.attributes.strength).toBe(3)
+    expect(dbMock.store.events).toHaveLength(1)
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("consume")
+    // The admin's id, not the owner's, is the actor on this consume.
+    const payload = event.payload as { actorId: string; definitionId: string }
+    expect(payload.actorId).toBe(admin.id)
+    expect(payload.definitionId).toBe("perm-admin")
   })
 
   it("supports repeated permanent applications", async () => {
@@ -6465,6 +6953,11 @@ describe("house rules threading (admin-editable defaults)", () => {
       name: "Gear",
       config: { slot: "head", bonus: { strength: 10 } },
     })
+    dbMock.store.addInventoryItem({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      quantity: 10,
+    })
     const before = await associateCharacter(
       "chr-1",
       {
@@ -6660,5 +7153,639 @@ describe("listCatalog (archived visibility)", () => {
     const items = await listCatalog("races", { includeArchived: true })
     const ids = items.map((i) => i.stableId).sort()
     expect(ids).toEqual(["race-active"])
+  })
+})
+
+describe("character inventory (owner-managed quantities)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedState() {
+    const state = createInitialState("integrated", null, null)
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedCatalog(
+    id: string,
+    kind: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind,
+      stableId: id,
+      name: extra.name ?? `${kind} ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedEquipment(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return seedCatalog(id, "equipment", config, extra)
+  }
+
+  function seedConsumable(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return seedCatalog(id, "consumables", config, extra)
+  }
+
+  function seedStock(definitionId: string, quantity: number) {
+    return dbMock.store.addInventoryItem({
+      characterId: "chr-1",
+      definitionId,
+      quantity,
+    })
+  }
+
+  function setStock(definitionId: string, quantity: number) {
+    const idx = dbMock.store.inventory.findIndex(
+      (i) => i.characterId === "chr-1" && i.definitionId === definitionId
+    )
+    if (idx >= 0) dbMock.store.inventory.splice(idx, 1)
+    return seedStock(definitionId, quantity)
+  }
+
+  const other = { id: "user-2", email: "x@y", isAdmin: false }
+
+  function addBody(overrides: Record<string, unknown> = {}) {
+    return {
+      operation: "add" as const,
+      definitionId: "gear-1" as const,
+      quantity: 1,
+      version: 0,
+      sourceNote: "bookkeeping",
+      ...overrides,
+    }
+  }
+
+  it("lets an owner add and remove inventory, and rejects a non-owner", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    const res = await adjustCharacterInventory("chr-1", addBody(), user)
+    expect(res.version).toBe(1)
+    expect(res.inventory).toHaveLength(1)
+    expect(res.inventory[0]).toMatchObject({
+      definitionId: "gear-1",
+      quantity: 1,
+      kind: "equipment",
+    })
+
+    const res2 = await adjustCharacterInventory(
+      "chr-1",
+      {
+        operation: "remove",
+        definitionId: "gear-1",
+        quantity: 1,
+        version: 1,
+        sourceNote: "spent",
+      },
+      user
+    )
+    expect(res2.inventory).toHaveLength(0)
+    expect(res2.version).toBe(2)
+
+    await expect(
+      adjustCharacterInventory("chr-1", addBody({ version: 2 }), other)
+    ).rejects.toMatchObject({ status: 403, code: "forbidden" })
+  })
+
+  it("lets an admin adjust any character and read any character's inventory", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    const admin = { ...user, isAdmin: true }
+    const res = await adjustCharacterInventory("chr-1", addBody(), admin)
+    expect(res.inventory).toHaveLength(1)
+    await expect(getCharacterInventory("chr-1", admin)).resolves.toMatchObject({
+      version: 1,
+    })
+  })
+
+  it("reads a character's inventory with the current version", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 2)
+    const { inventory, version } = await getCharacterInventory("chr-1", user)
+    expect(version).toBe(0)
+    expect(inventory).toHaveLength(1)
+    expect(inventory[0]).toMatchObject({
+      definitionId: "pot-1",
+      quantity: 2,
+      kind: "consumables",
+    })
+    await expect(getCharacterInventory("chr-1", other)).rejects.toMatchObject({
+      status: 403,
+    })
+  })
+
+  it("rejects an add that would exceed the 999999 cap", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    const res = await adjustCharacterInventory(
+      "chr-1",
+      addBody({ quantity: 999999 }),
+      user
+    )
+    expect(res.inventory[0].quantity).toBe(999999)
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        addBody({ quantity: 1, version: 1 }),
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "inventory_cap_exceeded" })
+    // The failed cap write never mutated anything.
+    expect(dbMock.store.inventory[0].quantity).toBe(999999)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("removing the final unit deletes the row", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 1)
+    const res = await adjustCharacterInventory(
+      "chr-1",
+      {
+        operation: "remove",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "x",
+      },
+      user
+    )
+    expect(res.inventory).toHaveLength(0)
+    expect(dbMock.store.inventory).toHaveLength(0)
+  })
+
+  it("rejects removing the final unit while the item is equipped (inventory_equipped, no auto-unequip)", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 1)
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: false,
+    })
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        {
+          operation: "remove",
+          definitionId: "gear-1",
+          quantity: 1,
+          version: 0,
+          sourceNote: "spent",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "inventory_equipped" })
+    // No auto-unequip: the link stays, the stock row survives untouched, the CAS
+    // version never bumps, and no journal event is written.
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.inventory).toHaveLength(1)
+    expect(dbMock.store.inventory[0].quantity).toBe(1)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("allows removing all but one unit while equipped (count > 1 may decrease to 1)", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 3)
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: false,
+    })
+    const res = await adjustCharacterInventory(
+      "chr-1",
+      {
+        operation: "remove",
+        definitionId: "gear-1",
+        quantity: 2,
+        version: 0,
+        sourceNote: "spent",
+      },
+      user
+    )
+    expect(res.inventory).toHaveLength(1)
+    expect(res.inventory[0].quantity).toBe(1)
+    expect(res.version).toBe(1)
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("rejects removing the final equipped unit even when the linked definition is archived", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" }, { archived: true })
+    seedStock("gear-1", 1)
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: false,
+    })
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        {
+          operation: "remove",
+          definitionId: "gear-1",
+          quantity: 1,
+          version: 0,
+          sourceNote: "spent",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "inventory_equipped" })
+    expect(dbMock.store.inventory[0].quantity).toBe(1)
+  })
+
+  it("rejects removing the final unit while equipped even on a grandfathered legacy link that owns stock", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 1)
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: true,
+    })
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        {
+          operation: "remove",
+          definitionId: "gear-1",
+          quantity: 1,
+          version: 0,
+          sourceNote: "spent",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "inventory_equipped" })
+    expect(dbMock.store.associations[0].legacyUnowned).toBe(true)
+    expect(dbMock.store.inventory[0].quantity).toBe(1)
+  })
+
+  it("removing the final unit while NOT equipped still deletes the row", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 1)
+    const res = await adjustCharacterInventory(
+      "chr-1",
+      {
+        operation: "remove",
+        definitionId: "gear-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "spent",
+      },
+      user
+    )
+    expect(res.inventory).toHaveLength(0)
+    expect(dbMock.store.inventory).toHaveLength(0)
+  })
+
+  it("rejects a remove beyond owned stock", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 2)
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        {
+          operation: "remove",
+          definitionId: "pot-1",
+          quantity: 3,
+          version: 0,
+          sourceNote: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "inventory_insufficient" })
+    expect(dbMock.store.inventory[0].quantity).toBe(2)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects adding an archived definition but permits removing owned archived stock", async () => {
+    seedState()
+    seedConsumable(
+      "pot-1",
+      { type: "permanent", amount: { strength: 1 } },
+      { archived: true }
+    )
+    seedStock("pot-1", 2)
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        addBody({ definitionId: "pot-1" }),
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+    const res = await adjustCharacterInventory(
+      "chr-1",
+      {
+        operation: "remove",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "x",
+      },
+      user
+    )
+    expect(res.inventory).toHaveLength(1)
+    expect(res.inventory[0].quantity).toBe(1)
+  })
+
+  it("rejects an archived character adjustment", async () => {
+    seedState()
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(createInitialState("integrated", null, null)),
+      version: 0,
+      archived: true,
+    })
+    seedEquipment("gear-1", { slot: "head" })
+    await expect(
+      adjustCharacterInventory("chr-1", addBody(), user)
+    ).rejects.toMatchObject({ status: 400, code: "character_archived" })
+  })
+
+  it("rejects a stale version (409) and rolls back the inventory change and journal", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 5)
+    const first = await adjustCharacterInventory(
+      "chr-1",
+      addBody({ quantity: 2 }),
+      user
+    )
+    expect(first.inventory[0].quantity).toBe(7)
+    expect(dbMock.store.events).toHaveLength(1)
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        addBody({ quantity: 1, version: 0 }),
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.inventory).toHaveLength(1)
+    expect(dbMock.store.inventory[0].quantity).toBe(7)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("journals an inventory_adjust event with prior/new quantity, definition and actor", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 3)
+    await adjustCharacterInventory("chr-1", addBody({ quantity: 2 }), user)
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("inventory_adjust")
+    expect(event.payload).toMatchObject({
+      operation: "add",
+      definitionId: "gear-1",
+      quantity: 2,
+      priorQuantity: 3,
+      newQuantity: 5,
+      sourceNote: "bookkeeping",
+      actorId: user.id,
+    })
+    expect(
+      (event.payload as { definition: { name: string } }).definition.name
+    ).toBe("equipment gear-1")
+  })
+
+  it("requires owned stock for an equipment add (inventory_insufficient)", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-1",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "inventory_insufficient" })
+    seedStock("gear-1", 1)
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-1",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.associations).toHaveLength(1)
+    const assoc = dbMock.store.associations.find(
+      (a) => a.definitionId === "gear-1"
+    )
+    expect(assoc!.legacyUnowned).toBe(false)
+  })
+
+  it("keeps a grandfathered EQUIPMENT link equipped and removable with zero stock", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: true,
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.associations).toHaveLength(1)
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-1",
+        operation: "remove",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.associations).toHaveLength(0)
+  })
+
+  it("slot swap unlinks the old item but leaves its stock intact", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
+    seedEquipment("gear-2", { slot: "head", bonus: { strength: 20 } })
+    seedStock("gear-1", 3)
+    seedStock("gear-2", 1)
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-1",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-2",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    expect(res.character.associations.map((a) => a.definitionId)).toEqual([
+      "gear-2",
+    ])
+    expect(
+      dbMock.store.inventory.find((i) => i.definitionId === "gear-1")!.quantity
+    ).toBe(3)
+    expect(
+      dbMock.store.inventory.find((i) => i.definitionId === "gear-2")!.quantity
+    ).toBe(1)
+  })
+
+  it("adjusting inventory quantity does not change live status or state", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
+    const before = await getCharacter("chr-1", user)
+    seedStock("gear-1", 5)
+    const res = await adjustCharacterInventory(
+      "chr-1",
+      addBody({ quantity: 3 }),
+      user
+    )
+    expect(res.character.status?.attributes).toEqual(before.status?.attributes)
+    expect(res.character.state).toEqual(before.state)
+    expect(res.character.inventory).toHaveLength(1)
+  })
+
+  it("consuming a consumable decrements stock by one and a failed cap/version rolls back stock, state and journal", async () => {
+    const state = createInitialState("born", null, null)
+    state.race = { ...state.race, level: 10, grade: "F" as Grade }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+      origin: "born",
+    })
+    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
+    seedStock("perm-1", 4)
+    const res = await consumeCharacter(
+      "chr-1",
+      { definitionId: "perm-1", version: 0 },
+      user
+    )
+    expect(res.status.attributes.strength).toBe(3)
+    expect(
+      dbMock.store.inventory.find((i) => i.definitionId === "perm-1")!.quantity
+    ).toBe(3)
+    const ev = dbMock.store.events[0]
+    expect(ev.payload).toMatchObject({ stockPrior: 4, stockAfter: 3 })
+
+    // A permanent gain above the cumulative cap rejects and rolls back.
+    const capState = createInitialState("born", null, null)
+    capState.race = { ...capState.race, level: 10, grade: "F" as Grade }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(capState),
+      version: 0,
+      origin: "born",
+    })
+    seedConsumable("perm-31", { type: "permanent", amount: { strength: 31 } })
+    seedStock("perm-31", 4)
+    const eventsBefore = dbMock.store.events.length
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "perm-31", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
+    expect(
+      dbMock.store.inventory.find((i) => i.definitionId === "perm-31")!.quantity
+    ).toBe(4)
+    expect(dbMock.store.events).toHaveLength(eventsBefore)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("rejects consuming a consumable the character owns none of", async () => {
+    const state = createInitialState("born", null, null)
+    state.race = { ...state.race, level: 1, grade: "F" as Grade }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+      origin: "born",
+    })
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    // No owned stock -> insufficient.
+    await expect(
+      consumeCharacter("chr-1", { definitionId: "pot-1", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "inventory_insufficient" })
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("concurrent consumes of the final stock unit let exactly one succeed", async () => {
+    const state = createInitialState("born", null, null)
+    state.race = { ...state.race, level: 1, grade: "F" as Grade }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+      origin: "born",
+    })
+    seedConsumable("temp-1", {
+      type: "temporary",
+      amount: { strength: 4 },
+      durationQuarters: 3,
+    })
+    setStock("temp-1", 1)
+    const results = await Promise.allSettled([
+      consumeCharacter("chr-1", { definitionId: "temp-1", version: 0 }, user),
+      consumeCharacter("chr-1", { definitionId: "temp-1", version: 0 }, user),
+    ])
+    const fulfilled = results.filter((r) => r.status === "fulfilled")
+    const rejected = results.filter((r) => r.status === "rejected")
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    const reason = (rejected[0] as PromiseRejectedResult).reason as {
+      status: number
+    }
+    expect(reason.status).toBeGreaterThanOrEqual(400)
+    expect(dbMock.store.inventory).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
   })
 })
