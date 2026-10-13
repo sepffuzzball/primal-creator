@@ -287,6 +287,10 @@ let inventoryPosts: Array<{
   version: number
   sourceNote: string
 }> = []
+/** Captured PATCH /api/characters/chr-1 request bodies (profile saves). */
+let patchPosts: Array<Record<string, unknown>> = []
+/** Thrown when PATCH /api/characters/chr-1 is called (a failed profile save). */
+let profileSaveError: unknown = null
 let activeCharacter: import("@/lib/api").CharacterDetail = character
 
 /** Build a blessing/bloodline catalog item with documented defaults. */
@@ -480,6 +484,22 @@ function applyInventory(
   return { ...current, inventory: rows, version: current.version + 1 }
 }
 
+/**
+ * Apply a profile PATCH the way the save route would, so a subsequent reload
+ * reflects the saved name/description/metadata. The PATCH body carries the CAS
+ * `version` being written against; a successful write bumps the stored version
+ * by one (mirrors the backend's optimistic-concurrency bump on every write).
+ */
+function applyProfilePatch(
+  current: import("@/lib/api").CharacterDetail,
+  body: Record<string, unknown>
+): import("@/lib/api").CharacterDetail {
+  // The PATCH body carries the CAS `version` being written against. Spreading
+  // it would overwrite the stored version with the request's (stale) value, so
+  // the successful write always bumps the stored version by one.
+  return { ...current, ...body, version: current.version + 1 }
+}
+
 function setupMock(options?: {
   character?: import("@/lib/api").CharacterDetail
   associationsError?: unknown
@@ -489,6 +509,8 @@ function setupMock(options?: {
   equipmentCatalog?: import("@/lib/api").CatalogItem[]
   consumablesCatalog?: import("@/lib/api").CatalogItem[]
   inventoryError?: unknown
+  /** Thrown when PATCH /api/characters/chr-1 is called (a failed profile save). */
+  profileSaveError?: unknown
 }) {
   activeCharacter = options?.character ?? character
   associationsError = options?.associationsError ?? null
@@ -498,13 +520,25 @@ function setupMock(options?: {
   equipmentCatalog = options?.equipmentCatalog ?? []
   consumablesCatalog = options?.consumablesCatalog ?? []
   inventoryError = options?.inventoryError ?? null
+  profileSaveError = options?.profileSaveError ?? null
   inventoryPosts = []
+  patchPosts = []
 
   const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
   mock.mockReset()
   mock.mockImplementation(async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET"
     if (url === "/api/characters/chr-1" && method === "GET") {
+      return { character: activeCharacter }
+    }
+    if (url === "/api/characters/chr-1" && method === "PATCH") {
+      if (profileSaveError) throw profileSaveError
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      patchPosts.push(body)
+      activeCharacter = applyProfilePatch(activeCharacter, body)
       return { character: activeCharacter }
     }
     if (url === "/api/characters/chr-1/portrait") return { portrait: null }
@@ -1454,5 +1488,218 @@ describe("CharacterDetail inventory", () => {
     })
     await flush()
     expect(confirm().disabled).toBe(false)
+  })
+})
+
+describe("CharacterDetail profile metadata whitespace", () => {
+  it("preserves exact multiline whitespace in biography/notes in the notes Save PATCH body (no trim)", async () => {
+    setupMock({ character: { ...character, biography: "", notes: "" } })
+    await renderDetail()
+
+    const bio = "\n  first line\n  second line  \n\n"
+    const notes = "  \nleading space line\n\tindented\t\n"
+    fireEvent.change(screen.getByLabelText("Biography"), {
+      target: { value: bio },
+    })
+    fireEvent.change(screen.getByLabelText("Notes"), {
+      target: { value: notes },
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+
+    // The Save PATCH carries the raw biography/notes: leading/trailing whitespace
+    // and internal newlines are never trimmed.
+    expect(patchPosts).toHaveLength(1)
+    expect(patchPosts[0].biography).toBe(bio)
+    expect(patchPosts[0].notes).toBe(notes)
+  })
+})
+
+describe("CharacterDetail profile metadata", () => {
+  it("renders the six profile metadata fields and the profile preview from the initial GET", async () => {
+    setupMock({
+      character: {
+        ...character,
+        nickname: "Kit",
+        pronouns: "they/them",
+        ageDescription: "Ancient wanderer",
+        appearance: "Tall, scarred",
+        biography: "Born under a red moon.",
+        notes: "Secretive.",
+      },
+    })
+    await renderDetail()
+
+    // The editor inputs are populated from the server-provided metadata.
+    expect((screen.getByLabelText("Nickname") as HTMLInputElement).value).toBe(
+      "Kit"
+    )
+    expect((screen.getByLabelText("Pronouns") as HTMLInputElement).value).toBe(
+      "they/them"
+    )
+    expect(
+      (screen.getByLabelText("Age description") as HTMLTextAreaElement).value
+    ).toBe("Ancient wanderer")
+    expect(
+      (screen.getByLabelText("Appearance") as HTMLTextAreaElement).value
+    ).toBe("Tall, scarred")
+    expect(
+      (screen.getByLabelText("Biography") as HTMLTextAreaElement).value
+    ).toBe("Born under a red moon.")
+    expect((screen.getByLabelText("Notes") as HTMLTextAreaElement).value).toBe(
+      "Secretive."
+    )
+
+    // The profile preview renders the persisted metadata. Value assertions are
+    // scoped to the preview container because controlled textareas also expose
+    // their text value as a text node, which would otherwise match twice.
+    const preview = screen.getByRole("heading", { name: "Profile preview" })
+      .parentElement as HTMLElement
+    const page = within(preview)
+
+    expect(page.getByText("Nickname:")).toBeTruthy()
+    expect(page.getByText("Kit")).toBeTruthy()
+    expect(page.getByText(/they\/them/)).toBeTruthy()
+    expect(page.getByText("Age:")).toBeTruthy()
+    expect(page.getByText("Ancient wanderer")).toBeTruthy()
+    expect(page.getByText("Appearance:")).toBeTruthy()
+    expect(page.getByText("Tall, scarred")).toBeTruthy()
+    expect(page.getByText("Biography:")).toBeTruthy()
+    expect(page.getByText("Born under a red moon.")).toBeTruthy()
+    expect(page.getByText("Notes:")).toBeTruthy()
+    expect(page.getByText("Secretive.")).toBeTruthy()
+  })
+
+  it("saves name/description and all six metadata fields via PATCH with the current version, then reload displays the changes", async () => {
+    setupMock({ character: { ...character } })
+    await renderDetail()
+
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Kael" },
+    })
+    fireEvent.change(screen.getByLabelText("Notes / description"), {
+      target: { value: "A description" },
+    })
+    fireEvent.change(screen.getByLabelText("Nickname"), {
+      target: { value: "Kit" },
+    })
+    fireEvent.change(screen.getByLabelText("Pronouns"), {
+      target: { value: "they/them" },
+    })
+    fireEvent.change(screen.getByLabelText("Age description"), {
+      target: { value: "Ancient wanderer" },
+    })
+    fireEvent.change(screen.getByLabelText("Appearance"), {
+      target: { value: "Tall, scarred" },
+    })
+    fireEvent.change(screen.getByLabelText("Biography"), {
+      target: { value: "Born under a red moon." },
+    })
+    fireEvent.change(screen.getByLabelText("Notes"), {
+      target: { value: "Secretive." },
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+
+    // Exactly one PATCH, carrying every edited field plus the CAS version.
+    expect(patchPosts).toHaveLength(1)
+    expect(patchPosts[0]).toEqual({
+      name: "Kael",
+      description: "A description",
+      nickname: "Kit",
+      pronouns: "they/them",
+      ageDescription: "Ancient wanderer",
+      appearance: "Tall, scarred",
+      biography: "Born under a red moon.",
+      notes: "Secretive.",
+      version: 3,
+    })
+
+    // The reload fetches the persisted character and displays the changes, and
+    // the optimistic-concurrency write bumped the stored version. The value is
+    // scoped to the profile preview because the editor textarea also carries the
+    // value as its text content.
+    expect(screen.getByText("v4")).toBeTruthy()
+    expect((screen.getByLabelText("Nickname") as HTMLInputElement).value).toBe(
+      "Kit"
+    )
+    const preview = screen.getByRole("heading", { name: "Profile preview" })
+      .parentElement as HTMLElement
+    const previewPage = within(preview)
+    expect(previewPage.getByText("Age:")).toBeTruthy()
+    expect(previewPage.getByText("Ancient wanderer")).toBeTruthy()
+  })
+
+  it("clearing previously-set metadata fields posts null in the Save PATCH", async () => {
+    setupMock({
+      character: {
+        ...character,
+        nickname: "Kit",
+        pronouns: "they/them",
+        ageDescription: "Ancient wanderer",
+        appearance: "Tall, scarred",
+        biography: "Born under a red moon.",
+        notes: "Secretive.",
+      },
+    })
+    await renderDetail()
+
+    fireEvent.change(screen.getByLabelText("Nickname"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Pronouns"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Age description"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Appearance"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Biography"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Notes"), {
+      target: { value: "" },
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+
+    expect(patchPosts).toHaveLength(1)
+    // A blank metadata field is cleared on the server (null), never kept as "".
+    expect(patchPosts[0].nickname).toBeNull()
+    expect(patchPosts[0].pronouns).toBeNull()
+    expect(patchPosts[0].ageDescription).toBeNull()
+    expect(patchPosts[0].appearance).toBeNull()
+    expect(patchPosts[0].biography).toBeNull()
+    expect(patchPosts[0].notes).toBeNull()
+  })
+
+  it("a failed profile save keeps the current form and surfaces the error (no fake Saved)", async () => {
+    setupMock({
+      character: { ...character },
+      profileSaveError: new Error("network down"),
+    })
+    await renderDetail()
+
+    fireEvent.change(screen.getByLabelText("Biography"), {
+      target: { value: "New bio" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+
+    // The failure is surfaced as a visible error, not swallowed.
+    expect(screen.getByText(/network down/)).toBeTruthy()
+    // No fake success: the "Saved." toast was never fired and the button is not
+    // stuck on "Saving...".
+    expect(toast.success).not.toHaveBeenCalled()
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy()
+    // A failed save must not reload/clobber the current form.
+    expect(
+      (screen.getByLabelText("Biography") as HTMLTextAreaElement).value
+    ).toBe("New bio")
   })
 })

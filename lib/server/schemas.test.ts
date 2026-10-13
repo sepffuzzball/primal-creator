@@ -3,6 +3,7 @@ import {
   blessingConfigSchema,
   bloodlineConfigSchema,
   characterCreateSchema,
+  characterUpdateSchema,
   evolveSchema,
   godConfigSchema,
   inventoryPostSchema,
@@ -401,6 +402,97 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
   it("rejects an empty-string id inside an array", () => {
     expect(
       specialAbilitiesSchema.safeParse({ transcendentSkillIds: [""] }).success
+    ).toBe(false)
+  })
+})
+
+describe("character profile metadata schema bounds", () => {
+  const base = {
+    name: "Kael",
+    origin: "integrated" as const,
+    raceId: "race-1",
+    classId: "cls-1",
+  }
+
+  it("accepts all six metadata fields on create and preserves them", () => {
+    const parsed = characterCreateSchema.safeParse({
+      ...base,
+      nickname: "Kael",
+      pronouns: "they/them",
+      ageDescription: "A youthful 30",
+      appearance: "Tall, dark hair",
+      biography: "Grew up in the lowlands",
+      notes: "Private GM notes",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.nickname).toBe("Kael")
+      expect(parsed.data.pronouns).toBe("they/them")
+      expect(parsed.data.ageDescription).toBe("A youthful 30")
+      expect(parsed.data.appearance).toBe("Tall, dark hair")
+      expect(parsed.data.biography).toBe("Grew up in the lowlands")
+      expect(parsed.data.notes).toBe("Private GM notes")
+    }
+  })
+
+  it("accepts null or omitted metadata fields on create (missing -> null)", () => {
+    const omitted = characterCreateSchema.safeParse(base)
+    expect(omitted.success).toBe(true)
+    if (omitted.success) {
+      expect(omitted.data.nickname).toBeUndefined()
+    }
+    const nulled = characterCreateSchema.safeParse({
+      ...base,
+      nickname: null,
+      appearance: null,
+    })
+    expect(nulled.success).toBe(true)
+  })
+
+  it("rejects metadata fields that exceed their per-field bounds", () => {
+    const cases: Array<[string, number, string]> = [
+      ["nickname", 200, "n".repeat(201)],
+      ["pronouns", 100, "p".repeat(101)],
+      ["ageDescription", 4000, "a".repeat(4001)],
+      ["appearance", 8000, "b".repeat(8001)],
+      ["biography", 8000, "c".repeat(8001)],
+      ["notes", 4000, "d".repeat(4001)],
+    ]
+    for (const [field, bound, tooLong] of cases) {
+      const parsed = characterCreateSchema.safeParse({
+        ...base,
+        [field]: tooLong,
+      })
+      expect(parsed.success, `${field} > ${bound} must reject`).toBe(false)
+    }
+  })
+
+  it("accepts a metadata field exactly at its bound", () => {
+    const parsed = characterCreateSchema.safeParse({
+      ...base,
+      nickname: "n".repeat(200),
+      notes: "d".repeat(4000),
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("update schema accepts metadata fields and allows clearing with null", () => {
+    const parsed = characterUpdateSchema.safeParse({
+      nickname: "Renamed",
+      pronouns: null,
+      ageDescription: null,
+      biography: "new bio",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.nickname).toBe("Renamed")
+      expect(parsed.data.pronouns).toBeNull()
+    }
+  })
+
+  it("update schema rejects metadata fields that exceed their bound", () => {
+    expect(
+      characterUpdateSchema.safeParse({ notes: "x".repeat(4001) }).success
     ).toBe(false)
   })
 })

@@ -180,7 +180,7 @@ deliberately **not** authoritative character state. The contract is:
   whitelist (`step`, `name`, `description`, `origin`, `raceId`, `classId`,
   `professionId`, `special`, `specialAbilities`, `equipment`, plus optional
   `nickname`, `pronouns`, `ageDescription`, `appearance`, `biography`, `notes`).
-  Each string is bounded and the whole payload is capped at 20KB. It never stores
+  Each string is bounded and the whole payload is capped at 256KiB. It never stores
   uploaded binaries and never stores stat vectors, awards or effects - those
   belong to the engine, not the draft. It does not derive any numbers.
   `specialAbilities` carries the explicit blessing `blessingId` and
@@ -232,6 +232,21 @@ deliberately **not** authoritative character state. The contract is:
   ability is ever auto-selected and no numeric bonus is fabricated: a link only
   synthesizes effects declared in the catalog, and the legacy `special` boolean
   never grants a power on its own.
+- **Profile metadata is persisted, not just drafted.** The optional
+  `nickname`, `pronouns`, `ageDescription`, `appearance`, `biography`, `notes`
+  fields are stored as nullable columns on the final `Character` (each bounded
+  by Zod at the API boundary, matching the draft bounds). The `create` journal
+  records only *which* of them were supplied; the `update` journal records only
+  the *changed field names* plus the acting user id, never the long prose - so a
+  detailed biography/private note is not duplicated into the journal.
+- **One blessing link per character, enforced at the database layer.** A
+  character may hold AT MOST ONE `BLESSING` association (active or archived). A
+  partial unique index backstops this at the DB level; `associateCharacter`
+  runs the add under SERIALIZABLE + CAS and maps a concurrent singleton-race
+  `P2002` to a 409 `blessing_singleton_conflict`. An archived blessing is inert
+  but still occupies the single slot until replaced (add a new blessing) or
+  removed, and an import backup carrying more than one total blessing link is
+  rejected with 400 `import_link_collision` before any write.
 
 ## Trusted-backup character export / import (contract)
 
@@ -244,7 +259,9 @@ no grandfathering marker, so importing it restores zero stock and marks every
 equipment link as grandfathered.
 
 - **Stable identifiers, not internal ids.** The document carries `identity`
-  (name, description, origin, race/class/profession) and every association /
+  (name, description, the nullable profile-metadata fields `nickname`,
+  `pronouns`, `ageDescription`, `appearance`, `biography`, `notes`, origin,
+  race/class/profession) and every association /
   skill-offer option reference by catalog `kind` + `stableId` (never the
   runtime-internal definition id). The raw engine `state` is exported verbatim
   (it keeps its engine-internal `definitionId` values), and on import those
@@ -252,14 +269,19 @@ equipment link as grandfathered.
   (via the same `resolveTrackDefinition` fallback the advancement flow uses - the
   id for the character's grade if defined, otherwise the lowest defined grade -
   for tracks, and the local per-grade `raceDefinitions[grade].id` for the race).
-  Historical level awards are preserved verbatim as source snapshots.
+  Historical level awards are preserved verbatim as source snapshots. Profile
+  metadata exported in `identity` is imported verbatim (nullable); an omitted or
+  null field in a backup is imported as NULL, so archives made before these
+  fields existed still import.
 - **No catalog is auto-created and no overwrite.** Every identity / association /
   offer-option reference must resolve to an EXISTING catalog definition; a
   missing, wrong-kind, or (for required race/class/profession) archived definition
   rejects the whole import with an actionable 400. Archived associations or offer
   options may be preserved as inert links only when the definition exists. Import
   always creates a NEW character (owned by the current user) - it never mutates an
-  existing row.
+  existing row. A backup carrying more than one total `blessing` link (e.g. one
+  active + one archived blessing) is rejected with 400 `import_link_collision`
+  before any write - the single-blessing invariant counts archived links too.
 - **History is provenance, not live ids.** Imported progression events are stored
   as `kind: 'import_history'` events with a `sourceKind` / `sourceCreatedAt` /
   `sourcePayload` provenance, so the source ids are clearly not valid live ids. A

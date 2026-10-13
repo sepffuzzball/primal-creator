@@ -95,10 +95,18 @@ mutate historical awards. The `tier` is forwarded as metadata on the event
 snapshot. Archived blessings are inert: a linked but archived definition
 contributes no effect.
 
-A character holds **exactly one active (unarchived) blessing** at a time. Adding
-a blessing atomically replaces every existing BLESSING link on that character,
-including archived ones; attempting to give a character a second active blessing
-is rejected as a duplicate. An archived blessing link can be removed, and an
-edit/unarchive that would leave a character with more than one active blessing is
-rejected with 409 `link_collision`. `compatibleBlessingStableIds` is stored as
-metadata but does not yet gate coexistence (phase 2).
+A character holds **at most one blessing link** - archived or active - at any
+time. Adding a blessing atomically replaces every existing BLESSING link on that
+character, including archived ones; an archived blessing, though inert, still
+occupies the single blessing slot until it is replaced (by adding a new blessing)
+or removed. The invariant is enforced at the database layer by a partial unique
+index (one BLESSING row per character); `associateCharacter` runs the add/remove
+under SERIALIZABLE with CAS and maps a concurrent singleton-race `P2002` to a 409
+`blessing_singleton_conflict`, while an `updateCatalogItem`/import that would
+leave a character with more than one blessing link is rejected with 409
+`link_collision`. Upgrades are explicit: choose the newer catalog blessing - the
+old link is displaced and journaled in the `removed` array of the `associate`
+event. `compatibleBlessingStableIds` is stored as metadata but does not yet gate
+coexistence (phase 2). An import backup that carries more than one total blessing
+link (active + archived) is rejected with 400 `import_link_collision` before any
+write.

@@ -88,6 +88,18 @@ function labelFor(key: AttributeKey): string {
   return key.charAt(0).toUpperCase() + key.slice(1)
 }
 
+/**
+ * Normalize a character-profile metadata field for a PATCH body. Converts ONLY
+ * the exact empty string `""` to null (a blank field is cleared on the server)
+ * and otherwise passes the value through VERBATIM - leading/trailing whitespace
+ * and newlines are never trimmed, so a multiline biography/notes value survives
+ * to the server exactly as typed.
+ */
+function metadataOrNull(value: string | null | undefined): string | null {
+  if (value === "") return null
+  return value ?? null
+}
+
 // Race grade ladder, lowest to highest. Mirrors the server's grade order.
 const GRADE_ORDER = ["G", "F", "E", "D", "C", "B", "A", "S"] as const
 
@@ -921,12 +933,15 @@ export function CharacterDetail({
   const [events, setEvents] = React.useState<ExportResponse["events"] | null>(
     null
   )
-  const [notes, setNotes] = React.useState<{
-    name: string
-    description: string
-  }>({
+  const [notes, setNotes] = React.useState({
     name: "",
     description: "",
+    nickname: "",
+    pronouns: "",
+    ageDescription: "",
+    appearance: "",
+    biography: "",
+    notes: "",
   })
   const [savingNotes, setSavingNotes] = React.useState(false)
   const [evolveOpen, setEvolveOpen] = React.useState(false)
@@ -1003,6 +1018,12 @@ export function CharacterDetail({
       setNotes({
         name: res.character.name,
         description: res.character.description ?? "",
+        nickname: res.character.nickname ?? "",
+        pronouns: res.character.pronouns ?? "",
+        ageDescription: res.character.ageDescription ?? "",
+        appearance: res.character.appearance ?? "",
+        biography: res.character.biography ?? "",
+        notes: res.character.notes ?? "",
       })
       setError(null)
     } catch (err) {
@@ -1150,6 +1171,12 @@ export function CharacterDetail({
         setNotes({
           name: res.character.name,
           description: res.character.description ?? "",
+          nickname: res.character.nickname ?? "",
+          pronouns: res.character.pronouns ?? "",
+          ageDescription: res.character.ageDescription ?? "",
+          appearance: res.character.appearance ?? "",
+          biography: res.character.biography ?? "",
+          notes: res.character.notes ?? "",
         })
         setError(null)
       })
@@ -1360,6 +1387,12 @@ export function CharacterDetail({
         ...jsonInit("PATCH", {
           name: notes.name,
           description: notes.description,
+          nickname: metadataOrNull(notes.nickname),
+          pronouns: metadataOrNull(notes.pronouns),
+          ageDescription: metadataOrNull(notes.ageDescription),
+          appearance: metadataOrNull(notes.appearance),
+          biography: metadataOrNull(notes.biography),
+          notes: metadataOrNull(notes.notes),
           version: character.version,
         }),
       })
@@ -3026,10 +3059,66 @@ export function CharacterDetail({
                     className="min-h-28 w-full rounded-md border border-input bg-input/20 px-2 py-1.5 text-xs/relaxed outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
                   />
                 </div>
+                {(
+                  [
+                    ["nickname", "Nickname", 200],
+                    ["pronouns", "Pronouns", 100],
+                    ["ageDescription", "Age description", 4000],
+                    ["appearance", "Appearance", 8000],
+                    ["biography", "Biography", 8000],
+                    ["notes", "Notes", 4000],
+                  ] as const
+                ).map(([field, label, maxLength]) => (
+                  <div key={field} className="flex flex-col gap-1.5">
+                    <Label htmlFor={`profile-${field}`}>{label}</Label>
+                    {maxLength < 2000 ? (
+                      <Input
+                        id={`profile-${field}`}
+                        maxLength={maxLength}
+                        value={notes[field]}
+                        onChange={(e) =>
+                          setNotes((n) => ({ ...n, [field]: e.target.value }))
+                        }
+                      />
+                    ) : (
+                      <textarea
+                        id={`profile-${field}`}
+                        maxLength={maxLength}
+                        value={notes[field]}
+                        onChange={(e) =>
+                          setNotes((n) => ({ ...n, [field]: e.target.value }))
+                        }
+                        className="min-h-28 w-full rounded-md border border-input bg-input/20 px-2 py-1.5 text-xs/relaxed"
+                      />
+                    )}
+                  </div>
+                ))}
+                <div className="rounded-lg border bg-input/20 p-3 text-xs/relaxed">
+                  <h3 className="mb-2 font-medium">Profile preview</h3>
+                  {(
+                    [
+                      ["Nickname", notes.nickname],
+                      ["Pronouns", notes.pronouns],
+                      ["Age", notes.ageDescription],
+                      ["Appearance", notes.appearance],
+                      ["Biography", notes.biography],
+                      ["Notes", notes.notes],
+                    ] as const
+                  ).map(([label, value]) => (
+                    <p key={label}>
+                      <span className="text-muted-foreground">{label}: </span>
+                      {value || "Not provided"}
+                    </p>
+                  ))}
+                </div>
                 <div>
                   <Button
                     onClick={saveNotes}
-                    disabled={savingNotes || notes.name.trim().length === 0}
+                    disabled={
+                      savingNotes ||
+                      notes.name.trim().length === 0 ||
+                      character.archived
+                    }
                   >
                     {savingNotes ? "Saving..." : "Save"}
                   </Button>

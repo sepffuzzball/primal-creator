@@ -48,6 +48,15 @@ const stableRefSchema = z.object({
 const identitySchema = z.object({
   name: z.string().min(1),
   description: z.string().max(8000).nullable().optional(),
+  // Character-profile metadata, mirroring lib/server/schemas.ts and
+  // lib/server/draft-schema.ts. Optional + nullable: an omitted or null field in
+  // a backup is imported as NULL (old backups without these fields still import).
+  nickname: z.string().max(200).nullable().optional(),
+  pronouns: z.string().max(100).nullable().optional(),
+  ageDescription: z.string().max(4000).nullable().optional(),
+  appearance: z.string().max(8000).nullable().optional(),
+  biography: z.string().max(8000).nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
   origin: z.enum(["integrated", "born"]),
   race: stableRefSchema,
   class: stableRefSchema,

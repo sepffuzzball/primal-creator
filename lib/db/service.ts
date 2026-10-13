@@ -157,6 +157,12 @@ export interface CharacterDetail {
   id: string
   name: string
   description: string | null
+  nickname: string | null
+  pronouns: string | null
+  ageDescription: string | null
+  appearance: string | null
+  biography: string | null
+  notes: string | null
   origin: "integrated" | "born"
   raceId: string | null
   classId: string | null
@@ -236,6 +242,25 @@ export interface CatalogItem {
   config: Record<string, unknown>
   createdAt: string
   updatedAt: string
+}
+
+// ------------------------------------------------------------------ //
+// Character-profile metadata normalization
+// ------------------------------------------------------------------ //
+
+/**
+ * Normalize an optional character-profile metadata value at the persistence
+ * boundary. Converts ONLY the exact empty string `""` to NULL (a blank posted
+ * field clears the stored value) and otherwise preserves the input VERBATIM -
+ * leading/trailing whitespace and internal newlines are never trimmed, so
+ * users can type "  \nHello\n  " and have it round-trip exactly as written.
+ * An omitted/null argument stays null.
+ */
+export function metadataOrNull(
+  value: string | null | undefined
+): string | null {
+  if (value === "") return null
+  return value ?? null
 }
 
 // ------------------------------------------------------------------ //
@@ -891,6 +916,12 @@ function toDetail(
     id: character.id,
     name: character.name,
     description: character.description,
+    nickname: character.nickname,
+    pronouns: character.pronouns,
+    ageDescription: character.ageDescription,
+    appearance: character.appearance,
+    biography: character.biography,
+    notes: character.notes,
     origin: character.origin,
     raceId: character.raceId,
     classId: character.classId,
@@ -1179,6 +1210,16 @@ export async function createCharacter(
   input: {
     name: string
     description?: string
+    // Character-profile metadata. Optional + nullable: an omitted/null field is
+    // persisted as NULL (a missing value is never a 400). Mirrors the create
+    // schema bounds (nickname 200, pronouns 100, ageDescription 4000,
+    // appearance 8000, biography 8000, notes 4000).
+    nickname?: string | null
+    pronouns?: string | null
+    ageDescription?: string | null
+    appearance?: string | null
+    biography?: string | null
+    notes?: string | null
     origin: "integrated" | "born"
     raceId: string
     classId: string
@@ -1259,6 +1300,12 @@ export async function createCharacter(
         ownerId: user.id,
         name: input.name,
         description: input.description ?? null,
+        nickname: metadataOrNull(input.nickname),
+        pronouns: metadataOrNull(input.pronouns),
+        ageDescription: metadataOrNull(input.ageDescription),
+        appearance: metadataOrNull(input.appearance),
+        biography: metadataOrNull(input.biography),
+        notes: metadataOrNull(input.notes),
         origin: input.origin,
         raceId: race.id,
         classId: cls.id,
@@ -1268,6 +1315,20 @@ export async function createCharacter(
       },
       include: characterInclude,
     })
+
+    // Record ONLY which profile-metadata fields were supplied (never the prose),
+    // so the create journal stays a compact auditable record without duplicating
+    // long nicknames/biographies/notes.
+    const suppliedMetadataFields = (
+      [
+        "nickname",
+        "pronouns",
+        "ageDescription",
+        "appearance",
+        "biography",
+        "notes",
+      ] as const
+    ).filter((field) => metadataOrNull(input[field]) != null)
 
     await tx.progressionEvent.create({
       data: {
@@ -1281,6 +1342,9 @@ export async function createCharacter(
           // Selection snapshots + provenance, present only when the caller supplied
           // a non-empty special-ability selection.
           ...(special.journal ? { specialAbilities: special.journal } : {}),
+          ...(suppliedMetadataFields.length
+            ? { metadataFields: suppliedMetadataFields }
+            : {}),
         } as Prisma.InputJsonValue,
       },
     })
@@ -1332,6 +1396,14 @@ export async function updateCharacter(
   patch: {
     name?: string
     description?: string | null
+    // Character-profile metadata. Optional + nullable so a PATCH may clear a field
+    // (null) or leave it untouched (omitted). Bounds mirror the update schema.
+    nickname?: string | null
+    pronouns?: string | null
+    ageDescription?: string | null
+    appearance?: string | null
+    biography?: string | null
+    notes?: string | null
     archived?: boolean
     currentResources?: Record<string, number>
     version?: number
@@ -1369,6 +1441,24 @@ export async function updateCharacter(
         ...(patch.description !== undefined
           ? { description: patch.description }
           : {}),
+        ...(patch.nickname !== undefined
+          ? { nickname: metadataOrNull(patch.nickname) }
+          : {}),
+        ...(patch.pronouns !== undefined
+          ? { pronouns: metadataOrNull(patch.pronouns) }
+          : {}),
+        ...(patch.ageDescription !== undefined
+          ? { ageDescription: metadataOrNull(patch.ageDescription) }
+          : {}),
+        ...(patch.appearance !== undefined
+          ? { appearance: metadataOrNull(patch.appearance) }
+          : {}),
+        ...(patch.biography !== undefined
+          ? { biography: metadataOrNull(patch.biography) }
+          : {}),
+        ...(patch.notes !== undefined
+          ? { notes: metadataOrNull(patch.notes) }
+          : {}),
         ...(patch.archived != null ? { archived: patch.archived } : {}),
         ...(patch.currentResources
           ? { state: serializeState(nextState) as Prisma.InputJsonValue }
@@ -1384,6 +1474,24 @@ export async function updateCharacter(
       )
     }
 
+    // The update journal names ONLY the profile-metadata fields that actually
+    // changed (never the long prose) so a biography/edit does not duplicate
+    // private notes into the journal. The actor id is always recorded.
+    const changedMetadataFields = (
+      [
+        "nickname",
+        "pronouns",
+        "ageDescription",
+        "appearance",
+        "biography",
+        "notes",
+      ] as const
+    ).filter(
+      (field) =>
+        patch[field] !== undefined &&
+        metadataOrNull(patch[field]) !== row[field]
+    )
+
     await tx.progressionEvent.create({
       data: {
         characterId: id,
@@ -1393,6 +1501,10 @@ export async function updateCharacter(
           description: patch.description,
           archived: patch.archived,
           currentResources: patch.currentResources,
+          ...(changedMetadataFields.length
+            ? { changedFields: changedMetadataFields }
+            : {}),
+          actorId: user.id,
         } as Prisma.InputJsonValue,
       },
     })
@@ -3945,6 +4057,28 @@ export async function associateCharacter(
           "Concurrent character association write conflict; retry the change"
         )
       }
+      // A unique-constraint violation is ambiguous across association kinds, so
+      // do NOT assume it is a blessing singleton. Only a BLESSING `add` (the one
+      // operation under a partial-unique index that enforces the single-slot
+      // invariant) is a blessing singleton conflict; the partial index itself is
+      // the other signal. Any OTHER association unique race (e.g. a concurrent
+      // title/equipment/bloodline link already occupying a slot) becomes a
+      // generic 409 `association_conflict` the client can retry.
+      if (isUniqueViolation(err)) {
+        const isBlessingAdd =
+          body.kind === "blessing" && body.operation === "add"
+        const blessesBlessingIndex = isBlessingPartialIndexViolation(err)
+        if (isBlessingAdd || blessesBlessingIndex) {
+          throw conflict(
+            "blessing_singleton_conflict",
+            "A blessing is already attached to this character; add a new blessing to replace it"
+          )
+        }
+        throw conflict(
+          "association_conflict",
+          "A conflicting association already exists; retry the change"
+        )
+      }
       throw err
     })
 }
@@ -4001,6 +4135,14 @@ export async function exportCharacter(
   const identity = {
     name: row.name,
     description: row.description,
+    // Profile metadata is exported verbatim (nullable) so a backup round-trips
+    // these fields exactly; an absent field exports as null.
+    nickname: row.nickname,
+    pronouns: row.pronouns,
+    ageDescription: row.ageDescription,
+    appearance: row.appearance,
+    biography: row.biography,
+    notes: row.notes,
     origin: row.origin,
     race: { stableId: row.race?.stableId ?? null },
     class: { stableId: row.class?.stableId ?? null },
@@ -4260,6 +4402,21 @@ async function resolveAssociationRefs(
   assocs: CharacterImportDocument["associations"],
   opts: ResolveAssocOpts
 ): Promise<ResolvedAssoc[]> {
+  // A character may hold AT MOST ONE blessing link (active or archived). Count
+  // every blessing ref first so a >1 total is ALWAYS a link collision
+  // (`import_link_collision`) - whether the same definition is referenced twice,
+  // or two different blessings (one possibly archived) are referenced - and
+  // never a generic duplicate-link error. This runs BEFORE the per-ref duplicate
+  // guard below, so `import_duplicate_link` only ever applies to non-blessing
+  // kinds; a duplicated blessing is reported as a collision, not a duplicate.
+  const blessingRefs = assocs.filter((a) => a.kind === "blessing")
+  if (blessingRefs.length > 1) {
+    throw badRequest(
+      "import_link_collision",
+      `More than one blessing: "${blessingRefs[0].definition.stableId}" and "${blessingRefs[1].definition.stableId}"`
+    )
+  }
+
   const seen = new Set<string>()
   const resolved: ResolvedAssoc[] = []
   for (const a of assocs) {
@@ -4340,8 +4497,22 @@ function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
   const titleGroups = new Map<string, string>()
   const skillGroups = new Map<string, string>()
   const bloodlineGroups = new Map<string, string>()
-  let activeBlessingName: string | null = null
+  // A character may hold AT MOST ONE total BLESSING link (active OR archived).
+  // Count every blessing BEFORE the archived-inert skip so an active+archived
+  // pair is rejected: an archived blessing still occupies the single slot until
+  // it is replaced or removed. All other kinds keep the archived-inert skip.
+  let blessingName: string | null = null
   for (const r of resolved) {
+    if (r.sourceKind === "blessing") {
+      if (blessingName != null) {
+        throw badRequest(
+          "import_link_collision",
+          `More than one blessing: "${blessingName}" and "${r.definition.name}"`
+        )
+      }
+      blessingName = r.definition.name
+      continue
+    }
     if (r.definition.archived) continue
     const config = parseCatalogConfig(
       r.definition.kind,
@@ -4383,14 +4554,6 @@ function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
         }
         skillGroups.set(group, r.definition.name)
       }
-    } else if (r.sourceKind === "blessing") {
-      if (activeBlessingName != null) {
-        throw badRequest(
-          "import_link_collision",
-          `More than one active blessing: "${activeBlessingName}" and "${r.definition.name}"`
-        )
-      }
-      activeBlessingName = r.definition.name
     } else if (r.sourceKind === "bloodline") {
       const group = upgradeGroupForConfig(config)
       if (group) {
@@ -4823,6 +4986,16 @@ export async function importCharacter(
         ownerId: user.id,
         name: input.identity.name,
         description: input.identity.description ?? null,
+        // Profile metadata is imported verbatim (nullable): an omitted/null field
+        // in the backup is NULL, never a default. The exact empty string is also
+        // stored as NULL; all other content (including whitespace/newlines) is
+        // preserved byte-for-byte.
+        nickname: metadataOrNull(input.identity.nickname),
+        pronouns: metadataOrNull(input.identity.pronouns),
+        ageDescription: metadataOrNull(input.identity.ageDescription),
+        appearance: metadataOrNull(input.identity.appearance),
+        biography: metadataOrNull(input.identity.biography),
+        notes: metadataOrNull(input.identity.notes),
         origin: input.identity.origin,
         raceId: race.id,
         classId: cls.id,
@@ -4947,8 +5120,28 @@ function parseConfigOr400(
 
 function isUniqueViolation(err: unknown): boolean {
   return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002"
+    !!err &&
+    typeof err === "object" &&
+    (err as { code?: string }).code === "P2002"
   )
+}
+
+/**
+ * Detect a P2002 whose `meta.target` names the BLESSING singleton partial unique
+ * index. Even when the caller did not pass kind/blessing (defensive),
+ * `character_associations_characterId_blessing_key` is the single-slot invariant
+ * index and can only be a blessing singleton conflict, never a generic one.
+ */
+function isBlessingPartialIndexViolation(err: unknown): boolean {
+  if (!isUniqueViolation(err)) return false
+  const meta = (err as { meta?: { target?: unknown } }).meta
+  const target = meta?.target
+  if (Array.isArray(target)) {
+    return target.some(
+      (t) => t === "character_associations_characterId_blessing_key"
+    )
+  }
+  return target === "character_associations_characterId_blessing_key"
 }
 
 /**

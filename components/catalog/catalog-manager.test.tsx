@@ -76,8 +76,17 @@ vi.mock("@/components/ui/dialog", () => ({
   Dialog: ({
     open,
     children,
-  }: React.ComponentProps<"div"> & { open?: boolean }) =>
-    open ? <div>{children}</div> : null,
+    onOpenChange,
+  }: React.ComponentProps<"div"> & {
+    open?: boolean
+    onOpenChange?: (open: boolean) => void
+  }) =>
+    open ? (
+      <div>
+        {children}
+        <button onClick={() => onOpenChange?.(false)}>Mock close</button>
+      </div>
+    ) : null,
   DialogContent: ({ children }: React.ComponentProps<"div">) => (
     <div>{children}</div>
   ),
@@ -689,5 +698,395 @@ describe("CatalogManager import preview existing metadata", () => {
         "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy"
       )
     ).toBeTruthy()
+  })
+})
+
+describe("CatalogManager bulk imports", () => {
+  afterEach(() => {
+    mockIsAdmin = true
+    vi.unstubAllGlobals()
+    cleanup()
+  })
+
+  const bulkPreview = (digest = "digest-1", skipped = false) => ({
+    source: "bulk" as const,
+    previewDigest: digest,
+    entries: [
+      {
+        row: 2,
+        kind: "blessings",
+        stableId: "custom-one",
+        name: "Custom One",
+        sourceUrl: "https://example.test/source",
+        provenance: "inferred",
+        status: skipped ? ("skip_existing" as const) : ("create" as const),
+        ...(skipped
+          ? {
+              existing: {
+                id: "old-id",
+                name: "Existing One",
+                sourceUrl: "https://old.test",
+                provenance: "house",
+                archived: true,
+              },
+            }
+          : {}),
+      },
+    ],
+    createCount: skipped ? 0 : 1,
+    skipCount: skipped ? 1 : 0,
+  })
+
+  function seedBulkMock() {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    let applied = false
+    mock.mockImplementation(async (url: string) => {
+      if (url === "/api/catalog/blessings")
+        return { kind: "blessings", items: [item] }
+      if (url === "/api/admin/catalog-import/bulk/preview")
+        return bulkPreview("digest-1", applied)
+      if (url === "/api/admin/catalog-import/bulk/apply") {
+        applied = true
+        return { ...bulkPreview("digest-1", true), createdIds: ["created-id"] }
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    return mock
+  }
+
+  async function chooseFile(name = "catalog.json") {
+    const file = new File(['{"entries":[]}'], name, {
+      type: "application/json",
+    })
+    Object.defineProperty(file, "text", {
+      value: vi.fn(async () => '{"entries":[]}'),
+    })
+    fireEvent.change(screen.getByLabelText(/Catalog file/), {
+      target: { files: [file] },
+    })
+    await flush()
+  }
+
+  it("previews without applying until the explicit confirmed action", async () => {
+    const mock = seedBulkMock()
+    const confirm = vi.fn(() => true)
+    vi.stubGlobal("confirm", confirm)
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    await chooseFile()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    expect(screen.getByText("Custom One")).toBeTruthy()
+    expect(
+      mock.mock.calls.some(
+        ([url]) => url === "/api/admin/catalog-import/bulk/apply"
+      )
+    ).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    expect(confirm).toHaveBeenCalled()
+    expect(screen.getByText("Created 1; skipped 1.")).toBeTruthy()
+    expect(
+      screen.getByText(/Existing preserved: Existing One \(house\) - Archived/)
+    ).toBeTruthy()
+  })
+
+  it("invalidates preview when the selected file changes", async () => {
+    seedBulkMock()
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    await chooseFile()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(false)
+    await chooseFile("replacement.csv")
+    expect(screen.queryByText("Custom One")).toBeNull()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    expect(screen.getByText(/Detected format: csv/)).toBeTruthy()
+  })
+
+  it("keeps apply disabled and reports errors without false success", async () => {
+    const mock = seedBulkMock()
+    mock.mockImplementation(async (url: string) => {
+      if (url === "/api/catalog/blessings")
+        return { kind: "blessings", items: [item] }
+      if (url === "/api/admin/catalog-import/bulk/preview") return bulkPreview()
+      if (url === "/api/admin/catalog-import/bulk/apply")
+        throw new ApiError(409, "conflict", "Preview digest mismatch.")
+      throw new Error("unexpected")
+    })
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    await chooseFile()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    expect(screen.getByText(/Re-preview the file before applying/)).toBeTruthy()
+    expect(screen.queryByText(/^Created/)).toBeNull()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("preserves successful apply counts when refresh preview fails and retries the same file", async () => {
+    const mock = seedBulkMock()
+    let failRefresh = false
+    let failedOnce = false
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/blessings")
+        return { kind: "blessings", items: [item] }
+      if (url === "/api/admin/catalog-import/bulk/preview") {
+        if (failRefresh && !failedOnce && init?.method === "POST") {
+          failedOnce = true
+          throw new Error("temporary preview outage")
+        }
+        return bulkPreview("digest-1", failedOnce)
+      }
+      if (url === "/api/admin/catalog-import/bulk/apply") {
+        failRefresh = true
+        return {
+          ...bulkPreview("digest-1", true),
+          skipCount: 2,
+          createdIds: ["id-1", "id-2"],
+        }
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    await chooseFile()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    expect(screen.getByText("Created 2; skipped 2.")).toBeTruthy()
+    expect(
+      screen.getByText("Import succeeded, but refresh failed. Retry preview")
+    ).toBeTruthy()
+    expect(screen.queryByText("Import failed.")).toBeNull()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Retry preview" }))
+    await flush()
+    expect(screen.getByText("Created 2; skipped 2.")).toBeTruthy()
+    expect(
+      mock.mock.calls.filter(
+        ([url]) => url === "/api/admin/catalog-import/bulk/preview"
+      )
+    ).toHaveLength(3)
+  })
+
+  it("only applies the newest response from overlapping previews of the same file", async () => {
+    const mock = seedBulkMock()
+    let previewCount = 0
+    let resolveOld!: (value: ReturnType<typeof bulkPreview>) => void
+    mock.mockImplementation(async (url: string) => {
+      if (url === "/api/catalog/blessings")
+        return { kind: "blessings", items: [item] }
+      if (url === "/api/admin/catalog-import/bulk/preview") {
+        previewCount += 1
+        if (previewCount === 2)
+          return new Promise((resolve) => {
+            resolveOld = resolve
+          })
+        return bulkPreview("newest", true)
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    await chooseFile()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+      fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    })
+    await flush()
+    resolveOld(bulkPreview("older", false))
+    await flush()
+    expect(screen.getByText("Skip existing")).toBeTruthy()
+  })
+
+  it("ignores a delayed file read after selecting a different file and applies the new file content", async () => {
+    const mock = seedBulkMock()
+    const confirm = vi.fn(() => true)
+    vi.stubGlobal("confirm", confirm)
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    let resolveOld!: (value: string) => void
+    const oldFile = new File(["old"], "old.json")
+    Object.defineProperty(oldFile, "text", {
+      value: () =>
+        new Promise<string>((resolve) => {
+          resolveOld = resolve
+        }),
+    })
+    fireEvent.change(screen.getByLabelText(/Catalog file/), {
+      target: { files: [oldFile] },
+    })
+    const newFile = new File(["new"], "new.json")
+    Object.defineProperty(newFile, "text", {
+      value: async () => '{"entries":[{"name":"B"}]}',
+    })
+    fireEvent.change(screen.getByLabelText(/Catalog file/), {
+      target: { files: [newFile] },
+    })
+    await flush()
+    resolveOld('{"entries":[{"name":"A"}]}')
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    const apply = mock.mock.calls.find(
+      ([url]) => url === "/api/admin/catalog-import/bulk/apply"
+    )
+    expect(JSON.parse((apply?.[1] as RequestInit).body as string).content).toBe(
+      '{"entries":[{"name":"B"}]}'
+    )
+  })
+
+  it("ignores an old preview response and keeps Apply disabled until the new preview resolves", async () => {
+    const mock = seedBulkMock()
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    let resolveOld!: (value: ReturnType<typeof bulkPreview>) => void
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/blessings")
+        return { kind: "blessings", items: [item] }
+      if (
+        url === "/api/admin/catalog-import/bulk/preview" &&
+        (init?.body as string).includes("A")
+      )
+        return new Promise((resolve) => {
+          resolveOld = resolve
+        })
+      if (url === "/api/admin/catalog-import/bulk/preview")
+        return bulkPreview("digest-B")
+      if (url === "/api/admin/catalog-import/bulk/apply")
+        return { ...bulkPreview(), createdIds: ["id"] }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    const choose = (name: string, text: string) => {
+      const file = new File([text], name)
+      Object.defineProperty(file, "text", { value: async () => text })
+      fireEvent.change(screen.getByLabelText(/Catalog file/), {
+        target: { files: [file] },
+      })
+    }
+    choose("a.json", "A")
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    choose("b.json", "B")
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Preview file" }))
+    await flush()
+    resolveOld(bulkPreview("digest-A"))
+    await flush()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Apply import" }))
+    await flush()
+    const apply = mock.mock.calls.find(
+      ([url]) => url === "/api/admin/catalog-import/bulk/apply"
+    )
+    expect(JSON.parse((apply?.[1] as RequestInit).body as string).content).toBe(
+      "B"
+    )
+  })
+
+  it("does not restore pending file state after closing and reopening", async () => {
+    seedBulkMock()
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    let resolve!: (value: string) => void
+    const file = new File(["old"], "old.json")
+    Object.defineProperty(file, "text", {
+      value: () =>
+        new Promise<string>((done) => {
+          resolve = done
+        }),
+    })
+    fireEvent.change(screen.getByLabelText(/Catalog file/), {
+      target: { files: [file] },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Mock close" }))
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
+    resolve("old")
+    await flush()
+    expect(screen.getByText(/Detected format: not selected/)).toBeTruthy()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply import",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("never renders bulk import controls or calls bulk endpoints for non-admins", async () => {
+    mockIsAdmin = false
+    const mock = setupMock()
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    expect(screen.queryByRole("button", { name: "Import CSV/JSON" })).toBeNull()
+    expect(
+      mock.mock.calls.every(
+        ([url]) => !String(url).includes("/api/admin/catalog-import/bulk/")
+      )
+    ).toBe(true)
   })
 })

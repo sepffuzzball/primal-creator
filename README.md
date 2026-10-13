@@ -21,7 +21,7 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
 - **Character creation & lifecycle**: create a character through an eight-step
   questionnaire (name/description, origin, and race/class/profession picked from
   the catalog), advance class/profession, allocate attribute points, evolve the
-  race grade, edit name/description, archive and restore.
+  race grade, edit name, description and all six narrative profile fields (nickname, pronouns, age description, appearance, biography and notes), archive and restore.
 - **Contextual race evolution paths**: race evolution is not a single hard-coded
   house formula. The `evolutions` catalog kind defines editable race paths
   (`track: "race"` with `fromRaceStableId`/`toRaceStableId`/`fromGrade`/`toGrade`
@@ -52,7 +52,7 @@ evolution_choice_required`).
   at most one blessing, up to 8 bloodlines and up to 8 transcendent skills - plus
   a legacy `special` boolean kept read-only (always normalized to `false` from the
   wizard) and an equipment list, plus optional narrative fields), bounded and
-  capped at 20KB - no uploaded binaries and no stat/award/effect fields. Drafts
+  capped at 256KiB - no uploaded binaries and no stat/award/effect fields. Drafts
   are optimistic-concurrency versioned (a stale write 409s) and are **not
   authoritative character state**: final creation of a `Character` (and its engine
   state) is a separate, still-transactional operation. The wizard's final create
@@ -118,6 +118,21 @@ evolution_choice_required`).
   entry is skipped instead). It is never run by `db:seed` or app startup. See
   `docs/catalog/wiki-reviewed.md` for source provenance, exact per-entry URLs and
   the "no fabricated numeric bonus" policy.
+- **Admin bulk catalog upload (JSON / CSV)**: an admin can paste a JSON or CSV
+  catalog file and preview it (`POST /api/admin/catalog-import/bulk/preview`),
+  then apply it (`POST /api/admin/catalog-import/bulk/apply`). The preview is
+  read-only; the apply inserts every missing row in one atomic `SERIALIZABLE`
+  transaction and never overwrites an existing row. `provenance` defaults to
+  `house` (only `house` / `inferred` are accepted - `verified` is rejected so an
+  unverified admin paste is not claimed as canon), `inferred` entries require an
+  https source, and would-create blessings revalidate their patron god against
+  both the live catalog and gods created by the same upload (archived / missing
+  patrons roll back the whole import). An optional content digest (SHA256 of the
+  uploaded text) is a content-integrity check, not proof that a preview ran;
+  preview is UI policy, not a server-enforced prerequisite. Like the reviewed
+  manifest, it is never run by `db:seed` or app startup, and created rows are
+  never auto-granted to characters.
+  See `docs/catalog/bulk-import.md`.
 - **Title & equipment linking**: a character can attach real catalog titles and
   equip catalog equipment. Effects and equipment bonuses are synthesized live
   from the **current**, unarchived catalog config at read time; the stored
@@ -203,12 +218,14 @@ evolution_choice_required`).
 
 The engine and schema already account for these, but they are not fully wired up:
 
-- **Catalog import**: the catalog is populated by `db:seed`. A reviewed,
+- **Catalog auto-creation**: the catalog is populated by `db:seed`. A reviewed,
   version-controlled manifest (`prisma/catalog/wiki-reviewed.ts`) can be applied
   by an admin as an explicit opt-in (`POST /api/admin/catalog-import`) - see
-  `docs/catalog/wiki-reviewed.md`. Bulk import from CSV or JSON is still deferred
-  (character backups are imported, but external catalog content is never
-  auto-created at startup or seed).
+  `docs/catalog/wiki-reviewed.md` - and an admin can bulk-upload JSON/CSV content
+  (`POST /api/admin/catalog-import/bulk/preview` and `/bulk/apply`) - see
+  `docs/catalog/bulk-import.md`. Both are explicit opt-ins; nothing auto-creates
+  catalog content at startup or seed. Character backups are imported, but external
+  catalog content is never created implicitly.
 
 ## Fan project disclaimer & attribution
 

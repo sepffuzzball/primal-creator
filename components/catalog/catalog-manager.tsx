@@ -93,6 +93,30 @@ interface ImportPreview {
   skipCount: number
 }
 
+type BulkFormat = "json" | "csv"
+interface BulkPreview {
+  source: "bulk"
+  previewDigest: string
+  entries: Array<{
+    row: number
+    kind: string
+    stableId: string
+    name: string
+    sourceUrl: string
+    provenance: string
+    status: "create" | "skip_existing"
+    existing?: {
+      id: string
+      name: string
+      sourceUrl: string | null
+      provenance: string
+      archived: boolean
+    }
+  }>
+  createCount: number
+  skipCount: number
+}
+
 function toForm(item: CatalogItem): FormState {
   return {
     name: item.name,
@@ -148,7 +172,178 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [importApplying, setImportApplying] = React.useState(false)
   const [importError, setImportError] = React.useState<string | null>(null)
   const [importResult, setImportResult] = React.useState<string | null>(null)
+  const [bulkOpen, setBulkOpen] = React.useState(false)
+  const [bulkFile, setBulkFile] = React.useState<File | null>(null)
+  const [bulkContent, setBulkContent] = React.useState<string | null>(null)
+  const [bulkFormat, setBulkFormat] = React.useState<BulkFormat | null>(null)
+  const [bulkPreview, setBulkPreview] = React.useState<BulkPreview | null>(null)
+  const [bulkLoading, setBulkLoading] = React.useState(false)
+  const [bulkApplying, setBulkApplying] = React.useState(false)
+  const [bulkError, setBulkError] = React.useState<string | null>(null)
+  const [bulkResult, setBulkResult] = React.useState<string | null>(null)
+  const bulkGeneration = React.useRef(0)
+  const bulkPreviewRequest = React.useRef(0)
   const catalogUrl = `/api/catalog/${kind}${isAdmin && showArchived ? "?includeArchived=1" : ""}`
+
+  function clearBulkPreview() {
+    setBulkPreview(null)
+    setBulkResult(null)
+    setBulkError(null)
+  }
+
+  async function readBulkFile(file: File | null) {
+    const generation = ++bulkGeneration.current
+    clearBulkPreview()
+    setBulkFile(file)
+    setBulkContent(null)
+    setBulkLoading(false)
+    setBulkApplying(false)
+    const extension = file?.name.toLowerCase().split(".").pop()
+    setBulkFormat(
+      extension === "csv" || extension === "json" ? extension : null
+    )
+    if (!file) return
+    if (file.size > 1024 * 1024) {
+      setBulkError("File exceeds the 1 MiB upload limit.")
+      return
+    }
+    if (extension !== "csv" && extension !== "json") {
+      setBulkError("Choose a .csv or .json file.")
+      return
+    }
+    try {
+      const content = await file.text()
+      if (generation !== bulkGeneration.current || !bulkOpen) return
+      if (content.length > 1024 * 1024)
+        throw new Error("File exceeds the 1 MiB upload limit.")
+      setBulkContent(content)
+    } catch (err) {
+      if (generation !== bulkGeneration.current || !bulkOpen) return
+      setBulkError(err instanceof Error ? err.message : "Could not read file.")
+    }
+  }
+
+  async function requestBulkPreview(
+    content = bulkContent,
+    format = bulkFormat
+  ) {
+    if (!isAdmin || !content || !format) return null
+    const generation = bulkGeneration.current
+    const requestId = ++bulkPreviewRequest.current
+    setBulkLoading(true)
+    setBulkError(null)
+    setBulkPreview(null)
+    try {
+      const result = await apiFetch<BulkPreview>(
+        "/api/admin/catalog-import/bulk/preview",
+        {
+          ...jsonInit("POST", { format, content }),
+        }
+      )
+      if (
+        generation !== bulkGeneration.current ||
+        requestId !== bulkPreviewRequest.current ||
+        !bulkOpen
+      )
+        return null
+      setBulkPreview(result)
+      return result
+    } catch (err) {
+      if (
+        generation !== bulkGeneration.current ||
+        requestId !== bulkPreviewRequest.current ||
+        !bulkOpen
+      )
+        return null
+      setBulkError(
+        err instanceof Error ? err.message : "Could not preview file."
+      )
+      return null
+    } finally {
+      if (
+        generation === bulkGeneration.current &&
+        requestId === bulkPreviewRequest.current &&
+        bulkOpen
+      )
+        setBulkLoading(false)
+    }
+  }
+
+  async function applyBulk() {
+    if (
+      !isAdmin ||
+      !bulkPreview ||
+      bulkPreview.createCount === 0 ||
+      !bulkContent ||
+      !bulkFormat
+    )
+      return
+    if (
+      !window.confirm(
+        `Create ${bulkPreview.createCount} catalog entries from this file? Existing entries will not be changed.`
+      )
+    )
+      return
+    const snapshotContent = bulkContent
+    const snapshotFormat = bulkFormat
+    const snapshotDigest = bulkPreview.previewDigest
+    const generation = bulkGeneration.current
+    setBulkApplying(true)
+    setBulkError(null)
+    setBulkResult(null)
+    try {
+      const result = await apiFetch<BulkPreview & { createdIds: string[] }>(
+        "/api/admin/catalog-import/bulk/apply",
+        {
+          ...jsonInit("POST", {
+            format: snapshotFormat,
+            content: snapshotContent,
+            previewDigest: snapshotDigest,
+          }),
+        }
+      )
+      if (generation !== bulkGeneration.current || !bulkOpen) {
+        await load()
+        return
+      }
+      setBulkResult(
+        `Created ${result.createdIds.length}; skipped ${result.skipCount}.`
+      )
+      // The POST succeeded: keep its result separate from refresh failures.
+      await load()
+      if (generation !== bulkGeneration.current || !bulkOpen) return
+      try {
+        const refreshed = await apiFetch<BulkPreview>(
+          "/api/admin/catalog-import/bulk/preview",
+          {
+            ...jsonInit("POST", {
+              format: snapshotFormat,
+              content: snapshotContent,
+            }),
+          }
+        )
+        if (generation !== bulkGeneration.current || !bulkOpen) return
+        setBulkPreview(refreshed)
+      } catch {
+        if (generation !== bulkGeneration.current || !bulkOpen) return
+        setBulkPreview(null)
+        setBulkError("Import succeeded, but refresh failed. Retry preview")
+      }
+    } catch (err) {
+      if (generation !== bulkGeneration.current || !bulkOpen) return
+      const message = err instanceof Error ? err.message : "Import failed."
+      setBulkPreview(null)
+      setBulkResult(null)
+      setBulkError(
+        err instanceof ApiError && err.status === 409
+          ? `${message} Re-preview the file before applying.`
+          : message
+      )
+    } finally {
+      if (generation === bulkGeneration.current && bulkOpen)
+        setBulkApplying(false)
+    }
+  }
 
   async function openImport() {
     if (!isAdmin) return
@@ -394,6 +589,21 @@ export function CatalogManager({ kind }: { kind: string }) {
             </Button>
             <Button variant="outline" onClick={openImport}>
               Import reviewed wiki entries
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                bulkGeneration.current += 1
+                clearBulkPreview()
+                setBulkFile(null)
+                setBulkContent(null)
+                setBulkFormat(null)
+                setBulkLoading(false)
+                setBulkApplying(false)
+                setBulkOpen(true)
+              }}
+            >
+              Import CSV/JSON
             </Button>
           </div>
         ) : null}
@@ -740,6 +950,152 @@ export function CatalogManager({ kind }: { kind: string }) {
                 }
               >
                 {importApplying ? "Applying..." : "Apply import"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+      {isAdmin ? (
+        <Dialog
+          open={bulkOpen}
+          onOpenChange={(open) => {
+            bulkGeneration.current += 1
+            bulkPreviewRequest.current += 1
+            setBulkOpen(open)
+            if (!open) {
+              setBulkFile(null)
+              setBulkContent(null)
+              setBulkFormat(null)
+              setBulkLoading(false)
+              setBulkApplying(false)
+              clearBulkPreview()
+            } else {
+              setBulkFile(null)
+              setBulkContent(null)
+              setBulkFormat(null)
+              setBulkLoading(false)
+              setBulkApplying(false)
+              clearBulkPreview()
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>Import CSV/JSON catalog entries</DialogTitle>
+              <DialogDescription>
+                Select a UTF-8 CSV or JSON file, preview proposed rows, then
+                explicitly apply.
+              </DialogDescription>
+            </DialogHeader>
+            <Alert>
+              No existing entries are overwritten. Imports do not grant
+              characters access, and provenance is not independently verified.
+              Review sources and provenance before applying.
+            </Alert>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="bulk-catalog-file">
+                Catalog file (maximum 1 MiB)
+              </Label>
+              <Input
+                id="bulk-catalog-file"
+                type="file"
+                accept=".csv,.json,text/csv,application/json"
+                onChange={(event) =>
+                  void readBulkFile(event.target.files?.[0] ?? null)
+                }
+              />
+              <p className="text-sm text-muted-foreground">
+                Detected format: {bulkFormat ?? "not selected"}
+                {bulkFile ? ` - ${bulkFile.name}` : ""}
+              </p>
+            </div>
+            {bulkLoading ? <p role="status">Preparing preview...</p> : null}
+            {bulkPreview ? (
+              <>
+                <p className="text-sm font-medium">
+                  {bulkPreview.createCount} to create; {bulkPreview.skipCount}{" "}
+                  to skip existing.
+                </p>
+                <div className="max-h-80 overflow-y-auto rounded-md border">
+                  <ul className="divide-y">
+                    {bulkPreview.entries.map((entry) => (
+                      <li
+                        key={`${entry.row}:${entry.kind}:${entry.stableId}`}
+                        className="flex flex-col gap-1 p-3 text-sm"
+                      >
+                        <span className="text-xs text-muted-foreground">
+                          Source row {entry.row}
+                        </span>
+                        <span className="font-medium">
+                          {entry.name}{" "}
+                          <span className="text-muted-foreground">
+                            ({entry.kind})
+                          </span>
+                        </span>
+                        <span className="font-mono text-xs">
+                          {entry.stableId}
+                        </span>
+                        <span>Provenance: {entry.provenance}</span>
+                        {entry.sourceUrl ? (
+                          <a
+                            className="break-all text-primary underline"
+                            href={entry.sourceUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {entry.sourceUrl}
+                          </a>
+                        ) : (
+                          <span>No source URL</span>
+                        )}
+                        <Badge variant="secondary">
+                          {entry.status === "create"
+                            ? "Create"
+                            : "Skip existing"}
+                        </Badge>
+                        {entry.status === "skip_existing" && entry.existing ? (
+                          <span className="text-xs text-muted-foreground">
+                            Existing preserved: {entry.existing.name} (
+                            {entry.existing.provenance})
+                            {entry.existing.archived ? " - Archived" : ""};{" "}
+                            {entry.existing.sourceUrl ?? "No source URL"}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </>
+            ) : null}
+            {bulkError ? (
+              <Alert variant="destructive">{bulkError}</Alert>
+            ) : null}
+            {bulkResult ? <Alert role="status">{bulkResult}</Alert> : null}
+            <DialogFooter showCloseButton>
+              <Button
+                variant="outline"
+                onClick={() => void requestBulkPreview()}
+                disabled={
+                  !bulkContent || !bulkFormat || bulkLoading || bulkApplying
+                }
+              >
+                {bulkError ===
+                "Import succeeded, but refresh failed. Retry preview"
+                  ? "Retry preview"
+                  : "Preview file"}
+              </Button>
+              <Button
+                onClick={applyBulk}
+                disabled={
+                  !bulkPreview ||
+                  !bulkContent ||
+                  bulkPreview.createCount === 0 ||
+                  bulkLoading ||
+                  bulkApplying ||
+                  !!bulkError
+                }
+              >
+                {bulkApplying ? "Applying..." : "Apply import"}
               </Button>
             </DialogFooter>
           </DialogContent>

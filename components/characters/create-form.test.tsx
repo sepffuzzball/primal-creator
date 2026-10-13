@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import * as React from "react"
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError, apiFetch, type CatalogItem } from "@/lib/api"
@@ -1635,5 +1642,302 @@ describe("CreateCharacterForm special step navigation (real questionnaire)", () 
     })
     const active = document.querySelector("[data-active]")
     expect(active?.textContent).toMatch(/Special abilities/)
+  })
+})
+
+describe("CreateCharacterForm profile metadata whitespace", () => {
+  it("preserves exact multiline whitespace in biography/notes in the create POST body (no trim)", async () => {
+    const bio = "\n  first line\n  second line  \n\n"
+    const notes = "  \nleading space line\n\tindented\t\n"
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Kael", biography: bio, notes }))
+    )
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "Kael" }), version: 1 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+
+    expect(createCalls).toBe(1)
+    const post = createPostBodies()[0] as Record<string, unknown>
+    // Leading/trailing whitespace and internal newlines are sent VERBATIM -
+    // never trimmed, never collapsed.
+    expect(post.biography).toBe(bio)
+    expect(post.notes).toBe(notes)
+  })
+})
+
+describe("CreateCharacterForm profile metadata", () => {
+  const META = {
+    nickname: "Kit",
+    pronouns: "they/them",
+    ageDescription: "Ancient wanderer",
+    appearance: "Tall, scarred",
+    biography: "Born under a red moon.",
+    notes: "Secretive.",
+  }
+
+  function fillMetadata() {
+    fireEvent.change(screen.getByLabelText("Nickname"), {
+      target: { value: META.nickname },
+    })
+    fireEvent.change(screen.getByLabelText("Pronouns"), {
+      target: { value: META.pronouns },
+    })
+    fireEvent.change(screen.getByLabelText("Age description (optional)"), {
+      target: { value: META.ageDescription },
+    })
+    fireEvent.change(screen.getByLabelText("Appearance (optional)"), {
+      target: { value: META.appearance },
+    })
+    fireEvent.change(screen.getByLabelText("Biography (optional)"), {
+      target: { value: META.biography },
+    })
+    fireEvent.change(screen.getByLabelText("Notes (optional)"), {
+      target: { value: META.notes },
+    })
+  }
+
+  it("persists nickname/pronouns/ageDescription/appearance/biography/notes exactly in the server draft PUT", async () => {
+    setupMock({
+      serverDraft: { data: serverData({ name: "Server" }), version: 3 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.change(screen.getByPlaceholderText("Character name"), {
+      target: { value: "Kael" },
+    })
+    fillMetadata()
+
+    // The debounced autosave PUTs the draft with every metadata field VERBATIM.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 900))
+    })
+
+    const putBodies = lastDraftPutBody()
+    expect(putBodies).toHaveLength(1)
+    const data = putBodies[0].data as Record<string, unknown>
+    expect(data.nickname).toBe(META.nickname)
+    expect(data.pronouns).toBe(META.pronouns)
+    expect(data.ageDescription).toBe(META.ageDescription)
+    expect(data.appearance).toBe(META.appearance)
+    expect(data.biography).toBe(META.biography)
+    expect(data.notes).toBe(META.notes)
+  })
+
+  it("shows all six profile metadata fields on the review step", async () => {
+    setupMock({
+      serverDraft: { data: serverData({ name: "Server" }), version: 3 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.change(screen.getByPlaceholderText("Character name"), {
+      target: { value: "Kael" },
+    })
+    fillMetadata()
+
+    // The review step renders each metadata field row: the value text is scoped
+    // to the review container because controlled textareas also expose their text
+    // value as a text node, which would otherwise match twice.
+    const reviewTitle = screen.getByRole("heading", { name: "Review" })
+    const reviewItem = reviewTitle.parentElement as HTMLElement
+    const review = within(reviewItem)
+
+    expect(review.getByText("Nickname:")).toBeTruthy()
+    expect(review.getByText(META.nickname)).toBeTruthy()
+    expect(review.getByText("Pronouns:")).toBeTruthy()
+    expect(review.getByText(META.pronouns)).toBeTruthy()
+    expect(review.getByText("Age description:")).toBeTruthy()
+    expect(review.getByText(META.ageDescription)).toBeTruthy()
+    expect(review.getByText("Appearance:")).toBeTruthy()
+    expect(review.getByText(META.appearance)).toBeTruthy()
+    expect(review.getByText("Biography:")).toBeTruthy()
+    expect(review.getByText(META.biography)).toBeTruthy()
+    expect(review.getByText("Notes:")).toBeTruthy()
+    expect(review.getByText(META.notes)).toBeTruthy()
+  })
+
+  it("includes the exact metadata values and the draft version in the create POST", async () => {
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "Kael" }), version: 4 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.change(screen.getByPlaceholderText("Character name"), {
+      target: { value: "Kael" },
+    })
+    fillMetadata()
+
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+
+    expect(createCalls).toBe(1)
+    const post = createPostBodies()[0] as Record<string, unknown>
+    // Every metadata field is sent verbatim, and the known draft version rides
+    // along for the atomic consume of the draft.
+    expect(post.nickname).toBe(META.nickname)
+    expect(post.pronouns).toBe(META.pronouns)
+    expect(post.ageDescription).toBe(META.ageDescription)
+    expect(post.appearance).toBe(META.appearance)
+    expect(post.biography).toBe(META.biography)
+    expect(post.notes).toBe(META.notes)
+    expect(post.draftVersion).toBe(4)
+  })
+
+  it("restores all six metadata fields from the device draft after a divergent server draft recovery (no clobber)", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Kael", ...META }))
+    )
+    setupMock({
+      serverDraft: {
+        data: serverData({
+          name: "Server",
+          nickname: "Srv",
+          pronouns: "he/him",
+          ageDescription: "Young",
+          appearance: "Short",
+          biography: "SBio",
+          notes: "SNotes",
+        }),
+        version: 3,
+      },
+    })
+
+    await renderForm()
+    await flush()
+
+    // Metadata-only divergence surfaces the explicit recovery choice, never a
+    // silent overwrite of the device copy.
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    const raw = window.localStorage.getItem(RECOVERY_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw as string).nickname).toBe(META.nickname)
+
+    // Keeping the device content restores every metadata field from the local
+    // copy.
+    fireEvent.click(screen.getByText(/Use device draft/))
+    await flush()
+
+    expect((screen.getByLabelText("Nickname") as HTMLInputElement).value).toBe(
+      META.nickname
+    )
+    expect((screen.getByLabelText("Pronouns") as HTMLInputElement).value).toBe(
+      META.pronouns
+    )
+    expect(
+      (
+        screen.getByLabelText(
+          "Age description (optional)"
+        ) as HTMLTextAreaElement
+      ).value
+    ).toBe(META.ageDescription)
+    expect(
+      (screen.getByLabelText("Appearance (optional)") as HTMLTextAreaElement)
+        .value
+    ).toBe(META.appearance)
+    expect(
+      (screen.getByLabelText("Biography (optional)") as HTMLTextAreaElement)
+        .value
+    ).toBe(META.biography)
+    expect(
+      (screen.getByLabelText("Notes (optional)") as HTMLTextAreaElement).value
+    ).toBe(META.notes)
+
+    // The chosen device snapshot is now the live draft - the server metadata was
+    // not clobbered in and the recovery copy is cleared.
+    const stored = JSON.parse(
+      window.localStorage.getItem(STORAGE_KEY) as string
+    )
+    expect(stored.nickname).toBe(META.nickname)
+    expect(stored.pronouns).toBe(META.pronouns)
+    expect(window.localStorage.getItem(RECOVERY_KEY)).toBeNull()
+  })
+
+  it("clearing previously-set metadata fields posts null in the create POST", async () => {
+    setupMock({
+      serverDraft: null,
+      putResult: { data: serverData({ name: "Kael" }), version: 5 },
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.change(screen.getByPlaceholderText("Character name"), {
+      target: { value: "Kael" },
+    })
+    fillMetadata()
+    // Clear every metadata field back to blank.
+    fireEvent.change(screen.getByLabelText("Nickname"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Pronouns"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Age description (optional)"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Appearance (optional)"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Biography (optional)"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("Notes (optional)"), {
+      target: { value: "" },
+    })
+
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+
+    expect(createCalls).toBe(1)
+    const post = createPostBodies()[0] as Record<string, unknown>
+    // A blank metadata field is cleared on the server (null), never kept as "".
+    expect(post.nickname).toBeNull()
+    expect(post.pronouns).toBeNull()
+    expect(post.ageDescription).toBeNull()
+    expect(post.appearance).toBeNull()
+    expect(post.biography).toBeNull()
+    expect(post.notes).toBeNull()
+  })
+
+  it("a metadata autosave failure keeps the current form and shows the error (no fake Saved)", async () => {
+    setupMock({
+      serverDraft: { data: serverData({ name: "Server" }), version: 3 },
+      putError: new Error("network down"),
+    })
+
+    await renderForm()
+    await flush()
+
+    fireEvent.change(screen.getByLabelText("Nickname"), {
+      target: { value: "Kit" },
+    })
+
+    // The debounced autosave PUT fails; the error is surfaced and the form is
+    // preserved (no reload/clobber, no fake "Saved").
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 900))
+    })
+
+    expect(screen.getByText(/network down/)).toBeTruthy()
+    expect(screen.queryByText("Saved")).toBeNull()
+    expect(screen.queryByText("Saving...")).toBeNull()
+    expect((screen.getByLabelText("Nickname") as HTMLInputElement).value).toBe(
+      "Kit"
+    )
   })
 })

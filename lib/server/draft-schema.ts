@@ -7,15 +7,25 @@
  * else (stat vectors, awards, effects, uploaded binaries) is rejected or dropped.
  *
  * The payload is bounded: each string field has a per-field cap and the whole
- * `data` object is capped at 20KB, so a draft never grows unbounded and no
+ * `data` object is capped at 256 KiB, so a draft never grows unbounded and no
  * binary is ever accepted (only JSON-serializable values).
  */
 
 import { z } from "zod"
 import { specialAbilitiesSchema } from "@/lib/server/schemas"
 
-/** Hard cap on the serialized `data` payload (20 KB). */
-export const DRAFT_DATA_MAX_BYTES = 20 * 1024
+/** Hard cap on the serialized `data` payload (256 KiB). */
+export const DRAFT_DATA_MAX_BYTES = 256 * 1024
+
+/**
+ * Hard cap on the entire PUT request body. The `data` payload may be up to
+ * `DRAFT_DATA_MAX_BYTES`, and the surrounding JSON wrapper (`{"data": ...,
+ * "version": n}` plus field names/whitespace) adds only a handful of bytes, so a
+ * 4 KiB allowance is far more than the wrapper needs. The API route rejects any
+ * body larger than this before parsing, so a pathological payload never
+ * allocates unbounded memory or reaches the Zod validator.
+ */
+export const DRAFT_REQUEST_MAX_BYTES = DRAFT_DATA_MAX_BYTES + 4096
 
 const boundedString = (max: number, opts?: { nullable?: boolean }) => {
   const s = z.string().max(max)

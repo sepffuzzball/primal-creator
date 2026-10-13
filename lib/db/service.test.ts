@@ -1042,6 +1042,327 @@ describe("createCharacter special abilities (atomic selection)", () => {
   })
 })
 
+describe("character profile metadata (create/read/edit/clear)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedRaceClass() {
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  function defaultIdentity() {
+    return {
+      name: "Imported",
+      description: null,
+      origin: "integrated" as const,
+      race: { stableId: "human" },
+      class: { stableId: "archer" },
+      profession: null,
+    }
+  }
+
+  function makeV3Doc(
+    identityOverride: Record<string, unknown> = {}
+  ): CharacterImportDocument {
+    return {
+      schema: IMPORT_SCHEMA_V3,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        ...defaultIdentity(),
+        ...identityOverride,
+      } as CharacterImportDocument["identity"],
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+  }
+
+  function makeV4Doc(
+    identityOverride: Record<string, unknown> = {}
+  ): CharacterImportDocument {
+    return {
+      schema: IMPORT_SCHEMA_V4,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        ...defaultIdentity(),
+        ...identityOverride,
+      } as CharacterImportDocument["identity"],
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+  }
+
+  it("creates a character with profile metadata and returns it in detail", async () => {
+    seedRaceClass()
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        nickname: "Kael",
+        pronouns: "they/them",
+        ageDescription: "A youthful 30",
+        appearance: "Tall, dark hair",
+        biography: "Grew up in the lowlands",
+        notes: "Private GM notes",
+      },
+      user
+    )
+    expect(detail.nickname).toBe("Kael")
+    expect(detail.pronouns).toBe("they/them")
+    expect(detail.ageDescription).toBe("A youthful 30")
+    expect(detail.appearance).toBe("Tall, dark hair")
+    expect(detail.biography).toBe("Grew up in the lowlands")
+    expect(detail.notes).toBe("Private GM notes")
+    // The create journal names only the supplied metadata fields, never the prose.
+    const createPayload = dbMock.store.events[0].payload as Record<
+      string,
+      unknown
+    >
+    expect(createPayload.metadataFields).toEqual([
+      "nickname",
+      "pronouns",
+      "ageDescription",
+      "appearance",
+      "biography",
+      "notes",
+    ])
+  })
+
+  it("creates a character with omitted metadata as null", async () => {
+    seedRaceClass()
+    const detail = await createCharacter(
+      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      user
+    )
+    expect(detail.nickname).toBeNull()
+    expect(detail.pronouns).toBeNull()
+    expect(detail.ageDescription).toBeNull()
+    expect(detail.appearance).toBeNull()
+    expect(detail.biography).toBeNull()
+    expect(detail.notes).toBeNull()
+  })
+
+  it("reads profile metadata through getCharacter", async () => {
+    seedRaceClass()
+    const created = await createCharacter(
+      {
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        nickname: "Kael",
+      },
+      user
+    )
+    const read = await getCharacter(created.id, user)
+    expect(read.nickname).toBe("Kael")
+    expect(read.pronouns).toBeNull()
+  })
+
+  it("edits and clears profile metadata through updateCharacter", async () => {
+    seedRaceClass()
+    const created = await createCharacter(
+      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      user
+    )
+    const updated = await updateCharacter(
+      created.id,
+      {
+        nickname: "Renamed",
+        pronouns: null,
+        biography: "new bio",
+        version: created.version,
+      },
+      user
+    )
+    expect(updated.nickname).toBe("Renamed")
+    expect(updated.pronouns).toBeNull()
+    expect(updated.biography).toBe("new bio")
+    const cleared = await updateCharacter(
+      created.id,
+      { nickname: null, version: updated.version },
+      user
+    )
+    expect(cleared.nickname).toBeNull()
+    expect(cleared.biography).toBe("new bio")
+  })
+
+  it("records the update journal as changed field names + actor, never the prose", async () => {
+    seedRaceClass()
+    const created = await createCharacter(
+      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      user
+    )
+    await updateCharacter(
+      created.id,
+      {
+        appearance: "Very long appearance prose ".repeat(10),
+        notes: "private",
+      },
+      user
+    )
+    // events[0] is the create event; events[1] is the update event.
+    const payload = dbMock.store.events[1].payload as Record<string, unknown>
+    expect(payload.changedFields).toEqual(["appearance", "notes"])
+    expect(payload.actorId).toBe(user.id)
+    // The long prose / private notes are not duplicated into the journal.
+    expect(payload.appearance).toBeUndefined()
+    expect(payload.notes).toBeUndefined()
+  })
+
+  it("round-trips profile metadata through export and re-import (v4)", async () => {
+    seedRaceClass()
+    const src = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        nickname: "Kael",
+        pronouns: "they/them",
+        appearance: "Tall, dark hair",
+        biography: "Grew up in the lowlands",
+        notes: "Private GM notes",
+      },
+      user
+    )
+    const exported = (await exportCharacter(
+      src.id,
+      user
+    )) as unknown as CharacterImportDocument
+    const identity = exported.identity as Record<string, unknown>
+    expect(identity.nickname).toBe("Kael")
+    expect(identity.notes).toBe("Private GM notes")
+
+    const imported = await importCharacter(exported, user)
+    expect(imported.nickname).toBe("Kael")
+    expect(imported.pronouns).toBe("they/them")
+    expect(imported.appearance).toBe("Tall, dark hair")
+    expect(imported.biography).toBe("Grew up in the lowlands")
+    expect(imported.notes).toBe("Private GM notes")
+  })
+
+  it("imports a v3/v4 backup with metadata fields absent as null", async () => {
+    seedRaceClass()
+    const imported = await importCharacter(makeV3Doc(), user)
+    expect(imported.nickname).toBeNull()
+    expect(imported.pronouns).toBeNull()
+    expect(imported.ageDescription).toBeNull()
+    expect(imported.appearance).toBeNull()
+    expect(imported.biography).toBeNull()
+    expect(imported.notes).toBeNull()
+  })
+
+  it("imports a v4 backup with metadata fields populated", async () => {
+    seedRaceClass()
+    const doc = makeV4Doc({
+      nickname: "Kael",
+      pronouns: "they/them",
+      ageDescription: "30",
+      appearance: "Tall",
+      biography: "Lowlands",
+      notes: "GM note",
+    })
+    const imported = await importCharacter(doc, user)
+    expect(imported.nickname).toBe("Kael")
+    expect(imported.pronouns).toBe("they/them")
+    expect(imported.ageDescription).toBe("30")
+    expect(imported.appearance).toBe("Tall")
+    expect(imported.biography).toBe("Lowlands")
+    expect(imported.notes).toBe("GM note")
+  })
+
+  it("preserves exact whitespace and newlines in multiline metadata through create/update/read", async () => {
+    seedRaceClass()
+    const bio = "\n  first line\n  second line  \n\n"
+    const notes = "  \nleading space line\n\tindented\t\n"
+    const created = await createCharacter(
+      {
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        biography: bio,
+        notes,
+      },
+      user
+    )
+    // The create must not trim leading/trailing whitespace or newlines.
+    expect(created.biography).toBe(bio)
+    expect(created.notes).toBe(notes)
+
+    const read = await getCharacter(created.id, user)
+    expect(read.biography).toBe(bio)
+    expect(read.notes).toBe(notes)
+
+    const updated = await updateCharacter(
+      created.id,
+      {
+        biography: bio + "\nappended  ",
+        notes: notes + "more\t",
+        version: created.version,
+      },
+      user
+    )
+    expect(updated.biography).toBe(bio + "\nappended  ")
+    expect(updated.notes).toBe(notes + "more\t")
+  })
+
+  it("stores an empty-string metadata field as null, never as an empty value", async () => {
+    seedRaceClass()
+    const created = await createCharacter(
+      {
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+        biography: "",
+        notes: "x",
+        pronouns: "",
+      },
+      user
+    )
+    // The exact empty string is normalized to NULL; a non-empty value survives.
+    expect(created.biography).toBeNull()
+    expect(created.pronouns).toBeNull()
+    expect(created.notes).toBe("x")
+    // An empty-string field is NOT recorded as supplied metadata.
+    const createPayload = dbMock.store.events[0].payload as Record<
+      string,
+      unknown
+    >
+    expect(createPayload.metadataFields).toEqual(["notes"])
+  })
+})
+
 describe("associateCharacter (titles / equipment)", () => {
   beforeEach(() => {
     dbMock.store.reset()
@@ -2066,6 +2387,87 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     // The catalog edit itself does not write any character progression event.
     expect(dbMock.store.events).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("associate")
+  })
+
+  it("maps a concurrent blessing singleton conflict (P2002) to a 409, never a 500", async () => {
+    seedCharacter()
+    seedBlessing("bless-1", { tier: "Minor", effects: [] })
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2002",
+      meta: { target: ["characterId"] },
+    })
+    try {
+      await expect(
+        associateCharacter(
+          "chr-1",
+          {
+            kind: "blessing",
+            definitionId: "bless-1",
+            operation: "add",
+            version: 0,
+          },
+          user
+        )
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "blessing_singleton_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    // The race that lost the singleton did not write anything.
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("maps a generic non-blessing association unique race to a retryable 409, never a blessing conflict", async () => {
+    seedCharacter()
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2002",
+      meta: { target: ["characterId", "definitionId"] },
+    })
+    try {
+      // The same-title/equipment/bloodline slot is not a blessing singleton, so
+      // the unique-race mapping must NOT label it as one.
+      await expect(
+        associateCharacter(
+          "chr-1",
+          {
+            kind: "title",
+            definitionId: "title-1",
+            operation: "add",
+            version: 0,
+          },
+          user
+        )
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "association_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("the partial unique index rejects a second BLESSING link for the same character", async () => {
+    seedCharacter()
+    seedBlessing("bless-1", { tier: "Minor", effects: [] })
+    seedBlessing("bless-2", { tier: "Minor", effects: [] })
+    await prisma.characterAssociation.create({
+      data: { characterId: "chr-1", definitionId: "bless-1", kind: "BLESSING" },
+    })
+    await expect(
+      prisma.characterAssociation.create({
+        data: {
+          characterId: "chr-1",
+          definitionId: "bless-2",
+          kind: "BLESSING",
+        },
+      })
+    ).rejects.toMatchObject({ code: "P2002" })
+    // Only the first link survived (the index is a hard guard, not a soft one).
+    expect(dbMock.store.associations).toHaveLength(1)
   })
 })
 
@@ -4712,6 +5114,68 @@ describe("importCharacter (trusted backup v3)", () => {
     })
   })
 
+  it("rejects the SAME blessing catalog definition referenced twice on import as a link collision", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "blessings",
+      "bless-1",
+      { tier: "Minor", effects: [] },
+      { name: "Bless One" }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "bless-1" },
+        },
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "bless-1" },
+        },
+      ],
+    })
+    // A duplicated blessing is a single-slot collision, never a generic duplicate
+    // link - the resolver counts blessing refs BEFORE the per-ref duplicate guard.
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+  })
+
+  it("rejects an active + archived blessing pair on import as a link collision", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "blessings",
+      "bless-1",
+      { tier: "Minor", effects: [] },
+      { name: "Bless One" }
+    )
+    addImportCatalog(
+      "blessings",
+      "bless-2",
+      { tier: "Minor", effects: [] },
+      { name: "Bless Two", archived: true }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "bless-1" },
+        },
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "bless-2" },
+        },
+      ],
+    })
+    // An archived blessing still occupies the single blessing slot, so an
+    // active + archived pair is a collision, not an inert append.
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+  })
+
   it("rejects two active bloodlines sharing an upgrade group on import", async () => {
     seedRaceClass()
     addImportCatalog(
@@ -4744,19 +5208,14 @@ describe("importCharacter (trusted backup v3)", () => {
     })
   })
 
-  it("ignores archived definitions when checking import collisions", async () => {
+  it("ignores archived definitions when checking import collisions for non-blessing kinds", async () => {
     seedRaceClass()
+    // A single blessing (an archived one would still count toward the singleton).
     addImportCatalog(
       "blessings",
       "bless-1",
       { tier: "Minor", effects: [] },
       { name: "Bless One" }
-    )
-    addImportCatalog(
-      "blessings",
-      "bless-arch",
-      { tier: "Minor", effects: [] },
-      { name: "Bless Arch", archived: true }
     )
     addImportCatalog(
       "bloodlines",
@@ -4777,10 +5236,6 @@ describe("importCharacter (trusted backup v3)", () => {
           definition: { kind: "blessings", stableId: "bless-1" },
         },
         {
-          kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-arch" },
-        },
-        {
           kind: "bloodline",
           definition: { kind: "bloodlines", stableId: "blood-1" },
         },
@@ -4791,7 +5246,43 @@ describe("importCharacter (trusted backup v3)", () => {
       ],
     })
     const result = await importCharacter(doc, user)
-    expect(result.associations).toHaveLength(4)
+    expect(result.associations).toHaveLength(3)
+  })
+
+  it("rejects an active plus archived blessing on import (two total blessings)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "blessings",
+      "bless-1",
+      { tier: "Minor", effects: [] },
+      { name: "Bless One" }
+    )
+    addImportCatalog(
+      "blessings",
+      "bless-arch",
+      { tier: "Minor", effects: [] },
+      { name: "Bless Arch", archived: true }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "bless-1" },
+        },
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "bless-arch" },
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+    // No character, event or link is written.
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
   })
 
   it("round-trips blessing and bloodline link kinds through export/import", async () => {

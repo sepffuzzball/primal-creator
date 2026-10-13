@@ -246,7 +246,7 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
  * A NEW manifest entry must carry the full modern shape; a legacy metadata-only
  * config that is fine for an existing row is rejected here.
  */
-function assertModernConfig(
+export function assertModernConfig(
   kind: string,
   config: Record<string, unknown>
 ): void {

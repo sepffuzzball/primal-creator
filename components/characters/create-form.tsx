@@ -39,6 +39,18 @@ import {
 
 const STORAGE_KEY = "primal-create-draft"
 
+/**
+ * Normalize a character-profile metadata field for the POST body. Converts ONLY
+ * the exact empty string `""` to null (a blank field is omitted/cleared) and
+ * otherwise passes the value through VERBATIM - leading/trailing whitespace and
+ * newlines are never trimmed, so a multiline biography/notes value survives to
+ * the server exactly as typed.
+ */
+function metadataOrNull(value: string | null | undefined): string | null {
+  if (value === "") return null
+  return value ?? null
+}
+
 // Separate recovery key: while a local vs server draft conflict is unresolved,
 // the device's local draft copy is kept here so a refresh cannot lose it. The
 // live fallback in STORAGE_KEY is overwritten by whichever draft is applied.
@@ -88,9 +100,7 @@ interface Draft {
   professionId: string
   special: string // 'yes' | 'none' (legacy only; the UI never sets 'yes')
   equipment: string // 'yes' | 'none' (always 'none'; no picker yet)
-  // Draft-only metadata passthrough fields. Not rendered by this wizard but
-  // preserved so a server draft never silently drops them. Neither is sent to
-  // the create request (only name/description are supported identity fields).
+  // Optional profile fields are carried through local and server draft recovery.
   nickname: string | null
   pronouns: string | null
   ageDescription: string | null
@@ -1036,12 +1046,24 @@ export function CreateCharacterForm() {
           professionId?: string
           draftVersion?: number
           specialAbilities: SpecialAbilitiesSelection
+          nickname: string | null
+          pronouns: string | null
+          ageDescription: string | null
+          appearance: string | null
+          biography: string | null
+          notes: string | null
         } = {
           name: draft.name,
           origin: draft.origin as "integrated" | "born",
           raceId,
           classId,
           specialAbilities: toServerData(draft).specialAbilities!,
+          nickname: metadataOrNull(draft.nickname),
+          pronouns: metadataOrNull(draft.pronouns),
+          ageDescription: metadataOrNull(draft.ageDescription),
+          appearance: metadataOrNull(draft.appearance),
+          biography: metadataOrNull(draft.biography),
+          notes: metadataOrNull(draft.notes),
           ...(professionId ? { professionId } : {}),
         }
         if (draft.description) body.description = draft.description
@@ -1229,6 +1251,48 @@ export function CreateCharacterForm() {
               placeholder="Character name"
               value={draft.name}
               onChange={(e) => setField("name", e.target.value)}
+            />
+            <QuestionnaireInput
+              aria-label="Nickname"
+              placeholder="Nickname (optional)"
+              maxLength={200}
+              value={draft.nickname ?? ""}
+              onChange={(e) => setField("nickname", e.target.value)}
+            />
+            <QuestionnaireInput
+              aria-label="Pronouns"
+              placeholder="Pronouns (optional)"
+              maxLength={100}
+              value={draft.pronouns ?? ""}
+              onChange={(e) => setField("pronouns", e.target.value)}
+            />
+            <label htmlFor="create-age">Age description (optional)</label>
+            <textarea
+              id="create-age"
+              maxLength={4000}
+              value={draft.ageDescription ?? ""}
+              onChange={(e) => setField("ageDescription", e.target.value)}
+            />
+            <label htmlFor="create-appearance">Appearance (optional)</label>
+            <textarea
+              id="create-appearance"
+              maxLength={8000}
+              value={draft.appearance ?? ""}
+              onChange={(e) => setField("appearance", e.target.value)}
+            />
+            <label htmlFor="create-biography">Biography (optional)</label>
+            <textarea
+              id="create-biography"
+              maxLength={8000}
+              value={draft.biography ?? ""}
+              onChange={(e) => setField("biography", e.target.value)}
+            />
+            <label htmlFor="create-notes">Notes (optional)</label>
+            <textarea
+              id="create-notes"
+              maxLength={4000}
+              value={draft.notes ?? ""}
+              onChange={(e) => setField("notes", e.target.value)}
             />
             <QuestionnaireInput
               placeholder="Description (optional)"
@@ -1698,6 +1762,38 @@ export function CreateCharacterForm() {
                 <span className="text-muted-foreground">Name: </span>
                 {draft.name || <span className="text-muted-foreground">-</span>}
               </div>
+              {(
+                [
+                  "nickname",
+                  "pronouns",
+                  "ageDescription",
+                  "appearance",
+                  "biography",
+                  "notes",
+                ] as const
+              ).map((field) => (
+                <div key={field}>
+                  <span className="text-muted-foreground">
+                    {field === "ageDescription"
+                      ? "Age description"
+                      : field[0].toUpperCase() + field.slice(1)}
+                    :{" "}
+                  </span>
+                  {draft[field]?.trim() ? (
+                    <span
+                      className={
+                        field === "biography"
+                          ? "line-clamp-4 whitespace-pre-wrap"
+                          : "whitespace-pre-wrap"
+                      }
+                    >
+                      {draft[field]}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">Not provided</span>
+                  )}
+                </div>
+              ))}
               <div>
                 <span className="text-muted-foreground">Origin: </span>
                 {draft.origin ? (

@@ -394,6 +394,12 @@ export interface CharacterDetail {
   id: string
   name: string
   description: string | null
+  nickname: string | null
+  pronouns: string | null
+  ageDescription: string | null
+  appearance: string | null
+  biography: string | null
+  notes: string | null
   origin: "integrated" | "born"
   raceId: string | null
   classId: string | null
@@ -460,6 +466,15 @@ export interface SpecialAbilitiesSelection {
 export interface CharacterCreateRequest {
   name: string
   description?: string
+  // Character-profile metadata. Optional + nullable: an omitted/null field is
+  // persisted as NULL. Bounds mirror the create schema (nickname 200, pronouns
+  // 100, ageDescription 4000, appearance 8000, biography 8000, notes 4000).
+  nickname?: string | null
+  pronouns?: string | null
+  ageDescription?: string | null
+  appearance?: string | null
+  biography?: string | null
+  notes?: string | null
   origin: "integrated" | "born"
   raceId: string
   classId: string
@@ -662,6 +677,14 @@ export interface ExportInventoryItem {
 export interface CharacterIdentityExport {
   name: string
   description: string | null
+  // Profile metadata, exported verbatim (nullable) so a backup round-trips the
+  // exact stored values; an absent field exports as null.
+  nickname: string | null
+  pronouns: string | null
+  ageDescription: string | null
+  appearance: string | null
+  biography: string | null
+  notes: string | null
   origin: "integrated" | "born"
   race: { stableId: string | null }
   class: { stableId: string | null }

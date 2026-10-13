@@ -21,13 +21,16 @@ import {
   associateCharacter,
   createCatalogItem,
   createCharacter,
+  createInitialState,
   exportCharacter,
   importCharacter,
+  serializeState,
   skillCharacter,
   updateCatalogItem,
 } from "@/lib/db/service"
 import {
   IMPORT_RULESET_VERSION,
+  IMPORT_SCHEMA_V4,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
 import { resolveDbIntegration } from "@/lib/test/db-integration"
@@ -955,5 +958,118 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       expect(stock).toBeDefined()
       expect(stock!.quantity).toBeGreaterThanOrEqual(1)
     }
+  })
+
+  it("rejects a second BLESSING link on one character via the partial unique index", async () => {
+    const char = await createCharacter(
+      {
+        name: "Blessing Singleton",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(char.id)
+
+    await associateCharacter(
+      char.id,
+      {
+        kind: "blessing",
+        definitionId: pgBlessId,
+        operation: "add",
+        version: char.version,
+      },
+      ownerUser
+    )
+
+    // A second, different blessing definition for the SAME character. The
+    // migration's partial unique index (at most one BLESSING link per character)
+    // must reject it with a P2002 unique-violation on the character id.
+    const other = await createCatalogItem("blessings", {
+      stableId: "pg-bless-singleton",
+      name: "PG Blessing Singleton Other",
+      config: { tier: "Minor", effects: [] },
+    })
+    createdCatalogIds.push(other.id)
+    await expect(
+      prisma.characterAssociation.create({
+        data: {
+          characterId: char.id,
+          definitionId: other.id,
+          kind: "BLESSING",
+        },
+      })
+    ).rejects.toMatchObject({ code: "P2002" })
+
+    // Only the single original link remains.
+    const links = await prisma.characterAssociation.findMany({
+      where: { characterId: char.id, kind: "BLESSING" },
+    })
+    expect(links).toHaveLength(1)
+    expect(links[0].definitionId).toBe(pgBlessId)
+  })
+
+  it("rejects a backup carrying an active + archived blessing pair (singleton) and writes nothing", async () => {
+    // Create an archived blessing definition so the backup can reference it.
+    const arch = await createCatalogItem("blessings", {
+      stableId: "pg-bless-arch",
+      name: "PG Blessing Archived",
+      config: { tier: "Minor", effects: [] },
+    })
+    createdCatalogIds.push(arch.id)
+    await prisma.catalogDefinition.update({
+      where: { id: arch.id },
+      data: { archived: true },
+    })
+
+    const before = await prisma.character.count({
+      where: { ownerId: ownerUser.id },
+    })
+
+    const doc = {
+      schema: IMPORT_SCHEMA_V4,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Imported Singleton",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "pg-bless-1" },
+        },
+        {
+          kind: "blessing",
+          definition: { kind: "blessings", stableId: "pg-bless-arch" },
+        },
+      ],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+
+    await expect(importCharacter(doc, ownerUser)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+
+    // The failed import committed nothing: no character row was created.
+    const after = await prisma.character.count({
+      where: { ownerId: ownerUser.id },
+    })
+    expect(after).toBe(before)
+    const assocCount = await prisma.characterAssociation.count({
+      where: { kind: "BLESSING" },
+    })
+    expect(assocCount).toBeGreaterThanOrEqual(1) // only the source round-trip's link
   })
 })

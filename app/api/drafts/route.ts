@@ -1,6 +1,9 @@
 import { requireUser } from "@/lib/auth/guard"
-import { badRequest, respond } from "@/lib/server/errors"
-import { draftPutSchema } from "@/lib/server/draft-schema"
+import { badRequest, payloadTooLarge, respond } from "@/lib/server/errors"
+import {
+  draftPutSchema,
+  DRAFT_REQUEST_MAX_BYTES,
+} from "@/lib/server/draft-schema"
 import { deleteDraft, getDraft, saveDraft } from "@/lib/db/draft-service"
 
 export const runtime = "nodejs"
@@ -17,6 +20,53 @@ function draftPayload(draft: {
     version: draft.version,
     updatedAt: draft.updatedAt,
   }
+}
+
+/**
+ * Read the PUT body with a hard byte cap, throwing a 413 before the JSON is ever
+ * parsed. Reading through the stream (rather than `request.json()`) means a
+ * pathological payload larger than the cap never allocates unbounded memory and
+ * never reaches the Zod validator. A trusted `Content-Length` header is checked
+ * up front so an obviously oversized body is rejected without reading a single
+ * byte; a missing or untrusted value falls back to the streamed hard limit.
+ */
+async function readDraftBodyBounded(req: Request): Promise<string> {
+  const declared = req.headers.get("content-length")
+  if (declared != null) {
+    const length = Number(declared)
+    if (Number.isFinite(length) && length > DRAFT_REQUEST_MAX_BYTES) {
+      throw payloadTooLarge(
+        "payload_too_large",
+        `Draft payload exceeds the ${DRAFT_REQUEST_MAX_BYTES / 1024}KiB limit`
+      )
+    }
+  }
+
+  const reader = req.body?.getReader()
+  if (!reader) return ""
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > DRAFT_REQUEST_MAX_BYTES) {
+      // Stop consuming the stream at the cap instead of buffering the whole body.
+      await reader.cancel()
+      throw payloadTooLarge(
+        "payload_too_large",
+        `Draft payload exceeds the ${DRAFT_REQUEST_MAX_BYTES / 1024}KiB limit`
+      )
+    }
+    chunks.push(value)
+  }
+  const merged = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    merged.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return new TextDecoder().decode(merged)
 }
 
 /**
@@ -40,8 +90,15 @@ export async function GET(req: Request) {
  */
 export async function PUT(req: Request) {
   return respond(async () => {
+    // Auth + same-origin CSRF are verified before the body is ever read.
     const user = await requireUser(req)
-    const body = await req.json().catch(() => null)
+    const raw = await readDraftBodyBounded(req)
+    let body: unknown
+    try {
+      body = raw.length ? JSON.parse(raw) : undefined
+    } catch {
+      throw badRequest("validation", "Draft payload is not valid JSON")
+    }
     const parsed = draftPutSchema.safeParse(body)
     if (!parsed.success) {
       throw badRequest("validation", "Invalid draft payload")

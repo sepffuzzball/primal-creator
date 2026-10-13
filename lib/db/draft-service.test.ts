@@ -3,6 +3,8 @@ import { deleteDraft, getDraft, saveDraft } from "@/lib/db/draft-service"
 import {
   draftDataSchema,
   draftPutSchema,
+  DRAFT_DATA_MAX_BYTES,
+  DRAFT_REQUEST_MAX_BYTES,
   type DraftData,
 } from "@/lib/server/draft-schema"
 import { DELETE, GET, PUT } from "@/app/api/drafts/route"
@@ -42,6 +44,35 @@ const DATA: DraftData = {
   appearance: "Dark hair, green cloak.",
   biography: "Born beyond the boundary.",
   notes: "Carries an heirloom dagger.",
+}
+
+/**
+ * A valid draft that pushes the payload close to its 256 KiB cap: every bounded
+ * string is filled to its per-field max with a 4-byte UTF-8 emoji (so the byte
+ * total far exceeds the old 20 KiB cap that could not persist it) and the
+ * equipment array is filled to its 128-item cap. Used to prove a legitimate
+ * large draft is accepted and persisted.
+ */
+function nearLimitData(): DraftData {
+  const emoji = "\u{1F600}" // U+1F600: 4 UTF-8 bytes, 2 UTF-16 code units.
+  const fill = (units: number) => emoji.repeat(units / 2)
+  return {
+    step: 4,
+    name: fill(256),
+    description: fill(8000),
+    origin: "born",
+    raceId: "race-1",
+    classId: "class-1",
+    professionId: "prof-1",
+    special: true,
+    equipment: Array.from({ length: 128 }, () => "e".repeat(128)),
+    nickname: fill(200),
+    pronouns: fill(100),
+    ageDescription: fill(4000),
+    appearance: fill(8000),
+    biography: fill(8000),
+    notes: fill(4000),
+  }
 }
 
 async function signedRequest(
@@ -109,12 +140,22 @@ describe("draft data schema (whitelist / bounds)", () => {
     expect(parsed.success).toBe(false)
   })
 
-  it("rejects an oversized data payload (over 20KB)", () => {
-    // Each field is under its own cap, but together they exceed the 20KB total.
+  it("accepts a near-limit data payload spread across fields (over 20KiB)", () => {
+    const data = nearLimitData()
+    const bytes = Buffer.byteLength(JSON.stringify(data), "utf8")
+    expect(bytes).toBeGreaterThan(20 * 1024)
+    expect(bytes).toBeLessThanOrEqual(DRAFT_DATA_MAX_BYTES)
+    const parsed = draftDataSchema.safeParse(data)
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects an oversized data payload (over 256KiB)", () => {
+    // Every field is at (or under) its own cap, but a deliberately long
+    // specialAbilities id (whose string length is intentionally unbounded) is
+    // enough to push the serialized total beyond the whole-payload cap.
     const parsed = draftDataSchema.safeParse({
-      biography: "x".repeat(7000),
-      appearance: "y".repeat(7000),
-      description: "z".repeat(7000),
+      ...nearLimitData(),
+      specialAbilities: { blessingId: "b".repeat(DRAFT_DATA_MAX_BYTES) },
     })
     expect(parsed.success).toBe(false)
   })
@@ -407,6 +448,86 @@ describe("api drafts route (auth + validation)", () => {
     }
     expect(json.draft.version).toBe(0)
     expect(json.draft.data).toEqual(DATA)
+  })
+
+  it("PUT accepts a near-limit draft payload (over 20KiB) and persists it", async () => {
+    const data = nearLimitData()
+    const res = await PUT(
+      await signedRequest("http://test/api/drafts", "PUT", { data })
+    )
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as {
+      draft: { id: string; version: number; data: DraftData }
+    }
+    expect(json.draft.version).toBe(0)
+    expect(json.draft.data).toEqual(data)
+    expect(dbMock.store.drafts.size).toBe(1)
+    const stored = [...dbMock.store.drafts.values()][0]
+    expect(stored.data).toEqual(data)
+  })
+
+  it("PUT rejects an oversized declared Content-Length with a 413 before reading", async () => {
+    const token = await createSessionToken(user)
+    const headers = new Headers()
+    headers.set("cookie", `${SESSION_COOKIE}=${token}`)
+    headers.set("content-type", "application/json")
+    headers.set("origin", "http://test")
+    headers.set("content-length", String(DRAFT_REQUEST_MAX_BYTES + 1))
+    const res = await PUT(
+      new Request("http://test/api/drafts", {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ data: DATA }),
+      })
+    )
+    expect(res.status).toBe(413)
+    const json = (await res.json()) as { error: { code: string } }
+    expect(json.error.code).toBe("payload_too_large")
+  })
+
+  it("PUT rejects an oversized streaming body (no Content-Length) with a 413", async () => {
+    const token = await createSessionToken(user)
+    const headers = new Headers()
+    headers.set("cookie", `${SESSION_COOKIE}=${token}`)
+    headers.set("content-type", "application/json")
+    headers.set("origin", "http://test")
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new Uint8Array(DRAFT_REQUEST_MAX_BYTES + 1).fill(0x61)
+        )
+        controller.close()
+      },
+    })
+    const res = await PUT(
+      new Request("http://test/api/drafts", {
+        method: "PUT",
+        headers,
+        body: stream,
+        // `duplex: "half"` is required by undici to send a stream body; the
+        // property is not in this TS lib's RequestInit, so assert the init.
+        duplex: "half",
+      } as RequestInit)
+    )
+    expect(res.status).toBe(413)
+    const json = (await res.json()) as { error: { code: string } }
+    expect(json.error.code).toBe("payload_too_large")
+  })
+
+  it("PUT rejects a body that is not valid JSON with a 400", async () => {
+    const token = await createSessionToken(user)
+    const headers = new Headers()
+    headers.set("cookie", `${SESSION_COOKIE}=${token}`)
+    headers.set("content-type", "application/json")
+    headers.set("origin", "http://test")
+    const res = await PUT(
+      new Request("http://test/api/drafts", {
+        method: "PUT",
+        headers,
+        body: "{ not json",
+      })
+    )
+    expect(res.status).toBe(400)
   })
 
   it("PUT returns 409 version_required when a draft exists and no version is supplied", async () => {

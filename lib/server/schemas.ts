@@ -312,6 +312,16 @@ export const specialAbilitiesSchema = z
 export const characterCreateSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
+  // Character-profile metadata. Optional + nullable: an omitted or null field is
+  // persisted as NULL (a missing value on create is never a 400). The bounds
+  // mirror draft-schema.ts (nickname 200, pronouns 100, ageDescription 4000,
+  // appearance 8000, biography 8000, notes 4000).
+  nickname: z.string().max(200).nullable().optional(),
+  pronouns: z.string().max(100).nullable().optional(),
+  ageDescription: z.string().max(4000).nullable().optional(),
+  appearance: z.string().max(8000).nullable().optional(),
+  biography: z.string().max(8000).nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
   origin: z.enum(["integrated", "born"]),
   raceId: z.string().min(1),
   classId: z.string().min(1),
@@ -332,6 +342,14 @@ export const characterCreateSchema = z.object({
 export const characterUpdateSchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().nullable().optional(),
+  // Character-profile metadata. Optional + nullable so a PATCH may clear a field
+  // (null) or leave it untouched (omitted). The bounds mirror draft-schema.ts.
+  nickname: z.string().max(200).nullable().optional(),
+  pronouns: z.string().max(100).nullable().optional(),
+  ageDescription: z.string().max(4000).nullable().optional(),
+  appearance: z.string().max(8000).nullable().optional(),
+  biography: z.string().max(8000).nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
   archived: z.boolean().optional(),
   currentResources: z.record(z.string(), z.number()).optional(),
   version: z.number().int().nonnegative().optional(),

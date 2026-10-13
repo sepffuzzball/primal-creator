@@ -94,6 +94,12 @@ export interface TestCharacterRow {
   ownerId: string
   name: string
   description: string | null
+  nickname: string | null
+  pronouns: string | null
+  ageDescription: string | null
+  appearance: string | null
+  biography: string | null
+  notes: string | null
   origin: string
   raceId: string | null
   classId: string | null
@@ -664,6 +670,12 @@ export function createTestPrisma(): TestPrismaInstance {
           ownerId: data.ownerId as string,
           name: data.name as string,
           description: (data.description as string | null) ?? null,
+          nickname: (data.nickname as string | null) ?? null,
+          pronouns: (data.pronouns as string | null) ?? null,
+          ageDescription: (data.ageDescription as string | null) ?? null,
+          appearance: (data.appearance as string | null) ?? null,
+          biography: (data.biography as string | null) ?? null,
+          notes: (data.notes as string | null) ?? null,
           origin: data.origin as string,
           raceId: (data.raceId as string | null) ?? null,
           classId: (data.classId as string | null) ?? null,
@@ -692,6 +704,20 @@ export function createTestPrisma(): TestPrismaInstance {
         if (data.description !== undefined) {
           c.description = data.description as string | null
         }
+        if (data.nickname !== undefined)
+          c.nickname = data.nickname as string | null
+        if (data.pronouns !== undefined)
+          c.pronouns = data.pronouns as string | null
+        if (data.ageDescription !== undefined) {
+          c.ageDescription = data.ageDescription as string | null
+        }
+        if (data.appearance !== undefined) {
+          c.appearance = data.appearance as string | null
+        }
+        if (data.biography !== undefined) {
+          c.biography = data.biography as string | null
+        }
+        if (data.notes !== undefined) c.notes = data.notes as string | null
         if (data.archived != null) c.archived = data.archived as boolean
         if (data.raceId !== undefined) c.raceId = data.raceId as string | null
         if (data.classId !== undefined)
@@ -863,10 +889,29 @@ export function createTestPrisma(): TestPrismaInstance {
     },
     characterAssociation: {
       create: async ({ data }) => {
+        const characterId = data.characterId as string
+        const kind = data.kind as string
+        // Enforce the partial-unique blessing singleton (at most one BLESSING link
+        // per character, active or archived) exactly as the migration's
+        // `character_associations_characterId_blessing_key` index would. The
+        // associateCharacter blessing-add deletes all old BLESSING links first, so
+        // the normal replace flow never false-positives here.
+        if (kind === "BLESSING") {
+          const existing = associations.find(
+            (a) => a.characterId === characterId && a.kind === "BLESSING"
+          )
+          if (existing) {
+            throw {
+              name: "PrismaClientKnownRequestError",
+              code: "P2002",
+              meta: { target: ["characterId"] },
+            }
+          }
+        }
         const id = (data.id as string) ?? `asc-${++associationCounter}`
         const row: TestAssociationRow = {
           id,
-          characterId: data.characterId as string,
+          characterId,
           definitionId: data.definitionId as string,
           kind: data.kind as
             | "TITLE"
@@ -1352,6 +1397,12 @@ export function createTestPrisma(): TestPrismaInstance {
           ownerId: row.ownerId ?? "",
           name: row.name ?? "",
           description: row.description ?? null,
+          nickname: row.nickname ?? null,
+          pronouns: row.pronouns ?? null,
+          ageDescription: row.ageDescription ?? null,
+          appearance: row.appearance ?? null,
+          biography: row.biography ?? null,
+          notes: row.notes ?? null,
           origin: row.origin ?? "integrated",
           raceId: row.raceId ?? null,
           classId: row.classId ?? null,

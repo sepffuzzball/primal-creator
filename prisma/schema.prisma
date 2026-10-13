@@ -137,6 +137,12 @@ model Character {
   owner         User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   name          String
   description   String?
+  nickname      String?
+  pronouns      String?
+  ageDescription String?
+  appearance    String?
+  biography     String?
+  notes         String?
   origin        Origin   @default(integrated)
   // Optional relations to catalog definitions. Null means "not yet chosen".
   raceId        String?
