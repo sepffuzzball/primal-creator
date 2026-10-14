@@ -126,6 +126,37 @@ export const LEGACY_HUMAN_BASELINE = {
 }
 
 /**
+ * The 0.0.3 baseline for the seeded Human row. This carries the same table as the
+ * sourced `HUMAN_ENTRY` but WITHOUT `raceType` (which 0.0.3 did not emit). It is
+ * the guard baseline the seed now compares the LIVE Human row against: an
+ * untouched 0.0.3 row matches and is promoted to `HUMAN_ENTRY` (gaining the
+ * `raceType`), while an untouched 0.0.2 row (see `LEGACY_HUMAN_BASELINE`) no
+ * longer matches any baseline and is preserved.
+ */
+export const LEGACY_HUMAN_BASELINE_V3 = {
+  name: "Human",
+  description:
+    "Balanced/most numerous race. Humans possess both a class and a profession. Per-grade race gains are documented for G/F/E/D/C/B; see config.raceDefinitions.",
+  grade: "F",
+  provenance: "inferred" as Provenance,
+  sourceUrl: JAKE_RACE_URL,
+  archived: false,
+  config: {
+    naturalGrade: "F",
+    inferredGrades: ["G", "F", "E", "D", "C", "B"],
+    houseGrades: [],
+    raceDefinitions: {
+      G: { id: "human:G", perLevel: allEqual(1), freePerLevel: 1 },
+      F: { id: "human:F", perLevel: allEqual(1), freePerLevel: 5 },
+      E: { id: "human:E", perLevel: allEqual(2), freePerLevel: 5 },
+      D: { id: "human:D", perLevel: allEqual(6), freePerLevel: 15 },
+      C: { id: "human:C", perLevel: allEqual(18), freePerLevel: 45 },
+      B: { id: "human:B", perLevel: allEqual(54), freePerLevel: 135 },
+    },
+  },
+}
+
+/**
  * The sourced Human table (Jake_Thayne/Race + Human). The G-grade line is now
  * sourced as +1 all / +1 free, so G moves out of the house-zero band.
  */
@@ -139,6 +170,9 @@ export const HUMAN_ENTRY: JakeCatalogEntry = {
   provenance: "inferred",
   sourceUrl: JAKE_RACE_URL,
   config: {
+    // Human is an enlightened race: it selects an exact class/profession and its
+    // race level is derived from those tracks (never race-only).
+    raceType: "enlightened",
     naturalGrade: "F",
     // The sourced grade values are fan-wiki-inferred, not verified canon, so they
     // are recorded under inferredGrades rather than verifiedGrades.
@@ -442,6 +476,113 @@ export const JAKE_PROFESSIONS: readonly JakeCatalogEntry[] = [
 ]
 
 // ------------------------------------------------------------------ //
+// Titles
+// ------------------------------------------------------------------ //
+
+const DUNGEON_PIONEER_URL = `${FANDOM_BASE}Dungeon_Pioneer`
+
+/**
+ * The canonical Roman numeral for each Dungeon Pioneer rank (1..15). Carried
+ * verbatim in the entry name (e.g. "Dungeon Pioneer IX"); the stableId is the
+ * lowercase numeral (`dungeon-pioneer-ix`).
+ */
+const DUNGEON_PIONEER_NUMERALS = [
+  "I",
+  "II",
+  "III",
+  "IV",
+  "V",
+  "VI",
+  "VII",
+  "VIII",
+  "IX",
+  "X",
+  "XI",
+  "XII",
+  "XIII",
+  "XIV",
+  "XV",
+] as const
+
+interface DungeonPioneerRankSpec {
+  rank: number
+  grade: string
+  minRaceGrade: string
+}
+
+/**
+ * The rank table for the Dungeon Pioneer progression. Ranks 1-5 are E-grade,
+ * 6-10 are D-grade and 11-15 are C-grade; the minRaceGrade mirrors the rank's own
+ * grade (a character's race grade is the authority for the progression gate, so a
+ * rank may only be attached when the character's race grade is at least this).
+ * The catalog-level `grade` is the rank's tier, never an enforced gate on its own.
+ */
+const DUNGEON_PIONEER_RANKS: readonly DungeonPioneerRankSpec[] = [
+  { rank: 1, grade: "E", minRaceGrade: "E" },
+  { rank: 2, grade: "E", minRaceGrade: "E" },
+  { rank: 3, grade: "E", minRaceGrade: "E" },
+  { rank: 4, grade: "E", minRaceGrade: "E" },
+  { rank: 5, grade: "E", minRaceGrade: "E" },
+  { rank: 6, grade: "D", minRaceGrade: "D" },
+  { rank: 7, grade: "D", minRaceGrade: "D" },
+  { rank: 8, grade: "D", minRaceGrade: "D" },
+  { rank: 9, grade: "D", minRaceGrade: "D" },
+  { rank: 10, grade: "D", minRaceGrade: "D" },
+  { rank: 11, grade: "C", minRaceGrade: "C" },
+  { rank: 12, grade: "C", minRaceGrade: "C" },
+  { rank: 13, grade: "C", minRaceGrade: "C" },
+  { rank: 14, grade: "C", minRaceGrade: "C" },
+  { rank: 15, grade: "C", minRaceGrade: "C" },
+]
+
+/**
+ * The cumulative all-attribute bonus for each Dungeon Pioneer rank (1..15). Each
+ * rank adds this total to EVERY one of the nine attributes (`config.flat`), so a
+ * rank is strictly better than the prior - never a partial or fabricated
+ * percent/loot package. Sourced as an inferred reading; there is no per-rank
+ * numeric table asserted.
+ */
+const DUNGEON_PIONEER_TOTALS = [
+  3, 6, 9, 12, 15, 24, 33, 42, 51, 60, 87, 114, 141, 168, 195,
+] as const
+
+/**
+ * The fifteen Dungeon Pioneer ranked title definitions (ranks I..XV).
+ *
+ * Every entry is create-only and metadata-only from the engine's perspective: the
+ * flat bonus is the ONLY numeric effect (no fabricated `percentBasisPoints` or
+ * loot), and each title's config declares the `improvement` descriptor used by the
+ * sequential rank gate plus the matching `upgradeGroup` (== seriesId). Nothing is
+ * auto-granted; a player attaches each rank through the association API.
+ */
+export const JAKE_TITLES: readonly JakeCatalogEntry[] =
+  DUNGEON_PIONEER_RANKS.map((spec, index) => {
+    const numeral = DUNGEON_PIONEER_NUMERALS[index]
+    const total = DUNGEON_PIONEER_TOTALS[index]
+    return {
+      kind: "titles",
+      stableId: `dungeon-pioneer-${numeral.toLowerCase()}`,
+      name: `Dungeon Pioneer ${numeral}`,
+      description:
+        `A rank ${numeral} Dungeon Pioneer title. Rather than invent a per-rank numeric ` +
+        `effect, the cumulative all-attribute bonus is sourced into config.flat ` +
+        `(${total} to every attribute). Requires race grade ${spec.minRaceGrade} or higher.`,
+      grade: spec.grade,
+      provenance: "inferred",
+      sourceUrl: DUNGEON_PIONEER_URL,
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: spec.rank,
+          minRaceGrade: spec.minRaceGrade,
+        },
+        flat: allEqual(total),
+      },
+    }
+  })
+
+// ------------------------------------------------------------------ //
 // Gods
 // ------------------------------------------------------------------ //
 
@@ -720,12 +861,15 @@ function isSerializationFailure(err: unknown): boolean {
  * calls; it never creates characters or evolution paths.
  */
 export async function seedJakeCatalog(prisma: PrismaClient): Promise<void> {
-  // Race: Human (legacy guarded update or create).
+  // Race: Human (legacy guarded update or create). The guard baseline is the
+  // 0.0.3 pre-raceType config, so a current row (0.0.3) is promoted to the sourced
+  // entry (gaining `raceType`); an untouched 0.0.2 row no longer matches and is
+  // preserved.
   await upsertLegacy(
     prisma,
     "races",
     "human",
-    LEGACY_HUMAN_BASELINE,
+    LEGACY_HUMAN_BASELINE_V3,
     HUMAN_ENTRY,
     "race"
   )
@@ -750,6 +894,11 @@ export async function seedJakeCatalog(prisma: PrismaClient): Promise<void> {
   // and is preserved when already present).
   for (const prof of JAKE_PROFESSIONS) {
     await createIfMissing(prisma, prof, "profession")
+  }
+
+  // The 15 Dungeon Pioneer ranked titles are create-only (never auto-granted).
+  for (const title of JAKE_TITLES) {
+    await createIfMissing(prisma, title, "title")
   }
 
   // Gods are create-only.

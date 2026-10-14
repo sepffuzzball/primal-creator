@@ -19,7 +19,10 @@
 - Humans inherently can possess **both** a class and a profession (unlike most
   races, which may have only one or neither) (`Human`).
 - Newly integrated races begin at G-grade and advance to F-grade at level 10; born
-  -into-system beings start at F-grade (`Race_Level`).
+  -into-system beings start at F-grade (`Race_Level`). In the engine a born race
+  starts at its selected race's `naturalGrade` (legacy fallback `F`), so the
+  sourced F-grade-at-birth applies to a race whose natural grade is F (e.g.
+  Human); see "Race type" below.
 
 ## Known races
 
@@ -58,12 +61,49 @@ mature (e.g. High Elves advance to C-grade without a quest) (`Race_Level`,
 ## House assumption
 
 For the engine, we choose:
+
 - **Round down (floor)** when averaging class and profession levels.
 - Treat a **missing profession as level 0** (and, symmetrically, a missing class as
   level 0) when computing the race-level average.
 
 These are explicit project choices, documented in `docs/rules/assumptions.md`,
 pending a source citation. They are configurable.
+
+## Race type (enlightened vs monster)
+
+A race catalog entry's config carries an authoritative `raceType`:
+
+- `enlightened` - the race is a class/profession-bearing people. It always selects
+  an **exact class** at creation (`classId` is required) and may optionally select a
+  profession. Its class/profession tracks are stamped with the race's `naturalGrade`
+  (legacy fallback `F`) and the selected class row must be at that natural grade with
+  a per-level config for it - no lower-grade fallback is permitted.
+- `monster` - the race is race-only. It has **no class and no profession** (`classId`
+  and `professionId` are always null). It advances on an **independent** race mode
+  using a four-quarter cadence (see `advanceRaceQuarter`), and its race level comes
+  purely from that race track. Its starting grade is its `naturalGrade`.
+
+`raceType` and `naturalGrade` are both required on NEW race definitions and on any
+config-changing edit. A legacy race config that omits `raceType` is interpreted as
+`enlightened` (non-authoritative, preserved for existing backups and UI); a legacy
+config that omits `naturalGrade` falls back to `F` for the class/profession stamp and
+skips the exact-natural-grade eligibility check (enlightened). On a config-changing
+edit of an ALREADY-TYPED race, either field may be omitted only when the existing row
+already declares a valid value for it - that value is preserved rather than erased, so
+a typed race never silently falls back to `F`. A legacy race that never declared
+either field must supply BOTH on a config-changing edit (there is nothing to
+preserve). An arbitrary grade string is rejected as an invalid `naturalGrade` on a
+NEW or config-changing write.
+
+For every race the engine requires a `raceDefinitions[<startingGrade>]` entry before
+the character can be created (integrated starts at `G`; a monster or born race
+starts at `naturalGrade`).
+
+Trusted-backup import enforces the same split: a monster backup must carry a null
+class identity, no profession, and no class/profession tracks in its state; an
+enlightened backup must carry the class track (and a profession track iff it declares
+a profession). See `docs/rules/leveling.md` for the four-quarter race advance and
+`docs/rules/evolution.md` for race evolution.
 
 ## Seeded Human race (`db:seed`)
 

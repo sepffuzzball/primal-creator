@@ -57,6 +57,7 @@ function metadataOrNull(value: string | null | undefined): string | null {
 const RECOVERY_KEY = "primal-create-recovery"
 
 const ITEMS = [
+  { name: "raceType", required: true },
   { name: "name", required: true },
   { name: "origin", required: true },
   { name: "race", required: true },
@@ -91,6 +92,7 @@ const ALLOWED_PORTRAIT_TYPES = ["image/png", "image/jpeg", "image/webp"]
 // `special=true`.
 interface Draft {
   step: string
+  raceType?: "enlightened" | "monster"
   name: string
   description: string
   origin: string
@@ -114,7 +116,8 @@ interface Draft {
 }
 
 const EMPTY_DRAFT: Draft = {
-  step: "name",
+  step: "raceType",
+  raceType: undefined,
   name: "",
   description: "",
   origin: "",
@@ -174,23 +177,69 @@ function normalizeDraft(partial: Partial<Draft>): Draft {
 
 type SaveState = "idle" | "saving" | "saved" | "error" | "conflict"
 
-function stepNameToIndex(step: string): number {
-  const idx = STEP_NAMES.indexOf(step)
+function visibleStepNames(raceType?: Draft["raceType"]): string[] {
+  return ITEMS.filter(
+    (item) =>
+      raceType !== "monster" || !["class", "profession"].includes(item.name)
+  ).map((item) => item.name)
+}
+
+function stepNameToIndex(step: string, raceType?: Draft["raceType"]): number {
+  const effectiveStep =
+    raceType === "monster" && (step === "class" || step === "profession")
+      ? "special"
+      : step
+  if (!raceType) {
+    const oldNames = [
+      "name",
+      "origin",
+      "race",
+      "class",
+      "profession",
+      "special",
+      "review",
+    ]
+    const legacyIndex = oldNames.indexOf(effectiveStep)
+    return legacyIndex >= 0 ? legacyIndex : 0
+  }
+  const idx = visibleStepNames(raceType).indexOf(effectiveStep)
   return idx >= 0 ? idx : 0
 }
 
-/** Restore a stored server step index as a valid questionnaire item name. */
-function stepIndexToName(index: number): string {
-  if (Number.isInteger(index) && index >= 0 && index < STEP_NAMES.length) {
-    return STEP_NAMES[index]
-  }
-  if (Number.isInteger(index) && index >= 6) return "review"
-  return STEP_NAMES[0]
+/** Restore a server step index; drafts without raceType use the legacy index map. */
+function stepIndexToName(index: number, raceType?: Draft["raceType"]): string {
+  // Historical seven-step server drafts predate the branch question.
+  const oldNames = [
+    "name",
+    "origin",
+    "race",
+    "class",
+    "profession",
+    "special",
+    "review",
+  ]
+  if (
+    !raceType &&
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index < oldNames.length
+  )
+    return oldNames[index]
+  const names = visibleStepNames(raceType)
+  if (Number.isInteger(index) && index >= 0 && index < names.length)
+    return names[index]
+  if (Number.isInteger(index) && index >= names.length) return "review"
+  return "raceType"
 }
 
 /** Map the wizard's string step and yes/no flags onto the server draft shape. */
-function toServerData(draft: Draft): DraftData {
-  const data: DraftData = { step: stepNameToIndex(draft.step) }
+function toServerData(
+  draft: Draft,
+  inferredRaceType?: Draft["raceType"]
+): DraftData {
+  const raceType = draft.raceType ?? inferredRaceType
+  const data: DraftData = { step: stepNameToIndex(draft.step, raceType) }
+  if (raceType) data.raceType = raceType
   if (draft.name) data.name = draft.name
   if (draft.description) data.description = draft.description
   if (draft.origin) data.origin = draft.origin as "integrated" | "born"
@@ -226,7 +275,10 @@ function toServerData(draft: Draft): DraftData {
 /** Map server draft data back onto the wizard's local representation. */
 function fromServerData(data: DraftData): Partial<Draft> {
   const d: Partial<Draft> = {}
-  if (typeof data.step === "number") d.step = stepIndexToName(data.step)
+  if (data.raceType === "enlightened" || data.raceType === "monster")
+    d.raceType = data.raceType
+  if (typeof data.step === "number")
+    d.step = stepIndexToName(data.step, d.raceType)
   if (typeof data.name === "string") d.name = data.name
   if (typeof data.description === "string") d.description = data.description
   if (typeof data.origin === "string") d.origin = data.origin
@@ -349,6 +401,8 @@ function hasContent(draft: Draft): boolean {
 function draftsDiffer(a: Draft, b: Draft): boolean {
   return (
     a.step !== b.step ||
+    (a.raceType !== b.raceType &&
+      (!a.raceId || !b.raceId || a.raceId !== b.raceId)) ||
     a.name !== b.name ||
     a.description !== b.description ||
     a.origin !== b.origin ||
@@ -530,6 +584,47 @@ export function CreateCharacterForm() {
   const setField = React.useCallback((field: keyof Draft, value: string) => {
     setDraft((d) => ({ ...d, [field]: value }))
   }, [])
+
+  const chosenRace = races?.find((race) => race.id === draft.raceId)
+  const raceType: Draft["raceType"] = chosenRace
+    ? chosenRace.config?.raceType === "monster"
+      ? "monster"
+      : "enlightened"
+    : (draft.raceType ??
+      (draft.raceId || draft.classId ? "enlightened" : undefined))
+  const setRaceType = (value: "enlightened" | "monster") =>
+    setDraft((current) => {
+      const sameBranch = value === raceType
+      return {
+        ...current,
+        raceType: value,
+        ...(sameBranch ? {} : { raceId: "", classId: "", professionId: "" }),
+        step:
+          current.step === "raceType" || !sameBranch ? "name" : current.step,
+      }
+    })
+  const visibleItems = raceType
+    ? ITEMS.filter(
+        (item) =>
+          raceType !== "monster" || !["class", "profession"].includes(item.name)
+      )
+    : ITEMS.filter((item) => item.name === "raceType")
+  const visibleStepNames: string[] = visibleItems.map((item) => item.name)
+  const naturalGrade = (chosenRace?.config?.naturalGrade ?? "F") as string
+  const hasExplicitNaturalGrade = chosenRace?.config?.naturalGrade != null
+  const gradeDefinitions = (entry: CatalogItem) => {
+    const grades = entry.config?.grades
+    return (
+      (!hasExplicitNaturalGrade || entry.grade === naturalGrade) &&
+      !!grades &&
+      typeof grades === "object" &&
+      !!(grades as Record<string, unknown>)[naturalGrade] &&
+      typeof (grades as Record<string, unknown>)[naturalGrade] === "object" &&
+      Object.keys((grades as Record<string, object>)[naturalGrade]).length > 0
+    )
+  }
+  const eligibleClasses = classes?.filter(gradeDefinitions) ?? []
+  const eligibleProfessions = professions?.filter(gradeDefinitions) ?? []
 
   const applyDraft = React.useCallback((next: Draft) => {
     draftRef.current = next
@@ -726,7 +821,14 @@ export function CreateCharacterForm() {
     setSaveState("saving")
     setSaveError(null)
     try {
-      const data = toServerData(draftRef.current)
+      const savedDraft = draftRef.current
+      const savedRace = races?.find((race) => race.id === savedDraft.raceId)
+      const inferredRaceType = savedRace
+        ? savedRace.config?.raceType === "monster"
+          ? "monster"
+          : "enlightened"
+        : undefined
+      const data = toServerData(savedDraft, inferredRaceType)
       const body: SaveDraftRequest = { data }
       if (versionRef.current != null) body.version = versionRef.current
       const res = await apiFetch<DraftResponse>("/api/drafts", {
@@ -751,7 +853,7 @@ export function CreateCharacterForm() {
       }
       return false
     }
-  }, [])
+  }, [races])
 
   // Coalesces saves into a single in-flight operation, returning a boolean that
   // says whether the latest draft was persisted. If a save is already running it
@@ -999,12 +1101,12 @@ export function CreateCharacterForm() {
   // no longer exists (catalog changed since the draft was saved), fall back to an
   // empty selection rather than submitting a stale reference.
   const raceId = races?.some((r) => r.id === draft.raceId) ? draft.raceId : ""
-  const classId = classes?.some((c) => c.id === draft.classId)
+  const classId = eligibleClasses.some((c) => c.id === draft.classId)
     ? draft.classId
     : ""
   const professionId =
     draft.professionId === "" ||
-    (professions?.some((p) => p.id === draft.professionId) ?? false)
+    eligibleProfessions.some((p) => p.id === draft.professionId)
       ? draft.professionId
       : ""
 
@@ -1063,7 +1165,7 @@ export function CreateCharacterForm() {
       // draft version is unknown and creation would proceed without touching the
       // draft, or flushSave would refuse). The submit button is disabled for the
       // same reasons; this guard is defense in depth.
-      if (showRecoverLocal || !ready) return
+      if (showRecoverLocal || !ready || !raceType) return
       // An invalid special-abilities selection must abort BEFORE the flushSave
       // (and thus before the POST): the draft stays intact and nothing is
       // silently dropped. The error is surfaced inline on the special and review
@@ -1082,8 +1184,8 @@ export function CreateCharacterForm() {
           description?: string
           origin: "integrated" | "born"
           raceId: string
-          classId: string
-          professionId?: string
+          classId: string | null
+          professionId: string | null
           draftVersion?: number
           specialAbilities: SpecialAbilitiesSelection
           nickname: string | null
@@ -1096,7 +1198,8 @@ export function CreateCharacterForm() {
           name: draft.name,
           origin: draft.origin as "integrated" | "born",
           raceId,
-          classId,
+          classId: raceType === "monster" ? null : classId,
+          professionId: raceType === "monster" ? null : professionId || null,
           specialAbilities: toServerData(draft).specialAbilities!,
           nickname: metadataOrNull(draft.nickname),
           pronouns: metadataOrNull(draft.pronouns),
@@ -1104,7 +1207,6 @@ export function CreateCharacterForm() {
           appearance: metadataOrNull(draft.appearance),
           biography: metadataOrNull(draft.biography),
           notes: metadataOrNull(draft.notes),
-          ...(professionId ? { professionId } : {}),
         }
         if (draft.description) body.description = draft.description
         // CAS: only the matching draft is consumed atomically with creation.
@@ -1145,6 +1247,7 @@ export function CreateCharacterForm() {
     },
     [
       draft,
+      raceType,
       router,
       raceId,
       classId,
@@ -1162,8 +1265,8 @@ export function CreateCharacterForm() {
       <div>
         <h1 className="font-heading text-lg font-medium">Create a character</h1>
         <p className="text-xs text-muted-foreground">
-          A seven-step questionnaire. Your progress is saved to the server and
-          locally so a refresh will not lose it.
+          A branching character questionnaire. Your progress is saved to the
+          server and locally so a refresh will not lose it.
         </p>
       </div>
 
@@ -1275,709 +1378,851 @@ export function CreateCharacterForm() {
           wizard also blocks step navigation during the unresolved choice. */}
       <fieldset disabled={showRecoverLocal} className="contents">
         <Questionnaire
-          items={ITEMS.map((i) => ({ name: i.name, required: i.required }))}
-          item={draft.step}
+          items={visibleItems.map((i) => ({
+            name: i.name,
+            required: i.required,
+          }))}
+          item={
+            visibleStepNames.includes(
+              raceType === "monster" &&
+                (draft.step === "class" || draft.step === "profession")
+                ? "special"
+                : draft.step
+            )
+              ? ((raceType === "monster" &&
+                (draft.step === "class" || draft.step === "profession")
+                  ? "special"
+                  : draft.step) as (typeof ITEMS)[number]["name"])
+              : (visibleStepNames[0] as (typeof ITEMS)[number]["name"])
+          }
           onItemChange={(name) => setField("step", name)}
           onSubmit={onSubmit}
         >
           <QuestionnaireProgress />
 
-          <QuestionnaireItem name="name" required>
-            <QuestionnaireTitle>Name</QuestionnaireTitle>
+          <QuestionnaireItem name="raceType" required>
+            <QuestionnaireTitle>Character kind</QuestionnaireTitle>
             <QuestionnaireDescription>
-              Give your character a name. The description is optional.
-            </QuestionnaireDescription>
-            <QuestionnaireInput
-              placeholder="Character name"
-              value={draft.name}
-              onChange={(e) => setField("name", e.target.value)}
-            />
-            <QuestionnaireInput
-              aria-label="Nickname"
-              placeholder="Nickname (optional)"
-              maxLength={200}
-              value={draft.nickname ?? ""}
-              onChange={(e) => setField("nickname", e.target.value)}
-            />
-            <QuestionnaireInput
-              aria-label="Pronouns"
-              placeholder="Pronouns (optional)"
-              maxLength={100}
-              value={draft.pronouns ?? ""}
-              onChange={(e) => setField("pronouns", e.target.value)}
-            />
-            <QuestionnaireInput
-              aria-label="Age description (optional)"
-              placeholder="Age description (optional)"
-              maxLength={4000}
-              value={draft.ageDescription ?? ""}
-              onChange={(e) => setField("ageDescription", e.target.value)}
-            />
-            <QuestionnaireInput
-              aria-label="Appearance (optional)"
-              placeholder="Appearance (optional)"
-              maxLength={8000}
-              value={draft.appearance ?? ""}
-              onChange={(e) => setField("appearance", e.target.value)}
-            />
-            <QuestionnaireInput
-              aria-label="Biography (optional)"
-              placeholder="Biography (optional)"
-              maxLength={8000}
-              value={draft.biography ?? ""}
-              onChange={(e) => setField("biography", e.target.value)}
-            />
-            <QuestionnaireInput
-              aria-label="Notes (optional)"
-              placeholder="Notes (optional)"
-              maxLength={4000}
-              value={draft.notes ?? ""}
-              onChange={(e) => setField("notes", e.target.value)}
-            />
-            <QuestionnaireInput
-              placeholder="Description (optional)"
-              value={draft.description}
-              onChange={(e) => setField("description", e.target.value)}
-            />
-          </QuestionnaireItem>
-
-          <QuestionnaireItem name="origin" required>
-            <QuestionnaireTitle>Origin</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              Where does your character come from? This sets their starting
-              grade progression.
+              Choose a path before naming your character.
             </QuestionnaireDescription>
             <QuestionnaireChoices>
               <QuestionnaireChoice
-                value="born"
-                checked={draft.origin === "born"}
-                onChange={(e) => e.target.checked && setField("origin", "born")}
+                value="enlightened"
+                checked={raceType === "enlightened"}
+                onClick={() => setRaceType("enlightened")}
               >
-                Born
-                <QuestionnaireChoiceDescription>
-                  Born into the system. Starts at F grade.
-                </QuestionnaireChoiceDescription>
+                Enlightened
               </QuestionnaireChoice>
               <QuestionnaireChoice
-                value="integrated"
-                checked={draft.origin === "integrated"}
-                onChange={(e) =>
-                  e.target.checked && setField("origin", "integrated")
-                }
+                value="monster"
+                checked={raceType === "monster"}
+                onClick={() => setRaceType("monster")}
               >
-                Integrated
-                <QuestionnaireChoiceDescription>
-                  Newly integrated into the system. Starts at G grade.
-                </QuestionnaireChoiceDescription>
+                Monster
               </QuestionnaireChoice>
             </QuestionnaireChoices>
           </QuestionnaireItem>
 
-          <QuestionnaireItem name="race" required>
-            <QuestionnaireTitle>Race</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              Select a race from the catalog.
-            </QuestionnaireDescription>
-            {catalogLoading && !races ? (
-              <p className="text-xs text-muted-foreground">Loading races...</p>
-            ) : null}
-            {races && races.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No races are available in the catalog yet.
-              </p>
-            ) : null}
-            <QuestionnaireChoices>
-              {races?.map((race) => (
-                <QuestionnaireChoice
-                  key={race.id}
-                  value={race.id}
-                  checked={raceId === race.id}
-                  onChange={(e) =>
-                    e.target.checked && setField("raceId", race.id)
-                  }
-                >
-                  {race.name}
-                  {race.grade ? (
-                    <QuestionnaireChoiceDescription>
-                      Grade {race.grade}
-                      {race.description ? ` - ${race.description}` : ""}
-                    </QuestionnaireChoiceDescription>
-                  ) : (
-                    <QuestionnaireChoiceDescription>
-                      {race.description}
-                    </QuestionnaireChoiceDescription>
-                  )}
-                </QuestionnaireChoice>
-              ))}
-            </QuestionnaireChoices>
-          </QuestionnaireItem>
+          {raceType ? (
+            <>
+              <QuestionnaireItem name="name" required>
+                <QuestionnaireTitle>Name</QuestionnaireTitle>
+                <QuestionnaireDescription>
+                  Give your character a name. The description is optional.
+                </QuestionnaireDescription>
+                <QuestionnaireInput
+                  placeholder="Character name"
+                  value={draft.name}
+                  onChange={(e) => setField("name", e.target.value)}
+                />
+                <QuestionnaireInput
+                  aria-label="Nickname"
+                  placeholder="Nickname (optional)"
+                  maxLength={200}
+                  value={draft.nickname ?? ""}
+                  onChange={(e) => setField("nickname", e.target.value)}
+                />
+                <QuestionnaireInput
+                  aria-label="Pronouns"
+                  placeholder="Pronouns (optional)"
+                  maxLength={100}
+                  value={draft.pronouns ?? ""}
+                  onChange={(e) => setField("pronouns", e.target.value)}
+                />
+                <QuestionnaireInput
+                  aria-label="Age description (optional)"
+                  placeholder="Age description (optional)"
+                  maxLength={4000}
+                  value={draft.ageDescription ?? ""}
+                  onChange={(e) => setField("ageDescription", e.target.value)}
+                />
+                <QuestionnaireInput
+                  aria-label="Appearance (optional)"
+                  placeholder="Appearance (optional)"
+                  maxLength={8000}
+                  value={draft.appearance ?? ""}
+                  onChange={(e) => setField("appearance", e.target.value)}
+                />
+                <QuestionnaireInput
+                  aria-label="Biography (optional)"
+                  placeholder="Biography (optional)"
+                  maxLength={8000}
+                  value={draft.biography ?? ""}
+                  onChange={(e) => setField("biography", e.target.value)}
+                />
+                <QuestionnaireInput
+                  aria-label="Notes (optional)"
+                  placeholder="Notes (optional)"
+                  maxLength={4000}
+                  value={draft.notes ?? ""}
+                  onChange={(e) => setField("notes", e.target.value)}
+                />
+                <QuestionnaireInput
+                  placeholder="Description (optional)"
+                  value={draft.description}
+                  onChange={(e) => setField("description", e.target.value)}
+                />
+              </QuestionnaireItem>
 
-          <QuestionnaireItem name="class" required>
-            <QuestionnaireTitle>Class</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              Select a class from the catalog.
-            </QuestionnaireDescription>
-            {catalogLoading && !classes ? (
-              <p className="text-xs text-muted-foreground">
-                Loading classes...
-              </p>
-            ) : null}
-            {classes && classes.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No classes are available in the catalog yet.
-              </p>
-            ) : null}
-            <QuestionnaireChoices>
-              {classes?.map((cls) => (
-                <QuestionnaireChoice
-                  key={cls.id}
-                  value={cls.id}
-                  checked={classId === cls.id}
-                  onChange={(e) =>
-                    e.target.checked && setField("classId", cls.id)
-                  }
-                >
-                  {cls.name}
-                  {cls.grade ? (
-                    <QuestionnaireChoiceDescription>
-                      Grade {cls.grade}
-                      {cls.description ? ` - ${cls.description}` : ""}
-                    </QuestionnaireChoiceDescription>
-                  ) : (
-                    <QuestionnaireChoiceDescription>
-                      {cls.description}
-                    </QuestionnaireChoiceDescription>
-                  )}
-                </QuestionnaireChoice>
-              ))}
-            </QuestionnaireChoices>
-          </QuestionnaireItem>
-
-          <QuestionnaireItem name="profession">
-            <QuestionnaireTitle>Profession</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              A profession is optional. Choose None if your character has none.
-            </QuestionnaireDescription>
-            {catalogLoading && !professions ? (
-              <p className="text-xs text-muted-foreground">
-                Loading professions...
-              </p>
-            ) : null}
-            <QuestionnaireChoices>
-              <QuestionnaireChoice
-                value=""
-                checked={professionId === ""}
-                onChange={(e) =>
-                  e.target.checked && setField("professionId", "")
-                }
-              >
-                None
-                <QuestionnaireChoiceDescription>
-                  No profession.
-                </QuestionnaireChoiceDescription>
-              </QuestionnaireChoice>
-              {professions?.map((prof) => (
-                <QuestionnaireChoice
-                  key={prof.id}
-                  value={prof.id}
-                  checked={professionId === prof.id}
-                  onChange={(e) =>
-                    e.target.checked && setField("professionId", prof.id)
-                  }
-                >
-                  {prof.name}
-                  <QuestionnaireChoiceDescription>
-                    {prof.description}
-                  </QuestionnaireChoiceDescription>
-                </QuestionnaireChoice>
-              ))}
-            </QuestionnaireChoices>
-          </QuestionnaireItem>
-
-          <QuestionnaireItem name="special">
-            <QuestionnaireTitle>Special abilities</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              Select optional catalog entries. No eligibility or effects are
-              inferred here.
-            </QuestionnaireDescription>
-            {draft.special === "yes" ? (
-              <p className="text-xs text-muted-foreground">
-                This legacy draft had a special-abilities flag, not a catalog
-                selection. Choose entries again if desired.
-              </p>
-            ) : null}
-            {specialError ? (
-              <Alert variant="destructive">{specialError}</Alert>
-            ) : null}
-            {creationRulesError ? (
-              <Alert variant="destructive">
-                <div className="flex flex-col gap-2">
-                  <span>{creationRulesError}</span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void loadCreationRules()}
+              <QuestionnaireItem name="origin" required>
+                <QuestionnaireTitle>Origin</QuestionnaireTitle>
+                <QuestionnaireDescription>
+                  Where does your character come from? This sets their starting
+                  grade progression.
+                </QuestionnaireDescription>
+                <QuestionnaireChoices>
+                  <QuestionnaireChoice
+                    value="born"
+                    checked={draft.origin === "born"}
+                    onChange={(e) =>
+                      e.target.checked && setField("origin", "born")
+                    }
                   >
-                    Retry rules
-                  </Button>
-                </div>
-              </Alert>
-            ) : null}
-            {!blessings || !bloodlines || !transcendentSkills ? (
-              <div className="flex flex-col gap-2 text-xs text-muted-foreground">
-                <span>
-                  {abilityCatalogError
-                    ? `Catalog unavailable: ${abilityCatalogError}`
-                    : "Loading ability catalogs..."}
-                </span>
-                {abilityCatalogError ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void loadAbilityCatalogs()}
+                    Born
+                    <QuestionnaireChoiceDescription>
+                      Born into the system. Starts at the race&apos;s natural
+                      grade.
+                    </QuestionnaireChoiceDescription>
+                  </QuestionnaireChoice>
+                  <QuestionnaireChoice
+                    value="integrated"
+                    checked={draft.origin === "integrated"}
+                    onChange={(e) =>
+                      e.target.checked && setField("origin", "integrated")
+                    }
                   >
-                    Retry
-                  </Button>
+                    Integrated
+                    <QuestionnaireChoiceDescription>
+                      Newly integrated into the system. Starts at G grade.
+                    </QuestionnaireChoiceDescription>
+                  </QuestionnaireChoice>
+                </QuestionnaireChoices>
+              </QuestionnaireItem>
+
+              <QuestionnaireItem name="race" required>
+                <QuestionnaireTitle>Race</QuestionnaireTitle>
+                <QuestionnaireDescription>
+                  Select a race from the catalog.
+                </QuestionnaireDescription>
+                {catalogLoading && !races ? (
+                  <p className="text-xs text-muted-foreground">
+                    Loading races...
+                  </p>
                 ) : null}
-              </div>
-            ) : null}
-            {/* The "None" blessing choice is rendered unconditionally so the
+                {races && races.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No races are available in the catalog yet.
+                  </p>
+                ) : null}
+                <QuestionnaireChoices>
+                  {races
+                    ?.filter(
+                      (race) =>
+                        (race.config?.raceType === "monster"
+                          ? "monster"
+                          : "enlightened") === raceType
+                    )
+                    .map((race) => {
+                      const invalid =
+                        !race.config?.raceDefinitions ||
+                        typeof race.config.raceDefinitions !== "object" ||
+                        !(
+                          race.config.raceDefinitions as Record<string, unknown>
+                        )[
+                          draft.origin === "integrated"
+                            ? "G"
+                            : ((race.config?.naturalGrade as
+                                string | undefined) ?? "F")
+                        ]
+                      return (
+                        <QuestionnaireChoice
+                          key={race.id}
+                          value={race.id}
+                          checked={raceId === race.id}
+                          disabled={invalid}
+                          onChange={(e) =>
+                            e.target.checked &&
+                            setDraft((d) => ({
+                              ...d,
+                              raceId: race.id,
+                              classId: "",
+                              professionId: "",
+                            }))
+                          }
+                        >
+                          {race.name}
+                          <QuestionnaireChoiceDescription>
+                            Natural grade{" "}
+                            {String(race.config?.naturalGrade ?? "F")}
+                            {race.config?.raceType == null
+                              ? " (legacy unclassified; treated as enlightened)"
+                              : ""}
+                            {invalid
+                              ? ` - unavailable: no race definition at starting grade ${draft.origin === "integrated" ? "G" : String(race.config?.naturalGrade ?? "F")}`
+                              : ""}
+                            {race.description ? ` - ${race.description}` : ""}
+                          </QuestionnaireChoiceDescription>
+                        </QuestionnaireChoice>
+                      )
+                    })}
+                </QuestionnaireChoices>
+              </QuestionnaireItem>
+
+              {raceType !== "monster" ? (
+                <QuestionnaireItem name="class" required>
+                  <QuestionnaireTitle>Class</QuestionnaireTitle>
+                  <QuestionnaireDescription>
+                    Select a class from the catalog.
+                  </QuestionnaireDescription>
+                  {chosenRace && !hasExplicitNaturalGrade ? (
+                    <p className="text-xs text-muted-foreground">
+                      Legacy race has no naturalGrade. Grade F configuration is
+                      used; catalog row grades are treated as legacy metadata.
+                    </p>
+                  ) : null}
+                  {catalogLoading && !classes ? (
+                    <p className="text-xs text-muted-foreground">
+                      Loading classes...
+                    </p>
+                  ) : null}
+                  {classes && classes.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No classes are available in the catalog yet.
+                    </p>
+                  ) : null}
+                  <QuestionnaireChoices>
+                    {eligibleClasses.map((cls) => (
+                      <QuestionnaireChoice
+                        key={cls.id}
+                        value={cls.id}
+                        checked={classId === cls.id}
+                        onChange={(e) =>
+                          e.target.checked && setField("classId", cls.id)
+                        }
+                      >
+                        {cls.name}
+                        {cls.grade ? (
+                          <QuestionnaireChoiceDescription>
+                            Grade {cls.grade}
+                            {cls.description ? ` - ${cls.description}` : ""}
+                          </QuestionnaireChoiceDescription>
+                        ) : (
+                          <QuestionnaireChoiceDescription>
+                            {cls.description}
+                          </QuestionnaireChoiceDescription>
+                        )}
+                      </QuestionnaireChoice>
+                    ))}
+                  </QuestionnaireChoices>
+                  {eligibleClasses.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No class definitions are configured for grade{" "}
+                      {naturalGrade}.
+                    </p>
+                  ) : null}
+                </QuestionnaireItem>
+              ) : null}
+
+              {raceType !== "monster" ? (
+                <QuestionnaireItem name="profession">
+                  <QuestionnaireTitle>Profession</QuestionnaireTitle>
+                  <QuestionnaireDescription>
+                    A profession is optional. Choose None if your character has
+                    none.
+                  </QuestionnaireDescription>
+                  {catalogLoading && !professions ? (
+                    <p className="text-xs text-muted-foreground">
+                      Loading professions...
+                    </p>
+                  ) : null}
+                  <QuestionnaireChoices>
+                    <QuestionnaireChoice
+                      value=""
+                      checked={professionId === ""}
+                      onChange={(e) =>
+                        e.target.checked && setField("professionId", "")
+                      }
+                    >
+                      None
+                      <QuestionnaireChoiceDescription>
+                        No profession.
+                      </QuestionnaireChoiceDescription>
+                    </QuestionnaireChoice>
+                    {eligibleProfessions.map((prof) => (
+                      <QuestionnaireChoice
+                        key={prof.id}
+                        value={prof.id}
+                        checked={professionId === prof.id}
+                        onChange={(e) =>
+                          e.target.checked && setField("professionId", prof.id)
+                        }
+                      >
+                        {prof.name}
+                        <QuestionnaireChoiceDescription>
+                          {prof.description}
+                        </QuestionnaireChoiceDescription>
+                      </QuestionnaireChoice>
+                    ))}
+                  </QuestionnaireChoices>
+                  {eligibleProfessions.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No profession definitions are configured for grade{" "}
+                      {naturalGrade}.
+                    </p>
+                  ) : null}
+                </QuestionnaireItem>
+              ) : null}
+
+              <QuestionnaireItem name="special">
+                <QuestionnaireTitle>Special abilities</QuestionnaireTitle>
+                <QuestionnaireDescription>
+                  Select optional catalog entries. No eligibility or effects are
+                  inferred here.
+                </QuestionnaireDescription>
+                {draft.special === "yes" ? (
+                  <p className="text-xs text-muted-foreground">
+                    This legacy draft had a special-abilities flag, not a
+                    catalog selection. Choose entries again if desired.
+                  </p>
+                ) : null}
+                {specialError ? (
+                  <Alert variant="destructive">{specialError}</Alert>
+                ) : null}
+                {creationRulesError ? (
+                  <Alert variant="destructive">
+                    <div className="flex flex-col gap-2">
+                      <span>{creationRulesError}</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void loadCreationRules()}
+                      >
+                        Retry rules
+                      </Button>
+                    </div>
+                  </Alert>
+                ) : null}
+                {!blessings || !bloodlines || !transcendentSkills ? (
+                  <div className="flex flex-col gap-2 text-xs text-muted-foreground">
+                    <span>
+                      {abilityCatalogError
+                        ? `Catalog unavailable: ${abilityCatalogError}`
+                        : "Loading ability catalogs..."}
+                    </span>
+                    {abilityCatalogError ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void loadAbilityCatalogs()}
+                      >
+                        Retry
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
+                {/* The "None" blessing choice is rendered unconditionally so the
                 special step always carries a real answered QuestionnaireChoice
                 and can be navigated past even when the ability catalogs fail (a
                 no-selection draft gains nothing that needs validating). The
                 catalog-loaded blessing choices are kept in the same group. */}
-            <section
-              aria-labelledby="create-blessings-heading"
-              className="flex flex-col gap-2 rounded-lg border p-3"
-            >
-              <h4 id="create-blessings-heading" className="text-sm font-medium">
-                Blessings
-              </h4>
-              <QuestionnaireChoices>
-                <QuestionnaireChoice
-                  value=""
-                  checked={!draft.specialAbilities.blessingId}
-                  onChange={() =>
-                    setDraft((d) => ({
-                      ...d,
-                      specialAbilities: {
-                        ...d.specialAbilities,
-                        blessingId: null,
-                      },
-                    }))
-                  }
+                <section
+                  aria-labelledby="create-blessings-heading"
+                  className="flex flex-col gap-2 rounded-lg border p-3"
                 >
-                  None
-                </QuestionnaireChoice>
-                {blessings
-                  ?.filter(
-                    (x) =>
-                      !x.archived || x.id === draft.specialAbilities.blessingId
-                  )
-                  .map((x) => (
+                  <h4
+                    id="create-blessings-heading"
+                    className="text-sm font-medium"
+                  >
+                    Blessings
+                  </h4>
+                  <QuestionnaireChoices>
                     <QuestionnaireChoice
-                      key={x.id}
-                      value={x.id}
-                      checked={draft.specialAbilities.blessingId === x.id}
+                      value=""
+                      checked={!draft.specialAbilities.blessingId}
                       onChange={() =>
                         setDraft((d) => ({
                           ...d,
                           specialAbilities: {
                             ...d.specialAbilities,
-                            blessingId: x.id,
+                            blessingId: null,
                           },
                         }))
                       }
                     >
-                      {x.name}
-                      {x.archived
-                        ? " (Unavailable - re-select required)"
-                        : null}
-                      <QuestionnaireChoiceDescription>
-                        {[x.provenance, x.grade, x.description]
-                          .filter(Boolean)
-                          .join(" - ")}
-                      </QuestionnaireChoiceDescription>
+                      None
                     </QuestionnaireChoice>
-                  ))}
-              </QuestionnaireChoices>
-            </section>
-            {blessings && bloodlines && transcendentSkills ? (
-              <>
-                <p className="text-xs font-medium">Bloodline (choose one)</p>
-                <label className="flex gap-2 rounded-md border p-2 text-sm">
-                  <input
-                    type="radio"
-                    name="create-bloodline"
-                    checked={draft.specialAbilities.bloodlineIds.length === 0}
-                    onChange={() =>
-                      setDraft((d) => ({
-                        ...d,
-                        specialAbilities: {
-                          ...d.specialAbilities,
-                          bloodlineIds: [],
-                        },
-                      }))
-                    }
-                  />
-                  <span>None</span>
-                </label>
-                {draft.specialAbilities.bloodlineIds.length > 1 ? (
-                  <Alert variant="destructive">
-                    <div className="flex flex-col gap-2">
-                      <span>
-                        This recovered draft has multiple bloodlines. Explicitly
-                        choose one to continue.
-                      </span>
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() =>
+                    {blessings
+                      ?.filter(
+                        (x) =>
+                          !x.archived ||
+                          x.id === draft.specialAbilities.blessingId
+                      )
+                      .map((x) => (
+                        <QuestionnaireChoice
+                          key={x.id}
+                          value={x.id}
+                          checked={draft.specialAbilities.blessingId === x.id}
+                          onChange={() =>
                             setDraft((d) => ({
                               ...d,
                               specialAbilities: {
                                 ...d.specialAbilities,
-                                bloodlineIds: [],
+                                blessingId: x.id,
                               },
                             }))
                           }
                         >
-                          Choose None
-                        </Button>
-                        {draft.specialAbilities.bloodlineIds.map((id) => (
-                          <Button
-                            key={id}
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            onClick={() =>
-                              setDraft((d) => ({
-                                ...d,
-                                specialAbilities: {
-                                  ...d.specialAbilities,
-                                  bloodlineIds: [id],
-                                },
-                              }))
-                            }
-                          >
-                            Keep{" "}
-                            {bloodlines.find((b) => b.id === id)?.name ?? id}
-                          </Button>
-                        ))}
-                      </div>
-                    </div>
-                  </Alert>
-                ) : null}
-                {bloodlines
-                  .filter(
-                    (x) =>
-                      !x.archived ||
-                      draft.specialAbilities.bloodlineIds.includes(x.id)
-                  )
-                  .map((x) => {
-                    const group = x.config.upgradeGroup
-                    const conflict =
-                      !!group &&
-                      draft.specialAbilities.bloodlineIds.some(
-                        (id) =>
-                          id !== x.id &&
-                          bloodlines.find((b) => b.id === id)?.config
-                            .upgradeGroup === group
+                          {x.name}
+                          {x.archived
+                            ? " (Unavailable - re-select required)"
+                            : null}
+                          <QuestionnaireChoiceDescription>
+                            {[x.provenance, x.grade, x.description]
+                              .filter(Boolean)
+                              .join(" - ")}
+                          </QuestionnaireChoiceDescription>
+                        </QuestionnaireChoice>
+                      ))}
+                  </QuestionnaireChoices>
+                </section>
+                {blessings && bloodlines && transcendentSkills ? (
+                  <>
+                    <p className="text-xs font-medium">
+                      Bloodline (choose one)
+                    </p>
+                    <label className="flex gap-2 rounded-md border p-2 text-sm">
+                      <input
+                        type="radio"
+                        name="create-bloodline"
+                        checked={
+                          draft.specialAbilities.bloodlineIds.length === 0
+                        }
+                        onChange={() =>
+                          setDraft((d) => ({
+                            ...d,
+                            specialAbilities: {
+                              ...d.specialAbilities,
+                              bloodlineIds: [],
+                            },
+                          }))
+                        }
+                      />
+                      <span>None</span>
+                    </label>
+                    {draft.specialAbilities.bloodlineIds.length > 1 ? (
+                      <Alert variant="destructive">
+                        <div className="flex flex-col gap-2">
+                          <span>
+                            This recovered draft has multiple bloodlines.
+                            Explicitly choose one to continue.
+                          </span>
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() =>
+                                setDraft((d) => ({
+                                  ...d,
+                                  specialAbilities: {
+                                    ...d.specialAbilities,
+                                    bloodlineIds: [],
+                                  },
+                                }))
+                              }
+                            >
+                              Choose None
+                            </Button>
+                            {draft.specialAbilities.bloodlineIds.map((id) => (
+                              <Button
+                                key={id}
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                onClick={() =>
+                                  setDraft((d) => ({
+                                    ...d,
+                                    specialAbilities: {
+                                      ...d.specialAbilities,
+                                      bloodlineIds: [id],
+                                    },
+                                  }))
+                                }
+                              >
+                                Keep{" "}
+                                {bloodlines.find((b) => b.id === id)?.name ??
+                                  id}
+                              </Button>
+                            ))}
+                          </div>
+                        </div>
+                      </Alert>
+                    ) : null}
+                    {bloodlines
+                      .filter(
+                        (x) =>
+                          !x.archived ||
+                          draft.specialAbilities.bloodlineIds.includes(x.id)
                       )
-                    const checked =
-                      draft.specialAbilities.bloodlineIds.includes(x.id)
-                    return (
+                      .map((x) => {
+                        const group = x.config.upgradeGroup
+                        const conflict =
+                          !!group &&
+                          draft.specialAbilities.bloodlineIds.some(
+                            (id) =>
+                              id !== x.id &&
+                              bloodlines.find((b) => b.id === id)?.config
+                                .upgradeGroup === group
+                          )
+                        const checked =
+                          draft.specialAbilities.bloodlineIds.includes(x.id)
+                        return (
+                          <label
+                            key={x.id}
+                            className="flex gap-2 rounded-md border p-2 text-sm"
+                          >
+                            <input
+                              type="radio"
+                              name="create-bloodline"
+                              checked={checked}
+                              disabled={x.archived}
+                              onChange={(e) =>
+                                setDraft((d) => ({
+                                  ...d,
+                                  specialAbilities: {
+                                    ...d.specialAbilities,
+                                    bloodlineIds: e.target.checked
+                                      ? [x.id]
+                                      : [],
+                                  },
+                                }))
+                              }
+                            />
+                            <span>
+                              {x.name}
+                              {x.archived
+                                ? " (Unavailable - re-select required)"
+                                : null}
+                              <small className="block text-muted-foreground">
+                                {[
+                                  x.provenance,
+                                  x.grade,
+                                  x.description,
+                                  conflict
+                                    ? "Conflicts with a selected bloodline upgrade group"
+                                    : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" - ")}
+                              </small>
+                            </span>
+                          </label>
+                        )
+                      })}
+                    {orphanBloodlineIds.map((id) => (
                       <label
-                        key={x.id}
+                        key={`orphan-bloodline-${id}`}
                         className="flex gap-2 rounded-md border p-2 text-sm"
                       >
                         <input
                           type="radio"
                           name="create-bloodline"
-                          checked={checked}
-                          disabled={x.archived}
+                          checked={draft.specialAbilities.bloodlineIds.includes(
+                            id
+                          )}
                           onChange={(e) =>
                             setDraft((d) => ({
                               ...d,
                               specialAbilities: {
                                 ...d.specialAbilities,
-                                bloodlineIds: e.target.checked ? [x.id] : [],
+                                bloodlineIds: e.target.checked ? [id] : [],
                               },
                             }))
                           }
                         />
                         <span>
-                          {x.name}
-                          {x.archived
-                            ? " (Unavailable - re-select required)"
-                            : null}
+                          {id}
                           <small className="block text-muted-foreground">
-                            {[
-                              x.provenance,
-                              x.grade,
-                              x.description,
-                              conflict
-                                ? "Conflicts with a selected bloodline upgrade group"
-                                : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" - ")}
+                            (Unavailable)
                           </small>
                         </span>
                       </label>
-                    )
-                  })}
-                {orphanBloodlineIds.map((id) => (
-                  <label
-                    key={`orphan-bloodline-${id}`}
-                    className="flex gap-2 rounded-md border p-2 text-sm"
-                  >
-                    <input
-                      type="radio"
-                      name="create-bloodline"
-                      checked={draft.specialAbilities.bloodlineIds.includes(id)}
-                      onChange={(e) =>
-                        setDraft((d) => ({
-                          ...d,
-                          specialAbilities: {
-                            ...d.specialAbilities,
-                            bloodlineIds: e.target.checked ? [id] : [],
-                          },
-                        }))
-                      }
-                    />
-                    <span>
-                      {id}
-                      <small className="block text-muted-foreground">
-                        (Unavailable)
-                      </small>
-                    </span>
-                  </label>
-                ))}
-                <p className="text-xs font-medium">Transcendent skills</p>
-                <p className="text-xs text-muted-foreground">
-                  Selected {draft.specialAbilities.transcendentSkillIds.length}{" "}
-                  / maximum {maxTranscendentSkills ?? "not loaded"}
-                </p>
-                {transcendentSkills
-                  .filter(
-                    (x) =>
-                      !x.archived ||
-                      draft.specialAbilities.transcendentSkillIds.includes(x.id)
-                  )
-                  .map((x) => (
-                    <label
-                      key={x.id}
-                      className="flex gap-2 rounded-md border p-2 text-sm"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={draft.specialAbilities.transcendentSkillIds.includes(
-                          x.id
-                        )}
-                        disabled={
-                          !draft.specialAbilities.transcendentSkillIds.includes(
+                    ))}
+                    <p className="text-xs font-medium">Transcendent skills</p>
+                    <p className="text-xs text-muted-foreground">
+                      Selected{" "}
+                      {draft.specialAbilities.transcendentSkillIds.length} /
+                      maximum {maxTranscendentSkills ?? "not loaded"}
+                    </p>
+                    {transcendentSkills
+                      .filter(
+                        (x) =>
+                          !x.archived ||
+                          draft.specialAbilities.transcendentSkillIds.includes(
                             x.id
-                          ) &&
-                          (draft.specialAbilities.transcendentSkillIds.length >=
-                            (maxTranscendentSkills ?? 0) ||
-                            x.archived)
-                        }
-                        onChange={(e) =>
-                          setDraft((d) => ({
-                            ...d,
-                            specialAbilities: {
-                              ...d.specialAbilities,
-                              transcendentSkillIds: e.target.checked
-                                ? [
-                                    ...d.specialAbilities.transcendentSkillIds,
-                                    x.id,
-                                  ]
-                                : d.specialAbilities.transcendentSkillIds.filter(
-                                    (id) => id !== x.id
-                                  ),
-                            },
-                          }))
-                        }
-                      />
-                      <span>
-                        {x.name}
-                        {x.archived
-                          ? " (Unavailable - re-select required)"
-                          : null}
-                        <small className="block text-muted-foreground">
-                          {[x.provenance, x.grade, x.description]
-                            .filter(Boolean)
-                            .join(" - ")}
-                        </small>
-                      </span>
-                    </label>
-                  ))}
-                {orphanTranscendentSkillIds.map((id) => (
-                  <label
-                    key={`orphan-transcendent-${id}`}
-                    className="flex gap-2 rounded-md border p-2 text-sm"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={draft.specialAbilities.transcendentSkillIds.includes(
-                        id
-                      )}
-                      onChange={(e) =>
-                        setDraft((d) => ({
-                          ...d,
-                          specialAbilities: {
-                            ...d.specialAbilities,
-                            transcendentSkillIds: e.target.checked
-                              ? [...d.specialAbilities.transcendentSkillIds, id]
-                              : d.specialAbilities.transcendentSkillIds.filter(
-                                  (tid) => tid !== id
-                                ),
-                          },
-                        }))
-                      }
-                    />
-                    <span>
-                      {id}
-                      <small className="block text-muted-foreground">
-                        (Unavailable)
-                      </small>
-                    </span>
-                  </label>
-                ))}
-              </>
-            ) : null}
-          </QuestionnaireItem>
+                          )
+                      )
+                      .map((x) => (
+                        <label
+                          key={x.id}
+                          className="flex gap-2 rounded-md border p-2 text-sm"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={draft.specialAbilities.transcendentSkillIds.includes(
+                              x.id
+                            )}
+                            disabled={
+                              !draft.specialAbilities.transcendentSkillIds.includes(
+                                x.id
+                              ) &&
+                              (draft.specialAbilities.transcendentSkillIds
+                                .length >= (maxTranscendentSkills ?? 0) ||
+                                x.archived)
+                            }
+                            onChange={(e) =>
+                              setDraft((d) => ({
+                                ...d,
+                                specialAbilities: {
+                                  ...d.specialAbilities,
+                                  transcendentSkillIds: e.target.checked
+                                    ? [
+                                        ...d.specialAbilities
+                                          .transcendentSkillIds,
+                                        x.id,
+                                      ]
+                                    : d.specialAbilities.transcendentSkillIds.filter(
+                                        (id) => id !== x.id
+                                      ),
+                                },
+                              }))
+                            }
+                          />
+                          <span>
+                            {x.name}
+                            {x.archived
+                              ? " (Unavailable - re-select required)"
+                              : null}
+                            <small className="block text-muted-foreground">
+                              {[x.provenance, x.grade, x.description]
+                                .filter(Boolean)
+                                .join(" - ")}
+                            </small>
+                          </span>
+                        </label>
+                      ))}
+                    {orphanTranscendentSkillIds.map((id) => (
+                      <label
+                        key={`orphan-transcendent-${id}`}
+                        className="flex gap-2 rounded-md border p-2 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={draft.specialAbilities.transcendentSkillIds.includes(
+                            id
+                          )}
+                          onChange={(e) =>
+                            setDraft((d) => ({
+                              ...d,
+                              specialAbilities: {
+                                ...d.specialAbilities,
+                                transcendentSkillIds: e.target.checked
+                                  ? [
+                                      ...d.specialAbilities
+                                        .transcendentSkillIds,
+                                      id,
+                                    ]
+                                  : d.specialAbilities.transcendentSkillIds.filter(
+                                      (tid) => tid !== id
+                                    ),
+                              },
+                            }))
+                          }
+                        />
+                        <span>
+                          {id}
+                          <small className="block text-muted-foreground">
+                            (Unavailable)
+                          </small>
+                        </span>
+                      </label>
+                    ))}
+                  </>
+                ) : null}
+              </QuestionnaireItem>
 
-          <QuestionnaireItem name="review">
-            <QuestionnaireTitle>Review</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              Confirm your choices. Attributes are calculated server-side; at
-              level 0 your base attributes are all 0 with no awards granted yet.
-            </QuestionnaireDescription>
-            <div className="flex flex-col gap-1 rounded-lg border bg-input/20 p-3 text-xs/relaxed">
-              <div>
-                <span className="text-muted-foreground">Name: </span>
-                {draft.name || <span className="text-muted-foreground">-</span>}
-              </div>
-              {(
-                [
-                  "nickname",
-                  "pronouns",
-                  "ageDescription",
-                  "appearance",
-                  "biography",
-                  "notes",
-                ] as const
-              ).map((field) => (
-                <div key={field}>
-                  <span className="text-muted-foreground">
-                    {field === "ageDescription"
-                      ? "Age description"
-                      : field[0].toUpperCase() + field.slice(1)}
-                    :{" "}
-                  </span>
-                  {draft[field]?.trim() ? (
-                    <span
-                      className={
-                        field === "biography"
-                          ? "line-clamp-4 whitespace-pre-wrap"
-                          : "whitespace-pre-wrap"
-                      }
-                    >
-                      {draft[field]}
+              <QuestionnaireItem name="review">
+                <QuestionnaireTitle>Review</QuestionnaireTitle>
+                <QuestionnaireDescription>
+                  Confirm your choices. Attributes are calculated server-side;
+                  at level 0 your base attributes are all 0 with no awards
+                  granted yet.
+                </QuestionnaireDescription>
+                <div className="flex flex-col gap-1 rounded-lg border bg-input/20 p-3 text-xs/relaxed">
+                  <div>
+                    <span className="text-muted-foreground">Name: </span>
+                    {draft.name || (
+                      <span className="text-muted-foreground">-</span>
+                    )}
+                  </div>
+                  {(
+                    [
+                      "nickname",
+                      "pronouns",
+                      "ageDescription",
+                      "appearance",
+                      "biography",
+                      "notes",
+                    ] as const
+                  ).map((field) => (
+                    <div key={field}>
+                      <span className="text-muted-foreground">
+                        {field === "ageDescription"
+                          ? "Age description"
+                          : field[0].toUpperCase() + field.slice(1)}
+                        :{" "}
+                      </span>
+                      {draft[field]?.trim() ? (
+                        <span
+                          className={
+                            field === "biography"
+                              ? "line-clamp-4 whitespace-pre-wrap"
+                              : "whitespace-pre-wrap"
+                          }
+                        >
+                          {draft[field]}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">
+                          Not provided
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                  <div>
+                    <span className="text-muted-foreground">Origin: </span>
+                    {draft.origin ? (
+                      <span className="capitalize">{draft.origin}</span>
+                    ) : (
+                      <span className="text-muted-foreground">-</span>
+                    )}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Race: </span>
+                    {raceName ?? (
+                      <span className="text-muted-foreground">-</span>
+                    )}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">
+                      Starting grade:{" "}
                     </span>
-                  ) : (
-                    <span className="text-muted-foreground">Not provided</span>
+                    {draft.origin === "integrated" ? "G" : naturalGrade}
+                  </div>
+                  {raceType === "monster" ? null : (
+                    <>
+                      <div>
+                        <span className="text-muted-foreground">Class: </span>
+                        {className ?? (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </div>
+                    </>
                   )}
+                  <div>
+                    <span className="text-muted-foreground">Profession: </span>
+                    {professionName ?? <span>None</span>}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">
+                      Special abilities:{" "}
+                    </span>
+                    {[
+                      draft.specialAbilities.blessingId &&
+                        blessings?.find(
+                          (x) => x.id === draft.specialAbilities.blessingId
+                        )?.name,
+                      ...draft.specialAbilities.bloodlineIds.map(
+                        (id) =>
+                          bloodlines?.find((x) => x.id === id)?.name ??
+                          `${id} (Unavailable)`
+                      ),
+                      ...draft.specialAbilities.transcendentSkillIds.map(
+                        (id) =>
+                          transcendentSkills?.find((x) => x.id === id)?.name ??
+                          `${id} (Unavailable)`
+                      ),
+                    ]
+                      .filter(Boolean)
+                      .join(", ") || "None"}
+                  </div>
                 </div>
-              ))}
-              <div>
-                <span className="text-muted-foreground">Origin: </span>
-                {draft.origin ? (
-                  <span className="capitalize">{draft.origin}</span>
-                ) : (
-                  <span className="text-muted-foreground">-</span>
-                )}
-              </div>
-              <div>
-                <span className="text-muted-foreground">Race: </span>
-                {raceName ?? <span className="text-muted-foreground">-</span>}
-              </div>
-              <div>
-                <span className="text-muted-foreground">Class: </span>
-                {className ?? <span className="text-muted-foreground">-</span>}
-              </div>
-              <div>
-                <span className="text-muted-foreground">Profession: </span>
-                {professionName ?? <span>None</span>}
-              </div>
-              <div>
-                <span className="text-muted-foreground">
-                  Special abilities:{" "}
-                </span>
-                {[
-                  draft.specialAbilities.blessingId &&
-                    blessings?.find(
-                      (x) => x.id === draft.specialAbilities.blessingId
-                    )?.name,
-                  ...draft.specialAbilities.bloodlineIds.map(
-                    (id) =>
-                      bloodlines?.find((x) => x.id === id)?.name ??
-                      `${id} (Unavailable)`
-                  ),
-                  ...draft.specialAbilities.transcendentSkillIds.map(
-                    (id) =>
-                      transcendentSkills?.find((x) => x.id === id)?.name ??
-                      `${id} (Unavailable)`
-                  ),
-                ]
-                  .filter(Boolean)
-                  .join(", ") || "None"}
-              </div>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Ability selections are linked atomically with character creation.
-              Portrait upload, if chosen, happens after creation and is not
-              atomic.
-            </p>
-            {specialError ? (
-              <Alert variant="destructive">{specialError}</Alert>
-            ) : null}
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="create-portrait">Portrait (optional)</Label>
-              <Input
-                id="create-portrait"
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                onChange={onPortraitFileChange}
-                className="bg-input/20"
-              />
-              {portraitFile ? (
                 <p className="text-xs text-muted-foreground">
-                  &quot;{portraitFile.name}&quot; will be uploaded after the
-                  character is created. If that upload fails, the character is
-                  still created.
+                  Ability selections are linked atomically with character
+                  creation. Portrait upload, if chosen, happens after creation
+                  and is not atomic.
                 </p>
-              ) : null}
-            </div>
-            <QuestionnaireChoices>
-              <QuestionnaireChoice value="confirmed" defaultChecked>
-                Looks good - create this character
-              </QuestionnaireChoice>
-            </QuestionnaireChoices>
-          </QuestionnaireItem>
+                {specialError ? (
+                  <Alert variant="destructive">{specialError}</Alert>
+                ) : null}
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="create-portrait">Portrait (optional)</Label>
+                  <Input
+                    id="create-portrait"
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    onChange={onPortraitFileChange}
+                    className="bg-input/20"
+                  />
+                  {portraitFile ? (
+                    <p className="text-xs text-muted-foreground">
+                      &quot;{portraitFile.name}&quot; will be uploaded after the
+                      character is created. If that upload fails, the character
+                      is still created.
+                    </p>
+                  ) : null}
+                </div>
+                <QuestionnaireChoices>
+                  <QuestionnaireChoice value="confirmed" defaultChecked>
+                    Looks good - create this character
+                  </QuestionnaireChoice>
+                </QuestionnaireChoices>
+              </QuestionnaireItem>
+            </>
+          ) : null}
 
           <QuestionnaireActions>
             <QuestionnairePrevious>Back</QuestionnairePrevious>
             <QuestionnaireNext>Next</QuestionnaireNext>
             <QuestionnaireSubmit
               disabled={
-                submitting || showRecoverLocal || !ready || !!specialError
+                submitting ||
+                showRecoverLocal ||
+                !ready ||
+                !raceType ||
+                !!specialError
               }
             >
               {submitting ? "Creating..." : "Create character"}

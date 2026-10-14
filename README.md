@@ -18,10 +18,12 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   races, grades, classes, professions, skills, titles, blessings, bloodlines,
   consumables and evolution. The client never supplies an award; every value is
   derived server-side from the catalog.
-- **Character creation & lifecycle**: create a character through a seven-step
-  questionnaire (name/description, origin, and race/class/profession picked from
-  the catalog), advance class/profession, allocate attribute points, evolve the
-  race grade, edit name, description and all six narrative profile fields (nickname, pronouns, age description, appearance, biography and notes), archive and restore.
+- **Character creation & lifecycle**: create a character through an eight-step
+  questionnaire for an enlightened race - race type first, then name/description,
+  origin, and race/class/profession picked from the catalog (a monster race
+  branch is six steps: race type, name, origin, race, special abilities, review) -
+  advance class/profession, allocate attribute points, evolve the race grade,
+  edit name, description and all six narrative profile fields (nickname, pronouns, age description, appearance, biography and notes), archive and restore.
 - **Contextual race evolution paths**: race evolution is not a single hard-coded
   house formula. The `evolutions` catalog kind defines editable race paths
   (`track: "race"` with `fromRaceStableId`/`toRaceStableId`/`fromGrade`/`toGrade`
@@ -33,10 +35,11 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   requested grade exists (otherwise the server returns `409
 evolution_choice_required`).
 - **Contextual class/profession track evolution paths**: class and profession
-  tracks are graded independently of the race. A new character is stamped with an
-  explicit `F` grade and a `stableId:F` definition on each selected track, so
-  each track has its own progression gate (the catalog must define a `grades.F`
-  per-level config for the track). The `evolutions` catalog kind also carries
+  tracks are graded independently of the race. A new character is stamped with
+  the race's exact `naturalGrade` grade (legacy fallback `F`) and a
+  `stableId:<grade>` definition on each selected track, so each track has its own
+  progression gate (the catalog must define a `grades.<grade>` per-level config
+  for the track). The `evolutions` catalog kind also carries
   active **class/profession paths** (`track: "class"|"profession"` with
   `fromDefinitionStableId`/`toDefinitionStableId`/`fromGrade`/`toGrade`, plus
   optional `minTrackLevel`, required title/skill stableIds, and a
@@ -307,8 +310,9 @@ pnpm build
 
 The authenticated character lifecycle is covered by a Playwright Chromium E2E
 test (`e2e/character-flow.spec.ts`). It logs in through the UI, asserts the
-dashboard starts empty, walks the seven-step questionnaire (born / Human /
-Archer / no profession), creates a uniquely-named character, advances the class
+dashboard starts empty, walks the eight-step enlightened-branch questionnaire
+(born / Human / Archer / no profession), creates a uniquely-named character,
+advances the class
 track four quarters, allocates one attribute point, and archives the character.
 
 The E2E is designed to run against a **fresh, isolated test database** with a

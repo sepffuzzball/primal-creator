@@ -278,6 +278,7 @@ let blessingsCatalog: import("@/lib/api").CatalogItem[] = []
 let bloodlinesCatalog: import("@/lib/api").CatalogItem[] = []
 let transcendentCatalog: import("@/lib/api").CatalogItem[] = []
 let equipmentCatalog: import("@/lib/api").CatalogItem[] = []
+let titlesCatalog: import("@/lib/api").CatalogItem[] = []
 let consumablesCatalog: import("@/lib/api").CatalogItem[] = []
 let inventoryError: unknown = null
 let inventoryPosts: Array<{
@@ -294,6 +295,8 @@ let profileSaveError: unknown = null
 let creationRulesError: unknown = null
 let maxTranscendentSkills = 3
 let activeCharacter: import("@/lib/api").CharacterDetail = character
+let advanceError: unknown = null
+let advancePosts: Array<Record<string, unknown>> = []
 
 /** Build a blessing/bloodline catalog item with documented defaults. */
 function catalogItem(
@@ -518,19 +521,24 @@ function setupMock(options?: {
   bloodlines?: import("@/lib/api").CatalogItem[]
   transcendentSkills?: import("@/lib/api").CatalogItem[]
   equipmentCatalog?: import("@/lib/api").CatalogItem[]
+  titles?: import("@/lib/api").CatalogItem[]
   consumablesCatalog?: import("@/lib/api").CatalogItem[]
   inventoryError?: unknown
   /** Thrown when PATCH /api/characters/chr-1 is called (a failed profile save). */
   profileSaveError?: unknown
   creationRulesError?: unknown
   maxTranscendentSkills?: number
+  advanceError?: unknown
 }) {
   activeCharacter = options?.character ?? character
+  advanceError = options?.advanceError ?? null
+  advancePosts = []
   associationsError = options?.associationsError ?? null
   blessingsCatalog = options?.blessings ?? []
   bloodlinesCatalog = options?.bloodlines ?? []
   transcendentCatalog = options?.transcendentSkills ?? []
   equipmentCatalog = options?.equipmentCatalog ?? []
+  titlesCatalog = options?.titles ?? []
   consumablesCatalog = options?.consumablesCatalog ?? []
   inventoryError = options?.inventoryError ?? null
   profileSaveError = options?.profileSaveError ?? null
@@ -561,6 +569,15 @@ function setupMock(options?: {
       return { character: activeCharacter }
     }
     if (url === "/api/characters/chr-1/portrait") return { portrait: null }
+    if (url === "/api/characters/chr-1/advance" && method === "POST") {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      advancePosts.push(body)
+      if (advanceError) throw advanceError
+      return { journal: {} }
+    }
     if (url === "/api/characters/chr-1/evolutions") {
       if (evolutionsError) throw evolutionsError
       return { options: [], legacyAvailable: true }
@@ -575,7 +592,7 @@ function setupMock(options?: {
       return { kind: "catalog", items: transcendentCatalog }
     }
     if (url === "/api/catalog/titles") {
-      return { kind: "catalog", items: [] }
+      return { kind: "catalog", items: titlesCatalog }
     }
     if (url === "/api/catalog/equipment") {
       return { kind: "catalog", items: equipmentCatalog }
@@ -586,12 +603,36 @@ function setupMock(options?: {
     if (url === "/api/characters/chr-1/associations" && method === "POST") {
       if (associationsError) throw associationsError
       const body = JSON.parse((init?.body as string) ?? "{}") as {
-        kind: "blessing" | "bloodline" | "transcendent"
+        kind: "blessing" | "bloodline" | "transcendent" | "title" | "equipment"
         definitionId: string
         operation: "add" | "remove"
         version: number
       }
-      activeCharacter = applyAssociation(activeCharacter, body)
+      if (body.kind === "title") {
+        const item = titlesCatalog.find(
+          (title) => title.id === body.definitionId
+        )
+        activeCharacter = {
+          ...activeCharacter,
+          associations: [
+            ...activeCharacter.associations,
+            association({
+              id: `title-${body.definitionId}`,
+              kind: "title",
+              definitionId: body.definitionId,
+              name: item?.name ?? body.definitionId,
+              ...(typeof item?.config?.upgradeGroup === "string"
+                ? { upgradeGroup: item.config.upgradeGroup as string }
+                : {}),
+            }),
+          ],
+        }
+      } else {
+        activeCharacter = applyAssociation(
+          activeCharacter,
+          body as Parameters<typeof applyAssociation>[1]
+        )
+      }
       return { character: activeCharacter }
     }
     if (url === "/api/characters/chr-1/inventory" && method === "POST") {
@@ -636,6 +677,240 @@ afterEach(() => {
 })
 
 // --- Tests ---------------------------------------------------------------- //
+
+describe("CharacterDetail ranked title claims", () => {
+  const rankedTitle = (
+    id: string,
+    name: string,
+    rank: number,
+    minRaceGrade: string = "G"
+  ) =>
+    catalogItem({
+      id,
+      name,
+      kind: "titles",
+      config: {
+        improvement: { seriesId: "pioneer", rank, minRaceGrade },
+        upgradeGroup: "pioneer",
+        flat: { strength: rank },
+      },
+    })
+
+  it("requires a self-reported first-clear detail and sends it with version", async () => {
+    setupMock({ titles: [rankedTitle("pioneer-1", "Pioneer I", 1)] })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
+    expect(
+      screen.getByText(/self-reported qualifying first-clear claim/)
+    ).toBeTruthy()
+    expect(
+      screen.getByText(/Rank 1; configured bonus: Flat strength:1/)
+    ).toBeTruthy()
+    const submit = screen.getByRole("button", {
+      name: "Confirm claim",
+    }) as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("Qualifying first-clear details"), {
+      target: { value: "Cleared the qualifying dungeon." },
+    })
+    fireEvent.click(submit)
+    await flush()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const post = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(JSON.parse((post![1] as RequestInit).body as string)).toEqual({
+      kind: "title",
+      definitionId: "pioneer-1",
+      operation: "add",
+      version: 3,
+      reason: "Cleared the qualifying dungeon.",
+    })
+  })
+
+  it("blocks below-grade claims and skipped ranks", async () => {
+    setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2, "C")] })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    expect(screen.getByText(/Locked: race grade G is below C/)).toBeTruthy()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Claim next rank",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("does not offer rank 2 when no rank 1 is linked", async () => {
+    setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2)] })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    expect(screen.getByText(/Locked: only rank 1 is next/)).toBeTruthy()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Claim next rank",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("uses archived association rank metadata to unlock the next rank without loading archived catalog entries", async () => {
+    setupMock({
+      character: {
+        ...character,
+        state: {
+          ...character.state,
+          race: { ...character.state.race, grade: "E" },
+        },
+        associations: [
+          association({
+            id: "archived-prior",
+            kind: "title",
+            definitionId: "old",
+            name: "Old Pioneer",
+            definitionArchived: true,
+            upgradeGroup: "pioneer",
+            improvement: { seriesId: "pioneer", rank: 3, minRaceGrade: "G" },
+          }),
+        ],
+      },
+      titles: [rankedTitle("pioneer-4", "Pioneer IV", 4, "E")],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    expect(screen.getByText("Rank 4 / minimum race grade E")).toBeTruthy()
+    expect(
+      screen.queryByText(/linked prior rank details unavailable/)
+    ).toBeNull()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Claim next rank",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(false)
+  })
+
+  it("fails closed when an archived same-series link has no improvement metadata", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "archived-prior",
+            kind: "title",
+            definitionId: "old",
+            name: "Old Pioneer",
+            definitionArchived: true,
+            upgradeGroup: "pioneer",
+          }),
+        ],
+      },
+      titles: [rankedTitle("pioneer-2", "Pioneer II", 2)],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    expect(
+      screen.getByText(
+        /linked prior rank details unavailable; retry catalog before claiming/
+      )
+    ).toBeTruthy()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Claim next rank",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  })
+
+  it("keeps ordinary title add payload unchanged and does not fake success on server rejection", async () => {
+    setupMock({
+      titles: [
+        catalogItem({ id: "ordinary", name: "Ordinary title", kind: "titles" }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    const titleRow =
+      screen.getByText("Ordinary title").parentElement?.parentElement
+    fireEvent.click(within(titleRow!).getByRole("button", { name: "Add" }))
+    await flush()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const post = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(JSON.parse((post![1] as RequestInit).body as string)).toEqual({
+      kind: "title",
+      definitionId: "ordinary",
+      operation: "add",
+      version: 3,
+    })
+
+    cleanup()
+    setupMock({
+      associationsError: new Error("title_rank_conflict"),
+      titles: [rankedTitle("pioneer-1", "Pioneer I", 1)],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
+    fireEvent.change(screen.getByLabelText("Qualifying first-clear details"), {
+      target: { value: "I cleared it." },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Confirm claim" }))
+    await flush()
+    expect(toast.error).toHaveBeenCalledWith("title_rank_conflict")
+    expect(screen.getByRole("button", { name: "Claim next rank" })).toBeTruthy()
+  })
+})
+
+describe("CharacterDetail race-only progression", () => {
+  it("posts race advancement and displays failures", async () => {
+    const monster = {
+      ...character,
+      classId: null,
+      className: null,
+      state: {
+        ...character.state,
+        race: { ...character.state.race, mode: "independent", quarter: 2 },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: monster,
+      advanceError: new Error("Race advance unavailable"),
+    })
+    await renderDetail()
+
+    expect(
+      screen.getByRole("button", { name: /Advance race \(L25 Q2\)/ })
+    ).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /Advance class/ })).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /Advance profession/ })
+    ).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /Advance race/ }))
+    await flush()
+    expect(advancePosts).toEqual([{ track: "race", version: 3 }])
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Race advance unavailable"
+    )
+  })
+})
 
 describe("CharacterDetail evolution options error state", () => {
   it("shows a retry and hides the legacy fallback/action when evolution options fail to load", async () => {

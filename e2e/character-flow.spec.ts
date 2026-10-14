@@ -7,8 +7,9 @@ import { test, expect, type Page } from "@playwright/test"
  * playwright.config.ts). It logs in through the UI, asserts the persisted
  * dashboard starts empty because the suite is required to run against a freshly
  * seeded, isolated test database (no active characters, no resumable draft),
- * then walks the official seven-step questionnaire (born / Human / Archer / no
- * profession), creates a uniquely-named character, advances the class track
+ * then walks the official eight-step enlightened-branch questionnaire (born /
+ * Human / Archer / no profession), creates a uniquely-named character, advances
+ * the class track
  * four quarters (reaching level 1 and gaining a free point), allocates one
  * attribute point, and archives the character through the confirmation dialog.
  *
@@ -31,6 +32,13 @@ async function next(page: Page): Promise<void> {
   // `exact` avoids matching the Next.js Dev Tools button, whose accessible name
   // is "Open Next.js Dev Tools" (contains "Next").
   await page.getByRole("button", { name: "Next", exact: true }).click()
+}
+
+/** Click `Back` in the questionnaire (the accessible Previous button). */
+async function back(page: Page): Promise<void> {
+  // `exact` avoids matching any other button whose accessible name merely
+  // contains "Back" (e.g. a "Back to dashboard" link on some pages).
+  await page.getByRole("button", { name: "Back", exact: true }).click()
 }
 
 /**
@@ -88,6 +96,27 @@ async function advanceClassQuarter(page: Page): Promise<void> {
 
 test.describe("character lifecycle", () => {
   test("login, create, progress, allocate, archive", async ({ page }) => {
+    // ------------------------------------------------------------------ //
+    // QuestionnairePrimitive registry guard.
+    //
+    // The @shadcn/react Questionnaire primitive warns on the console whenever
+    // a rendered Questionnaire.Item exists that is not present in the Root's
+    // `items` definition, e.g. "Rendered item \"X\" is missing from Root.items
+    // and is excluded from the questionnaire collection." The creation wizard
+    // renders a different item set per branch (the monster branch omits the
+    // class/profession items), so a transient or persistent mismatch when the
+    // branch changes would surface here. Collect ONLY that specific text (not
+    // every console message) for the whole test, then assert it is empty after
+    // creation. This is a guard, not a fix: app logic is unchanged.
+    // ------------------------------------------------------------------ //
+    const missingItemWarnings: string[] = []
+    page.on("console", (msg) => {
+      const text = msg.text()
+      if (text.includes("missing from Root.items")) {
+        missingItemWarnings.push(text)
+      }
+    })
+
     // ------------------------------------------------------------------ //
     // Login through the UI.
     // ------------------------------------------------------------------ //
@@ -284,34 +313,58 @@ test.describe("character lifecycle", () => {
     const name = `E2E-${Date.now()}`
 
     // ------------------------------------------------------------------ //
-    // Walk the seven-step questionnaire.
+    // Walk the enlightened branch of the questionnaire.
     // ------------------------------------------------------------------ //
     await page.getByRole("link", { name: "Create a character" }).click()
     await page.waitForURL(/\/characters\/new$/)
 
-    // Step 1 - name. The description is optional.
+    // Step 1 - exercise the monster branch first, then switch to the
+    // enlightened branch.
+    //
+    // The seed defines no monster races, so the monster branch is never taken
+    // past the name step; the point is to render the monster questionnaire
+    // (which omits the class/profession items), then transition to the
+    // enlightened one, so the console registry guard above sees both item sets.
+    // Selecting a branch auto-advances the wizard to the name step (the
+    // raceType choice is not a navigable step of its own once a branch is
+    // chosen), so there is no "Next" to press on branch selection. Return to
+    // the branch question with Back and switch to Enlightened before entering a
+    // name.
+    await choose(page, /^Monster$/i)
+    // Choosing Monster auto-advances to the name step.
+    await expect(page.getByPlaceholder("Character name")).toBeVisible()
+    // Go back to the branch question (monster omits class/profession items, so
+    // this Back press also trips the questionnaire's own navigation) and switch.
+    await back(page)
+    await choose(page, /^Enlightened$/i)
+    // Switching to Enlightened auto-advances to the name step again.
+    await expect(page.getByPlaceholder("Character name")).toBeVisible()
+    // The default enlightened branch still advances normally via Next after
+    // filling the name, so no explicit Next press is required here.
+
+    // Step 2 - name. The description is optional.
     await page.getByPlaceholder("Character name").fill(name)
     await next(page)
 
-    // Step 2 - origin: Born (starts at F grade).
+    // Step 3 - origin: Born (starts at F grade).
     await choose(page, /born/i)
     await next(page)
 
-    // Step 3 - race: Human. Wait for the catalog to load so the choice exists.
+    // Step 4 - race: Human. Wait for the catalog to load so the choice exists.
     await expect(page.getByRole("radio", { name: /^Human\b/i })).toBeVisible()
     await choose(page, /^Human\b/i)
     await next(page)
 
-    // Step 4 - class: Archer.
+    // Step 5 - class: Archer.
     await expect(page.getByRole("radio", { name: /^Archer\b/i })).toBeVisible()
     await choose(page, /^Archer\b/i)
     await next(page)
 
-    // Step 5 - profession: None.
+    // Step 6 - profession: None.
     await choose(page, /^None\b/i)
     await next(page)
 
-    // Step 6 - special abilities. The curated wiki manifest ships a blessing
+    // Step 7 - special abilities. The curated wiki manifest ships a blessing
     // (True Blessing of the Malefic Viper) and a bloodline (Bloodline of the
     // Primal Hunter) but no transcendent skill, so select the blessing +
     // bloodline and leave the transcendent section unselected. The wizard's
@@ -328,7 +381,7 @@ test.describe("character lifecycle", () => {
     await choose(page, /Bloodline of the Primal Hunter/)
     await next(page)
 
-    // Step 7 - review. Confirm and submit. There is no Next button on the
+    // Step 8 - review. Confirm and submit. There is no Next button on the
     // review step - it is replaced by the Submit button - so submit directly.
     await page.getByRole("button", { name: "Create character" }).click()
     // `new` also matches `[^/]+`, so exclude it explicitly: the create page keeps
@@ -338,6 +391,18 @@ test.describe("character lifecycle", () => {
 
     // The character detail page shows the created name.
     await expect(page.getByRole("heading", { name })).toBeVisible()
+
+    // The questionnaire's completion is done: no QuestionnairePrimitive item was
+    // reported as missing from Root.items during any creation-wizard branch
+    // (the monster branch was exercised at step 1, then the enlightened branch
+    // was walked to completion). Fail loudly with the actual warnings so a
+    // regression is actionable.
+    expect(
+      missingItemWarnings,
+      `The QuestionnairePrimitive logged ${missingItemWarnings.length} "missing ` +
+        `from Root.items" warning(s) during creation:
+${missingItemWarnings.join("\n")}`
+    ).toEqual([])
 
     // ------------------------------------------------------------------ //
     // The special-ability selections persisted: the Powers tab shows the

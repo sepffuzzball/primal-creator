@@ -50,12 +50,12 @@ race level is below its own boundary. A profession state **without** a grade is
 unaffected (legacy behavior preserved); the engine never infers one
 (see `docs/rules/leveling.md`).
 
-A new profession created through the wizard is stamped with an explicit `F`
-grade and a `stableId:F` definition, so the catalog must define an `F`-grade
-per-level config (`grades.F`) for it - the service refuses to create such a
-profession otherwise. Profession evolution is then a catalog-driven per-track
-path choice with **no** grade-only legacy fallback (see
-`docs/rules/evolution.md`).
+A new profession created through the wizard is stamped with the race's exact
+`naturalGrade` grade (legacy fallback `F`) and a `stableId:<grade>` definition,
+so the catalog must define a `<grade>`-grade per-level config
+(`grades.<grade>`) for it - the service refuses to create such a profession
+otherwise. Profession evolution is then a catalog-driven per-track path choice
+with **no** grade-only legacy fallback (see `docs/rules/evolution.md`).
 
 ## Seeded profession definitions (`db:seed`)
 
@@ -64,13 +64,13 @@ definitions (`prisma/catalog/jake-seed.ts`), sourced from
 `https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Profession`, each labelled
 `provenance: inferred` with exactly one `grades.<grade>` entry:
 
-| Grade | Name | stableId |
-| ----- | ---- | -------- |
-| F | Alchemist of the Malefic Viper | `alchemist-of-the-malefic-viper` |
-| E | Prodigious Alchemist of the Malefic Viper | `prodigious-alchemist-of-the-malefic-viper` |
-| D | Heretic-Chosen Alchemist of the Malefic Viper | `heretic-chosen-alchemist-of-the-malefic-viper-d` |
-| C | Heretic-Chosen Alchemist of the Malefic Viper | `heretic-chosen-alchemist-of-the-malefic-viper-c` |
-| B | Primeval Alchemist of Malefic Origins | `primeval-alchemist-of-malefic-origins` |
+| Grade | Name                                          | stableId                                          |
+| ----- | --------------------------------------------- | ------------------------------------------------- |
+| F     | Alchemist of the Malefic Viper                | `alchemist-of-the-malefic-viper`                  |
+| E     | Prodigious Alchemist of the Malefic Viper     | `prodigious-alchemist-of-the-malefic-viper`       |
+| D     | Heretic-Chosen Alchemist of the Malefic Viper | `heretic-chosen-alchemist-of-the-malefic-viper-d` |
+| C     | Heretic-Chosen Alchemist of the Malefic Viper | `heretic-chosen-alchemist-of-the-malefic-viper-c` |
+| B     | Primeval Alchemist of Malefic Origins         | `primeval-alchemist-of-malefic-origins`           |
 
 The F-grade stableId deliberately matches the reviewed manifest
 (`prisma/catalog/wiki-reviewed.ts`), so if an admin imports the manifest first the

@@ -21,11 +21,17 @@ import { z } from "zod"
 export const gradeSchema = z.enum(["G", "F", "E", "D", "C", "B", "A", "S"])
 
 /**
- * The seven-level blessing hierarchy, lowest to highest (docs/rules/blessings.md).
- * A blessing must declare one of these tiers; no other value is accepted on a NEW
- * or CONFIG-CHANGED write (legacy rows are readable without it).
+ * The blessing hierarchy, lowest to highest (docs/rules/blessings.md): eight
+ * tiers including Baptism. Baptism is the lowest entry tier - a ritual marking a
+ * follower as an adherent, below the seven substantive blessing levels
+ * (Minor..True). Baptism is NOT a canonical source-confirmed blessing level; it
+ * is a user-configured entry stage. A blessing must declare one of these tiers;
+ * no other value is accepted on a NEW or CONFIG-CHANGED write (legacy rows are
+ * readable without it). Baptism carries no invented numeric effect; a baptism
+ * blessing uses `effects: []`.
  */
 export const blessingTierSchema = z.enum([
+  "Baptism",
   "Minor",
   "Lesser",
   "Intermediate",
@@ -118,6 +124,10 @@ const raceStateSchema = z.object({
   grade: gradeSchema,
   mode: z.enum(["derived", "independent"]),
   definitionId: z.string().optional(),
+  // Quarter index within the current race level, present on monsters
+  // (independent race mode) advancing on a four-quarter cadence. Optional so
+  // legacy states that predate race-quarter tracking still deserialize.
+  quarter: z.number().int().min(0).max(3).optional(),
   origin: z.enum(["integrated", "born"]).optional(),
 })
 
@@ -328,8 +338,15 @@ export const characterCreateSchema = z.object({
   notes: z.string().max(4000).nullable().optional(),
   origin: z.enum(["integrated", "born"]),
   raceId: z.string().min(1),
-  classId: z.string().min(1),
-  professionId: z.string().optional(),
+  // `classId` is required for an enlightened race (a nonempty string) and null
+  // for a monster. The Zod shape only permits null/absent here; the authoritative
+  // per-raceType rule is enforced by the service layer, which knows the resolved
+  // race config (Zod cannot see it). A null/empty class on an enlightened race
+  // and a non-null class on a monster are rejected there.
+  classId: z.string().min(1).nullable().optional(),
+  // `professionId` is optional for an enlightened race and must be null for a
+  // monster (see classId: enforcement lives in the service layer).
+  professionId: z.string().min(1).nullable().optional(),
   // Explicit special-ability selections. When supplied, the corresponding
   // blessing/bloodline/transcendent-skill catalog definitions are resolved by
   // kind and linked as CharacterAssociations atomically with the create. When
@@ -360,7 +377,7 @@ export const characterUpdateSchema = z.object({
 })
 
 export const advanceSchema = z.object({
-  track: z.enum(["class", "profession"]),
+  track: z.enum(["class", "profession", "race"]),
   version: z.number().int().nonnegative(),
 })
 
@@ -448,6 +465,11 @@ export const associationSchema = z.object({
   definitionId: z.string().min(1),
   operation: z.enum(["add", "remove"]),
   version: z.number().int().nonnegative(),
+  // A self-reported qualifying reason, recorded on the associate event. Required
+  // for a RANKED title add (<=500 chars, trimmed nonempty enforced by the service
+  // which knows whether the target title is ranked); optional and ignored
+  // otherwise. Never a proof claim - just the player's account.
+  reason: z.string().max(500).optional(),
 })
 
 export const skillSelectSchema = z.object({
@@ -523,10 +545,65 @@ const raceDefinitionSchema = z.object({
 
 export const raceConfigSchema = z
   .object({
+    // How the race advances: an enlightened race selects exact class/profession
+    // tracks (derived race level), a monster has race-only levels (independent
+    // race mode). Required on NEW or config-changing writes; a legacy config
+    // without it is interpreted as `enlightened` by the service layer (never
+    // authoritative, preserved backups/UI).
+    raceType: z.enum(["enlightened", "monster"]).optional(),
     naturalGrade: gradeSchema.optional(),
     raceDefinitions: z.record(z.string(), raceDefinitionSchema).optional(),
   })
   .passthrough()
+
+/**
+ * Detect a `races` config whose `raceType` is present but not a recognized enum
+ * value (`"enlightened"` / `"monster"`). A legacy config without `raceType` is
+ * safe to read (it defaults to `enlightened`), but a NEW or CONFIG-CHANGED race
+ * is rejected by the service layer when this returns true.
+ */
+export function hasInvalidRaceTypeConfig(
+  config: Record<string, unknown>
+): boolean {
+  const raceType = config.raceType
+  if (raceType == null) return false
+  return raceType !== "enlightened" && raceType !== "monster"
+}
+
+/**
+ * Detect a `races` config whose `naturalGrade` is present but not a recognized
+ * grade value (`"G"` / `"F"` / `"E"` / `"D"` / `"C"` / `"B"` / `"A"` / `"S"`).
+ * A legacy config without `naturalGrade` is safe to read (it falls back to `F`
+ * for the class/profession stamp), but a NEW or CONFIG-CHANGED race is rejected
+ * by the service layer when this returns true - an arbitrary grade string is
+ * never silently accepted.
+ */
+export function hasInvalidNaturalGradeConfig(
+  config: Record<string, unknown>
+): boolean {
+  if (config.naturalGrade == null) return false
+  return !gradeSchema.safeParse(config.naturalGrade).success
+}
+
+/**
+ * Detect a `races` config that is not a valid authoritative race-advancement
+ * config for a NEW or CONFIG-CHANGED write. The modern-shape guard requires
+ * BOTH fields: `raceType` must be a recognized enum value
+ * (`"enlightened"` / `"monster"`) AND `naturalGrade` must be a gradeSchema-valid
+ * grade. A missing/invalid `raceType` or a missing/invalid `naturalGrade` makes
+ * this true. The service layer requires a complete config whenever a race is
+ * created or its config is changed; legacy rows lacking these fields remain
+ * readable and metadata-only-PATCHable (see `raceConfigSchema` and the service's
+ * preservation logic on a config-changing edit).
+ */
+export function isIncompleteRaceConfig(
+  config: Record<string, unknown>
+): boolean {
+  const hasValidType =
+    config.raceType === "enlightened" || config.raceType === "monster"
+  const hasValidGrade = gradeSchema.safeParse(config.naturalGrade).success
+  return !hasValidType || !hasValidGrade
+}
 
 export const trackConfigSchema = z
   .object({
@@ -656,6 +733,25 @@ export function hasInvalidSkillTrack(config: Record<string, unknown>): boolean {
   return track !== "class" && track !== "profession"
 }
 
+/**
+ * The sequential title-improvement descriptor carried by a ranked title config.
+ *
+ * A ranked title belongs to a named improvement `seriesId`, occupies a positive
+ * `rank` (1..100), and may only be attached to a character whose race grade is at
+ * least `minRaceGrade`. The subobject is strict: only these three keys are
+ * accepted, so a typo (e.g. `minGrade`) is rejected rather than silently dropped
+ * and never enforced.
+ */
+export const titleImprovementSchema = z
+  .object({
+    seriesId: z.string().min(1),
+    rank: z.number().int().min(1).max(100),
+    minRaceGrade: gradeSchema,
+  })
+  .strict()
+
+export type TitleImprovement = z.infer<typeof titleImprovementSchema>
+
 export const titleConfigSchema = z
   .object({
     grade: gradeSchema.optional(),
@@ -663,14 +759,29 @@ export const titleConfigSchema = z
     flat: nonnegativePartialVectorSchema.optional(),
     percentBasisPoints: nonnegativePartialVectorSchema.optional(),
     upgradeGroup: z.string().optional(),
+    improvement: titleImprovementSchema.optional(),
   })
   .passthrough()
+  .superRefine((config, ctx) => {
+    if (config.improvement == null) return
+    // A ranked title is progressed through its upgrade group; the group MUST be
+    // the series id so the same-group removal path can atomically displace the
+    // prior ranked link. A config that declares an improvement but not the
+    // matching group cannot be progressed and is rejected on authoring.
+    if (config.upgradeGroup !== config.improvement.seriesId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `ranked title improvement requires upgradeGroup to equal seriesId ("${config.improvement.seriesId}")`,
+        path: ["improvement"],
+      })
+    }
+  })
 
 /**
  * Catalog config for a `blessings` entry.
  *
  * Modern shape (required on NEW or CONFIG-CHANGED writes):
- *   - `tier` is the seven-level blessing hierarchy (Minor..True).
+ *   - `tier` is the eight-level blessing hierarchy (Baptism plus Minor..True).
  *   - `effects` is the typed flat/percent declarative effect list. A blessing
  *     with purely narrative benefits (no numeric effect) may use `effects: []`.
  *   - `patronGodStableId` (optional) names the unarchived `gods` entry that is

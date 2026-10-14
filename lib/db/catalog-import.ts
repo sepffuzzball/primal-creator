@@ -46,6 +46,7 @@ import {
   catalogCreateSchema,
   catalogKindSchema,
   hasInvalidSkillTrack,
+  isIncompleteRaceConfig,
   isIncompleteSkillConfig,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
@@ -266,6 +267,12 @@ export function assertModernConfig(
     throw badRequest(
       "invalid_config",
       'Skill config has an invalid "track": expected "class" or "profession"'
+    )
+  }
+  if (kind === "races" && isIncompleteRaceConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Race config must declare a valid "raceType": expected "enlightened" or "monster"'
     )
   }
   if (kind === "evolutions" && !isValidEvolutionConfig(config)) {

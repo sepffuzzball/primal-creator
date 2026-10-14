@@ -149,6 +149,48 @@ describe("createInitialState", () => {
     expect(state.race.level).toBe(0)
   })
 
+  it("starts an integrated monster at race grade G regardless of natural grade", () => {
+    const monster = {
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "B",
+        raceDefinitions: {
+          G: { id: "wyrm:G", perLevel: { strength: 2 }, freePerLevel: 1 },
+          B: { id: "wyrm:B", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    }
+    const state = createInitialState("integrated", monster, null)
+    expect(state.race.grade).toBe("G")
+    expect(state.race.mode).toBe("independent")
+    expect(state.race.origin).toBe("integrated")
+    // A monster has no class/profession tracks.
+    expect(Object.keys(state.tracks)).toEqual([])
+  })
+
+  it("starts a born monster at the race's natural grade", () => {
+    const monster = {
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "B",
+        raceDefinitions: {
+          G: { id: "wyrm:G", perLevel: { strength: 2 }, freePerLevel: 1 },
+          B: { id: "wyrm:B", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    }
+    const state = createInitialState("born", monster, null)
+    expect(state.race.grade).toBe("B")
+    expect(state.race.mode).toBe("independent")
+    expect(state.race.origin).toBe("born")
+  })
+
   it("creates a profession track only when one is provided", () => {
     const profession = {
       kind: "professions",
@@ -382,6 +424,7 @@ describe("optimistic concurrency (CAS)", () => {
       name: "Human",
       config: {
         raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
           F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
         },
       },
@@ -397,6 +440,117 @@ describe("optimistic concurrency (CAS)", () => {
     expect(dbMock.store.events).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("create")
     expect(dbMock.store.events[0].characterId).toBe(detail.id)
+  })
+
+  it("maps a serialization failure (P2034) on character create to 409 serialization_conflict and rolls back character/event/draft", async () => {
+    seedClassCatalog()
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael" },
+      version: 5,
+    })
+    // A concurrent admin raceType edit commits while this create is in flight. The
+    // SERIALIZABLE transaction detects the conflict and aborts the create with a
+    // P2034, which the service must surface as a meaningful 409 rather than a raw
+    // 500, and must roll back the character / event / draft consume entirely.
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        createCharacter(
+          {
+            name: "Kael",
+            origin: "integrated",
+            raceId: "race-1",
+            classId: "cls-1",
+            draftVersion: 5,
+          },
+          user
+        )
+      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.drafts.size).toBe(1)
+  })
+
+  it("rejects a concurrent race type change to monster without creating an inconsistent character (type re-read under the transaction)", async () => {
+    seedClassCatalog()
+    dbMock.store.addCatalog({
+      id: "race-1",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addDraft({
+      userId: user.id,
+      data: { step: 4, name: "Kael" },
+      version: 5,
+    })
+    // Simulate the admin editing the race's raceType to monster AFTER the wizard
+    // read the race but BEFORE the create transaction's insert. The authoritative
+    // type must be re-read only under the transaction snapshot, so the create
+    // landing on a monster (no class) rejects with invalid_class instead of
+    // writing an inconsistent enlightened-styled character.
+    const originalTransaction = prisma.$transaction
+    const spy = vi
+      .spyOn(prisma, "$transaction")
+      .mockImplementation((cb, opts) => {
+        const race = dbMock.store.catalog.get("race-1")
+        if (race) {
+          race.config = {
+            raceType: "monster",
+            naturalGrade: "F",
+            raceDefinitions: race.config.raceDefinitions ?? {},
+          }
+        }
+        return originalTransaction(cb, opts)
+      })
+    try {
+      await expect(
+        createCharacter(
+          {
+            name: "Kael",
+            origin: "integrated",
+            raceId: "race-1",
+            classId: "cls-1",
+            draftVersion: 5,
+          },
+          user
+        )
+      ).rejects.toMatchObject({ status: 400, code: "invalid_class" })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.drafts.size).toBe(1)
   })
 
   it("createCharacter does not create a character or event when the race is missing", async () => {
@@ -425,6 +579,7 @@ describe("optimistic concurrency (CAS)", () => {
       name: "Human",
       config: {
         raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
           F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
         },
       },
@@ -461,6 +616,7 @@ describe("optimistic concurrency (CAS)", () => {
       name: "Human",
       config: {
         raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
           F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
         },
       },
@@ -500,6 +656,7 @@ describe("optimistic concurrency (CAS)", () => {
       name: "Human",
       config: {
         raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
           F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
         },
       },
@@ -710,6 +867,584 @@ describe("optimistic concurrency (CAS)", () => {
     expect(dbMock.store.characters.get("chr-1")!.version).toBe(3)
     expect(dbMock.store.events).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("evolve")
+  })
+})
+
+describe("race adoption (monster vs enlightened)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedMonsterRace() {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedEnlightenedRace() {
+    dbMock.store.addCatalog({
+      id: "race-e",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedClassF() {
+    dbMock.store.addCatalog({
+      id: "cls-f",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      grade: "F",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  function seedClassE() {
+    dbMock.store.addCatalog({
+      id: "cls-e",
+      kind: "classes",
+      stableId: "mage",
+      name: "Mage",
+      grade: "E",
+      config: { grades: { E: { fixed: { wisdom: 2 }, free: 1 } } },
+    })
+  }
+
+  function seedProfessionF() {
+    dbMock.store.addCatalog({
+      id: "prof-f",
+      kind: "professions",
+      stableId: "alchemist",
+      name: "Alchemist",
+      grade: "F",
+      config: { grades: { F: { fixed: { wisdom: 1 }, free: 1 } } },
+    })
+  }
+
+  it("creates a monster as race-only with independent mode and no tracks", async () => {
+    seedMonsterRace()
+    const detail = await createCharacter(
+      {
+        name: "Wyrm",
+        origin: "born",
+        raceId: "race-m",
+        classId: null,
+        professionId: null,
+      },
+      user
+    )
+    expect(detail.classId).toBeNull()
+    expect(detail.professionId).toBeNull()
+    const state = detail.state as CharacterState
+    expect(state.race.mode).toBe("independent")
+    expect(state.race.grade).toBe("F")
+    expect(state.race.quarter).toBe(0)
+    expect(Object.keys(state.tracks)).toEqual([])
+  })
+
+  it("rejects a class or profession on a monster", async () => {
+    seedMonsterRace()
+    seedClassF()
+    seedProfessionF()
+    await expect(
+      createCharacter(
+        {
+          name: "Wyrm",
+          origin: "born",
+          raceId: "race-m",
+          classId: "cls-f",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_class" })
+    await expect(
+      createCharacter(
+        {
+          name: "Wyrm",
+          origin: "born",
+          raceId: "race-m",
+          classId: null,
+          professionId: "prof-f",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_profession" })
+  })
+
+  it("rejects a null class on an enlightened race", async () => {
+    seedEnlightenedRace()
+    seedClassF()
+    await expect(
+      createCharacter(
+        {
+          name: "Human",
+          origin: "integrated",
+          raceId: "race-e",
+          classId: null,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_class" })
+  })
+
+  it("enforces exact natural-grade eligibility for an enlightened race", async () => {
+    seedEnlightenedRace()
+    seedClassF()
+    // A class at the natural grade (F) with an F config is accepted.
+    const ok = await createCharacter(
+      {
+        name: "Archer",
+        origin: "born",
+        raceId: "race-e",
+        classId: "cls-f",
+      },
+      user
+    )
+    expect((ok.state as CharacterState).tracks.class.grade).toBe("F")
+
+    // A class NOT at the natural grade is rejected, even though it defines a track.
+    seedClassE()
+    await expect(
+      createCharacter(
+        {
+          name: "Mage",
+          origin: "born",
+          raceId: "race-e",
+          classId: "cls-e",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_class_grade" })
+  })
+
+  it("requires a race definition for the starting grade at create", async () => {
+    // Enlightened race with only an F definition: an integrated character starts
+    // at G and must be rejected.
+    dbMock.store.addCatalog({
+      id: "race-no-g",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    seedClassF()
+    await expect(
+      createCharacter(
+        {
+          name: "Human",
+          origin: "integrated",
+          raceId: "race-no-g",
+          classId: "cls-f",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_race_grade" })
+  })
+
+  it("creates an integrated monster at grade G and advances using the G race definition", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m-g",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "B",
+        raceDefinitions: {
+          G: { id: "wyrm:G", perLevel: { strength: 2 }, freePerLevel: 1 },
+          B: { id: "wyrm:B", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    const created = await createCharacter(
+      {
+        name: "Wyrm",
+        origin: "integrated",
+        raceId: "race-m-g",
+        classId: null,
+      },
+      user
+    )
+    const state = created.state as CharacterState
+    expect(state.race.grade).toBe("G")
+    expect(state.race.mode).toBe("independent")
+    // Advancing the race track four quarters levels up and snapshots the G-per-level
+    // definition, not the monster's natural B grade.
+    let version = created.version
+    let charId = created.id
+    let current = state
+    for (let i = 0; i < 4; i++) {
+      const { character } = await advanceCharacter(
+        charId,
+        { track: "race", version },
+        user
+      )
+      current = character.state as CharacterState
+      version = character.version
+      charId = character.id
+    }
+    expect(current.race.level).toBe(1)
+    expect(current.race.quarter).toBe(0)
+    expect(current.historicalLevelAwards[0]).toMatchObject({
+      track: "race",
+      definitionId: "wyrm:G",
+    })
+  })
+
+  it("creates a born monster at its natural grade", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m-b",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "B",
+        raceDefinitions: {
+          B: { id: "wyrm:B", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    const created = await createCharacter(
+      { name: "Wyrm", origin: "born", raceId: "race-m-b", classId: null },
+      user
+    )
+    const state = created.state as CharacterState
+    expect(state.race.grade).toBe("B")
+    expect(state.race.mode).toBe("independent")
+  })
+
+  it("rejects an integrated monster whose race lacks a G definition", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m-no-g",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "B",
+        raceDefinitions: {
+          B: { id: "wyrm:B", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    await expect(
+      createCharacter(
+        {
+          name: "Wyrm",
+          origin: "integrated",
+          raceId: "race-m-no-g",
+          classId: null,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_race_grade" })
+  })
+
+  it("advances a monster on the race-only four-quarter cadence", async () => {
+    seedMonsterRace()
+    const created = await createCharacter(
+      {
+        name: "Wyrm",
+        origin: "born",
+        raceId: "race-m",
+        classId: null,
+      },
+      user
+    )
+    let version = created.version
+    let charId = created.id
+    let state = created.state as CharacterState
+    for (let i = 0; i < 3; i++) {
+      const { character: c } = await advanceCharacter(
+        charId,
+        { track: "race", version },
+        user
+      )
+      state = c.state as CharacterState
+      version = c.version
+      charId = c.id
+    }
+    expect(state.race.quarter).toBe(3)
+    expect(state.race.level).toBe(0)
+    // The fourth quarter levels up and snapshots the race award.
+    const { character: c4 } = await advanceCharacter(
+      charId,
+      { track: "race", version },
+      user
+    )
+    state = c4.state as CharacterState
+    expect(state.race.level).toBe(1)
+    expect(state.race.quarter).toBe(0)
+    expect(state.historicalLevelAwards).toHaveLength(1)
+    expect(state.historicalLevelAwards[0].track).toBe("race")
+    expect(state.historicalLevelAwards[0].fixed.strength).toBe(2)
+  })
+
+  it("rejects a class/profession advance on a monster and a race advance on an enlightened race", async () => {
+    seedMonsterRace()
+    const created = await createCharacter(
+      { name: "Wyrm", origin: "born", raceId: "race-m", classId: null },
+      user
+    )
+    await expect(
+      advanceCharacter(created.id, { track: "class", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_track" })
+
+    seedEnlightenedRace()
+    seedClassF()
+    const human = await createCharacter(
+      {
+        name: "Human",
+        origin: "integrated",
+        raceId: "race-e",
+        classId: "cls-f",
+      },
+      user
+    )
+    await expect(
+      advanceCharacter(human.id, { track: "race", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_track" })
+  })
+
+  // Monster import/export classification lives with the race-adoption rules: a
+  // monster is race-only, so its imported identity must carry no class/profession
+  // reference and its imported state must declare no class/profession track.
+  function monsterState(): CharacterState {
+    return createInitialState(
+      "born",
+      {
+        kind: "races",
+        stableId: "wyrm",
+        name: "Wyrm",
+        config: {
+          raceType: "monster",
+          naturalGrade: "F",
+          raceDefinitions: {
+            F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+          },
+        },
+      },
+      null
+    )
+  }
+
+  function monsterDoc(
+    overrides: {
+      class?: { stableId: string | null }
+      profession?: { stableId: string } | null
+      state?: CharacterState
+    } = {}
+  ): CharacterImportDocument {
+    const state = overrides.state ?? monsterState()
+    const identityClass = overrides.class ?? { stableId: null }
+    const identityProfession =
+      overrides.profession !== undefined ? overrides.profession : null
+    return {
+      schema: IMPORT_SCHEMA_V3,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Wyrm",
+        description: null,
+        origin: "born",
+        race: { stableId: "wyrm" },
+        class: identityClass,
+        profession: identityProfession,
+      },
+      state: serializeState(state) as CharacterImportDocument["state"],
+      liveState: {},
+      status: {},
+      associations: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+  }
+
+  it("imports a monster backup as race-only with null class and no tracks", async () => {
+    seedMonsterRace()
+    const imported = await importCharacter(monsterDoc(), user)
+    expect(imported.classId).toBeNull()
+    expect(imported.professionId).toBeNull()
+    const state = imported.state as CharacterState
+    expect(state.race.mode).toBe("independent")
+    expect(state.race.quarter).toBe(0)
+    expect(state.race.grade).toBe("F")
+    expect(Object.keys(state.tracks)).toEqual([])
+  })
+
+  it("rejects an imported monster that declares a class identity", async () => {
+    seedMonsterRace()
+    await expect(
+      importCharacter(monsterDoc({ class: { stableId: "archer" } }), user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_import" })
+  })
+
+  it("rejects an imported monster that declares a profession identity", async () => {
+    seedMonsterRace()
+    await expect(
+      importCharacter(
+        monsterDoc({ profession: { stableId: "alchemist" } }),
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_import" })
+  })
+
+  it("rejects an imported monster state that declares a class track", async () => {
+    seedMonsterRace()
+    const state = monsterState()
+    state.tracks["class"] = { level: 0, quarter: 0, definitionId: "archer:F" }
+    await expect(
+      importCharacter(monsterDoc({ state }), user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_import" })
+  })
+
+  it("rejects an imported monster state that declares a profession track", async () => {
+    seedMonsterRace()
+    const state = monsterState()
+    state.tracks["profession"] = {
+      level: 0,
+      quarter: 0,
+      definitionId: "alchemist:G",
+    }
+    await expect(
+      importCharacter(monsterDoc({ state }), user)
+    ).rejects.toMatchObject({ status: 400, code: "invalid_import" })
+  })
+
+  it("rejects an imported monster whose race mode is derived (race_type/mode mismatch)", async () => {
+    seedMonsterRace()
+    const state = monsterState()
+    state.race.mode = "derived"
+    await expect(
+      importCharacter(monsterDoc({ state }), user)
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "import_race_mode_mismatch",
+    })
+  })
+
+  it("rejects an imported enlightened (legacy no-raceType) state whose race mode is independent", async () => {
+    // A legacy race config with no raceType defaults to enlightened (derived mode).
+    dbMock.store.addCatalog({
+      id: "race-legacy",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    seedClassF()
+    // The state declares independent (monster) mode; the resolved race is
+    // enlightened, so the mode mismatch must win over the derived-mode track
+    // validation.
+    const state = monsterState()
+    state.race.mode = "independent"
+    const doc = monsterDoc({ state, class: { stableId: "archer" } })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_race_mode_mismatch",
+    })
+  })
+
+  it("exports a monster with a null class/profession identity and no tracks", async () => {
+    seedMonsterRace()
+    const created = await createCharacter(
+      { name: "Wyrm", origin: "born", raceId: "race-m", classId: null },
+      user
+    )
+    const exported = (await exportCharacter(created.id, user)) as Record<
+      string,
+      unknown
+    >
+    const identity = exported.identity as {
+      class: { stableId: string | null }
+      profession: { stableId: string } | null
+    }
+    expect(identity.class.stableId).toBeNull()
+    expect(identity.profession).toBeNull()
+    const state = exported.state as CharacterState
+    expect(state.race.mode).toBe("independent")
+    expect(state.race.quarter).toBe(0)
+    expect(Object.keys(state.tracks)).toEqual([])
+  })
+
+  it("rejects an imported monster race level past the next grade entry level (import_grade_blocked)", async () => {
+    seedMonsterRace()
+    const state = monsterState()
+    // The monster advances race-only; F's next grade is E (entryLevel 25). A level
+    // past that threshold can never advance (the first level-up would reject), so
+    // the import must be rejected before any write.
+    state.race.level = 26
+    await expect(
+      importCharacter(monsterDoc({ state }), user)
+    ).rejects.toMatchObject({ status: 400, code: "import_grade_blocked" })
+    // No character row was created.
+    expect(dbMock.store.characters.size).toBe(0)
+  })
+
+  it("accepts an imported monster race level exactly at the next grade entry level", async () => {
+    seedMonsterRace()
+    const state = monsterState()
+    // Equality is allowed: F level 25 sits exactly at the E threshold (25).
+    state.race.level = 25
+    const imported = await importCharacter(monsterDoc({ state }), user)
+    expect((imported.state as CharacterState).race.level).toBe(25)
+  })
+
+  it("accepts a born monster at a higher natural grade with level 0", async () => {
+    // A race with a high natural grade, imported at level 0, must not be rejected
+    // just because the stored grade is higher than the starting grade.
+    dbMock.store.addCatalog({
+      id: "race-m-b",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "B",
+        raceDefinitions: {
+          B: { id: "wyrm:B", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    const state = monsterState()
+    state.race.grade = "B"
+    state.race.level = 0
+    const doc = monsterDoc({ state })
+    const imported = await importCharacter(doc, user)
+    const importedState = imported.state as CharacterState
+    expect(importedState.race.grade).toBe("B")
+    expect(importedState.race.level).toBe(0)
   })
 })
 
@@ -1831,6 +2566,532 @@ describe("associateCharacter (titles / equipment)", () => {
     expect(
       res.character.associations.every((a) => a.definitionArchived === false)
     ).toBe(true)
+  })
+})
+
+describe("ranked title progression (associateCharacter)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharacter(grade: Grade): unknown {
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, grade }
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedRankedTitle(
+    id: string,
+    rank: number,
+    minRaceGrade: Grade,
+    total: number,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "titles",
+      stableId: id,
+      name: extra.name ?? `Pioneer ${rank}`,
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank,
+          minRaceGrade,
+        },
+        flat: allEqual(total),
+      },
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedUnrankedTitle(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "titles",
+      stableId: id,
+      name: extra.name ?? `Title ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  it("adds ranked titles strictly one-by-one across the E->D grade tiers, replacing the prior", async () => {
+    seedCharacter("D")
+    // Seed ranks 1..6 (1-5 E-tier, 6 D-tier).
+    for (let rank = 1; rank <= 6; rank++) {
+      seedRankedTitle(`dp-${rank}`, rank, rank <= 5 ? "E" : "D", rank * 3)
+    }
+    let expectedVersion = 0
+    let prevId: string | null = null
+    for (let rank = 1; rank <= 6; rank++) {
+      const id = `dp-${rank}`
+      const res = await associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: id,
+          operation: "add",
+          version: expectedVersion,
+          reason: `cleared rank ${rank}`,
+        },
+        user
+      )
+      expectedVersion++
+      // Only the latest rank remains linked; the prior is atomically replaced.
+      expect(res.character.associations.map((a) => a.definitionId)).toEqual([
+        id,
+      ])
+      expect(res.character.version).toBe(expectedVersion)
+      expect(res.character.associations[0].improvement).toEqual({
+        seriesId: "dungeon-pioneer",
+        rank,
+        minRaceGrade: rank <= 5 ? "E" : "D",
+      })
+      if (prevId != null) {
+        // The removal journal names the superseded prior rank.
+        const event = dbMock.store.events[dbMock.store.events.length - 1]
+        const removed = (
+          event.payload as { removed: Array<{ definitionId: string }> }
+        ).removed
+        expect(removed.some((r) => r.definitionId === prevId)).toBe(true)
+      }
+      prevId = id
+    }
+    // The final event carries the full improvement snapshot and the reason.
+    const event = dbMock.store.events[dbMock.store.events.length - 1]
+    expect(event.payload).toMatchObject({
+      operation: "add",
+      kind: "title",
+      definitionId: "dp-6",
+      reason: "cleared rank 6",
+      definition: {
+        id: "dp-6",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 6,
+          minRaceGrade: "D",
+        },
+      },
+    })
+  })
+
+  it("rejects a ranked title add without a reason (no write or event)", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    await expect(
+      associateCharacter(
+        "chr-1",
+        { kind: "title", definitionId: "dp-1", operation: "add", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_reason_required" })
+    // Nothing written: version unchanged, no event, no link.
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects a skipped/no prior rank with title_rank_conflict", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    seedRankedTitle("dp-3", 3, "E", 9)
+    // Rank 3 with no prior at all.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-3",
+          operation: "add",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_rank_conflict" })
+    // Add rank 1, then jump to rank 3 (skipping rank 2).
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-1",
+        operation: "add",
+        version: 0,
+        reason: "x",
+      },
+      user
+    )
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-3",
+          operation: "add",
+          version: 1,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_rank_conflict" })
+  })
+
+  it("rejects a low race grade against a ranked title minRaceGrade", async () => {
+    seedCharacter("E") // E-grade character cannot take a D-grade rank.
+    seedRankedTitle("dp-6", 6, "D", 24)
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-6",
+          operation: "add",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_grade_blocked" })
+  })
+
+  it("rejects a duplicate series link (rank 1 cannot downgrade over a later rank)", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    seedRankedTitle("dp-2", 2, "E", 6)
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-1",
+        operation: "add",
+        version: 0,
+        reason: "x",
+      },
+      user
+    )
+    // Adding rank 1 again (same definition) is a duplicate.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-1",
+          operation: "add",
+          version: 1,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "duplicate" })
+    // Adding rank 1 while rank 2 is present (after progressing) is a downgrade.
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-2",
+        operation: "add",
+        version: 1,
+        reason: "x",
+      },
+      user
+    )
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-1",
+          operation: "add",
+          version: 2,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_rank_conflict" })
+  })
+
+  it("rejects an ambiguous rank 1 over an unrelated title in the same upgrade group", async () => {
+    seedCharacter("D")
+    // An unrelated (unranked) title that happens to occupy the same upgrade group.
+    seedUnrankedTitle("unrelated", {
+      flat: { strength: 5 },
+      upgradeGroup: "dungeon-pioneer",
+    })
+    seedRankedTitle("dp-1", 1, "E", 3)
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "unrelated",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-1",
+          operation: "add",
+          version: 1,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_rank_conflict" })
+    // The unrelated title is untouched.
+    expect(dbMock.store.associations.map((a) => a.definitionId)).toEqual([
+      "unrelated",
+    ])
+  })
+
+  it("counts an archived prior title link for rank progression", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    seedRankedTitle("dp-2", 2, "E", 6)
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-1",
+        operation: "add",
+        version: 0,
+        reason: "x",
+      },
+      user
+    )
+    // Archive the linked rank-1 definition (still linked).
+    dbMock.store.addCatalog({
+      id: "dp-1",
+      kind: "titles",
+      stableId: "dp-1",
+      name: "Pioneer 1",
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 1,
+          minRaceGrade: "E",
+        },
+        flat: allEqual(3),
+      },
+      archived: true,
+    })
+    // Rank 2 can still be added: the archived rank-1 link is the required prior.
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-2",
+        operation: "add",
+        version: 1,
+        reason: "x",
+      },
+      user
+    )
+    expect(res.character.associations.map((a) => a.definitionId)).toEqual([
+      "dp-2",
+    ])
+  })
+
+  it("rejects a non-owner (unauthorized) ranked title add", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    const stranger = { id: "user-2", email: "s@example.com", isAdmin: false }
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-1",
+          operation: "add",
+          version: 0,
+          reason: "x",
+        },
+        stranger
+      )
+    ).rejects.toMatchObject({ status: 403, code: "forbidden" })
+  })
+
+  it("accepts the Baptism tier on a blessing add and records it in the event", async () => {
+    const state = createInitialState("integrated", null, null)
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+    dbMock.store.addCatalog({
+      id: "bless-baptism",
+      kind: "blessings",
+      stableId: "bless-baptism",
+      name: "Baptism Blessing",
+      config: { tier: "Baptism", effects: [] },
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "blessing",
+        definitionId: "bless-baptism",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.associations).toHaveLength(1)
+    expect(res.character.associations[0].kind).toBe("blessing")
+    const event = dbMock.store.events[dbMock.store.events.length - 1]
+    expect(event.payload).toMatchObject({
+      kind: "blessing",
+      definition: { tier: "Baptism", id: "bless-baptism" },
+    })
+  })
+
+  it("rejects a rank>1 add when an unrelated title occupies the same upgrade group", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    seedRankedTitle("dp-2", 2, "E", 6)
+    seedUnrankedTitle("stray", {
+      flat: { strength: 5 },
+      upgradeGroup: "dungeon-pioneer",
+    })
+    // Seed the prior rank AND the unrelated title directly, so the add flow's
+    // same-group deletion cannot remove the prior before the rank gate runs.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "dp-1",
+      kind: "TITLE",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "stray",
+      kind: "TITLE",
+    })
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "title",
+          definitionId: "dp-2",
+          operation: "add",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_rank_conflict" })
+    // Nothing written: no link changed, no event, version unchanged.
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(
+      dbMock.store.associations
+        .map((a) => a.definitionId)
+        .sort((a, b) => a.localeCompare(b))
+    ).toEqual(["dp-1", "stray"])
+  })
+
+  it("accepts a rank>1 add when only the prior series link occupies the upgrade group", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    seedRankedTitle("dp-2", 2, "E", 6)
+    // Seed only the prior rank link; no unrelated same-group title.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "dp-1",
+      kind: "TITLE",
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-2",
+        operation: "add",
+        version: 0,
+        reason: "x",
+      },
+      user
+    )
+    expect(res.character.associations.map((a) => a.definitionId)).toEqual([
+      "dp-2",
+    ])
+    expect(res.character.version).toBe(1)
+  })
+
+  it("rejects adding an unranked title into an upgrade group held by a ranked title (400 title_rank_conflict)", async () => {
+    seedCharacter("D")
+    seedRankedTitle("dp-1", 1, "E", 3)
+    // Link the ranked rank-1 title first; it is the authority for rank progression.
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-1",
+        operation: "add",
+        version: 0,
+        reason: "x",
+      },
+      user
+    )
+    // An ordinary (unranked) title that happens to occupy the same upgrade group
+    // would silently displace the ranked title and bypass its rank sequence, so it
+    // must be rejected BEFORE any same-group link is removed.
+    seedUnrankedTitle("plain", {
+      flat: { strength: 5 },
+      upgradeGroup: "dungeon-pioneer",
+    })
+    await expect(
+      associateCharacter(
+        "chr-1",
+        { kind: "title", definitionId: "plain", operation: "add", version: 1 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "title_rank_conflict" })
+    // Nothing written: the ranked title stays linked, version unchanged, no event.
+    expect(dbMock.store.associations.map((a) => a.definitionId)).toEqual([
+      "dp-1",
+    ])
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("allows an unranked title to replace another unranked title in the same upgrade group", async () => {
+    seedCharacter("D")
+    seedUnrankedTitle("plain-1", {
+      flat: { strength: 5 },
+      upgradeGroup: "hero",
+    })
+    seedUnrankedTitle("plain-2", {
+      flat: { strength: 9 },
+      upgradeGroup: "hero",
+    })
+    await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "plain-1", operation: "add", version: 0 },
+      user
+    )
+    const res = await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "plain-2", operation: "add", version: 1 },
+      user
+    )
+    expect(res.character.associations.map((a) => a.definitionId)).toEqual([
+      "plain-2",
+    ])
+    expect(res.character.version).toBe(2)
   })
 })
 
@@ -3107,6 +4368,53 @@ describe("updateCatalogItem link-collision rejection", () => {
     ).toBe("villain")
   })
 
+  it("maps a serialization failure (P2034) on a linked-title catalog update to a 409, never a 500", async () => {
+    seedState()
+    seedTitle("title-1", {
+      flat: { strength: 5 },
+      upgradeGroup: "hero",
+      improvement: { seriesId: "hero", rank: 1, minRaceGrade: "F" },
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    // A concurrent `associateCharacter` claims rank on this linked title (or
+    // another catalog edit races the row) while this title update reads the linked
+    // associations. The SERIALIZABLE transaction detects the conflict and aborts
+    // with P2034, which the service must surface as a 409 rather than a raw 500,
+    // and must not apply the config change.
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        updateCatalogItem("titles", "title-1", {
+          config: {
+            flat: { strength: 6 },
+            upgradeGroup: "hero",
+            improvement: { seriesId: "hero", rank: 1, minRaceGrade: "F" },
+          },
+        })
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "catalog_serialization_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    // The rejected update left the catalog row untouched (flat still 5).
+    expect(
+      (
+        dbMock.store.catalog.get("title-1")!.config as {
+          flat: { strength: number }
+        }
+      ).flat.strength
+    ).toBe(5)
+  })
+
   it("does not reject a config edit on an archived definition (it is inert)", async () => {
     seedState()
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
@@ -3331,6 +4639,289 @@ describe("updateCatalogItem link-collision rejection", () => {
       config: { effects: [], upgradeGroup: "gamma" },
     })
     expect((item.config as { upgradeGroup: string }).upgradeGroup).toBe("gamma")
+  })
+
+  it("rejects changing the improvement identity of a linked ranked title (409 title_improvement_conflict)", async () => {
+    seedState()
+    seedTitle("title-1", {
+      upgradeGroup: "dungeon-pioneer",
+      improvement: { seriesId: "dungeon-pioneer", rank: 1, minRaceGrade: "E" },
+      flat: allEqual(3),
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    // Bumping the rank changes the improvement identity on a linked title.
+    await expect(
+      updateCatalogItem("titles", "title-1", {
+        config: {
+          upgradeGroup: "dungeon-pioneer",
+          improvement: {
+            seriesId: "dungeon-pioneer",
+            rank: 2,
+            minRaceGrade: "E",
+          },
+          flat: allEqual(6),
+        },
+      })
+    ).rejects.toMatchObject({ status: 409, code: "title_improvement_conflict" })
+    // The update never applied - title-1 is still rank 1.
+    expect(
+      (
+        dbMock.store.catalog.get("title-1")!.config as {
+          improvement: { rank: number }
+        }
+      ).improvement.rank
+    ).toBe(1)
+  })
+
+  it("rejects removing the improvement identity of a linked ranked title (409 title_improvement_conflict)", async () => {
+    seedState()
+    seedTitle("title-1", {
+      upgradeGroup: "dungeon-pioneer",
+      improvement: { seriesId: "dungeon-pioneer", rank: 1, minRaceGrade: "E" },
+      flat: allEqual(3),
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    // Dropping the improvement on a linked title is a removal of the identity.
+    await expect(
+      updateCatalogItem("titles", "title-1", {
+        config: {
+          upgradeGroup: "dungeon-pioneer",
+          flat: allEqual(3),
+        },
+      })
+    ).rejects.toMatchObject({ status: 409, code: "title_improvement_conflict" })
+    // title-1 still carries the improvement.
+    expect(
+      (
+        dbMock.store.catalog.get("title-1")!.config as {
+          improvement?: { rank: number }
+        }
+      ).improvement?.rank
+    ).toBe(1)
+  })
+
+  it("allows an owner to edit the metadata/bonus of a ranked title they currently hold (identity stable)", async () => {
+    seedState()
+    seedTitle("title-1", {
+      upgradeGroup: "dungeon-pioneer",
+      improvement: { seriesId: "dungeon-pioneer", rank: 1, minRaceGrade: "E" },
+      flat: allEqual(3),
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    // A name/bonus edit keeps the improvement identity intact, so it is allowed.
+    const item = await updateCatalogItem("titles", "title-1", {
+      name: "Dungeon Pioneer Renamed",
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 1,
+          minRaceGrade: "E",
+        },
+        flat: allEqual(9),
+      },
+    })
+    expect(item.name).toBe("Dungeon Pioneer Renamed")
+    const cfg = item.config as {
+      improvement: { rank: number }
+      flat: { strength: number }
+    }
+    expect(cfg.improvement.rank).toBe(1)
+    expect(cfg.flat.strength).toBe(9)
+  })
+
+  it("allows changing the improvement identity of an unlinked ranked title (no links)", async () => {
+    seedState()
+    seedTitle("title-1", {
+      upgradeGroup: "dungeon-pioneer",
+      improvement: { seriesId: "dungeon-pioneer", rank: 1, minRaceGrade: "E" },
+      flat: allEqual(3),
+    })
+    // The title is not assigned to any character, so the identity can change.
+    const item = await updateCatalogItem("titles", "title-1", {
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 2,
+          minRaceGrade: "E",
+        },
+        flat: allEqual(6),
+      },
+    })
+    const cfg = item.config as { improvement: { rank: number } }
+    expect(cfg.improvement.rank).toBe(2)
+  })
+
+  it("rejects adding an improvement to a linked unranked title (409 title_improvement_conflict)", async () => {
+    seedState()
+    seedTitle("title-1", {
+      flat: { strength: 5 },
+      upgradeGroup: "dungeon-pioneer",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    // Adding an improvement to a title that had none is an identity ADD on a
+    // linked title; the link is the authority, so it is rejected (no write).
+    await expect(
+      updateCatalogItem("titles", "title-1", {
+        config: {
+          upgradeGroup: "dungeon-pioneer",
+          improvement: {
+            seriesId: "dungeon-pioneer",
+            rank: 1,
+            minRaceGrade: "E",
+          },
+          flat: allEqual(3),
+        },
+      })
+    ).rejects.toMatchObject({ status: 409, code: "title_improvement_conflict" })
+    // The promotion never applied - title-1 still carries no improvement.
+    expect(
+      (
+        dbMock.store.catalog.get("title-1")!.config as {
+          improvement?: { rank: number }
+        }
+      ).improvement
+    ).toBeUndefined()
+  })
+
+  it("allows promoting an unlinked unranked title to ranked (the prior identity was absent)", async () => {
+    seedState()
+    seedTitle("title-1", {
+      flat: { strength: 5 },
+      upgradeGroup: "dungeon-pioneer",
+    })
+    // No character references this title, so promoting it to ranked is allowed.
+    const item = await updateCatalogItem("titles", "title-1", {
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 1,
+          minRaceGrade: "E",
+        },
+        flat: allEqual(3),
+      },
+    })
+    const cfg = item.config as { improvement: { rank: number } }
+    expect(cfg.improvement.rank).toBe(1)
+  })
+})
+
+describe("updateCatalogItem race type in use", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedRace(id: string, config: Record<string, unknown>): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "races",
+      stableId: id,
+      name: `Race ${id}`,
+      config,
+    })
+  }
+
+  function seedCharacterReferencing(raceId: string): void {
+    const state = createInitialState("integrated", null, null)
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      raceId,
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  const monsterConfig = {
+    raceType: "monster",
+    naturalGrade: "F",
+    raceDefinitions: {
+      F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+    },
+  }
+
+  it("rejects changing raceType while characters reference the race (409 race_type_in_use)", async () => {
+    seedRace("race-m", monsterConfig)
+    seedCharacterReferencing("race-m")
+    await expect(
+      updateCatalogItem("races", "race-m", {
+        config: { raceType: "enlightened", naturalGrade: "F" },
+      })
+    ).rejects.toMatchObject({ status: 409, code: "race_type_in_use" })
+    // No conversion: the race stays a monster.
+    expect(
+      (dbMock.store.catalog.get("race-m")!.config as { raceType: string })
+        .raceType
+    ).toBe("monster")
+  })
+
+  it("allows changing raceType when no character references the race", async () => {
+    seedRace("race-m", monsterConfig)
+    const item = await updateCatalogItem("races", "race-m", {
+      config: { raceType: "enlightened", naturalGrade: "F" },
+    })
+    expect((item.config as { raceType: string }).raceType).toBe("enlightened")
+  })
+
+  it("allows a same-type config edit on a referenced race", async () => {
+    seedRace("race-m", monsterConfig)
+    seedCharacterReferencing("race-m")
+    const item = await updateCatalogItem("races", "race-m", {
+      config: { raceType: "monster", naturalGrade: "B" },
+    })
+    expect((item.config as { raceType: string }).raceType).toBe("monster")
+    expect((item.config as { naturalGrade: string }).naturalGrade).toBe("B")
+  })
+
+  it("allows an archival toggle on a referenced race (type unchanged)", async () => {
+    seedRace("race-m", monsterConfig)
+    seedCharacterReferencing("race-m")
+    const item = await updateCatalogItem("races", "race-m", { archived: true })
+    expect(item.archived).toBe(true)
+    expect(item.config).toMatchObject({ raceType: "monster" })
+  })
+
+  it("rejects a default-raceType change on a legacy race referenced by characters (409 race_type_in_use)", async () => {
+    // A legacy race config (no raceType) reads as "enlightened". Changing it to a
+    // monster type while characters reference it must reject before any write.
+    seedRace("race-legacy", {
+      naturalGrade: "F",
+      raceDefinitions: {
+        F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+      },
+    })
+    seedCharacterReferencing("race-legacy")
+    await expect(
+      updateCatalogItem("races", "race-legacy", {
+        config: { raceType: "monster", naturalGrade: "F" },
+      })
+    ).rejects.toMatchObject({ status: 409, code: "race_type_in_use" })
+    expect(
+      (
+        dbMock.store.catalog.get("race-legacy")!.config as {
+          raceType?: string
+        }
+      ).raceType
+    ).toBeUndefined()
   })
 })
 
@@ -3879,6 +5470,34 @@ describe("race evolution path choices", () => {
     expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
   })
 
+  it("maps a serialization failure (P2034) on evolve to 409 serialization_conflict and rolls back the evolution state/event", async () => {
+    seedHumanRace()
+    seedElfRace()
+    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+    seedCharacter()
+    const before = dbMock.store.characters.get("chr-1")!
+    const beforeState = before.state
+    // A concurrent admin edit to the destination race's config commits while this
+    // evolve is in flight. The SERIALIZABLE transaction detects the conflict and
+    // aborts with P2034, which the service must surface as a 409 rather than a raw
+    // 500, and must not advance the character state or write a stray evolve event.
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        evolveCharacter("chr-1", { optionId: "evo-1", version: 0 }, user)
+      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
+    } finally {
+      spy.mockRestore()
+    }
+    const after = dbMock.store.characters.get("chr-1")!
+    expect(after.state).toBe(beforeState)
+    expect(after.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
   it("evolves along a chosen catalog path to the destination race and grade", async () => {
     seedHumanRace()
     seedElfRace()
@@ -4043,6 +5662,155 @@ describe("race evolution path choices", () => {
     // Only the update event was written; the path evolve never committed.
     expect(dbMock.store.events).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("update")
+  })
+
+  it("evolves a monster race to a same-type (monster) destination via a catalog path", async () => {
+    dbMock.store.addCatalog({
+      id: "race-wyrm",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addCatalog({
+      id: "race-beast",
+      kind: "races",
+      stableId: "beast",
+      name: "Beast",
+      config: {
+        raceType: "monster",
+        raceDefinitions: {
+          E: { id: "beast:E", perLevel: { strength: 3 }, freePerLevel: 2 },
+        },
+      },
+    })
+    seedEvolution("evo-monster", "Wyrm to Beast", {
+      track: "race",
+      fromRaceStableId: "wyrm",
+      toRaceStableId: "beast",
+      fromGrade: "F",
+      toGrade: "E",
+    })
+
+    const base = createInitialState("born", null, null)
+    base.tracks = {}
+    base.race = {
+      level: 30,
+      grade: "F",
+      mode: "independent",
+      origin: "born",
+      quarter: 0,
+    }
+    seedCharacter({ state: serializeState(base), raceId: "race-wyrm" })
+
+    const res = await evolveCharacter(
+      "chr-1",
+      { optionId: "evo-monster", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    expect(res.character.raceId).toBe("race-beast")
+    expect(res.character.raceName).toBe("Beast")
+    const state = deserializeState(res.character.state)
+    expect(state.race.grade).toBe("E")
+    // A same-type evolution never changes the race mode (no implicit conversion).
+    expect(state.race.mode).toBe("independent")
+    expect(state.race.definitionId).toBe("beast:E")
+  })
+
+  it("rejects a catalog evolution that would cross from enlightened to monster with no write", async () => {
+    seedHumanRace()
+    dbMock.store.addCatalog({
+      id: "race-beast",
+      kind: "races",
+      stableId: "beast",
+      name: "Beast",
+      config: {
+        raceType: "monster",
+        raceDefinitions: {
+          F: { id: "beast:F", perLevel: { strength: 3 }, freePerLevel: 2 },
+        },
+      },
+    })
+    seedEvolution("evo-x", "Human to Beast", {
+      track: "race",
+      fromRaceStableId: "human",
+      toRaceStableId: "beast",
+      fromGrade: "G",
+      toGrade: "F",
+    })
+    seedCharacter()
+
+    await expect(
+      evolveCharacter("chr-1", { optionId: "evo-x", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "race_type_mismatch" })
+
+    // The rejected evolution never committed: no event, no raceId change, no bump.
+    expect(dbMock.store.events).toHaveLength(0)
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.raceId).toBe("race-human")
+    expect(fresh.version).toBe(0)
+  })
+
+  it("rejects a catalog evolution that would cross from monster to enlightened with no write", async () => {
+    dbMock.store.addCatalog({
+      id: "race-wyrm",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+    dbMock.store.addCatalog({
+      id: "race-elf-e",
+      kind: "races",
+      stableId: "elf",
+      name: "Elf",
+      config: {
+        raceType: "enlightened",
+        raceDefinitions: {
+          E: { id: "elf:E", perLevel: { agility: 2 }, freePerLevel: 2 },
+        },
+      },
+    })
+    seedEvolution("evo-y", "Wyrm to Elf", {
+      track: "race",
+      fromRaceStableId: "wyrm",
+      toRaceStableId: "elf",
+      fromGrade: "F",
+      toGrade: "E",
+    })
+
+    const base = createInitialState("born", null, null)
+    base.tracks = {}
+    base.race = {
+      level: 30,
+      grade: "F",
+      mode: "independent",
+      origin: "born",
+      quarter: 0,
+    }
+    seedCharacter({ state: serializeState(base), raceId: "race-wyrm" })
+
+    await expect(
+      evolveCharacter("chr-1", { optionId: "evo-y", version: 0 }, user)
+    ).rejects.toMatchObject({ status: 400, code: "race_type_mismatch" })
+
+    expect(dbMock.store.events).toHaveLength(0)
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.raceId).toBe("race-wyrm")
+    expect(fresh.version).toBe(0)
   })
 
   it("rejects a legacy grade-only evolution to a skip grade even when the race level falls in a higher grade band", async () => {
@@ -4928,6 +6696,32 @@ describe("importCharacter (trusted backup v3)", () => {
     expect((evs[2].payload as { rulesetVersion: string }).rulesetVersion).toBe(
       IMPORT_RULESET_VERSION
     )
+  })
+
+  it("maps a serialization failure (P2034) on import to 409 serialization_conflict and rolls back character/associations/events", async () => {
+    seedRaceClass()
+    // A concurrent admin edit to the imported race's config (e.g. raceType) commits
+    // while this import is in flight. The SERIALIZABLE transaction detects the
+    // conflict and aborts with P2034, which the service must surface as a 409
+    // rather than a raw 500, and must roll back the character / links / events
+    // entirely (no partially-imported character, no stray import event).
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(importCharacter(importDoc(), user)).rejects.toMatchObject({
+        status: 409,
+        code: "serialization_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    // The rejected import left no character, event, association or offer behind.
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
   })
 
   it("rejects a backup whose race stableId is not in the catalog", async () => {
@@ -6074,6 +7868,126 @@ describe("importCharacter (trusted backup v3)", () => {
     expect(dbMock.store.characters.size).toBe(2)
     expect(dbMock.store.characters.get(existing.id)?.name).toBe("Existing")
   })
+
+  it("rejects importing a ranked title whose backup race grade is below minRaceGrade (import_grade_blocked)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "titles",
+      "dp-6",
+      {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 6,
+          minRaceGrade: "D",
+        },
+        flat: allEqual(24),
+      },
+      { name: "Dungeon Pioneer VI" }
+    )
+    // The backup's race grade is E, below the title's D requirement.
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, grade: "E" }
+    const doc = importDoc({
+      state,
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "dp-6" } },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_grade_blocked",
+    })
+    // Nothing was written: the import rolled back the whole character.
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("imports a ranked title at rank > 1 without any prior rank history", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "titles",
+      "dp-5",
+      {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 5,
+          minRaceGrade: "E",
+        },
+        flat: allEqual(15),
+      },
+      { name: "Dungeon Pioneer V" }
+    )
+    // A backup is a trusted association snapshot: rank 5 needs no ranks 1-4.
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, grade: "D" }
+    const doc = importDoc({
+      state,
+      associations: [
+        { kind: "title", definition: { kind: "titles", stableId: "dp-5" } },
+      ],
+    })
+    const result = await importCharacter(doc, user)
+    expect(result.associations).toHaveLength(1)
+    expect(result.associations[0].definitionId).toBe("dp-5")
+    expect(result.associations[0].improvement).toEqual({
+      seriesId: "dungeon-pioneer",
+      rank: 5,
+      minRaceGrade: "E",
+    })
+  })
+
+  it("round-trips a ranked title: export carries the association and re-import restores the improvement", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "titles",
+      "dp-3",
+      {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank: 3,
+          minRaceGrade: "E",
+        },
+        flat: allEqual(9),
+      },
+      { name: "Dungeon Pioneer III" }
+    )
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, grade: "D" }
+    dbMock.store.addCharacter({
+      id: "chr-rank",
+      ownerId: user.id,
+      name: "Ranked",
+      raceId: "human",
+      classId: "archer",
+      state: serializeState(state),
+      version: 0,
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-rank",
+      definitionId: "dp-3",
+      kind: "TITLE",
+    })
+
+    const portable = (await exportCharacter(
+      "chr-rank",
+      user
+    )) as CharacterImportDocument
+    const titleAssoc = portable.associations.find((a) => a.kind === "title")
+    expect(titleAssoc).toBeDefined()
+
+    const imported = await importCharacter(portable, user)
+    expect(imported.associations).toHaveLength(1)
+    expect(imported.associations[0].definitionId).toBe("dp-3")
+    expect(imported.associations[0].improvement).toEqual({
+      seriesId: "dungeon-pioneer",
+      rank: 3,
+      minRaceGrade: "E",
+    })
+  })
+
   describe("trusted-backup v4 import (inventory + grandfathered marker)", () => {
     it("imports a v4 backup with owned stock and an equipment association, preserving the marker", async () => {
       seedRaceClass()
@@ -6859,6 +8773,263 @@ describe("catalog consumable config legacy handling", () => {
       })
     ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+})
+
+describe("catalog race raceType enforcement", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("creates a race with an explicit raceType", async () => {
+    const item = await createCatalogItem("races", {
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    expect(item.config).toMatchObject({ raceType: "monster" })
+  })
+
+  it("rejects creating a race without raceType (legacy config)", async () => {
+    await expect(
+      createCatalogItem("races", {
+        stableId: "wyrm",
+        name: "Wyrm",
+        config: {
+          naturalGrade: "F",
+          raceDefinitions: {
+            F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+          },
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects creating a race with an invalid raceType", async () => {
+    await expect(
+      createCatalogItem("races", {
+        stableId: "wyrm",
+        name: "Wyrm",
+        config: { raceType: "humanoid", naturalGrade: "F" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("allows a metadata-only PATCH on a legacy race (config unchanged)", async () => {
+    dbMock.store.addCatalog({
+      id: "race-legacy",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    const item = await updateCatalogItem("races", "race-legacy", {
+      name: "Renamed Wyrm",
+    })
+    expect(item.name).toBe("Renamed Wyrm")
+    // The legacy config is preserved untouched.
+    expect((item.config as Record<string, unknown>).raceType).toBeUndefined()
+    expect((item.config as Record<string, unknown>).naturalGrade).toBe("F")
+  })
+
+  it("requires raceType on a config-changing PATCH of a legacy race that never declared one", async () => {
+    dbMock.store.addCatalog({
+      id: "race-legacy",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    await expect(
+      updateCatalogItem("races", "race-legacy", {
+        config: { naturalGrade: "G" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The update never applied - the row is unchanged.
+    expect(
+      (
+        dbMock.store.catalog.get("race-legacy")!.config as Record<
+          string,
+          unknown
+        >
+      ).naturalGrade
+    ).toBe("F")
+  })
+
+  it("preserves an existing explicit raceType when a config-changing PATCH omits it", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    const item = await updateCatalogItem("races", "race-m", {
+      config: { naturalGrade: "G" },
+    })
+    // The existing explicit raceType is preserved into the new config.
+    expect(item.config).toMatchObject({
+      raceType: "monster",
+      naturalGrade: "G",
+    })
+  })
+
+  it("rejects a config-changing PATCH with an invalid raceType", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    await expect(
+      updateCatalogItem("races", "race-m", {
+        config: { raceType: "humanoid", naturalGrade: "F" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The update never applied.
+    expect(
+      (dbMock.store.catalog.get("race-m")!.config as Record<string, unknown>)
+        .raceType
+    ).toBe("monster")
+  })
+
+  it("rejects creating a race without a naturalGrade (modern shape requires both)", async () => {
+    await expect(
+      createCatalogItem("races", {
+        stableId: "wyrm",
+        name: "Wyrm",
+        config: {
+          raceType: "monster",
+          raceDefinitions: {
+            F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+          },
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects creating a race with an arbitrary invalid naturalGrade", async () => {
+    await expect(
+      createCatalogItem("races", {
+        stableId: "wyrm",
+        name: "Wyrm",
+        config: { raceType: "enlightened", naturalGrade: "Z" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("preserves an existing naturalGrade when a config-changing PATCH omits it", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    const item = await updateCatalogItem("races", "race-m", {
+      config: { raceType: "monster" },
+    })
+    // The existing explicit naturalGrade is preserved (never silently dropped into
+    // the legacy F fallback), just as the existing raceType would be.
+    expect(item.config).toMatchObject({
+      raceType: "monster",
+      naturalGrade: "F",
+    })
+  })
+
+  it("rejects a config-changing PATCH with an invalid naturalGrade", async () => {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    await expect(
+      updateCatalogItem("races", "race-m", {
+        config: { raceType: "monster", naturalGrade: "Z" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The update never applied.
+    expect(
+      (dbMock.store.catalog.get("race-m")!.config as Record<string, unknown>)
+        .naturalGrade
+    ).toBe("F")
+  })
+
+  it("requires both raceType and naturalGrade on a config-changing PATCH of a legacy race that declares neither", async () => {
+    dbMock.store.addCatalog({
+      id: "race-legacy",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    // Supplying only a raceType is not enough - there is no existing naturalGrade
+    // to preserve, so the modern shape must be explicit.
+    await expect(
+      updateCatalogItem("races", "race-legacy", {
+        config: { raceType: "enlightened" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The update never applied.
+    expect(
+      (
+        dbMock.store.catalog.get("race-legacy")!.config as Record<
+          string,
+          unknown
+        >
+      ).raceType
+    ).toBeUndefined()
   })
 })
 

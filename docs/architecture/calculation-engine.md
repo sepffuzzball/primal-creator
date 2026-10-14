@@ -38,12 +38,17 @@ dependents) must hold.
 
 1. **Identity & grade resolution** - Determine the starting grade from provenance
    (newly integrated vs. born into system) and the resolved race/class/profession.
+   A born participant starts at the selected race's `naturalGrade` (legacy
+   fallback `F`); a newly integrated participant starts at `G`.
 2. **Level resolution** - Resolve each track's level (race, class, profession).
 3. **Track awards** - For each track, apply the per-level stat awards from the
    historical snapshot for the relevant grade.
 4. **Race-level derivation** - Compute the displayed race level from class and
    profession levels (average, per the sourced rule and the configured
-   rounding/missing-track assumptions).
+   rounding/missing-track assumptions). A **monster** race is race-only (no class or
+   profession); its race level is its own race-track level in independent mode, so
+   this averaging phase is skipped and the race level is taken directly from the
+   race track.
 5. **Cap enforcement** - Apply the grade cap for class and profession, distributing
    per the configured distribution rule.
 6. **Grade transitions / evolution gating** - Check grade boundaries; if an
@@ -116,7 +121,7 @@ distributes the cap **proportionally** to the source values:
 
 The grade bands are sourced as ranges (see `docs/rules/grades.md`). The engine
 treats them as a lookup table, not as a continuous function. Example mapping for a
-fixed level:
+fixed level, for a race whose natural grade is F (e.g. Human):
 
 - level 8 -> G-grade (if newly integrated) or F-grade (if born-into-system).
 - level 10 -> F-grade (auto-advance boundary, source-verified).
@@ -125,8 +130,11 @@ fixed level:
 
 Implication: the G/F overlap (G 0-9 vs F 0-24) is resolved by **provenance**, not
 by a formula. The engine must record whether the participant was newly integrated
-or born into the system and choose the appropriate band. This is a data decision,
-not a math one.
+or born into the system and choose the appropriate band. That born band is NOT
+universal: a born participant starts at the selected race's `naturalGrade`
+(legacy fallback `F`), so a race that does not start at F resolves the overlap
+differently - this example is for a Human-like race with natural grade F. This is
+a data decision, not a math one.
 
 ### 4. Equipment / consumable assumption implications
 
@@ -139,7 +147,8 @@ The consumable grade rates are **per-level** rates on **permanent external stat
 gains** acquired from consumables, not a cap on temporary potions. A character's
 permanent consumable capacity for an attribute is the cumulative sum of the
 per-level rate across every race level attained through the grade bands (including
-the born-F vs integrated-G handling of the overlapping G/F bands). This capacity is
+the born-natural-grade vs integrated-G handling of the overlapping G/F bands for a
+race whose natural grade is F). This capacity is
 enforced at application time, and a recorded gain is never re-capped by later
 config changes - historical facts are immutable. Temporary potion effects are
 bounded only by their effect duration.
@@ -161,7 +170,7 @@ and list items when the row exists.
 
 - **Verified:** grade/level bands; race-level = average of class/profession;
   evolution blocks XP until completed; free-point pools per grade for Human;
-  skill rarity tiers; blessing 7-level hierarchy; Bloodline of the Primal Hunter
+  skill rarity tiers; blessing 8-level hierarchy; Bloodline of the Primal Hunter
   per-grade gradient; class/profession per-level stat caps (partial grade set).
 - **Wiki-uncertain:** exact XP curve; sub-stage boundaries for non-E grades;
   rounding and single-track handling; blessing magnitudes; most bloodline numeric

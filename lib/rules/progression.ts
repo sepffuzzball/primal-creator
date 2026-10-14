@@ -541,6 +541,158 @@ export function evolveTrackGrade(
 }
 
 /* ------------------------------------------------------------------ *
+ * race-only advancement (monsters / independent race mode)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Advance an independent (monster) race by one quarter.
+ *
+ * A monster race does not derive its race level from class/profession tracks;
+ * it tracks its own race level directly and advances on a four-quarter cadence.
+ * This function is the race-only analogue of `advanceQuarter`:
+ *
+ * - It increments `race.quarter` 0..3. A quarter advance alone never levels up.
+ * - The fourth quarter (quarter 3 -> level-up, back to quarter 0) advances
+ *   `race.level` by exactly one and snapshots the race fixed/free award at the
+ *   CURRENT race grade into `historicalLevelAwards` (`track: "race"`). It never
+ *   fabricates a starter award - only an actual level-up snapshots anything.
+ * - It enforces the same NEXT-grade entry threshold as the derived race gate: a
+ *   level-up may reach exactly the next grade's entry level but may not push the
+ *   race level past it until the caller explicitly evolves the grade.
+ * - It offers evolution exactly like the derived engine (grade-gate aware).
+ *
+ * The `raceDefinition` is the per-level race definition for the character's
+ * CURRENT race grade (from `config.raceDefinitions[grade]`). It must be supplied;
+ * when missing the caller should reject the advance rather than award a silent
+ * zero. Like every engine function it is pure and never mutates its inputs.
+ */
+export function advanceRaceQuarter(
+  state: CharacterState,
+  raceDefinition: RaceDefinition,
+  config: RulesConfig
+): AdvanceResult {
+  const race = state.race
+
+  // Bounds validation: race level is a non-negative integer, quarter is 0..3.
+  if (!Number.isInteger(race.level) || race.level < 0) {
+    throw new Error(
+      `advanceRaceQuarter: race level ${race.level} is invalid (must be a nonnegative integer)`
+    )
+  }
+  const quarter = race.quarter ?? 0
+  if (!Number.isInteger(quarter) || quarter < 0 || quarter > 3) {
+    throw new Error(
+      `advanceRaceQuarter: race quarter ${quarter} is invalid (must be an integer in 0..3)`
+    )
+  }
+
+  const quarterBefore = quarter
+  const levelBefore = race.level
+  let newQuarter = quarterBefore + 1
+  let newLevel = levelBefore
+  let leveledUp = false
+
+  if (newQuarter > 3) {
+    leveledUp = true
+    newLevel = levelBefore + 1
+    newQuarter = 0
+  }
+
+  const newState: CharacterState = {
+    ...state,
+    baseAttributes: { ...state.baseAttributes },
+    tracks: { ...state.tracks },
+    race: { ...race, level: newLevel, quarter: newQuarter },
+    historicalLevelAwards: [...state.historicalLevelAwards],
+    allocations: [...state.allocations],
+    permanentGains: [...state.permanentGains],
+    activeEffects: [...state.activeEffects],
+    equipment: [...state.equipment],
+    currentResources: { ...state.currentResources },
+    turn: state.turn + 1,
+  }
+
+  const journal: JournalDelta = {
+    track: "race",
+    levelBefore,
+    levelAfter: newLevel,
+    quarterBefore,
+    quarterAfter: newQuarter,
+    leveledUp,
+    raceLevelBefore: levelBefore,
+    raceLevelAfter: newLevel,
+    notes: [],
+  }
+
+  if (leveledUp) {
+    const perLevel = makeVector(raceDefinition.perLevel)
+    const fixed = perLevel
+    const free = raceDefinition.freePerLevel
+    newState.historicalLevelAwards.push({
+      track: "race",
+      level: newLevel,
+      definitionId: raceDefinition.id,
+      fixed,
+      free,
+    })
+    journal.award = { definitionId: raceDefinition.id, fixed, free }
+    journal.raceGain = {
+      grade: race.grade,
+      levelsGained: 1,
+      fixed: { ...fixed },
+      free,
+    }
+    journal.notes.push(
+      `race level-up to ${newLevel}; award snapshotted at grade ${race.grade} (fixed + ${free} free)`
+    )
+    // Never fabricate a starter award: only an actual level-up snapshots.
+  } else {
+    journal.raceGain = null
+    journal.notes.push(`quarter advanced for race; no level-up`)
+  }
+
+  // Grade-ceiling gate: a level-up may not push the character past the entry
+  // level of the NEXT grade until that next grade has been acquired (manual
+  // evolveGrade). The character is permitted to reach exactly the next grade's
+  // entry level; any level-up that would push race level PAST that threshold is
+  // rejected while the current grade remains below it. The top grade (S) has no
+  // higher band, so it is not gated.
+  if (leveledUp) {
+    const next = nextGrade(newState.race.grade)
+    if (next) {
+      const nextBand = bandForGrade(next, config.gradeTable)
+      if (nextBand && newLevel > nextBand.entryLevel) {
+        throw new Error(
+          `advanceRaceQuarter: race level-up would push race level past the ${newState.race.grade}->${next} threshold (${nextBand.entryLevel}) without completed evolution`
+        )
+      }
+    }
+  }
+
+  // Grade evolution offer (identical to the derived engine).
+  const table = config.gradeTable
+  const targetGrade = gradeForLevel(newState.race.level, table)
+  if (
+    targetGrade != null &&
+    gradeOrderIndex(targetGrade) > gradeOrderIndex(newState.race.grade)
+  ) {
+    const gateOpen = config.gradeGates[targetGrade] !== false
+    journal.evolutionOffer = { grade: targetGrade, available: gateOpen }
+    if (gateOpen) {
+      journal.notes.push(`evolution offered to ${targetGrade} (manual)`)
+    } else {
+      journal.evolutionBlocked = targetGrade
+      journal.notes.push(`evolution to ${targetGrade} blocked by grade gate`)
+    }
+  } else {
+    journal.evolutionOffer = null
+    journal.evolutionBlocked = null
+  }
+
+  return { state: newState, journal }
+}
+
+/* ------------------------------------------------------------------ *
  * Convenience reference for the next grade after a given one.
  * ------------------------------------------------------------------ */
 

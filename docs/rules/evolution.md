@@ -121,8 +121,9 @@ grade-only house evolution.
 ## Class/profession track evolution paths (catalog-driven)
 
 Class and profession tracks are **graded** independently of the race. A new
-character created through the wizard is stamped with an explicit starting `F`
-grade and a `stableId:F` definition on each selected track (see
+character created through the wizard is stamped with the race's **natural grade**
+(legacy `F` fallback when the race config declares none) and a
+`stableId:<grade>` definition on each selected track (see
 `docs/rules/classes.md` and `docs/rules/professions.md`), so the class and
 profession each have their **own** progression gate and never inherit the race
 grade. For these tracks evolution is a per-track catalog path choice - there is

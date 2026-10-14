@@ -119,6 +119,45 @@ describe("draft data schema (whitelist / bounds)", () => {
     expect(parsed.success).toBe(true)
   })
 
+  it("accepts a draft that records an enlightened raceType branch", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 7,
+      name: "Kael",
+      raceType: "enlightened",
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.success && parsed.data.raceType).toBe("enlightened")
+  })
+
+  it("accepts a draft that records a monster raceType branch", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 7,
+      name: "Kael",
+      raceType: "monster",
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.success && parsed.data.raceType).toBe("monster")
+  })
+
+  it("rejects an arbitrary/unknown raceType value", () => {
+    for (const bad of ["humanoid", "dragon", "M", ""]) {
+      const parsed = draftDataSchema.safeParse({ raceType: bad })
+      expect(parsed.success).toBe(false)
+    }
+  })
+
+  it("accepts a legacy draft with no raceType field (old drafts remain valid)", () => {
+    const parsed = draftDataSchema.safeParse({
+      step: 6,
+      name: "Kael",
+      origin: "born",
+      raceId: "race-1",
+      classId: "class-1",
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.success && parsed.data.raceType).toBeUndefined()
+  })
+
   it("rejects a stat/award/effect field that is not in the whitelist", () => {
     const parsed = draftDataSchema.safeParse({
       step: 2,

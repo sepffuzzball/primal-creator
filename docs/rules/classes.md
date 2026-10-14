@@ -54,11 +54,16 @@ when the race level is still below its own boundary. A class state **without** a
 grade is unaffected (legacy behavior preserved); the engine never infers one
 (see `docs/rules/leveling.md`).
 
-A new class created through the wizard is stamped with an explicit `F` grade and
-a `stableId:F` definition, so the catalog must define an `F`-grade per-level
-config (`grades.F`) for it - the service refuses to create such a class
-otherwise. Class evolution is then a catalog-driven per-track path choice with
-**no** grade-only legacy fallback (see `docs/rules/evolution.md`).
+A new class created through the wizard is stamped with the race's **natural grade**
+(legacy `F` fallback when the race config declares none) and a
+`stableId:<grade>` definition, so the catalog must define a `<grade>`-grade
+per-level config (`grades.<grade>`) for it - the service refuses to create such a
+class otherwise. For an enlightened race the selected class must be **at** that
+natural grade (exact match, no lower-grade fallback) AND define a per-level config
+for it; a class at any other grade is rejected with `invalid_class_grade`. Class
+evolution is then a catalog-driven per-track path choice with **no** grade-only
+legacy fallback (see `docs/rules/evolution.md`). A monster race is race-only and
+carries no class at all (see `docs/rules/races.md`).
 
 ## Seeded class definitions (`db:seed`)
 

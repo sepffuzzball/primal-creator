@@ -209,11 +209,22 @@ export interface TrackState {
 
 export type RaceMode = "derived" | "independent"
 
+/** How a race advances: whether it is a human-like track race or a monster. */
+export type RaceType = "enlightened" | "monster"
+
 export interface RaceState {
   level: number
   grade: Grade
   mode: RaceMode
   definitionId?: string
+  /**
+   * Quarter index within the current race level (0 = 0%, 1 = 25%, 2 = 50%,
+   * 3 = 75%). Present on monsters (independent race mode) that advance on a
+   * four-quarter cadence via `advanceRaceQuarter`; absent on legacy states, in
+   * which case the engine treats it as 0. Enlightened (derived) races never
+   * use it - their race level is derived from the class/profession tracks.
+   */
+  quarter?: number
   /**
    * Provenance of the starting grade, recorded at character creation: `born`
    * races enter at F-grade, `integrated` races at G-grade. Used to resolve the

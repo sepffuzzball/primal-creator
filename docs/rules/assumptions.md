@@ -67,10 +67,11 @@ potion effects are **not** capped by these rates - they use only their effect
 duration.
 
 - **G-grade and unknown grades: rate 0** by default (`consumable.rates.G` unset).
-  A **born** race counts levels 1..9 at the **F rate** because it enters the
-  system at F-grade; an **integrated** race counts levels 1..9 at the **G rate**
-  (0 unless configured). The overlapping G/F bands are resolved by provenance, so
-  we do not invent a canonical G multiplier.
+  A **born** race counts levels 1..9 at the **F rate** when its natural grade is F
+  (e.g. Human) because it enters the system at that grade; an **integrated** race
+  counts levels 1..9 at the **G rate** (0 unless configured). The overlapping G/F
+  bands are resolved by provenance, so we do not invent a canonical G multiplier;
+  the F band applies only to a race whose `naturalGrade` is F, not universally.
 
 ## 3. Race-level rounding and missing track
 

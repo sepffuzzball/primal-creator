@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   advanceQuarter,
+  advanceRaceQuarter,
   allocatePoints,
   availablePoints,
   deriveRaceLevel,
@@ -10,6 +11,12 @@ import {
 import { calculateStatus } from "./calculate"
 import { character, config, trackDef } from "./testUtils"
 import { vec } from "./testUtils"
+import {
+  createCharacterState,
+  type CharacterState,
+  type Grade,
+  zeroVector,
+} from "./types"
 
 function advanceN(
   state: ReturnType<typeof character>,
@@ -781,5 +788,114 @@ describe("graded track ceiling (class / profession)", () => {
     const result = evolveTrackGrade(state, "class", "E", "", config())
     expect(result.ok).toBe(false)
     expect(result.errors.join(" ")).toMatch(/nonempty target definition id/)
+  })
+})
+
+describe("advanceRaceQuarter (monster race-only cadence)", () => {
+  // A monster advances on an independent race-only track with no class or
+  // profession tracks. Build the raw state by hand (the `character` builder
+  // always adds class/profession tracks).
+  function monsterState(
+    overrides: { level?: number; quarter?: number; grade?: Grade } = {}
+  ): CharacterState {
+    return createCharacterState({
+      baseAttributes: zeroVector(),
+      tracks: {},
+      race: {
+        level: overrides.level ?? 0,
+        grade: overrides.grade ?? "F",
+        mode: "independent",
+        quarter: overrides.quarter ?? 0,
+      },
+    })
+  }
+
+  const raceDef = {
+    id: "monster:F",
+    perLevel: { strength: 2 },
+    freePerLevel: 1,
+  }
+  const raceConfig = config({ raceDefinitions: { F: raceDef } })
+
+  it("advances a quarter without leveling up, snapshoting no starter award", () => {
+    const result = advanceRaceQuarter(
+      monsterState({ grade: "F" }),
+      raceDef,
+      raceConfig
+    )
+    expect(result.state.race.quarter).toBe(1)
+    expect(result.state.race.level).toBe(0)
+    expect(result.state.turn).toBe(1)
+    expect(result.state.historicalLevelAwards).toEqual([])
+    expect(result.journal.leveledUp).toBe(false)
+    expect(result.journal.track).toBe("race")
+    expect(result.journal.raceGain).toBeNull()
+  })
+
+  it("levels up on the fourth quarter and snapshots the race award", () => {
+    let s: CharacterState = monsterState({ grade: "F" })
+    let leveledUp = false
+    for (let i = 0; i < 4; i++) {
+      const r = advanceRaceQuarter(s, raceDef, raceConfig)
+      s = r.state
+      leveledUp = r.journal.leveledUp
+    }
+    expect(s.race.level).toBe(1)
+    expect(s.race.quarter).toBe(0)
+    expect(s.turn).toBe(4)
+    // Only an actual level-up snapshots; never a fabricated starter award.
+    expect(s.historicalLevelAwards).toHaveLength(1)
+    expect(s.historicalLevelAwards[0].track).toBe("race")
+    expect(s.historicalLevelAwards[0].level).toBe(1)
+    expect(s.historicalLevelAwards[0].definitionId).toBe("monster:F")
+    expect(s.historicalLevelAwards[0].fixed.strength).toBe(2)
+    expect(s.historicalLevelAwards[0].free).toBe(1)
+    expect(leveledUp).toBe(true)
+  })
+
+  it("rejects an invalid (negative) race level and an out-of-range quarter", () => {
+    expect(() =>
+      advanceRaceQuarter(monsterState({ level: -1 }), raceDef, raceConfig)
+    ).toThrow(/nonnegative integer/)
+    expect(() =>
+      advanceRaceQuarter(monsterState({ quarter: 4 }), raceDef, raceConfig)
+    ).toThrow(/integer in 0\.\.3/)
+  })
+
+  it("rejects a level-up that would push race level past the next-grade threshold", () => {
+    // At grade F the next band (E) entry level is 25. Reaching exactly 25 is legal;
+    // pushing to 26 is rejected without a completed evolution.
+    const atThreshold = monsterState({ grade: "F", level: 24, quarter: 3 })
+    const reached = advanceRaceQuarter(atThreshold, raceDef, raceConfig)
+    expect(reached.state.race.level).toBe(25)
+    expect(reached.state.race.quarter).toBe(0)
+    expect(reached.journal.leveledUp).toBe(true)
+
+    // Pushing past the E threshold (25) is rejected while the grade stays F.
+    const justPast = monsterState({ grade: "F", level: 25, quarter: 3 })
+    expect(() => advanceRaceQuarter(justPast, raceDef, raceConfig)).toThrow(
+      /past the F->E threshold/
+    )
+  })
+
+  it("offers evolution when a level-up crosses into a higher grade", () => {
+    // G-grade monster at level 9: the next advance to level 10 reaches F's entry
+    // level (10) and offers evolution to F (manual, gate open).
+    const atG = monsterState({ grade: "G", level: 9, quarter: 3 })
+    const result = advanceRaceQuarter(
+      atG,
+      { id: "monster:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      config({
+        raceDefinitions: {
+          G: { id: "monster:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      })
+    )
+    expect(result.journal.leveledUp).toBe(true)
+    expect(result.journal.evolutionOffer).toEqual({
+      grade: "F",
+      available: true,
+    })
+    expect(result.state.race.level).toBe(10)
   })
 })

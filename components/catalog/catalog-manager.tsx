@@ -54,6 +54,17 @@ const PROVENANCE_OPTIONS = [
   { value: "house", label: "House" },
 ] as const
 
+const BLESSING_TIERS = [
+  "Baptism",
+  "Minor",
+  "Lesser",
+  "Intermediate",
+  "Major",
+  "Greater",
+  "Divine",
+  "True",
+] as const
+
 interface FormState {
   name: string
   description: string
@@ -158,6 +169,23 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [editing, setEditing] = React.useState<CatalogItem | null>(null)
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM)
+  const blessingConfig = React.useMemo(() => {
+    if (kind !== "blessings") return null
+    try {
+      const value: unknown = JSON.parse(form.configText || "{}")
+      if (value == null || typeof value !== "object" || Array.isArray(value))
+        return { valid: false as const, config: null, legacy: false }
+      const config = value as Record<string, unknown>
+      return {
+        valid: true as const,
+        config,
+        legacy:
+          Object.hasOwn(config, "grade") || Object.hasOwn(config, "effect"),
+      }
+    } catch {
+      return { valid: false as const, config: null, legacy: false }
+    }
+  }, [form.configText, kind])
   const [submitting, setSubmitting] = React.useState(false)
   const [formError, setFormError] = React.useState<string | null>(null)
   const [showArchived, setShowArchived] = React.useState(false)
@@ -516,6 +544,15 @@ export function CatalogManager({ kind }: { kind: string }) {
       )
       return
     }
+    if (
+      kind === "blessings" &&
+      (Object.hasOwn(config, "grade") || Object.hasOwn(config, "effect"))
+    ) {
+      setFormError(
+        "Legacy blessing config must be explicitly migrated to modern tier and effects config before saving."
+      )
+      return
+    }
     setSubmitting(true)
     setFormError(null)
     try {
@@ -818,6 +855,69 @@ export function CatalogManager({ kind }: { kind: string }) {
                 />
               </div>
               <div className="flex flex-col gap-1.5">
+                {kind === "blessings" ? (
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="cat-blessing-tier">Blessing tier</Label>
+                    <Select
+                      value={
+                        blessingConfig?.valid &&
+                        !blessingConfig.legacy &&
+                        typeof blessingConfig.config.tier === "string"
+                          ? blessingConfig.config.tier
+                          : ""
+                      }
+                      disabled={!blessingConfig?.valid || blessingConfig.legacy}
+                      onValueChange={(value) => {
+                        if (
+                          !value ||
+                          !blessingConfig?.valid ||
+                          blessingConfig.legacy
+                        )
+                          return
+                        const next: Record<string, unknown> = {
+                          ...blessingConfig.config,
+                          tier: value,
+                        }
+                        if (
+                          !editing &&
+                          Object.keys(blessingConfig.config).length === 0
+                        )
+                          next.effects = []
+                        setForm((current) => ({
+                          ...current,
+                          configText: JSON.stringify(next, null, 2),
+                        }))
+                      }}
+                    >
+                      <SelectTrigger id="cat-blessing-tier" className="w-full">
+                        <SelectValue placeholder="Select a tier" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {BLESSING_TIERS.map((tier) => (
+                          <SelectItem key={tier} value={tier}>
+                            {tier}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Tier is descriptive only; it does not imply numeric
+                      effects.
+                    </p>
+                    {!blessingConfig?.valid ? (
+                      <p role="alert" className="text-sm text-destructive">
+                        Correct Config JSON before selecting a tier; current
+                        edits are preserved.
+                      </p>
+                    ) : blessingConfig.legacy ? (
+                      <p role="alert" className="text-sm text-destructive">
+                        Legacy grade/effect config cannot be changed here.
+                        Explicitly migrate to modern tier and effects config
+                        first.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
                 <Label htmlFor="cat-config">Config (JSON)</Label>
                 <Textarea
                   id="cat-config"

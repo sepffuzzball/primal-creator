@@ -69,3 +69,27 @@ grade gate, and an empty target definition id. On success it returns a new state
 with only the track's `grade` and `definitionId` updated; historical awards and
 every other ledger stay snapshotted, and the track then continues under the new
 grade (and the new definition id, which must match on subsequent advances).
+
+## Race-only advancement (monster)
+
+A **monster** race is race-only: it has no class or profession track and its race
+state carries `mode: "independent"`. It advances through the pure engine function
+`advanceRaceQuarter(state, definition, config)` on a four-quarter cadence, mirroring
+the way a class/profession quarter is consumed:
+
+- Each race advance increments `state.race.quarter` by one (0 -> 1 -> 2 -> 3).
+- On the **fourth** quarter the race level increments by one, `quarter` resets to 0,
+  and the race award for the current grade is **snapshotted** into
+  `historicalLevelAwards` with `track: "race"`. The award is taken from the race
+  definition for the character's grade and is never fabricated at create - only a
+  level-up snapshots it.
+- The race track also enforces the **NEXT-grade entry threshold**: it will refuse a
+  level-up that would push the race level past the next grade's entry level until
+  the caller evolves the race grade.
+- Advancement is mutually exclusive with the class/profession path: a monster
+  summoning a `class`/`profession` advance is rejected (`invalid_track`), and an
+  enlightened (derived) race advancing via the `race` track is rejected the same
+  way.
+
+See `docs/rules/races.md` for the `raceType` split that decides which path a race
+takes.

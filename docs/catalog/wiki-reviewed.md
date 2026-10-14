@@ -134,11 +134,14 @@ The reviewed manifest above is the **admin opt-in** import, not what `db:seed`
 runs. `pnpm db:seed` separately seeds a curated Jake Thayne catalog
 (`prisma/catalog/jake-seed.ts`): the Human race table, Jake's five class
 progression definitions, his five alchemist profession progression definitions,
-and the fifteen god names (each god a metadata-only row with an empty `config`,
-backed by its own wiki page). That seed and this manifest share exactly one
-stableId - the F-grade profession `alchemist-of-the-malefic-viper` - so whichever
-applies first creates the row and the other preserves it: the seed never
-overwrites an existing row, and the import skips existing rows. See
+the fifteen god names (each god a metadata-only row with an empty `config`,
+backed by its own wiki page), and the **Dungeon Pioneer** series - fifteen
+ranked title entries (`dungeon-pioneer-i` .. `dungeon-pioneer-xv`, named
+"Dungeon Pioneer I" .. "Dungeon Pioneer XV") with cumulative all-stat `flat`
+bonuses drawn from the series catalog. That seed and this manifest share exactly
+one stableId - the F-grade profession `alchemist-of-the-malefic-viper` - so
+whichever applies first creates the row and the other preserves it: the seed
+never overwrites an existing row, and the import skips existing rows. See
 `docs/rules/races.md`, `docs/rules/classes.md` and `docs/rules/professions.md` for
 the seeded definitions.
 

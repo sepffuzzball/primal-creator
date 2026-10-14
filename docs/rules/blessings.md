@@ -12,9 +12,11 @@
 - Blessings are an investment of **records** by a god into a mortal. They raise the
   mortal's potential toward godhood and tie their Path to that god's. Upon issuing
   a blessing, the issuing god becomes the mortal's **patron**.
-- There are **seven levels** in the blessing hierarchy, from lowest to highest:
-  **Minor, Lesser, Intermediate, Major, Greater, Divine, True**.
-- Some gods require **baptisms** for followers, marking them as adherents.
+- There are **eight** levels in the blessing hierarchy, from lowest to highest:
+  **Baptism, Minor, Lesser, Intermediate, Major, Greater, Divine, True**.
+  **Baptism** is the lowest entry tier - a ritual marking a follower as an
+  adherent of a god (below the seven substantive blessing levels). Some gods
+  require baptisms for followers, marking them as adherents.
 - A blessed individual is expected to worship the patron god. Individuals who
   revoke a blessing but still access its records are called **Heretics**.
 - Benefits of receiving a blessing (verified list excerpt):
@@ -42,7 +44,8 @@ Primordial's Divine Blessing", "Holder of a Primordial's True Blessing".
 
 ## Engine note
 
-Model blessings as a seven-level hierarchy that confers stat bonuses, a skill of
+Model blessings as an eight-level hierarchy (Baptism as the low entry tier, plus
+the seven substantive levels Minor..True) that confers stat bonuses, a skill of
 rarity tied to the blessing level, and possibly class/profession unlock
 (clerical). Levels and values should be **configurable data**, since no source
 table pins the magnitudes. No invented formula should be used to derive them.
@@ -54,8 +57,10 @@ config-changing update:
 
 ```ts
 {
-  // Required: the seven-level blessing hierarchy (Minor..True).
-  tier: "Minor" | "Lesser" | "Intermediate" | "Major" | "Greater" | "Divine" | "True",
+  // Required: the blessed tier (lowest to highest). Baptism is an entry tier with
+  // no invented numeric effect (use `effects: []`); Minor..True are the seven
+  // substantive blessing levels.
+  tier: "Baptism" | "Minor" | "Lesser" | "Intermediate" | "Major" | "Greater" | "Divine" | "True",
   // Optional: the stableId of the unarchived `gods` entry that is this blessing's
   // patron. When present the server resolves it to the FK `patronId`. A
   // `gods` entry with no blessing may have no `patronId` (it is not a patron).

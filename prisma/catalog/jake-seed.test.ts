@@ -8,13 +8,32 @@ import {
   JAKE_CLASSES,
   JAKE_PROFESSIONS,
   JAKE_GODS,
+  JAKE_TITLES,
   LEGACY_HUMAN_BASELINE,
+  LEGACY_HUMAN_BASELINE_V3,
   LEGACY_ARCHER_BASELINE,
 } from "./jake-seed"
 
 type TestStore = ReturnType<typeof createTestPrisma>["store"]
 
 const FANDOM = "https://the-primal-hunter.fandom.com/wiki/"
+
+function allEqual(value: number): Record<string, number> {
+  const attrs = [
+    "strength",
+    "agility",
+    "endurance",
+    "vitality",
+    "toughness",
+    "wisdom",
+    "intelligence",
+    "perception",
+    "willpower",
+  ]
+  const out: Record<string, number> = {}
+  for (const attr of attrs) out[attr] = value
+  return out
+}
 
 // Minimal structural views of the per-kind configs the assertions inspect. The
 // seed stores these as JSON, so the tests read them back through these narrow
@@ -32,6 +51,7 @@ interface RaceDefinition {
   freePerLevel: number
 }
 interface HumanRaceConfig {
+  raceType?: string
   naturalGrade: string
   // The legacy 0.0.2 baseline config carries verifiedGrades; the sourced
   // replacement records its fan-wiki-inferred values under inferredGrades.
@@ -230,11 +250,105 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     }
   })
 
+  interface DungeonPioneerConfig {
+    upgradeGroup?: string
+    improvement?: { seriesId?: string; rank?: number; minRaceGrade?: string }
+    flat?: Record<string, number>
+  }
+
+  // The cumulative all-attribute bonus per rank (1..15), mirrored from the seed so
+  // the assertion is not a tautology against the same constant.
+  const DP_TOTALS = [
+    3, 6, 9, 12, 15, 24, 33, 42, 51, 60, 87, 114, 141, 168, 195,
+  ]
+
+  it("declares fifteen Dungeon Pioneer ranked titles with canonical numerals and the cumulative flat vector", () => {
+    expect(JAKE_TITLES).toHaveLength(15)
+    const numerals = [
+      "I",
+      "II",
+      "III",
+      "IV",
+      "V",
+      "VI",
+      "VII",
+      "VIII",
+      "IX",
+      "X",
+      "XI",
+      "XII",
+      "XIII",
+      "XIV",
+      "XV",
+    ]
+    const serials: string[] = []
+    for (let i = 0; i < JAKE_TITLES.length; i++) {
+      const entry = JAKE_TITLES[i]
+      const rank = i + 1
+      const numeral = numerals[i]
+      expect(entry.kind).toBe("titles")
+      expect(entry.provenance).toBe("inferred")
+      expect(entry.stableId).toBe(`dungeon-pioneer-${numeral.toLowerCase()}`)
+      expect(entry.name).toBe(`Dungeon Pioneer ${numeral}`)
+      expect(entry.sourceUrl).toBe(`${FANDOM}Dungeon_Pioneer`)
+      serials.push(entry.stableId)
+
+      // Grade mapping: ranks 1-5 E, 6-10 D, 11-15 C (mirrors minRaceGrade).
+      const expectedGrade = rank <= 5 ? "E" : rank <= 10 ? "D" : "C"
+      expect(entry.grade).toBe(expectedGrade)
+
+      const config = entry.config as DungeonPioneerConfig
+      expect(config.upgradeGroup).toBe("dungeon-pioneer")
+      expect(config.improvement).toEqual({
+        seriesId: "dungeon-pioneer",
+        rank,
+        minRaceGrade: expectedGrade,
+      })
+      // Flat bonus is the ONLY numeric effect: every attribute gets the cumulative
+      // total; no percent/loot is fabricated.
+      expect(config.flat).toEqual(allEqual(DP_TOTALS[i]))
+      expect(Object.keys(config.flat ?? {}).length).toBe(9)
+      // The flat amounts are nonnegative integers.
+      for (const v of Object.values(config.flat ?? {})) {
+        expect(Number.isInteger(v)).toBe(true)
+        expect(v).toBeGreaterThanOrEqual(0)
+      }
+    }
+    expect(new Set(serials).size).toBe(15)
+  })
+
+  it("persists the fifteen Dungeon Pioneer ranks and never auto-grants them", async () => {
+    await seedJakeCatalog(seedPrismaOf(instance))
+    const titles = [...store.catalog.values()].filter(
+      (r) => r.kind === "titles"
+    )
+    expect(titles).toHaveLength(15)
+    for (const row of titles) {
+      expect(row.provenance).toBe("inferred")
+      expect(row.archived).toBe(false)
+      expect(row.stableId).toMatch(/^dungeon-pioneer-/)
+      const config = row.config as DungeonPioneerConfig
+      expect(config.upgradeGroup).toBe("dungeon-pioneer")
+      expect(config.improvement?.seriesId).toBe("dungeon-pioneer")
+      expect(config.improvement?.rank).toBeGreaterThanOrEqual(1)
+      expect(config.improvement?.rank).toBeLessThanOrEqual(15)
+    }
+    // A repeated seed is idempotent over the new rows too.
+    await seedJakeCatalog(seedPrismaOf(instance))
+    expect(store.catalog.size).toBe(41)
+    expect(
+      [...store.catalog.values()].filter((r) => r.kind === "titles")
+    ).toHaveLength(15)
+  })
+
   it("keeps the sourced Human race table and the legacy baselines intact", () => {
     expect(HUMAN_ENTRY.kind).toBe("races")
     expect(HUMAN_ENTRY.provenance).toBe("inferred")
     expect(HUMAN_ENTRY.sourceUrl).toBe(`${FANDOM}Jake_Thayne/Race`)
     const config = HUMAN_ENTRY.config as Record<string, unknown>
+    // Human is authoritative and enlightened: it always selects an exact
+    // class/profession; it is never a race-only monster.
+    expect(config.raceType).toBe("enlightened")
     expect(config.naturalGrade).toBe("F")
     expect(config.inferredGrades).toEqual(["G", "F", "E", "D", "C", "B"])
     expect(config.houseGrades).toEqual([])
@@ -287,6 +401,19 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       agility: 2,
       perception: 1,
     })
+
+    // The 0.0.3 guard baseline carries the sourced table WITHOUT raceType, so the
+    // seed detects a current 0.0.3 row and promotes it to the sourced entry that
+    // now carries raceType. It is never authoritative itself.
+    expect(LEGACY_HUMAN_BASELINE_V3.name).toBe("Human")
+    expect(LEGACY_HUMAN_BASELINE_V3.provenance).toBe("inferred")
+    expect(
+      (LEGACY_HUMAN_BASELINE_V3.config as unknown as HumanRaceConfig).raceType
+    ).toBeUndefined()
+    expect(
+      (LEGACY_HUMAN_BASELINE_V3.config as unknown as HumanRaceConfig)
+        .raceDefinitions.F.freePerLevel
+    ).toBe(5)
   })
 
   it("uses provenance inferred and never emits an evolutions row", () => {
@@ -311,12 +438,13 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
 
   it("seeds the full Jake catalog without a character or evolution row", async () => {
     await seedJakeCatalog(seedPrismaOf(instance))
-    expect(store.catalog.size).toBe(26)
+    expect(store.catalog.size).toBe(41)
     const kinds = [...store.catalog.values()].map((r) => r.kind)
     expect(kinds.filter((k) => k === "races")).toHaveLength(1)
     expect(kinds.filter((k) => k === "classes")).toHaveLength(5)
     expect(kinds.filter((k) => k === "professions")).toHaveLength(5)
     expect(kinds.filter((k) => k === "gods")).toHaveLength(15)
+    expect(kinds.filter((k) => k === "titles")).toHaveLength(15)
     expect(kinds.includes("evolutions")).toBe(false)
     expect(store.characters.size).toBe(0)
     for (const row of store.catalog.values()) {
@@ -329,11 +457,11 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     await seedJakeCatalog(seedPrismaOf(instance))
     const before = snapshotCatalog(store)
     await seedJakeCatalog(seedPrismaOf(instance))
-    expect(store.catalog.size).toBe(26)
+    expect(store.catalog.size).toBe(41)
     expect(snapshotCatalog(store)).toBe(before)
   })
 
-  it("updates the untouched 0.0.2 Human/Archer rows to the sourced replacement", async () => {
+  it("preserves the untouched 0.0.2 Human row while updating the untouched Archer row", async () => {
     store.addCatalog({
       id: "human-baseline",
       kind: "races",
@@ -360,17 +488,22 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     })
     await seedJakeCatalog(seedPrismaOf(instance))
 
+    // A 0.0.2 Human row no longer matches the 0.0.3 guard baseline, so it is LEFT
+    // AT THE LEGACY BASELINE (never promoted): it stays verified/house-zero and
+    // gains no raceType.
     const human = store.catalog.get("human-baseline")!
-    expect(human.name).toBe(HUMAN_ENTRY.name)
-    expect(human.provenance).toBe("inferred")
-    expect(human.sourceUrl).toBe(HUMAN_ENTRY.sourceUrl)
+    expect(human.name).toBe(LEGACY_HUMAN_BASELINE.name)
+    expect(human.provenance).toBe("verified")
+    expect(human.sourceUrl).toBe(LEGACY_HUMAN_BASELINE.sourceUrl)
     const humanConfig = human.config as unknown as HumanRaceConfig
-    expect(humanConfig.inferredGrades).toEqual(["G", "F", "E", "D", "C", "B"])
-    // The replacement row no longer carries the legacy verifiedGrades key.
-    expect(humanConfig.verifiedGrades).toBeUndefined()
-    expect(humanConfig.houseGrades).toEqual([])
-    expect(humanConfig.raceDefinitions.G.freePerLevel).toBe(1)
+    expect(humanConfig.raceType).toBeUndefined()
+    expect(humanConfig.verifiedGrades).toEqual(["F", "E", "D", "C", "B"])
+    expect(humanConfig.inferredGrades).toBeUndefined()
+    expect(humanConfig.houseGrades).toEqual(["G"])
+    expect(humanConfig.raceDefinitions.G.freePerLevel).toBe(0)
 
+    // The Archer baseline is unchanged, so the untouched 0.0.2 Archer row is still
+    // promoted to the sourced replacement.
     const archer = store.catalog.get("archer-baseline")!
     expect(archer.name).toBe(ARCHER_ENTRY.name)
     expect(archer.provenance).toBe("inferred")
@@ -383,6 +516,33 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       strength: 1,
     })
     expect(archerConfig.grades.F.free).toBe(1)
+  })
+
+  it("promotes an untouched 0.0.3 Human row to the sourced entry that now carries raceType", async () => {
+    store.addCatalog({
+      id: "human-003",
+      kind: "races",
+      stableId: "human",
+      name: LEGACY_HUMAN_BASELINE_V3.name,
+      description: LEGACY_HUMAN_BASELINE_V3.description,
+      grade: LEGACY_HUMAN_BASELINE_V3.grade,
+      provenance: LEGACY_HUMAN_BASELINE_V3.provenance,
+      sourceUrl: LEGACY_HUMAN_BASELINE_V3.sourceUrl,
+      archived: LEGACY_HUMAN_BASELINE_V3.archived,
+      config: LEGACY_HUMAN_BASELINE_V3.config,
+    })
+    await seedJakeCatalog(seedPrismaOf(instance))
+
+    const human = store.catalog.get("human-003")!
+    expect(human.name).toBe(HUMAN_ENTRY.name)
+    expect(human.provenance).toBe("inferred")
+    expect(human.sourceUrl).toBe(HUMAN_ENTRY.sourceUrl)
+    const humanConfig = human.config as unknown as HumanRaceConfig
+    expect(humanConfig.raceType).toBe("enlightened")
+    expect(humanConfig.inferredGrades).toEqual(["G", "F", "E", "D", "C", "B"])
+    expect(humanConfig.verifiedGrades).toBeUndefined()
+    expect(humanConfig.houseGrades).toEqual([])
+    expect(humanConfig.raceDefinitions.G.freePerLevel).toBe(1)
   })
 
   it("preserves an admin-modified Human/Archer row untouched", async () => {
@@ -456,24 +616,25 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     const row = store.catalog.get("prof-existing")!
     // The manifest row is never overwritten by the seed.
     expect(row.description).toBe("description from the reviewed manifest")
-    expect(store.catalog.size).toBe(26)
+    expect(store.catalog.size).toBe(41)
   })
 
   it("deferred on a P2034 serialization conflict, preserving a concurrently admin-modified row (no update after conflict)", async () => {
-    // A baseline Human row exists, so the seed's guarded transaction genuinely
-    // attempts the update. A concurrent serialization conflict (P2034) aborts it,
-    // and a concurrent admin edit has already changed the row.
+    // A 0.0.3 (V3 baseline) Human row exists, so the seed's guarded transaction
+    // genuinely attempts the update (the row matches the baseline). A concurrent
+    // serialization conflict (P2034) aborts it, and a concurrent admin edit has
+    // already changed the row.
     store.addCatalog({
       id: "human-baseline-conflict",
       kind: "races",
       stableId: "human",
-      name: LEGACY_HUMAN_BASELINE.name,
-      description: LEGACY_HUMAN_BASELINE.description,
-      grade: LEGACY_HUMAN_BASELINE.grade,
-      provenance: LEGACY_HUMAN_BASELINE.provenance,
-      sourceUrl: LEGACY_HUMAN_BASELINE.sourceUrl,
-      archived: LEGACY_HUMAN_BASELINE.archived,
-      config: LEGACY_HUMAN_BASELINE.config,
+      name: LEGACY_HUMAN_BASELINE_V3.name,
+      description: LEGACY_HUMAN_BASELINE_V3.description,
+      grade: LEGACY_HUMAN_BASELINE_V3.grade,
+      provenance: LEGACY_HUMAN_BASELINE_V3.provenance,
+      sourceUrl: LEGACY_HUMAN_BASELINE_V3.sourceUrl,
+      archived: LEGACY_HUMAN_BASELINE_V3.archived,
+      config: LEGACY_HUMAN_BASELINE_V3.config,
     })
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {})

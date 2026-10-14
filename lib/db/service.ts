@@ -18,6 +18,7 @@ import { z } from "zod"
 import { Prisma } from "@prisma/client"
 import {
   advanceQuarter,
+  advanceRaceQuarter,
   allocatePoints,
   allocatedPoints,
   applyPermanentConsumable,
@@ -36,12 +37,14 @@ import {
   totalFreePoints,
   zeroVector,
   type AttributeVector,
+  type AdvanceResult,
   type CharacterState,
   type EffectCondition,
   type Grade,
   type GradeBand,
   type PartialVector,
   type RaceDefinition,
+  type RaceType,
   type RulesConfig,
   type StatusResult,
   type TrackDefinition,
@@ -55,7 +58,11 @@ import {
 } from "@/lib/db/ruleset"
 import {
   characterStateSchema,
+  gradeSchema,
+  hasInvalidNaturalGradeConfig,
+  hasInvalidRaceTypeConfig,
   hasInvalidSkillTrack,
+  isIncompleteRaceConfig,
   isIncompleteSkillConfig,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
@@ -65,6 +72,8 @@ import {
   isValidRaceEvolutionConfig,
   isValidTrackEvolutionConfig,
   parseCatalogConfig,
+  titleImprovementSchema,
+  type TitleImprovement,
 } from "@/lib/server/schemas"
 import {
   IMPORT_RULESET_VERSION,
@@ -108,6 +117,8 @@ export interface CharacterAssociationView {
   grade?: string
   /** Provenance label of the linked definition. */
   provenance?: string
+  /** Ranked title progression metadata, when the linked title declares it. */
+  improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
 }
@@ -449,30 +460,68 @@ export function createInitialState(
   const classLevel = 0
   const professionLevel = 0
 
-  tracks["class"] = {
-    level: classLevel,
-    quarter: 0,
-    definitionId: classRow ? `${classRow.stableId}:F` : "",
-    ...(classRow ? { grade: "F" as const } : {}),
-  }
-  if (professionRow) {
-    tracks["profession"] = {
-      level: professionLevel,
+  // Resolve the race's authoritative advancement mode from its config. A legacy
+  // config without `raceType` is interpreted as `enlightened` (non-authoritative,
+  // preserved backups/UI). A monster is race-only: no class/profession tracks.
+  const raceConfig = raceRow
+    ? parseCatalogConfig(raceRow.kind, raceRow.config ?? {})
+    : {}
+  const raceType =
+    (raceConfig.raceType as RaceType | undefined) ?? "enlightened"
+  const naturalGrade = gradeSchema.safeParse(raceConfig.naturalGrade).success
+    ? (raceConfig.naturalGrade as Grade)
+    : undefined
+
+  // An enlightened race's class/profession tracks are stamped with the race's
+  // natural grade (or the legacy F fallback when the config carries none), so a
+  // new class/profession is immediately gated by the grade it must operate at.
+  const trackStartGrade: Grade = naturalGrade ?? "F"
+
+  // The race's own starting grade is provenance-driven: an integrated character
+  // always enters at G; a born character enters at the race's natural grade (F
+  // fallback) - never derived from level.
+  const raceStartGrade: Grade =
+    origin === "integrated" ? "G" : (naturalGrade ?? "F")
+
+  if (raceType !== "monster") {
+    tracks["class"] = {
+      level: classLevel,
       quarter: 0,
-      definitionId: classRow ? `${professionRow.stableId}:F` : "",
-      ...(classRow ? { grade: "F" as const } : {}),
+      definitionId: classRow ? `${classRow.stableId}:${trackStartGrade}` : "",
+      ...(classRow ? { grade: trackStartGrade } : {}),
+    }
+    if (professionRow) {
+      tracks["profession"] = {
+        level: professionLevel,
+        quarter: 0,
+        definitionId: classRow
+          ? `${professionRow.stableId}:${trackStartGrade}`
+          : "",
+        ...(classRow ? { grade: trackStartGrade } : {}),
+      }
     }
   }
 
   return {
     baseAttributes: zeroVector(),
     tracks,
-    race: {
-      level: 0,
-      grade: origin === "born" ? "F" : "G",
-      mode: "derived",
-      origin,
-    },
+    race:
+      raceType === "monster"
+        ? {
+            level: 0,
+            grade: raceStartGrade,
+            mode: "independent",
+            origin,
+            // Monsters advance on a four-quarter cadence; derived (enlightened)
+            // races never use it.
+            quarter: 0,
+          }
+        : {
+            level: 0,
+            grade: raceStartGrade,
+            mode: "derived",
+            origin,
+          },
     historicalLevelAwards: [],
     allocations: [],
     permanentGains: [],
@@ -833,6 +882,16 @@ function associationView(
   ) {
     const upgradeGroup = config.upgradeGroup as string | undefined
     if (upgradeGroup) view.upgradeGroup = upgradeGroup
+  }
+  if (kind === "title") {
+    const improvement = titleImprovementForConfig(config)
+    if (improvement) {
+      view.improvement = {
+        seriesId: improvement.seriesId,
+        rank: improvement.rank,
+        minRaceGrade: improvement.minRaceGrade,
+      }
+    }
   }
   if (kind === "skill" || kind === "transcendent") {
     if (link.definition.grade) view.grade = link.definition.grade
@@ -1248,8 +1307,12 @@ export async function createCharacter(
     notes?: string | null
     origin: "integrated" | "born"
     raceId: string
-    classId: string
-    professionId?: string
+    // Required for an enlightened race (a nonempty string), null for a monster.
+    // The authoritative per-raceType rule is enforced below against the resolved
+    // race config (Zod cannot see it). Omitted is treated as null.
+    classId?: string | null
+    // Optional for an enlightened race, must be null for a monster.
+    professionId?: string | null
     // Explicit special-ability selections. When supplied, the referenced
     // blessing/bloodline/transcendent-skill catalog definitions are resolved by
     // kind, validated (unarchived, no collision) and linked atomically with the
@@ -1266,159 +1329,267 @@ export async function createCharacter(
   },
   user: SessionUser
 ): Promise<CharacterDetail> {
-  const [race, cls, profession] = await Promise.all([
-    prisma.catalogDefinition.findUnique({ where: { id: input.raceId } }),
-    prisma.catalogDefinition.findUnique({ where: { id: input.classId } }),
-    input.professionId
-      ? prisma.catalogDefinition.findUnique({
-          where: { id: input.professionId },
-        })
-      : Promise.resolve(null),
-  ])
-  if (!race) throw notFound("race_not_found", "Race not found")
-  if (!cls) throw notFound("class_not_found", "Class not found")
-  if (input.professionId && !profession) {
-    throw notFound("profession_not_found", "Profession not found")
+  // Resolve the race / class / profession, run every eligibility check and build
+  // the initial engine state INSIDE the SAME SERIALIZABLE transaction that writes
+  // the character + create event + draft CAS. This makes a concurrent admin edit
+  // to the race's `raceType` safe: the authoritative type is read only from the
+  // transaction snapshot (never a stale value resolved outside it), and if the
+  // edit commits while this create is in flight the SERIALIZABLE conflict
+  // surfaces as a 409 `serialization_conflict` instead of a raw P2034 - with no
+  // partially-written character, no stray event and no draft consumed.
+  const serializable = {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
   }
-  if (race.kind !== "races")
-    throw badRequest("invalid_race", "Race catalog entry has wrong kind")
-  if (cls.kind !== "classes")
-    throw badRequest("invalid_class", "Class catalog entry has wrong kind")
-  if (profession && profession.kind !== "professions") {
-    throw badRequest(
-      "invalid_profession",
-      "Profession catalog entry has wrong kind"
-    )
-  }
-
-  // A graded new character requires an explicit F-grade per-level config for the
-  // selected class (and profession when one is chosen). Without it the class track
-  // cannot be stamped with its `stableId:F` definition and would fail to advance.
-  if (!trackHasGradeConfig(cls, "F")) {
-    throw badRequest(
-      "invalid_class_grade",
-      `Class "${cls.name}" defines no F-grade per-level config; add a "grades.F" entry to create it`
-    )
-  }
-  if (profession && !trackHasGradeConfig(profession, "F")) {
-    throw badRequest(
-      "invalid_profession_grade",
-      `Profession "${profession.name}" defines no F-grade per-level config; add a "grades.F" entry to create it`
-    )
-  }
-
-  const state = createInitialState(input.origin, race, profession, cls)
-  const serialized = serializeState(state)
-
-  // Create the character and append the "create" progression event atomically: a
-  // character row must never exist without its corresponding journal entry.
-  return prisma.$transaction(async (tx) => {
-    // Load the house rules ONCE for this mutation, through the SAME tx client.
-    const houseRules = await loadHouseRules(tx)
-    // Resolve the explicit special-ability selections INSIDE the transaction so a
-    // wrong-kind / archived / collision / missing failure rolls back the whole
-    // create (no character, no event, no links, no draft deletion). Omitted or
-    // empty grants nothing (no inferred power from a legacy `special` bool).
-    const special = await resolveSpecialAbilities(
-      tx,
-      input.specialAbilities,
-      houseRules.config.maxTranscendentSkills
-    )
-
-    const created = await tx.character.create({
-      data: {
-        ownerId: user.id,
-        name: input.name,
-        description: input.description ?? null,
-        nickname: metadataOrNull(input.nickname),
-        pronouns: metadataOrNull(input.pronouns),
-        ageDescription: metadataOrNull(input.ageDescription),
-        appearance: metadataOrNull(input.appearance),
-        biography: metadataOrNull(input.biography),
-        notes: metadataOrNull(input.notes),
-        origin: input.origin,
-        raceId: race.id,
-        classId: cls.id,
-        professionId: profession?.id ?? null,
-        state: serialized as Prisma.InputJsonValue,
-        version: 0,
-      },
-      include: characterInclude,
-    })
-
-    // Record ONLY which profile-metadata fields were supplied (never the prose),
-    // so the create journal stays a compact auditable record without duplicating
-    // long nicknames/biographies/notes.
-    const suppliedMetadataFields = (
-      [
-        "nickname",
-        "pronouns",
-        "ageDescription",
-        "appearance",
-        "biography",
-        "notes",
-      ] as const
-    ).filter((field) => metadataOrNull(input[field]) != null)
-
-    await tx.progressionEvent.create({
-      data: {
-        characterId: created.id,
-        kind: "create",
-        payload: {
-          origin: input.origin,
-          raceId: race.id,
-          classId: cls.id,
-          professionId: profession?.id ?? null,
-          // Selection snapshots + provenance, present only when the caller supplied
-          // a non-empty special-ability selection.
-          ...(special.journal ? { specialAbilities: special.journal } : {}),
-          ...(suppliedMetadataFields.length
-            ? { metadataFields: suppliedMetadataFields }
-            : {}),
-        } as Prisma.InputJsonValue,
-      },
-    })
-
-    // Insert the resolved associations atomically with the create + event. Each
-    // link is persisted with the exact catalog kind, so a stored BLESSING /
-    // BLOODLINE / TRANSCENDENT link is never mislabelled by a later read.
-    for (const assoc of special.associations) {
-      await tx.characterAssociation.create({
-        data: {
-          characterId: created.id,
-          definitionId: assoc.definitionId,
-          kind: assoc.kind,
-        },
-      })
-    }
-
-    // The wizard's final create step consumes the matching draft atomically: the
-    // draft delete is committed or rolled back with the character + event. A
-    // supplied `draftVersion` that does not match the current draft is a 409
-    // conflict (no second best-effort DELETE later, and no unvalidated state).
-    // When `draftVersion` is absent (a non-wizard API client) the draft is left
-    // untouched.
-    if (input.draftVersion != null) {
-      const draftResult = await tx.characterDraft.deleteMany({
-        where: { userId: user.id, version: input.draftVersion },
-      })
-      if (draftResult.count !== 1) {
-        throw conflict(
-          "draft_conflict",
-          `Draft version mismatch: expected ${input.draftVersion}`
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // Load the house rules ONCE for this mutation, through the SAME tx client.
+      const houseRules = await loadHouseRules(tx)
+      // Resolve the race and the optional class / profession through the tx client
+      // so every eligibility check and the state build below observe the SAME
+      // snapshot the write will be committed against. Re-reading the type under
+      // the transaction is the whole point: a concurrent `updateCatalogItem`
+      // raceType change is either visible here (rejected by the eligibility
+      // guards, no inconsistent character) or committed after this snapshot, in
+      // which case SERIALIZABLE aborts this transaction instead of writing a
+      // character built from a stale type.
+      const [race, cls, profession] = await Promise.all([
+        tx.catalogDefinition.findUnique({ where: { id: input.raceId } }),
+        input.classId
+          ? tx.catalogDefinition.findUnique({ where: { id: input.classId } })
+          : Promise.resolve(null),
+        input.professionId
+          ? tx.catalogDefinition.findUnique({
+              where: { id: input.professionId },
+            })
+          : Promise.resolve(null),
+      ])
+      if (!race) throw notFound("race_not_found", "Race not found")
+      if (input.classId && !cls) {
+        throw notFound("class_not_found", "Class not found")
+      }
+      if (input.professionId && !profession) {
+        throw notFound("profession_not_found", "Profession not found")
+      }
+      if (race.kind !== "races")
+        throw badRequest("invalid_race", "Race catalog entry has wrong kind")
+      if (cls && cls.kind !== "classes")
+        throw badRequest("invalid_class", "Class catalog entry has wrong kind")
+      if (profession && profession.kind !== "professions") {
+        throw badRequest(
+          "invalid_profession",
+          "Profession catalog entry has wrong kind"
         )
       }
-    }
 
-    // Re-fetch AFTER inserting associations so the returned detail exposes the
-    // linked blessing / bloodline / transcendent (and their synthesized live
-    // effects), not the empty snapshot returned by `character.create`.
-    const withAssociations = (await tx.character.findUnique({
-      where: { id: created.id },
-      include: characterInclude,
-    }))!
-    return detailFor(withAssociations, houseRules)
-  })
+      // Resolve the race's authoritative advancement mode + natural grade. A legacy
+      // config without `raceType` is interpreted as `enlightened`; a legacy config
+      // without `naturalGrade` falls back to F for the class/profession stamp and
+      // skips the strict natural-grade eligibility checks.
+      const raceConfig = parseCatalogConfig(race.kind, race.config ?? {})
+      const raceType =
+        (raceConfig.raceType as RaceType | undefined) ?? "enlightened"
+      const naturalGrade = gradeSchema.safeParse(raceConfig.naturalGrade)
+        .success
+        ? (raceConfig.naturalGrade as Grade)
+        : undefined
+      // The class/profession tracks are stamped with the grade they must operate at:
+      // the race's natural grade, or the legacy F fallback.
+      const trackStartGrade: Grade = naturalGrade ?? "F"
+      // The race's own starting grade is provenance-driven: integrated always G;
+      // born enters at the race's natural grade (F fallback).
+      const raceStartGrade: Grade =
+        input.origin === "integrated" ? "G" : (naturalGrade ?? "F")
+
+      if (raceType === "monster") {
+        // A monster is race-only: no class tracked, no profession tracked.
+        if (input.classId != null) {
+          throw badRequest(
+            "invalid_class",
+            `Monster race "${race.name}" has no class; classId must be null`
+          )
+        }
+        if (input.professionId != null) {
+          throw badRequest(
+            "invalid_profession",
+            `Monster race "${race.name}" has no profession; professionId must be null`
+          )
+        }
+      } else {
+        // An enlightened race always selects an exact class.
+        if (!cls) {
+          throw badRequest(
+            "invalid_class",
+            `Enlightened race "${race.name}" requires a class; classId is required`
+          )
+        }
+        // A graded new character requires an explicit per-level config for the grade
+        // its track is stamped with. Without it the class/profession track cannot be
+        // stamped with its `${stableId}:${grade}` definition and would fail to advance.
+        if (!trackHasGradeConfig(cls, trackStartGrade)) {
+          throw badRequest(
+            "invalid_class_grade",
+            `Class "${cls.name}" defines no ${trackStartGrade}-grade per-level config; add a "grades.${trackStartGrade}" entry to create it`
+          )
+        }
+        if (profession && !trackHasGradeConfig(profession, trackStartGrade)) {
+          throw badRequest(
+            "invalid_profession_grade",
+            `Profession "${profession.name}" defines no ${trackStartGrade}-grade per-level config; add a "grades.${trackStartGrade}" entry to create it`
+          )
+        }
+        // Exact natural-grade eligibility (no lower-grade fallback): when the race
+        // declares a naturalGrade, the selected class/profession catalog row must be
+        // that grade AND define a per-level config at that grade.
+        if (naturalGrade) {
+          if (cls.grade !== naturalGrade) {
+            throw badRequest(
+              "invalid_class_grade",
+              `Class "${cls.name}" is grade ${cls.grade ?? "(unset)"}; the "${race.name}" race requires the natural grade ${naturalGrade}`
+            )
+          }
+          if (profession) {
+            if (profession.grade !== naturalGrade) {
+              throw badRequest(
+                "invalid_profession_grade",
+                `Profession "${profession.name}" is grade ${profession.grade ?? "(unset)"}; the "${race.name}" race requires the natural grade ${naturalGrade}`
+              )
+            }
+          }
+        }
+      }
+
+      // The race must define a per-level definition for the grade the character
+      // starts in; otherwise the first race-gain would reject for lack of a snapshot.
+      const raceDefs = (raceConfig.raceDefinitions ?? {}) as Record<
+        string,
+        unknown
+      >
+      if (raceDefs[raceStartGrade] == null) {
+        throw badRequest(
+          "invalid_race_grade",
+          `Race "${race.name}" defines no ${raceStartGrade}-grade race definition; add a "raceDefinitions.${raceStartGrade}" entry to create it`
+        )
+      }
+
+      const state = createInitialState(input.origin, race, profession, cls)
+      const serialized = serializeState(state)
+
+      // Resolve the explicit special-ability selections INSIDE the transaction so a
+      // wrong-kind / archived / collision / missing failure rolls back the whole
+      // create (no character, no event, no links, no draft deletion). Omitted or
+      // empty grants nothing (no inferred power from a legacy `special` bool).
+      const special = await resolveSpecialAbilities(
+        tx,
+        input.specialAbilities,
+        houseRules.config.maxTranscendentSkills
+      )
+
+      // Create the character and append the "create" progression event atomically: a
+      // character row must never exist without its corresponding journal entry.
+      const created = await tx.character.create({
+        data: {
+          ownerId: user.id,
+          name: input.name,
+          description: input.description ?? null,
+          nickname: metadataOrNull(input.nickname),
+          pronouns: metadataOrNull(input.pronouns),
+          ageDescription: metadataOrNull(input.ageDescription),
+          appearance: metadataOrNull(input.appearance),
+          biography: metadataOrNull(input.biography),
+          notes: metadataOrNull(input.notes),
+          origin: input.origin,
+          raceId: race.id,
+          // A monster has no class; every other (enlightened) race has one.
+          classId: cls?.id ?? null,
+          professionId: profession?.id ?? null,
+          state: serialized as Prisma.InputJsonValue,
+          version: 0,
+        },
+        include: characterInclude,
+      })
+
+      // Record ONLY which profile-metadata fields were supplied (never the prose),
+      // so the create journal stays a compact auditable record without duplicating
+      // long nicknames/biographies/notes.
+      const suppliedMetadataFields = (
+        [
+          "nickname",
+          "pronouns",
+          "ageDescription",
+          "appearance",
+          "biography",
+          "notes",
+        ] as const
+      ).filter((field) => metadataOrNull(input[field]) != null)
+
+      await tx.progressionEvent.create({
+        data: {
+          characterId: created.id,
+          kind: "create",
+          payload: {
+            origin: input.origin,
+            raceId: race.id,
+            classId: cls?.id ?? null,
+            professionId: profession?.id ?? null,
+            // Selection snapshots + provenance, present only when the caller supplied
+            // a non-empty special-ability selection.
+            ...(special.journal ? { specialAbilities: special.journal } : {}),
+            ...(suppliedMetadataFields.length
+              ? { metadataFields: suppliedMetadataFields }
+              : {}),
+          } as Prisma.InputJsonValue,
+        },
+      })
+
+      // Insert the resolved associations atomically with the create + event. Each
+      // link is persisted with the exact catalog kind, so a stored BLESSING /
+      // BLOODLINE / TRANSCENDENT link is never mislabelled by a later read.
+      for (const assoc of special.associations) {
+        await tx.characterAssociation.create({
+          data: {
+            characterId: created.id,
+            definitionId: assoc.definitionId,
+            kind: assoc.kind,
+          },
+        })
+      }
+
+      // The wizard's final create step consumes the matching draft atomically: the
+      // draft delete is committed or rolled back with the character + event. A
+      // supplied `draftVersion` that does not match the current draft is a 409
+      // conflict (no second best-effort DELETE later, and no unvalidated state).
+      // When `draftVersion` is absent (a non-wizard API client) the draft is left
+      // untouched.
+      if (input.draftVersion != null) {
+        const draftResult = await tx.characterDraft.deleteMany({
+          where: { userId: user.id, version: input.draftVersion },
+        })
+        if (draftResult.count !== 1) {
+          throw conflict(
+            "draft_conflict",
+            `Draft version mismatch: expected ${input.draftVersion}`
+          )
+        }
+      }
+
+      // Re-fetch AFTER inserting associations so the returned detail exposes the
+      // linked blessing / bloodline / transcendent (and their synthesized live
+      // effects), not the empty snapshot returned by `character.create`.
+      const withAssociations = (await tx.character.findUnique({
+        where: { id: created.id },
+        include: characterInclude,
+      }))!
+      return detailFor(withAssociations, houseRules)
+    }, serializable)
+  } catch (err) {
+    if (isSerializationFailure(err)) {
+      throw conflict(
+        "serialization_conflict",
+        "Concurrent catalog change detected; retry the character creation"
+      )
+    }
+    throw err
+  }
 }
 
 export async function updateCharacter(
@@ -1694,7 +1865,7 @@ async function createSkillOffersForAdvance(
 
 export async function advanceCharacter(
   id: string,
-  body: { track: "class" | "profession"; version: number },
+  body: { track: "class" | "profession" | "race"; version: number },
   user: SessionUser
 ): Promise<{ character: CharacterDetail; journal: unknown }> {
   return prisma.$transaction(async (tx) => {
@@ -1702,15 +1873,52 @@ export async function advanceCharacter(
     const houseRules = await loadHouseRules(tx)
     const state = deserializeState(row.state)
     const config = configFor(row, houseRules.config)
-    const trackRow = body.track === "class" ? row.class : row.profession
-    const definition = resolveTrackDefinition(trackRow, state, body.track)
-    if (!definition) {
-      throw badRequest(
-        "no_definition",
-        `No supported track definition for ${body.track}`
-      )
+
+    // How the character advances is fixed by its race mode: a monster advances on
+    // an independent race-only track; an enlightened race advances via its
+    // class/profession (derived) tracks. The two are mutually exclusive.
+    const isMonster = state.race.mode === "independent"
+    const isRaceTrack = body.track === "race"
+
+    let result: AdvanceResult
+    let definitionId: string
+    if (isRaceTrack) {
+      // Race-only advance is legal only for a monster (independent race mode).
+      if (!isMonster) {
+        throw badRequest(
+          "invalid_track",
+          `Race advance is only for an independent (monster) race; character race mode is "${state.race.mode}"`
+        )
+      }
+      const def = config.raceDefinitions?.[state.race.grade]
+      if (!def) {
+        throw badRequest(
+          "no_definition",
+          `No race definition for grade ${state.race.grade}`
+        )
+      }
+      definitionId = def.id
+      result = advanceRaceQuarter(state, def, config)
+    } else {
+      // A class/profession advance is legal only for an enlightened race.
+      if (isMonster) {
+        throw badRequest(
+          "invalid_track",
+          `A monster (independent) race has no "${body.track}" track`
+        )
+      }
+      const trackRow = body.track === "class" ? row.class : row.profession
+      const definition = resolveTrackDefinition(trackRow, state, body.track)
+      if (!definition) {
+        throw badRequest(
+          "no_definition",
+          `No supported track definition for ${body.track}`
+        )
+      }
+      definitionId = definition.id
+      result = applyAdvance(state, body.track, definition, config)
     }
-    const result = applyAdvance(state, body.track, definition, config)
+
     const serialized = serializeState(result.state)
     // Compare-and-swap against the client's expected version. If any concurrent
     // mutation bumped the version, `updateMany` matches 0 rows and we 409 (the
@@ -1729,13 +1937,14 @@ export async function advanceCharacter(
       )
     }
 
-    // Skills are offered, never auto-awarded: on a LEVEL-UP only, generate one
-    // offer per choice group from the current unarchived skills catalog. A
-    // quarter-only advance (no level up) produces no offers. The offers are
-    // created inside the same transaction as the CAS state write and the
-    // immutable advance event, so a conflict rolls all of them back together.
+    // Skills are offered, never auto-awarded: on a CLASS/PROFESSION LEVEL-UP only,
+    // generate one offer per choice group from the current unarchived skills
+    // catalog. A quarter-only advance (no level up) and a race-only advance (which
+    // has no skill offers) produce none. The offers are created inside the same
+    // transaction as the CAS state write and the immutable advance event, so a
+    // conflict rolls all of them back together.
     let skillOffers: Array<{ id: string; choiceGroup: string }> = []
-    if (result.journal.leveledUp) {
+    if (!isRaceTrack && body.track !== "race" && result.journal.leveledUp) {
       const newLevel = result.journal.levelAfter
       const raceGrade = result.state.race.grade
       // A graded class/profession track filters milestone offers by the track's OWN
@@ -1766,7 +1975,7 @@ export async function advanceCharacter(
         kind: "advance",
         payload: {
           track: body.track,
-          definitionId: definition.id,
+          definitionId,
           journal: advanceJournal,
         } as unknown as Prisma.InputJsonValue,
       },
@@ -2339,11 +2548,23 @@ interface ValidRacePath {
  * returned paths are the authoritative set used both to build the choice list and
  * to decide whether a legacy grade-only request must be rejected.
  */
+/**
+ * Resolve a race catalog row's authoritative advancement type from its config. A
+ * legacy config without `raceType` is interpreted as `enlightened` (the same
+ * non-authoritative default the rest of the service uses). Used to enforce that a
+ * race evolution never crosses raceType.
+ */
+function raceTypeForRow(row: { config?: unknown }): RaceType {
+  const parsed = parseCatalogConfig("races", row.config ?? {})
+  return (parsed.raceType as RaceType | undefined) ?? "enlightened"
+}
+
 async function collectValidRacePathsForTarget(
   db: DbClient,
   currentRaceStableId: string | null,
   currentGrade: Grade,
-  targetGrade: Grade
+  targetGrade: Grade,
+  currentRaceType: RaceType | null
 ): Promise<ValidRacePath[]> {
   const rows = await db.catalogDefinition.findMany({
     where: { kind: "evolutions", archived: false },
@@ -2361,6 +2582,17 @@ async function collectValidRacePathsForTarget(
       path.toRaceStableId
     )
     if (!destRace || destRace.archived) continue
+    // An evolution must never cross raceType without an explicit conversion: only
+    // collect a path whose destination advances in the same mode as the current
+    // race. A cross-type path is not offered (and never accepted), so the
+    // grade-only house fallback remains available for a character that cannot
+    // convert.
+    if (
+      currentRaceType != null &&
+      raceTypeForRow(destRace) !== currentRaceType
+    ) {
+      continue
+    }
     const destConfig = parseCatalogConfig("races", destRace.config ?? {})
     const defs = (destConfig.raceDefinitions ?? {}) as Record<string, unknown>
     if (!(path.toGrade in defs)) continue
@@ -2591,6 +2823,9 @@ export async function getEvolutionOptions(
 
   const currentGrade = state.race.grade
   const currentRaceStableId = row.race?.stableId ?? null
+  const currentRaceType: RaceType | null = row.race
+    ? raceTypeForRow(row.race)
+    : null
   const targetGrade = nextGrade(currentGrade)
 
   const valid =
@@ -2600,7 +2835,8 @@ export async function getEvolutionOptions(
           prisma,
           currentRaceStableId,
           currentGrade,
-          targetGrade
+          targetGrade,
+          currentRaceType
         )
 
   // The race level resolved exactly as the pure evolveGrade engine does for its
@@ -2726,55 +2962,228 @@ export async function evolveCharacter(
   body: EvolveCharacterInput,
   user: SessionUser
 ): Promise<{ character: CharacterDetail; journal: unknown }> {
-  return prisma.$transaction(async (tx) => {
-    const row = await assertOwner(tx, id, user)
-    const houseRules = await loadHouseRules(tx)
-    const state = deserializeState(row.state)
-    const currentGrade = state.race.grade
-    const currentRaceStableId = row.race?.stableId ?? null
+  const serializable = {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const row = await assertOwner(tx, id, user)
+      const houseRules = await loadHouseRules(tx)
+      const state = deserializeState(row.state)
+      const currentGrade = state.race.grade
+      const currentRaceStableId = row.race?.stableId ?? null
+      const currentRaceType: RaceType | null = row.race
+        ? raceTypeForRow(row.race)
+        : null
 
-    // ---- Class/profession track evolution path --------------------------- //
-    // Discriminated on the track value, not on key presence: a race path may carry
-    // an explicit `track: "race"` (new clients) or omit the key (legacy clients),
-    // so `"track" in body` would wrongly route a `track: "race"` body here. Only a
-    // `"class"` / `"profession"` value is a track evolution.
-    if (body.track === "class" || body.track === "profession") {
-      return evolveTrackCharacter(tx, row, state, body, user, houseRules)
-    }
+      // ---- Class/profession track evolution path --------------------------- //
+      // Discriminated on the track value, not on key presence: a race path may carry
+      // an explicit `track: "race"` (new clients) or omit the key (legacy clients),
+      // so `"track" in body` would wrongly route a `track: "race"` body here. Only a
+      // `"class"` / `"profession"` value is a track evolution.
+      if (body.track === "class" || body.track === "profession") {
+        return evolveTrackCharacter(tx, row, state, body, user, houseRules)
+      }
 
-    // ---- Legacy grade-only path (house fallback) ------------------------- //
-    if ("grade" in body) {
-      // Only the NEXT grade may be evolved into. A skip grade (e.g. G->E while
-      // the race level already falls in E's published band) is rejected up front
-      // here, before any option/path gating, even though the engine's level check
-      // alone would accept it - the character must never jump a grade.
+      // ---- Legacy grade-only path (house fallback) ------------------------- //
+      if ("grade" in body) {
+        // Only the NEXT grade may be evolved into. A skip grade (e.g. G->E while
+        // the race level already falls in E's published band) is rejected up front
+        // here, before any option/path gating, even though the engine's level check
+        // alone would accept it - the character must never jump a grade.
+        const targetGrade = nextGrade(currentGrade)
+        if (body.grade !== targetGrade) {
+          throw badRequest(
+            "invalid_evolution_grade",
+            `Character is grade ${currentGrade}; can only evolve to the next grade ${targetGrade ?? "(none)"}, got ${body.grade}`
+          )
+        }
+        // If ANY valid, unarchived catalog path to the NEXT grade exists (even when
+        // every such path is currently blocked), the client must choose a path.
+        // Cross-type paths are not collected, so a character that cannot convert is
+        // still offered the grade-only fallback.
+        const valid = await collectValidRacePathsForTarget(
+          tx,
+          currentRaceStableId,
+          currentGrade,
+          targetGrade,
+          currentRaceType
+        )
+        if (valid.length > 0) {
+          throw conflict(
+            "evolution_choice_required",
+            `Catalog defines race evolution path(s) to grade ${targetGrade}; submit an optionId choice`
+          )
+        }
+        const config = configFor(row, houseRules.config)
+        const result = applyEvolve(state, body.grade, config)
+        const serialized = serializeState(result.state)
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: body.version },
+          data: {
+            state: serialized as Prisma.InputJsonValue,
+            version: { increment: 1 },
+          },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${body.version}, got a newer version`
+          )
+        }
+        await tx.progressionEvent.create({
+          data: {
+            characterId: id,
+            kind: "evolve",
+            payload: {
+              grade: body.grade,
+              journal: result.journal,
+            } as Prisma.InputJsonValue,
+          },
+        })
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return {
+          character: toDetail(updated, true, config, houseRules.version),
+          journal: result.journal,
+        }
+      }
+
+      // ---- Catalog race path choice ---------------------------------------- //
+      const optionId = body.optionId
+      const evo = await tx.catalogDefinition.findUnique({
+        where: { id: optionId },
+      })
+      if (!evo || evo.kind !== "evolutions") {
+        throw notFound("evolution_not_found", "Evolution path not found")
+      }
+      if (evo.archived) {
+        throw badRequest(
+          "catalog_archived",
+          `Evolution path "${evo.name}" is archived`
+        )
+      }
+      const path = parseRaceEvolutionPath(evo)
+      if (!path) {
+        throw badRequest(
+          "evolution_invalid_config",
+          `Evolution path "${evo.name}" has no usable race config`
+        )
+      }
+      if (
+        currentRaceStableId == null ||
+        path.fromRaceStableId !== currentRaceStableId
+      ) {
+        throw badRequest(
+          "evolution_race_mismatch",
+          `Path requires race "${path.fromRaceStableId}", character is "${currentRaceStableId ?? "(none)"}"`
+        )
+      }
+      if (path.fromGrade !== currentGrade) {
+        throw badRequest(
+          "evolution_grade_mismatch",
+          `Path requires current grade ${path.fromGrade}, character is ${currentGrade}`
+        )
+      }
+
+      // Only the NEXT grade may be targeted. A skip-grade path (e.g. G->E while the
+      // race level already falls in E's published band) is rejected up front, before
+      // destination resolution and eligibility gating, even though every other gate
+      // would pass - the character must never jump a grade.
       const targetGrade = nextGrade(currentGrade)
-      if (body.grade !== targetGrade) {
+      if (path.toGrade !== targetGrade) {
         throw badRequest(
           "invalid_evolution_grade",
-          `Character is grade ${currentGrade}; can only evolve to the next grade ${targetGrade ?? "(none)"}, got ${body.grade}`
+          `Path evolves to grade ${path.toGrade}; character is grade ${currentGrade} and can only evolve to the next grade ${targetGrade ?? "(none)"}`
         )
       }
-      // If ANY valid, unarchived catalog path to the NEXT grade exists (even when
-      // every such path is currently blocked), the client must choose a path.
-      const valid = await collectValidRacePathsForTarget(
+
+      // Destination race must exist, be enabled, and define the target grade.
+      const destRace = await findCatalogByStableId(
         tx,
+        "races",
+        path.toRaceStableId
+      )
+      if (!destRace) {
+        throw badRequest(
+          "evolution_destination_missing",
+          `Destination race "${path.toRaceStableId}" is not in the catalog`
+        )
+      }
+      if (destRace.archived) {
+        throw badRequest(
+          "evolution_destination_archived",
+          `Destination race "${destRace.name}" is archived`
+        )
+      }
+      // An evolution must never cross raceType without an explicit conversion. The
+      // GET options (and the grade-only fallback filter) never offer a cross-type
+      // path, so a client normally cannot land here, but a direct optionId choice
+      // to a differently-typed destination is rejected up front rather than
+      // silently mutating the race mode.
+      const destRaceType = raceTypeForRow(destRace)
+      if (currentRaceType != null && destRaceType !== currentRaceType) {
+        throw badRequest(
+          "race_type_mismatch",
+          `Evolution would change race type from "${currentRaceType}" to "${destRaceType}"; a race cannot cross its advancement mode without an explicit conversion`
+        )
+      }
+      const destConfigParsed = parseCatalogConfig(
+        "races",
+        destRace.config ?? {}
+      )
+      const defs = (destConfigParsed.raceDefinitions ?? {}) as Record<
+        string,
+        unknown
+      >
+      if (!(path.toGrade in defs)) {
+        throw badRequest(
+          "evolution_destination_definition_missing",
+          `Destination race "${destRace.name}" has no ${path.toGrade}-grade race definition`
+        )
+      }
+
+      // Re-evaluate eligibility INSIDE the transaction. A user or admin reason can
+      // never bypass a mechanical blocker; manualRequirementsText can be overridden
+      // only by a nonempty admin reason.
+      const { eligible, blockers } = evaluateRacePathEligibility(path, {
         currentRaceStableId,
         currentGrade,
-        targetGrade
-      )
-      if (valid.length > 0) {
-        throw conflict(
-          "evolution_choice_required",
-          `Catalog defines race evolution path(s) to grade ${targetGrade}; submit an optionId choice`
-        )
+        raceLevel: state.race.level,
+        linkedTitleStableIds: linkedStableIds(row, "TITLE"),
+        linkedSkillStableIds: linkedStableIds(row, "SKILL"),
+      })
+      if (!eligible) {
+        throw badRequest("evolution_prerequisites", blockers.join("; "))
       }
-      const config = configFor(row, houseRules.config)
-      const result = applyEvolve(state, body.grade, config)
+      if (path.manualRequirementsText != null) {
+        const canBypass =
+          user.isAdmin &&
+          typeof body.reason === "string" &&
+          body.reason.trim().length > 0
+        if (!canBypass) {
+          throw badRequest(
+            "evolution_manual_required",
+            user.isAdmin
+              ? `A reason is required to override manual requirements: ${path.manualRequirementsText}`
+              : `Requires manual (admin) review: ${path.manualRequirementsText}`
+          )
+        }
+      }
+
+      // Run the pure engine (evolveGrade) with the TARGET race's rules config, only
+      // after validating both current and destination. No rewards/skills are
+      // invented: class/profession tracks, historical awards and allocations are
+      // preserved.
+      const destRulesConfig = buildRulesConfig(destRace, houseRules.config)
+      const result = applyEvolve(state, path.toGrade, destRulesConfig)
       const serialized = serializeState(result.state)
       const updatedMany = await tx.character.updateMany({
         where: { id, version: body.version },
         data: {
+          raceId: destRace.id,
           state: serialized as Prisma.InputJsonValue,
           version: { increment: 1 },
         },
@@ -2785,13 +3194,41 @@ export async function evolveCharacter(
           `Version mismatch: expected ${body.version}, got a newer version`
         )
       }
+
+      const reason =
+        typeof body.reason === "string" && body.reason.trim().length > 0
+          ? body.reason.trim()
+          : null
+      const journal: Record<string, unknown> = {
+        ...result.journal,
+        source: "catalog",
+        optionId: evo.id,
+        option: { id: evo.id, name: evo.name, stableId: evo.stableId },
+        prerequisites: {
+          fromRaceStableId: path.fromRaceStableId,
+          toRaceStableId: path.toRaceStableId,
+          fromGrade: path.fromGrade,
+          toGrade: path.toGrade,
+          minRaceLevel: path.minRaceLevel ?? null,
+          requiredTitleStableIds: path.requiredTitleStableIds,
+          requiredSkillStableIds: path.requiredSkillStableIds,
+        },
+        destinationRace: {
+          id: destRace.id,
+          stableId: destRace.stableId,
+          name: destRace.name,
+        },
+        reason,
+      }
+
       await tx.progressionEvent.create({
         data: {
           characterId: id,
           kind: "evolve",
           payload: {
-            grade: body.grade,
-            journal: result.journal,
+            optionId: evo.id,
+            journal,
+            reason,
           } as Prisma.InputJsonValue,
         },
       })
@@ -2799,188 +3236,21 @@ export async function evolveCharacter(
         where: { id },
         include: characterInclude,
       }))!
+      const updatedConfig = buildRulesConfig(updated.race, houseRules.config)
       return {
-        character: toDetail(updated, true, config, houseRules.version),
-        journal: result.journal,
+        character: toDetail(updated, true, updatedConfig, houseRules.version),
+        journal,
       }
-    }
-
-    // ---- Catalog race path choice ---------------------------------------- //
-    const optionId = body.optionId
-    const evo = await tx.catalogDefinition.findUnique({
-      where: { id: optionId },
-    })
-    if (!evo || evo.kind !== "evolutions") {
-      throw notFound("evolution_not_found", "Evolution path not found")
-    }
-    if (evo.archived) {
-      throw badRequest(
-        "catalog_archived",
-        `Evolution path "${evo.name}" is archived`
-      )
-    }
-    const path = parseRaceEvolutionPath(evo)
-    if (!path) {
-      throw badRequest(
-        "evolution_invalid_config",
-        `Evolution path "${evo.name}" has no usable race config`
-      )
-    }
-    if (
-      currentRaceStableId == null ||
-      path.fromRaceStableId !== currentRaceStableId
-    ) {
-      throw badRequest(
-        "evolution_race_mismatch",
-        `Path requires race "${path.fromRaceStableId}", character is "${currentRaceStableId ?? "(none)"}"`
-      )
-    }
-    if (path.fromGrade !== currentGrade) {
-      throw badRequest(
-        "evolution_grade_mismatch",
-        `Path requires current grade ${path.fromGrade}, character is ${currentGrade}`
-      )
-    }
-
-    // Only the NEXT grade may be targeted. A skip-grade path (e.g. G->E while the
-    // race level already falls in E's published band) is rejected up front, before
-    // destination resolution and eligibility gating, even though every other gate
-    // would pass - the character must never jump a grade.
-    const targetGrade = nextGrade(currentGrade)
-    if (path.toGrade !== targetGrade) {
-      throw badRequest(
-        "invalid_evolution_grade",
-        `Path evolves to grade ${path.toGrade}; character is grade ${currentGrade} and can only evolve to the next grade ${targetGrade ?? "(none)"}`
-      )
-    }
-
-    // Destination race must exist, be enabled, and define the target grade.
-    const destRace = await findCatalogByStableId(
-      tx,
-      "races",
-      path.toRaceStableId
-    )
-    if (!destRace) {
-      throw badRequest(
-        "evolution_destination_missing",
-        `Destination race "${path.toRaceStableId}" is not in the catalog`
-      )
-    }
-    if (destRace.archived) {
-      throw badRequest(
-        "evolution_destination_archived",
-        `Destination race "${destRace.name}" is archived`
-      )
-    }
-    const destConfigParsed = parseCatalogConfig("races", destRace.config ?? {})
-    const defs = (destConfigParsed.raceDefinitions ?? {}) as Record<
-      string,
-      unknown
-    >
-    if (!(path.toGrade in defs)) {
-      throw badRequest(
-        "evolution_destination_definition_missing",
-        `Destination race "${destRace.name}" has no ${path.toGrade}-grade race definition`
-      )
-    }
-
-    // Re-evaluate eligibility INSIDE the transaction. A user or admin reason can
-    // never bypass a mechanical blocker; manualRequirementsText can be overridden
-    // only by a nonempty admin reason.
-    const { eligible, blockers } = evaluateRacePathEligibility(path, {
-      currentRaceStableId,
-      currentGrade,
-      raceLevel: state.race.level,
-      linkedTitleStableIds: linkedStableIds(row, "TITLE"),
-      linkedSkillStableIds: linkedStableIds(row, "SKILL"),
-    })
-    if (!eligible) {
-      throw badRequest("evolution_prerequisites", blockers.join("; "))
-    }
-    if (path.manualRequirementsText != null) {
-      const canBypass =
-        user.isAdmin &&
-        typeof body.reason === "string" &&
-        body.reason.trim().length > 0
-      if (!canBypass) {
-        throw badRequest(
-          "evolution_manual_required",
-          user.isAdmin
-            ? `A reason is required to override manual requirements: ${path.manualRequirementsText}`
-            : `Requires manual (admin) review: ${path.manualRequirementsText}`
-        )
-      }
-    }
-
-    // Run the pure engine (evolveGrade) with the TARGET race's rules config, only
-    // after validating both current and destination. No rewards/skills are
-    // invented: class/profession tracks, historical awards and allocations are
-    // preserved.
-    const destRulesConfig = buildRulesConfig(destRace, houseRules.config)
-    const result = applyEvolve(state, path.toGrade, destRulesConfig)
-    const serialized = serializeState(result.state)
-    const updatedMany = await tx.character.updateMany({
-      where: { id, version: body.version },
-      data: {
-        raceId: destRace.id,
-        state: serialized as Prisma.InputJsonValue,
-        version: { increment: 1 },
-      },
-    })
-    if (updatedMany.count !== 1) {
+    }, serializable)
+  } catch (err) {
+    if (isSerializationFailure(err)) {
       throw conflict(
-        "version_conflict",
-        `Version mismatch: expected ${body.version}, got a newer version`
+        "serialization_conflict",
+        "Concurrent catalog change detected; retry the evolution"
       )
     }
-
-    const reason =
-      typeof body.reason === "string" && body.reason.trim().length > 0
-        ? body.reason.trim()
-        : null
-    const journal: Record<string, unknown> = {
-      ...result.journal,
-      source: "catalog",
-      optionId: evo.id,
-      option: { id: evo.id, name: evo.name, stableId: evo.stableId },
-      prerequisites: {
-        fromRaceStableId: path.fromRaceStableId,
-        toRaceStableId: path.toRaceStableId,
-        fromGrade: path.fromGrade,
-        toGrade: path.toGrade,
-        minRaceLevel: path.minRaceLevel ?? null,
-        requiredTitleStableIds: path.requiredTitleStableIds,
-        requiredSkillStableIds: path.requiredSkillStableIds,
-      },
-      destinationRace: {
-        id: destRace.id,
-        stableId: destRace.stableId,
-        name: destRace.name,
-      },
-      reason,
-    }
-
-    await tx.progressionEvent.create({
-      data: {
-        characterId: id,
-        kind: "evolve",
-        payload: {
-          optionId: evo.id,
-          journal,
-          reason,
-        } as Prisma.InputJsonValue,
-      },
-    })
-    const updated = (await tx.character.findUnique({
-      where: { id },
-      include: characterInclude,
-    }))!
-    const updatedConfig = buildRulesConfig(updated.race, houseRules.config)
-    return {
-      character: toDetail(updated, true, updatedConfig, houseRules.version),
-      journal,
-    }
-  })
+    throw err
+  }
 }
 
 /**
@@ -3742,6 +4012,138 @@ function definitionUpgradeGroup(def: {
   return typeof group === "string" && group.length > 0 ? group : undefined
 }
 
+/**
+ * Parse a title config's `improvement` descriptor when present. The config has
+ * already passed `parseCatalogConfig`, so the descriptor is validated; this still
+ * returns undefined defensively for a config that omits it (an ordinary title).
+ */
+function titleImprovementForConfig(
+  config: Record<string, unknown>
+): TitleImprovement | undefined {
+  const imp = config.improvement
+  if (imp == null) return undefined
+  const parsed = titleImprovementSchema.safeParse(imp)
+  return parsed.success ? parsed.data : undefined
+}
+
+/** The improvement seriesId carried by a link's linked title definition, if any. */
+function titleSeriesIdForLink(l: {
+  kind: string
+  definition: { kind: string; config?: unknown }
+}): string | undefined {
+  if (l.kind !== "TITLE") return undefined
+  const cfg = parseCatalogConfig(l.definition.kind, l.definition.config ?? {})
+  return titleImprovementForConfig(cfg)?.seriesId
+}
+
+/** Whether a linked title definition carries a ranked `improvement` descriptor. */
+function isRankedTitleLink(l: {
+  kind: string
+  definition: { kind: string; config?: unknown }
+}): boolean {
+  if (l.kind !== "TITLE") return false
+  const cfg = parseCatalogConfig(l.definition.kind, l.definition.config ?? {})
+  return titleImprovementForConfig(cfg) != null
+}
+
+/**
+ * Validate an add of a RANKED title (one whose config carries `improvement`).
+ * This runs before any link is removed, so a rejected add writes nothing. The
+ * character's race grade is the authority for the grade gate; rank progression is
+ * strictly sequential:
+ *   - rank 1 is only accepted when NO current link in the same series exists, and
+ *     when no unrelated non-ranked title silently occupies the same upgrade group
+ *     (that would be ambiguous and is rejected rather than displaced).
+ *   - rank > 1 is only accepted when EXACTLY ONE current link in the same series
+ *     exists with `improvement.rank === target.rank - 1` (archived links count)
+ *     AND when no unrelated/non-ranked title occupies the target upgrade group
+ *     (that add would silently displace it, which is rejected rather than
+ *     silently applied).
+ *
+ * Resolves to 400 `title_grade_blocked` (grade gate), 400 `title_rank_conflict`
+ * (skip/repeat/missing-prior/ambiguous) or 400 `title_reason_required` (a ranked
+ * title add must carry a self-reported reason).
+ */
+function assertRankedTitleAdd(
+  improvement: TitleImprovement,
+  config: Record<string, unknown>,
+  existing: CharacterWithCatalog["associations"],
+  raceGrade: Grade,
+  reason: string | undefined
+): void {
+  const trimmed = (reason ?? "").trim()
+  if (trimmed.length === 0) {
+    throw badRequest(
+      "title_reason_required",
+      "A ranked title add requires a reason (your qualifying clear)"
+    )
+  }
+  if (gradeOrderIndex(raceGrade) < gradeOrderIndex(improvement.minRaceGrade)) {
+    throw badRequest(
+      "title_grade_blocked",
+      `This rank requires race grade ${improvement.minRaceGrade} or higher (current race grade is ${raceGrade})`
+    )
+  }
+  const seriesLinks = existing.filter(
+    (l) => titleSeriesIdForLink(l) === improvement.seriesId
+  )
+  if (improvement.rank === 1) {
+    if (seriesLinks.length > 0) {
+      throw badRequest(
+        "title_rank_conflict",
+        `Rank 1 of series "${improvement.seriesId}" is already present; downgrade is not allowed`
+      )
+    }
+    const group = config.upgradeGroup as string | undefined
+    const groupLinks = existing.filter(
+      (l) =>
+        l.kind === "TITLE" && definitionUpgradeGroup(l.definition) === group
+    )
+    const unrelated = groupLinks.filter((l) => !seriesLinks.includes(l))
+    if (unrelated.length > 0) {
+      throw badRequest(
+        "title_rank_conflict",
+        `Rank 1 would replace the unrelated title "${unrelated[0].definition.name}" in upgrade group "${group}"; remove it first or use a distinct group`
+      )
+    }
+    return
+  }
+  if (seriesLinks.length !== 1) {
+    throw badRequest(
+      "title_rank_conflict",
+      `Rank ${improvement.rank} requires exactly one prior title in series "${improvement.seriesId}" (found ${seriesLinks.length})`
+    )
+  }
+  const prior = seriesLinks[0]
+  const priorImp = titleImprovementForConfig(
+    parseCatalogConfig(prior.definition.kind, prior.definition.config ?? {})
+  )
+  if (priorImp?.rank !== improvement.rank - 1) {
+    throw badRequest(
+      "title_rank_conflict",
+      `Rank ${improvement.rank} requires the immediately prior rank ${improvement.rank - 1} to be linked (found ${priorImp?.rank ?? "unranked"})`
+    )
+  }
+  // Rank > 1 must occupy the target upgrade group alone: no unrelated / non-ranked
+  // title may sit in the same group, or the add would silently displace it. The
+  // immediately-prior series link is allowed (it is atomically replaced); a title
+  // from ANOTHER series or an unranked title in the same group is rejected.
+  if (improvement.rank > 1) {
+    const group = config.upgradeGroup as string | undefined
+    const groupLinks = existing.filter(
+      (l) =>
+        l.kind === "TITLE" && definitionUpgradeGroup(l.definition) === group
+    )
+    const unrelated = groupLinks.filter((l) => !seriesLinks.includes(l))
+    if (unrelated.length > 0) {
+      throw badRequest(
+        "title_rank_conflict",
+        `Rank ${improvement.rank} would replace the unrelated title "${unrelated[0].definition.name}" in upgrade group "${group}"; remove it first or use a distinct group`
+      )
+    }
+  }
+}
+
 /** A human label for each associable kind, used only in error messages. */
 function labelForKind(
   kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent"
@@ -3795,6 +4197,7 @@ export async function associateCharacter(
     definitionId: string
     operation: "add" | "remove"
     version: number
+    reason?: string
   },
   user: SessionUser
 ): Promise<{ character: CharacterDetail }> {
@@ -3857,6 +4260,49 @@ export async function associateCharacter(
             definition.kind,
             definition.config ?? {}
           )
+
+          // A ranked title (its config carries `improvement`) is added through a
+          // strict sequential rank gate. This runs before any link is removed, so a
+          // rejected add writes nothing: the grade gate uses the character's race
+          // grade (never the title's grade), the reason is mandatory, and rank
+          // progression requires the immediately prior rank (or no prior for rank
+          // 1). Ordinary titles carry no `improvement` and skip this entirely.
+          if (body.kind === "title") {
+            const improvement = titleImprovementForConfig(config)
+            if (improvement) {
+              const state = deserializeState(row.state)
+              assertRankedTitleAdd(
+                improvement,
+                config,
+                existing,
+                state.race.grade,
+                body.reason
+              )
+            } else {
+              // Adding an UNRANKED title must never silently displace an existing
+              // RANKED title in the same upgrade group: the ranked link is the
+              // authority for a character's rank progression, so letting an
+              // ordinary title replace it would bypass the rank sequence. Reject
+              // BEFORE any same-group link is removed (so the ranked title stays),
+              // while an ordinary unranked title replacing another ordinary
+              // unranked title in a group remains allowed.
+              const upgradeGroup = config.upgradeGroup as string | undefined
+              if (upgradeGroup) {
+                const sameGroupLinks = existing.filter(
+                  (l) =>
+                    l.kind === "TITLE" &&
+                    definitionUpgradeGroup(l.definition) === upgradeGroup
+                )
+                const ranked = sameGroupLinks.find((l) => isRankedTitleLink(l))
+                if (ranked) {
+                  throw badRequest(
+                    "title_rank_conflict",
+                    `The upgrade group "${upgradeGroup}" is held by the ranked title "${ranked.definition.name}"; an ordinary title would bypass its rank progression - add it to a distinct group or remove the ranked title first`
+                  )
+                }
+              }
+            }
+          }
 
           // A blessing never stacks. Adding one atomically replaces EVERY existing
           // blessing link on the character (active or archived - an archived link
@@ -4041,6 +4487,11 @@ export async function associateCharacter(
           definition.kind,
           definition.config ?? {}
         )
+        const improvement = titleImprovementForConfig(config)
+        const rankedTitleAdd =
+          body.kind === "title" &&
+          body.operation === "add" &&
+          improvement != null
         await tx.progressionEvent.create({
           data: {
             characterId: id,
@@ -4049,6 +4500,7 @@ export async function associateCharacter(
               operation: body.operation,
               kind: body.kind,
               definitionId: definition.id,
+              ...(rankedTitleAdd ? { reason: (body.reason ?? "").trim() } : {}),
               definition: {
                 id: definition.id,
                 name: definition.name,
@@ -4065,6 +4517,15 @@ export async function associateCharacter(
                   ? {
                       upgradeGroup:
                         (config.upgradeGroup as string | undefined) ?? null,
+                    }
+                  : {}),
+                ...(body.kind === "title" && improvement != null
+                  ? {
+                      improvement: {
+                        seriesId: improvement.seriesId,
+                        rank: improvement.rank,
+                        minRaceGrade: improvement.minRaceGrade,
+                      },
                     }
                   : {}),
                 ...(body.kind === "blessing"
@@ -4404,6 +4865,12 @@ type ResolveAssocOpts = {
    * `import_link_collision` before any write.
    */
   maxTranscendentSkills: number
+  /**
+   * The imported character's race grade (from the backup state). Used to enforce
+   * a ranked title's minRaceGrade gate on import; a ranked title whose required
+   * grade exceeds the backup's race grade is rejected before any write.
+   */
+  raceGrade: Grade
 }
 
 /**
@@ -4528,6 +4995,27 @@ async function resolveAssociationRefs(
       )
     }
     seen.add(def.id)
+
+    // A ranked title (its catalog config carries `improvement`) may be imported at
+    // ANY rank without prior rank history (a backup is a trusted association
+    // snapshot), but only if the imported character's race grade meets the title's
+    // minRaceGrade. A legacy backup's title simply has no improvement metadata and
+    // is treated as unranked (no check).
+    if (a.kind === "title") {
+      const defConfig = parseCatalogConfig(def.kind, def.config ?? {})
+      const improvement = titleImprovementForConfig(defConfig)
+      if (improvement) {
+        if (
+          gradeOrderIndex(opts.raceGrade) <
+          gradeOrderIndex(improvement.minRaceGrade)
+        ) {
+          throw badRequest(
+            "import_grade_blocked",
+            `Imported "${def.name}" requires race grade ${improvement.minRaceGrade} or higher, but the backup's race grade is ${opts.raceGrade}`
+          )
+        }
+      }
+    }
 
     let legacyUnowned: boolean
     if (a.kind === "equipment") {
@@ -4786,8 +5274,9 @@ function normalizeImportedState(
   state: CharacterState,
   identity: CharacterImportDocument["identity"],
   raceRow: CatalogLookupRow,
-  classRow: CatalogLookupRow,
-  profRow: CatalogLookupRow | null
+  classRow: CatalogLookupRow | null,
+  profRow: CatalogLookupRow | null,
+  raceType: RaceType
 ): CharacterState {
   const grade = state.race.grade
   // Normalize the race part first so the track definitions below are resolved
@@ -4797,10 +5286,24 @@ function normalizeImportedState(
     ...state.race,
     origin: identity.origin,
   }
+  // A monster advances on an independent four-quarter cadence. Default an absent
+  // quarter to 0 (the engine also treats it as 0); an enlightened (derived) race
+  // never uses it, so it stays absent.
+  if (raceType === "monster") {
+    raceState.quarter = state.race.quarter ?? 0
+  } else {
+    delete raceState.quarter
+  }
   const resolvedState: CharacterState = { ...state, race: raceState }
 
   const tracks: CharacterState["tracks"] = { ...state.tracks }
   if (tracks["class"]) {
+    if (!classRow) {
+      throw badRequest(
+        "invalid_import",
+        "Imported state declares a class track but the imported class identity is null"
+      )
+    }
     const def = resolveTrackDefinition(classRow, resolvedState, "class")
     if (!def) {
       throw badRequest(
@@ -4847,6 +5350,26 @@ function assertGradeBand(band: GradeBand, context: string): void {
 }
 
 /**
+ * Assert the imported state's race mode agrees with the race's authoritative
+ * advancement type. A monster race (raceType "monster") must be stored with race
+ * mode "independent"; an enlightened race (raceType "enlightened", including a
+ * legacy config that defaults to enlightened) must be stored with race mode
+ * "derived". A mismatch means the backup was authored against a different (or
+ * differently-configured) race definition, so reject with 400
+ * `import_race_mode_mismatch` BEFORE any write. No automatic mode conversion is
+ * attempted.
+ */
+function assertImportRaceMode(state: CharacterState, raceType: RaceType): void {
+  const expectedMode = raceType === "monster" ? "independent" : "derived"
+  if (state.race.mode !== expectedMode) {
+    throw badRequest(
+      "import_race_mode_mismatch",
+      `Imported race mode "${state.race.mode}" disagrees with race type "${raceType}"; expected mode "${expectedMode}"`
+    )
+  }
+}
+
+/**
  * Validate the imported state's self-consistency before persisting. Rejects a
  * backup that (after Zod shape validation) has the wrong track set, out-of-range
  * track levels/quarters, a graded class/profession track already sitting past the
@@ -4859,34 +5382,71 @@ function assertGradeBand(band: GradeBand, context: string): void {
 function assertImportState(
   state: CharacterState,
   identity: CharacterImportDocument["identity"],
-  config: RulesConfig
+  config: RulesConfig,
+  raceType: RaceType
 ): void {
-  // Exactly the class track must be present; the profession track must be present
-  // iff a profession identity is declared, and no other track key is allowed.
-  const allowedTracks = new Set(["class", "profession"])
-  for (const key of Object.keys(state.tracks)) {
-    if (!allowedTracks.has(key)) {
+  if (raceType === "monster") {
+    // A monster is race-only: exactly no class or profession tracks. Any track key
+    // (including the class/profession tracks) is invalid for it.
+    const monsterTracks = Object.keys(state.tracks)
+    if (monsterTracks.length > 0) {
       throw badRequest(
         "invalid_import",
-        `Imported state declares unknown track "${key}"`
+        `Imported monster state declares track(s): "${monsterTracks.join('", "')}"; a monster has no class or profession tracks`
       )
     }
-  }
-  if (!state.tracks["class"]) {
-    throw badRequest(
-      "invalid_import",
-      "Imported state is missing the required class track"
-    )
-  }
-  const hasProfessionIdentity = identity.profession != null
-  const hasProfessionTrack = state.tracks["profession"] != null
-  if (hasProfessionTrack !== hasProfessionIdentity) {
-    throw badRequest(
-      "invalid_import",
-      hasProfessionIdentity
-        ? "Imported state is missing the profession track for the declared profession"
-        : "Imported state has a profession track but no profession identity"
-    )
+    // Race-only grade ceiling: a monster's stored race level must not already sit
+    // PAST the entry level of its NEXT grade (the same ceiling advanceRaceQuarter
+    // enforces on a level-up), or the first quarter that levels up would reject
+    // and the imported character could never advance. Equality is allowed. A
+    // monster born at a higher natural grade at level 0 is fine (level 0 never
+    // exceeds a nonnegative entry level). The top grade has no next band and is
+    // not gated.
+    const next = nextGrade(state.race.grade)
+    if (next) {
+      const nextBand = bandForGrade(next, config.gradeTable)
+      if (!nextBand) {
+        throw badRequest(
+          "invalid_import",
+          `Imported monster race next grade "${next}" has no grade band defined`
+        )
+      }
+      assertGradeBand(nextBand, "Imported monster race")
+      if (state.race.level > nextBand.entryLevel) {
+        throw badRequest(
+          "import_grade_blocked",
+          `Imported monster race level ${state.race.level} exceeds the ${state.race.grade}->${next} threshold (${nextBand.entryLevel}); advancing would fail`
+        )
+      }
+    }
+  } else {
+    // Exactly the class track must be present; the profession track must be present
+    // iff a profession identity is declared, and no other track key is allowed.
+    const allowedTracks = new Set(["class", "profession"])
+    for (const key of Object.keys(state.tracks)) {
+      if (!allowedTracks.has(key)) {
+        throw badRequest(
+          "invalid_import",
+          `Imported state declares unknown track "${key}"`
+        )
+      }
+    }
+    if (!state.tracks["class"]) {
+      throw badRequest(
+        "invalid_import",
+        "Imported state is missing the required class track"
+      )
+    }
+    const hasProfessionIdentity = identity.profession != null
+    const hasProfessionTrack = state.tracks["profession"] != null
+    if (hasProfessionTrack !== hasProfessionIdentity) {
+      throw badRequest(
+        "invalid_import",
+        hasProfessionIdentity
+          ? "Imported state is missing the profession track for the declared profession"
+          : "Imported state has a profession track but no profession identity"
+      )
+    }
   }
 
   // Track levels are nonnegative integers; quarters are 0..3. The document Zod
@@ -5003,212 +5563,257 @@ export async function importCharacter(
   input: CharacterImportDocument,
   user: SessionUser
 ): Promise<CharacterDetail> {
-  return prisma.$transaction(async (tx) => {
-    const houseRules = await loadHouseRules(tx)
-    const race = await resolveIdentityRef(
-      tx,
-      "races",
-      input.identity.race.stableId,
-      "race"
-    )
-    const cls = await resolveIdentityRef(
-      tx,
-      "classes",
-      input.identity.class.stableId,
-      "class"
-    )
-    const prof = input.identity.profession
-      ? await resolveIdentityRef(
-          tx,
-          "professions",
-          input.identity.profession.stableId,
-          "profession"
-        )
-      : null
-
-    // Deserialize with a hard rejection: a state that violates the engine schema
-    // (including track levels/quarters) must 400 `invalid_import` before any DB
-    // write, even when the route's Zod check was bypassed by a direct caller.
-    let rawState: CharacterState
-    try {
-      rawState = deserializeState(input.state)
-    } catch (err) {
-      if (err instanceof z.ZodError) {
-        const issues = err.issues
-          .slice(0, 3)
-          .map(
-            (i) =>
-              `${i.path.length ? i.path.join(".") : "(root)"}: ${i.message}`
-          )
-          .join("; ")
-        throw badRequest(
-          "invalid_import",
-          `Imported state is malformed - ${issues}`
-        )
-      }
-      throw err
-    }
-    const config = buildRulesConfig(race, houseRules.config)
-    // Validate the RAW document state before normalizing: `normalizeImportedState`
-    // rewrites the origin to identity.origin, which would otherwise mask a
-    // backup whose state.race.origin disagrees with identity.origin.
-    assertImportState(rawState, input.identity, config)
-    const state = normalizeImportedState(
-      rawState,
-      input.identity,
-      race,
-      cls,
-      prof
-    )
-
-    // A v3 doc has no inventory model; a v4 doc carries owned stock (which is
-    // validated and resolved before any DB write). The resolved stock map is what
-    // the association resolver consults to enforce the ownership invariant on
-    // non-grandfathered equipment links.
-    const isV4 = input.schema === IMPORT_SCHEMA_V4
-    let resolvedInventory: ResolvedInventoryItem[] = []
-    let ownedStockByDefId = new Map<string, number>()
-    if (isV4) {
-      resolvedInventory = await resolveInventoryRefs(tx, input.inventory)
-      ownedStockByDefId = new Map(
-        resolvedInventory.map((i) => [i.definitionId, i.quantity])
+  const serializable = {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const houseRules = await loadHouseRules(tx)
+      const race = await resolveIdentityRef(
+        tx,
+        "races",
+        input.identity.race.stableId,
+        "race"
       )
-    }
 
-    const resolvedAssocs = await resolveAssociationRefs(
-      tx,
-      input.associations,
-      {
-        enforceOwnership: isV4,
-        ownedStockByDefId,
-        maxTranscendentSkills: houseRules.config.maxTranscendentSkills,
+      // The race's advancement mode determines what the class/profession identity
+      // may carry. A monster is race-only: its class identity must be null and it
+      // tracks no profession. An enlightened race always resolves an exact class.
+      const raceConfig = parseCatalogConfig(race.kind, race.config ?? {})
+      const raceType =
+        (raceConfig.raceType as RaceType | undefined) ?? "enlightened"
+      if (raceType === "monster") {
+        if (input.identity.class.stableId != null) {
+          throw badRequest(
+            "invalid_import",
+            `Monster race "${race.name}" has no class; imported class stableId "${input.identity.class.stableId}" is not allowed`
+          )
+        }
+        if (input.identity.profession != null) {
+          throw badRequest(
+            "invalid_import",
+            `Monster race "${race.name}" has no profession; imported profession is not allowed`
+          )
+        }
       }
-    )
-    assertAssocCollisions(
-      resolvedAssocs,
-      houseRules.config.maxTranscendentSkills
-    )
-    const resolvedOffers = await resolveSkillOfferRefs(tx, input.skillOffers)
 
-    const serialized = serializeState(state)
-    const created = await tx.character.create({
-      data: {
-        ownerId: user.id,
-        name: input.identity.name,
-        description: input.identity.description ?? null,
-        // Profile metadata is imported verbatim (nullable): an omitted/null field
-        // in the backup is NULL, never a default. The exact empty string is also
-        // stored as NULL; all other content (including whitespace/newlines) is
-        // preserved byte-for-byte.
-        nickname: metadataOrNull(input.identity.nickname),
-        pronouns: metadataOrNull(input.identity.pronouns),
-        ageDescription: metadataOrNull(input.identity.ageDescription),
-        appearance: metadataOrNull(input.identity.appearance),
-        biography: metadataOrNull(input.identity.biography),
-        notes: metadataOrNull(input.identity.notes),
-        origin: input.identity.origin,
-        raceId: race.id,
-        classId: cls.id,
-        professionId: prof?.id ?? null,
-        state: serialized as Prisma.InputJsonValue,
-        version: 0,
-        imported: true,
-      },
-      include: characterInclude,
-    })
+      const cls =
+        raceType === "monster"
+          ? null
+          : await resolveIdentityRef(
+              tx,
+              "classes",
+              input.identity.class.stableId,
+              "class"
+            )
+      const prof = input.identity.profession
+        ? await resolveIdentityRef(
+            tx,
+            "professions",
+            input.identity.profession.stableId,
+            "profession"
+          )
+        : null
 
-    for (const a of resolvedAssocs) {
-      await tx.characterAssociation.create({
+      // Deserialize with a hard rejection: a state that violates the engine schema
+      // (including track levels/quarters) must 400 `invalid_import` before any DB
+      // write, even when the route's Zod check was bypassed by a direct caller.
+      let rawState: CharacterState
+      try {
+        rawState = deserializeState(input.state)
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          const issues = err.issues
+            .slice(0, 3)
+            .map(
+              (i) =>
+                `${i.path.length ? i.path.join(".") : "(root)"}: ${i.message}`
+            )
+            .join("; ")
+          throw badRequest(
+            "invalid_import",
+            `Imported state is malformed - ${issues}`
+          )
+        }
+        throw err
+      }
+      const config = buildRulesConfig(race, houseRules.config)
+      // Validate the RAW document state before normalizing: `normalizeImportedState`
+      // rewrites the origin to identity.origin, which would otherwise mask a
+      // backup whose state.race.origin disagrees with identity.origin. The race-mode
+      // consistency check runs FIRST so a backup authored against a differently
+      // configured race definition fails with `import_race_mode_mismatch` rather
+      // than surfacing the downstream origin/track checks.
+      assertImportRaceMode(rawState, raceType)
+      assertImportState(rawState, input.identity, config, raceType)
+      const state = normalizeImportedState(
+        rawState,
+        input.identity,
+        race,
+        cls,
+        prof,
+        raceType
+      )
+
+      // A v3 doc has no inventory model; a v4 doc carries owned stock (which is
+      // validated and resolved before any DB write). The resolved stock map is what
+      // the association resolver consults to enforce the ownership invariant on
+      // non-grandfathered equipment links.
+      const isV4 = input.schema === IMPORT_SCHEMA_V4
+      let resolvedInventory: ResolvedInventoryItem[] = []
+      let ownedStockByDefId = new Map<string, number>()
+      if (isV4) {
+        resolvedInventory = await resolveInventoryRefs(tx, input.inventory)
+        ownedStockByDefId = new Map(
+          resolvedInventory.map((i) => [i.definitionId, i.quantity])
+        )
+      }
+
+      const resolvedAssocs = await resolveAssociationRefs(
+        tx,
+        input.associations,
+        {
+          enforceOwnership: isV4,
+          ownedStockByDefId,
+          maxTranscendentSkills: houseRules.config.maxTranscendentSkills,
+          raceGrade: state.race.grade,
+        }
+      )
+      assertAssocCollisions(
+        resolvedAssocs,
+        houseRules.config.maxTranscendentSkills
+      )
+      const resolvedOffers = await resolveSkillOfferRefs(tx, input.skillOffers)
+
+      const serialized = serializeState(state)
+      const created = await tx.character.create({
         data: {
-          characterId: created.id,
-          definitionId: a.definitionId,
-          kind: a.dbKind as never,
-          // Only equipment links carry the grandfathered marker; non-equipment
-          // links fall back to the schema default (false). Preserved verbatim so a
-          // re-imported grandfathered link stays grandfathered and vice versa.
-          ...(a.sourceKind === "equipment"
-            ? { legacyUnowned: a.legacyUnowned }
-            : {}),
+          ownerId: user.id,
+          name: input.identity.name,
+          description: input.identity.description ?? null,
+          // Profile metadata is imported verbatim (nullable): an omitted/null field
+          // in the backup is NULL, never a default. The exact empty string is also
+          // stored as NULL; all other content (including whitespace/newlines) is
+          // preserved byte-for-byte.
+          nickname: metadataOrNull(input.identity.nickname),
+          pronouns: metadataOrNull(input.identity.pronouns),
+          ageDescription: metadataOrNull(input.identity.ageDescription),
+          appearance: metadataOrNull(input.identity.appearance),
+          biography: metadataOrNull(input.identity.biography),
+          notes: metadataOrNull(input.identity.notes),
+          origin: input.identity.origin,
+          raceId: race.id,
+          // A monster has no class; every other (enlightened) race has one.
+          classId: cls?.id ?? null,
+          professionId: prof?.id ?? null,
+          state: serialized as Prisma.InputJsonValue,
+          version: 0,
+          imported: true,
         },
+        include: characterInclude,
       })
-    }
 
-    // Import owned stock. Only reached for a v4 document (v3 imports no stock, so
-    // the array is empty). Archived catalog stock is imported inert.
-    for (const item of resolvedInventory) {
-      await tx.characterInventoryItem.create({
-        data: {
-          characterId: created.id,
-          definitionId: item.definitionId,
-          quantity: item.quantity,
-        },
-      })
-    }
-
-    for (const o of resolvedOffers) {
-      await tx.skillOffer.create({
-        data: {
-          characterId: created.id,
-          track: o.track,
-          level: o.level,
-          choiceGroup: o.choiceGroup,
-          offeredAt: o.offeredAt,
-          selectedDefinitionId: o.selectedDefinitionId,
-          selectedAt: o.selectedAt,
-          options: {
-            create: o.options.map((opt) => ({
-              definitionId: opt.definitionId,
-              nameSnapshot: opt.nameSnapshot,
-              configSnapshot: opt.configSnapshot as Prisma.InputJsonValue,
-            })),
+      for (const a of resolvedAssocs) {
+        await tx.characterAssociation.create({
+          data: {
+            characterId: created.id,
+            definitionId: a.definitionId,
+            kind: a.dbKind as never,
+            // Only equipment links carry the grandfathered marker; non-equipment
+            // links fall back to the schema default (false). Preserved verbatim so a
+            // re-imported grandfathered link stays grandfathered and vice versa.
+            ...(a.sourceKind === "equipment"
+              ? { legacyUnowned: a.legacyUnowned }
+              : {}),
           },
-        },
-      })
-    }
+        })
+      }
 
-    for (const event of input.events) {
+      // Import owned stock. Only reached for a v4 document (v3 imports no stock, so
+      // the array is empty). Archived catalog stock is imported inert.
+      for (const item of resolvedInventory) {
+        await tx.characterInventoryItem.create({
+          data: {
+            characterId: created.id,
+            definitionId: item.definitionId,
+            quantity: item.quantity,
+          },
+        })
+      }
+
+      for (const o of resolvedOffers) {
+        await tx.skillOffer.create({
+          data: {
+            characterId: created.id,
+            track: o.track,
+            level: o.level,
+            choiceGroup: o.choiceGroup,
+            offeredAt: o.offeredAt,
+            selectedDefinitionId: o.selectedDefinitionId,
+            selectedAt: o.selectedAt,
+            options: {
+              create: o.options.map((opt) => ({
+                definitionId: opt.definitionId,
+                nameSnapshot: opt.nameSnapshot,
+                configSnapshot: opt.configSnapshot as Prisma.InputJsonValue,
+              })),
+            },
+          },
+        })
+      }
+
+      for (const event of input.events) {
+        await tx.progressionEvent.create({
+          data: {
+            characterId: created.id,
+            kind: "import_history",
+            payload: {
+              sourceKind: event.kind ?? "unknown",
+              sourceCreatedAt: event.createdAt ?? new Date().toISOString(),
+              sourcePayload: event.payload ?? {},
+            } as Prisma.InputJsonValue,
+          },
+        })
+      }
+
       await tx.progressionEvent.create({
         data: {
           characterId: created.id,
-          kind: "import_history",
+          kind: "import",
           payload: {
-            sourceKind: event.kind ?? "unknown",
-            sourceCreatedAt: event.createdAt ?? new Date().toISOString(),
-            sourcePayload: event.payload ?? {},
+            origin: input.identity.origin,
+            raceStableId: race.stableId,
+            classStableId: cls?.stableId ?? null,
+            professionStableId: prof?.stableId ?? null,
+            rulesetVersion: IMPORT_RULESET_VERSION,
+            // Record which backup schema produced this import and how many distinct
+            // stock definitions were restored, so the marker is an auditable record
+            // of the backup's origin (never verified source provenance itself).
+            backupSchema: input.schema,
+            inventoryCount: resolvedInventory.length,
+            sourceEvents: input.events.length,
           } as Prisma.InputJsonValue,
         },
       })
+
+      // Re-fetch so the returned detail includes the associations and skill offers
+      // created above (the `character.create` snapshot has empty relation arrays).
+      const refetched = (await tx.character.findUnique({
+        where: { id: created.id },
+        include: characterInclude,
+      }))!
+
+      return detailFor(refetched, houseRules)
+    }, serializable)
+  } catch (err) {
+    if (isSerializationFailure(err)) {
+      throw conflict(
+        "serialization_conflict",
+        "Concurrent catalog change detected; retry the import"
+      )
     }
-
-    await tx.progressionEvent.create({
-      data: {
-        characterId: created.id,
-        kind: "import",
-        payload: {
-          origin: input.identity.origin,
-          raceStableId: race.stableId,
-          classStableId: cls.stableId,
-          professionStableId: prof?.stableId ?? null,
-          rulesetVersion: IMPORT_RULESET_VERSION,
-          // Record which backup schema produced this import and how many distinct
-          // stock definitions were restored, so the marker is an auditable record
-          // of the backup's origin (never verified source provenance itself).
-          backupSchema: input.schema,
-          inventoryCount: resolvedInventory.length,
-          sourceEvents: input.events.length,
-        } as Prisma.InputJsonValue,
-      },
-    })
-
-    // Re-fetch so the returned detail includes the associations and skill offers
-    // created above (the `character.create` snapshot has empty relation arrays).
-    const refetched = (await tx.character.findUnique({
-      where: { id: created.id },
-      include: characterInclude,
-    }))!
-
-    return detailFor(refetched, houseRules)
-  })
+    throw err
+  }
 }
 
 // ------------------------------------------------------------------ //
@@ -5377,6 +5982,15 @@ export async function createCatalogItem(
       'Skill config has an invalid "track": expected "class" or "profession"'
     )
   }
+  // A NEW race must carry a recognized raceType ("enlightened" or "monster") AND
+  // a gradeSchema-valid naturalGrade ("G".."S"). A legacy config lacking either is
+  // allowed to read but is never authoritative for a new/config-changing write.
+  if (kind === "races" && isIncompleteRaceConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Race config must declare a valid "raceType" ("enlightened"/"monster") and a valid "naturalGrade" ("G","F","E","D","C","B","A","S")'
+    )
+  }
   // A NEW evolutions entry must be a valid full race OR class/profession path; a
   // legacy metadata-only config cannot be used as an optionId choice.
   if (kind === "evolutions" && !isValidEvolutionConfig(config)) {
@@ -5470,6 +6084,58 @@ export async function createCatalogItem(
     }
     throw err
   }
+}
+
+/**
+ * Reject a catalog update that would change a RANKED title's improvement identity
+ * (seriesId / rank / minRaceGrade) or drop the improvement entirely, but only when
+ * the title is actually linked to a character. A linked ranked title is the
+ * authority for its character's rank progression, so changing its identity would
+ * invalidate the sequence; the owner's current association must stay intact.
+ *
+ * Allowed on a linked title: metadata (name/description/grade/provenance) edits
+ * and bonus recalculations (flat / percent), as long as the improvement identity
+ * is not being added, changed or removed. Rejected with 409
+ * `title_improvement_conflict` (no write) for a linked title whose improvement
+ * identity is ADDED (an unranked row being promoted to ranked), changes
+ * (series/rank/grade), or is removed. An unlinked catalog row may be edited
+ * freely, including being promoted to ranked.
+ */
+async function assertTitleImprovementStable(
+  tx: DbClient,
+  definitionId: string,
+  existingConfig: Record<string, unknown>,
+  finalConfig: Record<string, unknown>
+): Promise<void> {
+  const existingImp = titleImprovementForConfig(
+    parseCatalogConfig("titles", existingConfig)
+  )
+  const finalImp = titleImprovementForConfig(finalConfig)
+  // No improvement on either side - an ordinary title, nothing to protect.
+  if (existingImp == null && finalImp == null) return
+  // Both present and identity unchanged - metadata/bonus edits may recalc live.
+  if (existingImp != null && finalImp != null) {
+    if (
+      existingImp.seriesId === finalImp.seriesId &&
+      existingImp.rank === finalImp.rank &&
+      existingImp.minRaceGrade === finalImp.minRaceGrade
+    ) {
+      return
+    }
+  }
+  const links = await tx.characterAssociation.findMany({
+    where: { definitionId },
+  })
+  if (links.length === 0) return
+  // On a linked title the improvement is immutable: adding it to a formerly
+  // unranked title, removing it, or changing its series/rank/grade identity are
+  // all rejected, because the link is the authority for a character's rank
+  // progression. Metadata / bonus edits that keep the identity stable are
+  // permitted (handled above).
+  throw conflict(
+    "title_improvement_conflict",
+    "This ranked title is assigned to a character; its improvement series/rank/grade cannot be added, changed or removed"
+  )
 }
 
 /**
@@ -5604,12 +6270,21 @@ export async function updateCatalogItem(
     config?: Record<string, unknown>
   }
 ): Promise<CatalogItem> {
-  // A god stableId change and every blessing / bloodline config change read the
-  // existing row and then write it, so they run under SERIALIZABLE isolation:
-  // two concurrent edits that race on the same catalog row cannot both commit,
-  // and the loser surfaces as P2034 which we map to a 409.
+  // A god stableId change, a race `raceType` change, every blessing / bloodline
+  // config change, and every ranked-title identity guard (which reads the linked
+  // character associations) read the existing row and then write it, so they run
+  // under SERIALIZABLE isolation: two concurrent edits that race on the same
+  // catalog row cannot both commit, and the loser surfaces as P2034 which we map
+  // to a 409. A race type change is serializable so it also conflicts correctly
+  // with an in-flight `createCharacter` that has read the race row (a serializable
+  // read / write dependency), instead of silently allowing a character built from
+  // a stale `raceType`.
   const serializable =
-    kind === "gods" || kind === "blessings" || kind === "bloodlines"
+    kind === "gods" ||
+    kind === "races" ||
+    kind === "blessings" ||
+    kind === "bloodlines" ||
+    kind === "titles"
       ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       : undefined
   try {
@@ -5644,6 +6319,62 @@ export async function updateCatalogItem(
             'Skill config has an invalid "track": expected "class" or "profession"'
           )
         }
+        if (kind === "races" && isIncompleteRaceConfig(config)) {
+          // raceType / naturalGrade are either present-but-invalid or missing
+          // entirely. An explicitly-provided invalid value is rejected outright;
+          // a missing value is allowed only when the EXISTING config already
+          // carries a valid one (preserved into the new config, the same way a
+          // raceType is preserved). This keeps a config-changing PATCH on an
+          // already-typed race from silently erasing its naturalGrade into the
+          // legacy F fallback. A config-changing PATCH on a legacy race that never
+          // declared either field is rejected - there is nothing to preserve, so
+          // both must be supplied.
+          if (hasInvalidRaceTypeConfig(config)) {
+            throw badRequest(
+              "invalid_config",
+              'Race config has an invalid "raceType": expected "enlightened" or "monster"'
+            )
+          }
+          if (hasInvalidNaturalGradeConfig(config)) {
+            throw badRequest(
+              "invalid_config",
+              'Race config has an invalid "naturalGrade": expected one of "G","F","E","D","C","B","A","S"'
+            )
+          }
+          const merged = { ...config }
+          const existingParsed = parseCatalogConfig(
+            "races",
+            existing.config ?? {}
+          )
+          const existingRaceType = existingParsed.raceType
+          if (
+            merged.raceType == null &&
+            (existingRaceType === "enlightened" ||
+              existingRaceType === "monster")
+          ) {
+            merged.raceType = existingRaceType as RaceType
+          }
+          const existingNaturalGrade = existingParsed.naturalGrade
+          if (
+            merged.naturalGrade == null &&
+            gradeSchema.safeParse(existingNaturalGrade).success
+          ) {
+            merged.naturalGrade = existingNaturalGrade as Grade
+          }
+          // After preservation, a legacy row that never declared an authoritative
+          // type or natural grade must supply BOTH explicitly.
+          if (
+            (merged.raceType !== "enlightened" &&
+              merged.raceType !== "monster") ||
+            !gradeSchema.safeParse(merged.naturalGrade).success
+          ) {
+            throw badRequest(
+              "invalid_config",
+              'Race config must declare a valid "raceType" ("enlightened"/"monster") and a valid "naturalGrade" ("G","F","E","D","C","B","A","S")'
+            )
+          }
+          config = merged
+        }
         if (kind === "evolutions" && !isValidEvolutionConfig(config)) {
           throw badRequest(
             "invalid_config",
@@ -5676,6 +6407,31 @@ export async function updateCatalogItem(
         config ?? parseCatalogConfig(kind, existing.config ?? {})
       const finalArchived =
         patch.archived != null ? patch.archived : existing.archived
+      // A race's `raceType` is a mechanical advancement-mode fact: it governs how
+      // a character advances and what tracks it may carry. A legacy config missing
+      // `raceType` is interpreted as "enlightened" (the same non-authoritative
+      // default used everywhere else). When the effective type would change and
+      // any character still references this race as its raceId, reject BEFORE the
+      // write (no silent conversion of those characters); metadata, archival /
+      // unarchival and same-type config edits are allowed.
+      if (kind === "races") {
+        const currentEffectiveType =
+          (parseCatalogConfig("races", existing.config ?? {}).raceType as
+            RaceType | undefined) ?? "enlightened"
+        const proposedType =
+          (finalConfig.raceType as RaceType | undefined) ?? "enlightened"
+        if (currentEffectiveType !== proposedType) {
+          const references = await tx.character.findMany({
+            where: { raceId: id },
+          })
+          if (references.length > 0) {
+            throw conflict(
+              "race_type_in_use",
+              `Race "${existing.name}" is referenced by ${references.length} character(s); its type cannot change from "${currentEffectiveType}" to "${proposedType}" without an explicit conversion`
+            )
+          }
+        }
+      }
       // A god's stableId cannot change while any blessing still names it as its
       // patron (via the FK patronId): the JSON `patronGodStableId` in that blessing
       // config would go stale and diverge from the FK, so reject the change (409)
@@ -5703,6 +6459,14 @@ export async function updateCatalogItem(
           ? { patronId: await resolveBlessingPatronId(tx, config) }
           : {}
       await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
+      if (kind === "titles") {
+        await assertTitleImprovementStable(
+          tx,
+          id,
+          parseCatalogConfig("titles", existing.config ?? {}),
+          finalConfig
+        )
+      }
       const row = await tx.catalogDefinition.update({
         where: { id },
         data: {

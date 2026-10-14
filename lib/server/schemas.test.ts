@@ -1,16 +1,23 @@
 import { describe, expect, it } from "vitest"
 import {
+  advanceSchema,
   blessingConfigSchema,
   bloodlineConfigSchema,
   characterCreateSchema,
   characterUpdateSchema,
   evolveSchema,
   godConfigSchema,
+  hasInvalidNaturalGradeConfig,
+  hasInvalidRaceTypeConfig,
   inventoryPostSchema,
+  isIncompleteRaceConfig,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
+  raceConfigSchema,
   specialAbilitiesSchema,
+  titleConfigSchema,
+  titleImprovementSchema,
   transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
@@ -110,6 +117,20 @@ describe("blessing / bloodline / god catalog config", () => {
     }
   })
 
+  it("accepts the Baptism tier (below Minor) with no invented numeric effect", () => {
+    // Baptism is the lowest entry tier; a baptism blessing carries no fabricated
+    // numeric bonus, so `effects` is empty.
+    const parsed = blessingConfigSchema.safeParse({
+      tier: "Baptism",
+      effects: [],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.tier).toBe("Baptism")
+      expect(parsed.data.effects).toEqual([])
+    }
+  })
+
   it("reads a legacy blessing config (grade/effect) without tier/effects", () => {
     const parsed = blessingConfigSchema.safeParse({
       grade: "F",
@@ -185,6 +206,86 @@ describe("blessing / bloodline / god catalog config", () => {
   it("reads a god config that only carries unknown fields", () => {
     const parsed = godConfigSchema.safeParse({ realm: "the void" })
     expect(parsed.success).toBe(true)
+  })
+})
+
+describe("title catalog config (improvement)", () => {
+  it("parses a ranked title config with a valid improvement descriptor", () => {
+    const parsed = titleConfigSchema.safeParse({
+      upgradeGroup: "dungeon-pioneer",
+      flat: { strength: 3, agility: 3 },
+      improvement: {
+        seriesId: "dungeon-pioneer",
+        rank: 3,
+        minRaceGrade: "D",
+      },
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.improvement).toEqual({
+        seriesId: "dungeon-pioneer",
+        rank: 3,
+        minRaceGrade: "D",
+      })
+      expect(parsed.data.upgradeGroup).toBe("dungeon-pioneer")
+    }
+  })
+
+  it("rejects a ranked title whose upgradeGroup differs from improvement.seriesId", () => {
+    const parsed = titleConfigSchema.safeParse({
+      upgradeGroup: "hero",
+      improvement: {
+        seriesId: "dungeon-pioneer",
+        rank: 1,
+        minRaceGrade: "E",
+      },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("accepts an ordinary title config with no improvement descriptor", () => {
+    const parsed = titleConfigSchema.safeParse({
+      flat: { strength: 5 },
+      upgradeGroup: "hero",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.improvement).toBeUndefined()
+    }
+  })
+
+  it("titleImprovementSchema is a strict subobject (rejects unknown keys)", () => {
+    const parsed = titleImprovementSchema.safeParse({
+      seriesId: "dungeon-pioneer",
+      rank: 1,
+      minRaceGrade: "E",
+      minGrade: "E", // typo
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects an improvement with a rank outside 1..100 or a bad grade", () => {
+    expect(
+      titleImprovementSchema.safeParse({
+        seriesId: "dungeon-pioneer",
+        rank: 0,
+        minRaceGrade: "E",
+      }).success
+    ).toBe(false)
+    expect(
+      titleImprovementSchema.safeParse({
+        seriesId: "dungeon-pioneer",
+        rank: 101,
+        minRaceGrade: "E",
+      }).success
+    ).toBe(false)
+    expect(
+      titleImprovementSchema.safeParse({
+        seriesId: "dungeon-pioneer",
+        rank: 1,
+        minRaceGrade: "Z",
+      }).success
+    ).toBe(false)
   })
 })
 
@@ -493,6 +594,97 @@ describe("character profile metadata schema bounds", () => {
   it("update schema rejects metadata fields that exceed their bound", () => {
     expect(
       characterUpdateSchema.safeParse({ notes: "x".repeat(4001) }).success
+    ).toBe(false)
+  })
+})
+
+describe("race advancement (raceType / quarter / track)", () => {
+  it("advanceSchema accepts a race track", () => {
+    const parsed = advanceSchema.safeParse({ track: "race", version: 0 })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data.track).toBe("race")
+  })
+
+  it("advanceSchema rejects an unknown track", () => {
+    expect(
+      advanceSchema.safeParse({ track: "monster", version: 0 }).success
+    ).toBe(false)
+  })
+
+  it("characterCreateSchema accepts a null class and profession (a monster)", () => {
+    const parsed = characterCreateSchema.safeParse({
+      name: "Kael",
+      origin: "integrated",
+      raceId: "race-1",
+      classId: null,
+      professionId: null,
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("characterCreateSchema accepts an omitted class and profession (treated as null)", () => {
+    const parsed = characterCreateSchema.safeParse({
+      name: "Kael",
+      origin: "integrated",
+      raceId: "race-1",
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("raceConfigSchema accepts an enlightened or monster raceType", () => {
+    expect(
+      raceConfigSchema.safeParse({ raceType: "enlightened" }).success
+    ).toBe(true)
+    expect(raceConfigSchema.safeParse({ raceType: "monster" }).success).toBe(
+      true
+    )
+  })
+
+  it("raceConfigSchema accepts a legacy config without raceType", () => {
+    expect(raceConfigSchema.safeParse({ naturalGrade: "F" }).success).toBe(true)
+  })
+
+  it("raceConfigSchema rejects an unknown raceType", () => {
+    expect(raceConfigSchema.safeParse({ raceType: "humanoid" }).success).toBe(
+      false
+    )
+  })
+
+  it("hasInvalidRaceTypeConfig detects only a present-but-invalid raceType", () => {
+    expect(hasInvalidRaceTypeConfig({})).toBe(false)
+    expect(hasInvalidRaceTypeConfig({ naturalGrade: "F" })).toBe(false)
+    expect(hasInvalidRaceTypeConfig({ raceType: "enlightened" })).toBe(false)
+    expect(hasInvalidRaceTypeConfig({ raceType: "monster" })).toBe(false)
+    expect(hasInvalidRaceTypeConfig({ raceType: "humanoid" })).toBe(true)
+  })
+
+  it("hasInvalidNaturalGradeConfig detects only a present-but-invalid naturalGrade", () => {
+    expect(hasInvalidNaturalGradeConfig({})).toBe(false)
+    expect(hasInvalidNaturalGradeConfig({ raceType: "enlightened" })).toBe(
+      false
+    )
+    expect(hasInvalidNaturalGradeConfig({ naturalGrade: "F" })).toBe(false)
+    expect(hasInvalidNaturalGradeConfig({ naturalGrade: "S" })).toBe(false)
+    expect(hasInvalidNaturalGradeConfig({ naturalGrade: "Z" })).toBe(true)
+  })
+
+  it("isIncompleteRaceConfig requires BOTH a valid raceType and a valid naturalGrade", () => {
+    expect(isIncompleteRaceConfig({})).toBe(true)
+    expect(isIncompleteRaceConfig({ naturalGrade: "F" })).toBe(true)
+    expect(isIncompleteRaceConfig({ raceType: "enlightened" })).toBe(true)
+    expect(isIncompleteRaceConfig({ raceType: "monster" })).toBe(true)
+    expect(isIncompleteRaceConfig({ raceType: "humanoid" })).toBe(true)
+    expect(
+      isIncompleteRaceConfig({ raceType: "humanoid", naturalGrade: "F" })
+    ).toBe(true)
+    expect(
+      isIncompleteRaceConfig({ raceType: "enlightened", naturalGrade: "Z" })
+    ).toBe(true)
+    expect(
+      isIncompleteRaceConfig({ raceType: "enlightened", naturalGrade: "F" })
+    ).toBe(false)
+    expect(
+      isIncompleteRaceConfig({ raceType: "monster", naturalGrade: "S" })
     ).toBe(false)
   })
 })

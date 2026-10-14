@@ -296,7 +296,11 @@ function AssociationSheet({
   loading: boolean
   busy: boolean
   consumeBusy: boolean
-  onAdd: (kind: "title" | "equipment", definitionId: string) => void
+  onAdd: (
+    kind: "title" | "equipment",
+    definitionId: string,
+    reason?: string
+  ) => void
   onRemove: (kind: "title" | "equipment", definitionId: string) => void
   onConsume: (definitionId: string) => void
   onPowerAdd: (
@@ -308,6 +312,8 @@ function AssociationSheet({
     definitionId: string
   ) => void
 }) {
+  const [rankedClaim, setRankedClaim] = React.useState<CatalogItem | null>(null)
+  const [rankedReason, setRankedReason] = React.useState("")
   const linked = new Map(character.associations.map((a) => [a.definitionId, a]))
   const equipmentStatusById = new Map(
     (character.status?.equipment.items ?? []).map((item) => [item.id, item])
@@ -452,6 +458,55 @@ function AssociationSheet({
   function titleRow(item: CatalogItem) {
     const isLinked = linked.has(item.id)
     const group = upgradeGroupFor(item)
+    const improvement = item.config?.improvement as
+      { seriesId?: unknown; rank?: unknown; minRaceGrade?: unknown } | undefined
+    const isRanked =
+      typeof improvement?.seriesId === "string" &&
+      Number.isInteger(improvement.rank) &&
+      typeof improvement.minRaceGrade === "string"
+    const gradeIndex = (grade: unknown) => GRADE_ORDER.indexOf(grade as Grade)
+    const gradeBlocked =
+      isRanked &&
+      (gradeIndex(character.state.race.grade) < 0 ||
+        gradeIndex(character.state.race.grade) <
+          gradeIndex(improvement?.minRaceGrade))
+    const seriesLinks = isRanked
+      ? character.associations.filter((a) => {
+          if (a.kind !== "title") return false
+          const catalogImprovement = titles.find((t) => t.id === a.definitionId)
+            ?.config?.improvement as
+            { seriesId?: string; rank?: number } | undefined
+          const linkedImprovement = a.improvement ?? catalogImprovement
+          return (
+            linkedImprovement?.seriesId === improvement?.seriesId ||
+            // Preserve the server's ambiguity guard: legacy linked titles
+            // sharing a series upgradeGroup but lacking rank metadata make
+            // the prior rank unknowable and therefore block progression.
+            (!a.improvement &&
+              !catalogImprovement &&
+              a.upgradeGroup === improvement?.seriesId)
+          )
+        })
+      : []
+    const knownLinkedRanks = seriesLinks.map((a) => {
+      const catalog = titles.find((t) => t.id === a.definitionId)
+      return (
+        a.improvement?.rank ??
+        (catalog?.config?.improvement as { rank?: number } | undefined)?.rank
+      )
+    })
+    const unknownLinkedRank = knownLinkedRanks.some(
+      (rank) => !Number.isInteger(rank)
+    )
+    const currentRank = knownLinkedRanks
+      .filter((rank): rank is number => Number.isInteger(rank))
+      .sort((a, b) => b - a)[0]
+    const nextRank = currentRank == null ? 1 : currentRank + 1
+    const rankIsNext =
+      isRanked &&
+      !unknownLinkedRank &&
+      improvement.rank === nextRank &&
+      !isLinked
     return (
       <div
         key={item.id}
@@ -463,6 +518,18 @@ function AssociationSheet({
             Flat: {titleFlatFor(item)} - Percent: {titlePercentFor(item)}
             {group ? <> - Upgrade group: {group}</> : null}
           </div>
+          {isRanked ? (
+            <div className="text-[0.6875rem] text-muted-foreground">
+              Rank {String(improvement.rank)} / minimum race grade{" "}
+              {String(improvement.minRaceGrade)}
+              {unknownLinkedRank
+                ? " - linked prior rank details unavailable; retry catalog before claiming"
+                : null}
+              {!unknownLinkedRank && !rankIsNext && !isLinked
+                ? ` - ${gradeBlocked ? `Locked: race grade ${character.state.race.grade} is below ${String(improvement.minRaceGrade)}` : `Locked: only rank ${nextRank} is next`}`
+                : null}
+            </div>
+          ) : null}
           {isLinked && group ? (
             <div className="text-[0.6875rem] text-muted-foreground">
               Replaces any title in group &quot;{group}&quot; (superseded tiers
@@ -478,6 +545,18 @@ function AssociationSheet({
             onClick={() => onRemove("title", item.id)}
           >
             Remove
+          </Button>
+        ) : isRanked ? (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy || !rankIsNext || Boolean(gradeBlocked)}
+            onClick={() => {
+              setRankedReason("")
+              setRankedClaim(item)
+            }}
+          >
+            Claim next rank
           </Button>
         ) : (
           <Button
@@ -946,6 +1025,56 @@ function AssociationSheet({
             )}
           </TabsContent>
         </Tabs>
+        <Dialog
+          open={rankedClaim !== null}
+          onOpenChange={(open) => {
+            if (!open) setRankedClaim(null)
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Claim next rank</DialogTitle>
+              <DialogDescription>
+                This is a self-reported qualifying first-clear claim; it is not
+                automatically verified.
+                {rankedClaim
+                  ? ` Rank ${(rankedClaim.config?.improvement as { rank: number }).rank}; configured bonus: Flat ${titleFlatFor(rankedClaim)} / Percent ${titlePercentFor(rankedClaim)}.`
+                  : ""}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="ranked-first-clear">
+                Qualifying first-clear details
+              </Label>
+              <Input
+                id="ranked-first-clear"
+                maxLength={500}
+                value={rankedReason}
+                onChange={(event) => setRankedReason(event.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {rankedReason.length}/500 characters
+              </p>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setRankedClaim(null)}>
+                Cancel
+              </Button>
+              <Button
+                disabled={
+                  busy || !rankedReason.trim() || rankedReason.length > 500
+                }
+                onClick={() => {
+                  if (rankedClaim)
+                    onAdd("title", rankedClaim.id, rankedReason.trim())
+                  setRankedClaim(null)
+                }}
+              >
+                Confirm claim
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </SheetContent>
     </Sheet>
   )
@@ -1264,7 +1393,7 @@ export function CharacterDetail({
   }, [activeTab, events, id])
 
   const advance = React.useCallback(
-    async (track: "class" | "profession") => {
+    async (track: "class" | "profession" | "race") => {
       if (!character) return
       setBusy(true)
       setError(null)
@@ -1551,7 +1680,8 @@ export function CharacterDetail({
   const addAssociation = React.useCallback(
     async (
       kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent",
-      definitionId: string
+      definitionId: string,
+      reason?: string
     ) => {
       if (!character) return
       setAssocBusy(true)
@@ -1565,6 +1695,7 @@ export function CharacterDetail({
               definitionId,
               operation: "add",
               version: character.version,
+              ...(kind === "title" && reason ? { reason } : {}),
             }),
           }
         )
@@ -1905,18 +2036,31 @@ export function CharacterDetail({
       {error ? <Alert variant="destructive">{error}</Alert> : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1"
-          onClick={() => advance("class")}
-          disabled={busy || !classTrack}
-        >
-          <ArrowUpIcon />
-          Advance class
-          {classTrack ? ` (L${classTrack.level} Q${classTrack.quarter})` : ""}
-        </Button>
-        {professionTrack ? (
+        {character.classId == null || state.race.mode === "independent" ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1"
+            onClick={() => advance("race")}
+            disabled={busy}
+          >
+            <ArrowUpIcon />
+            Advance race (L{state.race.level} Q{state.race.quarter})
+          </Button>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1"
+            onClick={() => advance("class")}
+            disabled={busy || !classTrack}
+          >
+            <ArrowUpIcon />
+            Advance class
+            {classTrack ? ` (L${classTrack.level} Q${classTrack.quarter})` : ""}
+          </Button>
+        )}
+        {character.classId != null && professionTrack ? (
           <Button
             variant="outline"
             size="sm"
@@ -1929,7 +2073,7 @@ export function CharacterDetail({
             {professionTrack.quarter})
           </Button>
         ) : null}
-        {classTrack ? (
+        {character.classId != null && classTrack ? (
           <Button
             variant="outline"
             size="sm"
@@ -1946,7 +2090,7 @@ export function CharacterDetail({
             Evolve class{classTrack.grade ? ` (${classTrack.grade})` : ""}
           </Button>
         ) : null}
-        {professionTrack ? (
+        {character.classId != null && professionTrack ? (
           <Button
             variant="outline"
             size="sm"
@@ -3439,7 +3583,9 @@ export function CharacterDetail({
         loading={catalogLoading}
         busy={assocBusy}
         consumeBusy={consumeBusy}
-        onAdd={(kind, definitionId) => void addAssociation(kind, definitionId)}
+        onAdd={(kind, definitionId, reason) =>
+          void addAssociation(kind, definitionId, reason)
+        }
         onRemove={(kind, definitionId) =>
           void removeAssociation(kind, definitionId)
         }

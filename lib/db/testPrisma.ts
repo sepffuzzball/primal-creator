@@ -209,6 +209,17 @@ export interface TestPrismaInstance {
         where: { id: string }
         include?: unknown
       }) => Promise<TestCharacterRow | null>
+      findMany: (args: {
+        where?: {
+          id?: string
+          raceId?: string
+          ownerId?: string
+          archived?: boolean
+          imported?: boolean
+        }
+        include?: unknown
+        orderBy?: unknown
+      }) => Promise<TestCharacterRow[]>
       create: (args: {
         data: Record<string, unknown>
         include?: unknown
@@ -353,6 +364,17 @@ interface Transaction {
       where: { id: string }
       include?: unknown
     }) => Promise<TestCharacterRow | null>
+    findMany: (args: {
+      where?: {
+        id?: string
+        raceId?: string
+        ownerId?: string
+        archived?: boolean
+        imported?: boolean
+      }
+      include?: unknown
+      orderBy?: unknown
+    }) => Promise<TestCharacterRow[]>
     create: (args: {
       data: Record<string, unknown>
       include?: unknown
@@ -662,6 +684,26 @@ export function createTestPrisma(): TestPrismaInstance {
     },
     character: {
       findUnique: async ({ where }) => findChar(where.id),
+      findMany: async ({ where, include, orderBy }) => {
+        let results = [...characters.values()]
+        if (where?.id != null)
+          results = results.filter((c) => c.id === where.id)
+        if (where?.raceId != null)
+          results = results.filter((c) => c.raceId === where.raceId)
+        if (where?.ownerId != null)
+          results = results.filter((c) => c.ownerId === where.ownerId)
+        if (where?.archived != null)
+          results = results.filter((c) => c.archived === where.archived)
+        if (where?.imported != null)
+          results = results.filter((c) => c.imported === where.imported)
+        const order = orderBy as { updatedAt?: string } | undefined
+        if (order?.updatedAt === "desc") {
+          results.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+        }
+        return include
+          ? results.map((c) => attachRelations(c))
+          : results.map((c) => ({ ...c }))
+      },
       create: async ({ data }) => {
         const id = (data.id as string) ?? `chr-${++idCounter}`
         const now = new Date()

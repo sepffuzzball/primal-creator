@@ -59,19 +59,47 @@ vi.mock("@/components/ui/questionnaire", () => {
     Questionnaire: ({
       children,
       onSubmit,
+      items,
       ...props
     }: React.ComponentProps<"form"> & {
       items?: unknown[]
       item?: string
       onItemChange?: (name: string) => void
     }) => (
-      <form data-testid="questionnaire" onSubmit={onSubmit} {...props}>
+      <form
+        data-testid="questionnaire"
+        data-item-count={items?.length}
+        data-item-names={items
+          ?.map((entry) => (entry as { name: string }).name)
+          .join(",")}
+        onSubmit={onSubmit}
+        {...props}
+      >
         {children}
       </form>
     ),
     QuestionnaireActions: div,
-    QuestionnaireChoice: ({ children }: React.ComponentProps<"span">) => (
-      <span>{children}</span>
+    QuestionnaireChoice: ({
+      children,
+      checked,
+      defaultChecked,
+      disabled,
+      onChange,
+      onClick,
+      value,
+    }: React.ComponentProps<"input"> & { children?: React.ReactNode }) => (
+      <label>
+        <input
+          type="radio"
+          value={value}
+          checked={checked}
+          defaultChecked={defaultChecked}
+          disabled={disabled}
+          onChange={onChange}
+          onClick={onClick}
+        />
+        {children}
+      </label>
     ),
     QuestionnaireChoiceDescription: ({
       children,
@@ -134,7 +162,8 @@ type ServerDraft = {
 /** Build a draft data payload the way the wizard's server contract expects. */
 function serverData(partial: Record<string, unknown>) {
   return {
-    step: 0,
+    step: 1,
+    raceType: "enlightened",
     name: "",
     description: null,
     origin: "integrated",
@@ -149,6 +178,7 @@ function serverData(partial: Record<string, unknown>) {
 
 const EMPTY = {
   step: "name",
+  raceType: "enlightened",
   name: "",
   description: "",
   origin: "",
@@ -322,6 +352,12 @@ function setupMock(options: Options) {
 
 /** Render the form and let the mount effects (catalog + draft GET) settle. */
 async function renderForm() {
+  if (!window.localStorage.getItem(STORAGE_KEY)) {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ ...EMPTY, raceType: "enlightened" })
+    )
+  }
   render(<CreateCharacterForm />)
   await flush()
 }
@@ -365,6 +401,10 @@ function lastDraftPutBody(): Array<{
   data?: {
     name?: string
     raceId?: string
+    raceType?: "enlightened" | "monster"
+    step?: number
+    classId?: string
+    professionId?: string | null
     special?: boolean
     specialAbilities?: unknown
   }
@@ -904,6 +944,412 @@ describe("CreateCharacterForm local recovery", () => {
 })
 
 describe("CreateCharacterForm special abilities", () => {
+  it("mounts only registry items and avoids missing-item console warnings", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      setupMock({ serverDraft: null })
+      render(<CreateCharacterForm />)
+      const questionnaire = screen.getByTestId("questionnaire")
+      expect(questionnaire.dataset.itemNames).toBe("raceType")
+      expect(
+        questionnaire.querySelectorAll("[name=class], [name=profession]")
+      ).toHaveLength(0)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Monster"))
+      expect(questionnaire.dataset.itemNames).toBe(
+        "raceType,name,origin,race,special,review"
+      )
+      expect(
+        questionnaire.querySelectorAll("[name=class], [name=profession]")
+      ).toHaveLength(0)
+      expect(
+        [...consoleError.mock.calls, ...consoleWarn.mock.calls].flat().join(" ")
+      ).not.toContain("Rendered item")
+    } finally {
+      consoleError.mockRestore()
+      consoleWarn.mockRestore()
+    }
+  })
+
+  it("requires an explicit branch choice and persists its canonical step", async () => {
+    setupMock({ serverDraft: null })
+    render(<CreateCharacterForm />)
+    await flush()
+
+    expect(
+      (screen.getByLabelText("Enlightened") as HTMLInputElement).checked
+    ).toBe(false)
+    expect((screen.getByLabelText("Monster") as HTMLInputElement).checked).toBe(
+      false
+    )
+    fireEvent.click(screen.getByLabelText("Enlightened"))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    })
+
+    const put = lastDraftPutBody()[0]
+    expect(put.data?.raceType).toBe("enlightened")
+    expect(put.data?.step).toBe(1)
+  })
+
+  it("uses six steps and omits class and profession for monsters", async () => {
+    setupMock({ serverDraft: null })
+    render(<CreateCharacterForm />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Monster"))
+
+    expect(
+      screen.getByTestId("questionnaire").getAttribute("data-item-count")
+    ).toBe("6")
+    expect(screen.queryByRole("heading", { name: "Class" })).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Profession" })).toBeNull()
+  })
+
+  it("clears race/class/profession when changing branch but preserves profile fields", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          raceType: "enlightened",
+          name: "Keep my name",
+          notes: "Keep my notes",
+          raceId: "human",
+          classId: "archer",
+          professionId: "smith",
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [
+          makeItem("human", {
+            name: "Human",
+            config: {
+              raceType: "enlightened",
+              naturalGrade: "F",
+              raceDefinitions: { F: {} },
+            },
+          }),
+        ],
+        classes: [
+          makeItem("archer", {
+            name: "Archer",
+            grade: "F",
+            config: { grades: { F: { award: 1 } } },
+          }),
+        ],
+        professions: [
+          makeItem("smith", {
+            name: "Smith",
+            grade: "F",
+            config: { grades: { F: { award: 1 } } },
+          }),
+        ],
+      },
+    })
+    await renderForm()
+    fireEvent.click(screen.getByLabelText("Monster"))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    })
+
+    const payload = lastDraftPutBody().at(-1)?.data
+    expect(payload?.raceType).toBe("monster")
+    expect(payload?.raceId).toBeUndefined()
+    expect(payload?.classId).toBeUndefined()
+    expect(payload?.professionId).toBeNull()
+    expect(payload?.name).toBe("Keep my name")
+    expect(window.localStorage.getItem(STORAGE_KEY)).toContain("Keep my notes")
+  })
+
+  it("offers only exact natural-grade definitions with usable grade data", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ raceId: "race-b", origin: "born" }))
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [
+          makeItem("race-b", {
+            name: "B race",
+            config: {
+              raceType: "enlightened",
+              naturalGrade: "B",
+              raceDefinitions: { B: {} },
+            },
+          }),
+        ],
+        classes: [
+          makeItem("class-b", {
+            name: "Usable B",
+            grade: "B",
+            config: { grades: { B: { award: 1 } } },
+          }),
+          makeItem("class-low", {
+            name: "Lower grade",
+            grade: "F",
+            config: { grades: { F: { award: 1 } } },
+          }),
+          makeItem("class-missing", {
+            name: "Missing B data",
+            grade: "B",
+            config: { grades: { F: { award: 1 } } },
+          }),
+        ],
+        professions: [
+          makeItem("prof-b", {
+            name: "B profession",
+            grade: "B",
+            config: { grades: { B: { award: 1 } } },
+          }),
+        ],
+      },
+    })
+    await renderForm()
+
+    expect(screen.getByText("Usable B")).toBeTruthy()
+    expect(screen.queryByText("Lower grade")).toBeNull()
+    expect(screen.queryByText("Missing B data")).toBeNull()
+    expect(screen.getByText("B profession")).toBeTruthy()
+  })
+
+  it("allows legacy catalog grades by usable F config but enforces explicit naturalGrade", async () => {
+    const gradeOptions = [
+      makeItem("class-null", {
+        name: "Legacy ungraded class",
+        grade: null,
+        config: { grades: { F: { award: 1 } } },
+      }),
+      makeItem("class-e", {
+        name: "Legacy E class",
+        grade: "E",
+        config: { grades: { F: { award: 1 } } },
+      }),
+      makeItem("class-f", {
+        name: "Explicit F class",
+        grade: "F",
+        config: { grades: { F: { award: 1 } } },
+      }),
+    ]
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ raceId: "legacy-race", origin: "born" }))
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [
+          makeItem("legacy-race", {
+            name: "Legacy",
+            config: { raceType: "enlightened" },
+          }),
+        ],
+        classes: gradeOptions,
+      },
+    })
+    await renderForm()
+    expect(screen.getByText("Legacy ungraded class")).toBeTruthy()
+    expect(screen.getByText("Legacy E class")).toBeTruthy()
+    expect(screen.getByText(/Legacy race has no naturalGrade/)).toBeTruthy()
+
+    cleanup()
+    window.localStorage.clear()
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ raceId: "explicit-race", origin: "born" }))
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [
+          makeItem("explicit-race", {
+            name: "Explicit",
+            config: { raceType: "enlightened", naturalGrade: "F" },
+          }),
+        ],
+        classes: gradeOptions,
+      },
+    })
+    await renderForm()
+    expect(screen.getByText("Explicit F class")).toBeTruthy()
+    expect(screen.queryByText("Legacy E class")).toBeNull()
+    expect(screen.queryByText("Legacy ungraded class")).toBeNull()
+  })
+
+  it("posts null class and profession for a monster character", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          raceType: "monster",
+          name: "Moss",
+          origin: "born",
+          raceId: "race-monster",
+          classId: "stale-class",
+          professionId: "stale-prof",
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [
+          makeItem("race-monster", {
+            name: "Moss beast",
+            config: {
+              raceType: "monster",
+              naturalGrade: "F",
+              raceDefinitions: { F: {} },
+            },
+          }),
+        ],
+      },
+    })
+    await renderForm()
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+
+    expect(createPostBodies()[0]).toMatchObject({
+      name: "Moss",
+      raceId: "race-monster",
+      classId: null,
+      professionId: null,
+    })
+  })
+
+  it("infers a legacy server draft branch from its selected race", async () => {
+    const legacyData = serverData({ step: 0, raceId: "old-monster" })
+    delete (legacyData as Record<string, unknown>).raceType
+    setupMock({
+      serverDraft: { data: legacyData, version: 8 },
+      catalog: {
+        races: [
+          makeItem("old-monster", {
+            name: "Old monster",
+            config: {
+              raceType: "monster",
+              naturalGrade: "F",
+              raceDefinitions: { F: {} },
+            },
+          }),
+        ],
+      },
+    })
+    await renderForm()
+
+    expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
+      "name"
+    )
+    expect((screen.getByLabelText("Monster") as HTMLInputElement).checked).toBe(
+      true
+    )
+    expect(
+      screen.getByTestId("questionnaire").getAttribute("data-item-count")
+    ).toBe("6")
+  })
+
+  it("preserves legacy server race and class selections when reaffirming Enlightened", async () => {
+    const legacyData = serverData({
+      step: 3,
+      raceId: "human",
+      classId: "archer",
+      origin: "born",
+    })
+    delete (legacyData as Record<string, unknown>).raceType
+    setupMock({
+      serverDraft: { data: legacyData, version: 12 },
+      catalog: {
+        races: [
+          makeItem("human", {
+            name: "Human",
+            config: { raceDefinitions: { F: {} } },
+          }),
+        ],
+        classes: [
+          makeItem("archer", {
+            name: "Archer",
+            grade: null,
+            config: { grades: { F: { award: 1 } } },
+          }),
+        ],
+      },
+    })
+    await renderForm()
+
+    expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
+      "class"
+    )
+    expect(
+      (screen.getByLabelText("Enlightened") as HTMLInputElement).checked
+    ).toBe(true)
+    fireEvent.click(screen.getByLabelText("Enlightened"))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    })
+    expect(lastDraftPutBody().at(-1)?.data).toMatchObject({
+      raceType: "enlightened",
+      raceId: "human",
+      classId: "archer",
+      step: 4,
+    })
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createPostBodies().at(-1)).toMatchObject({
+      raceId: "human",
+      classId: "archer",
+    })
+  })
+
+  it("preserves no-server local legacy selections when reaffirming Enlightened", async () => {
+    const local = localDraft({
+      step: "class",
+      raceId: "human",
+      classId: "archer",
+      origin: "born",
+      name: "Legacy hero",
+    })
+    delete (local as Record<string, unknown>).raceType
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(local))
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: [
+          makeItem("human", {
+            name: "Human",
+            config: { raceDefinitions: { F: {} } },
+          }),
+        ],
+        classes: [
+          makeItem("archer", {
+            name: "Archer",
+            grade: null,
+            config: { grades: { F: { award: 1 } } },
+          }),
+        ],
+      },
+    })
+    await renderForm()
+    fireEvent.click(screen.getByLabelText("Enlightened"))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    })
+    expect(lastDraftPutBody().at(-1)?.data).toMatchObject({
+      raceType: "enlightened",
+      raceId: "human",
+      classId: "archer",
+      step: 4,
+    })
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createPostBodies().at(-1)).toMatchObject({
+      raceId: "human",
+      classId: "archer",
+    })
+  })
+
   it("shows the catalog picker and does not offer a yes/no special-abilities choice", async () => {
     setupMock({
       serverDraft: { data: serverData({ name: "Server" }), version: 3 },
@@ -1447,7 +1893,7 @@ describe("CreateCharacterForm special abilities", () => {
     expect(createCalls).toBe(1)
   })
 
-  it("resumes legacy equipment and review step indexes at review with seven items", async () => {
+  it("resumes a local equipment step at review with the current step map", async () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(localDraft({ step: "equipment", name: "Resume me" }))
@@ -1457,17 +1903,17 @@ describe("CreateCharacterForm special abilities", () => {
     expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
       "review"
     )
-    expect(screen.getByText(/A seven-step questionnaire/)).toBeTruthy()
+    expect(screen.getByText(/branching character questionnaire/)).toBeTruthy()
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
     const put = mock.mock.calls.find(
       ([url, init]) =>
         url === "/api/drafts" && (init as RequestInit)?.method === "PUT"
     )
     expect(JSON.parse((put![1] as RequestInit).body as string).data.step).toBe(
-      6
+      7
     )
     cleanup()
-    setupMock({ serverDraft: { data: serverData({ step: 6 }), version: 2 } })
+    setupMock({ serverDraft: { data: serverData({ step: 7 }), version: 2 } })
     await renderForm()
     expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
       "review"

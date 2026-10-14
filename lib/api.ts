@@ -279,6 +279,12 @@ export interface RaceState {
   grade: Grade
   mode: string
   definitionId?: string
+  /**
+   * Quarter index within the current race level (0 = 0%, 1 = 25%, 2 = 50%,
+   * 3 = 75%). Present on monsters (independent race mode) that advance on a
+   * four-quarter cadence; absent on legacy states and enlightened races.
+   */
+  quarter?: number
   origin?: "integrated" | "born"
 }
 
@@ -326,6 +332,8 @@ export interface CharacterAssociationView {
   grade?: string
   /** Provenance label of the linked definition. */
   provenance?: string
+  /** Ranked title progression metadata, when the linked title declares it. */
+  improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
 }
@@ -483,8 +491,13 @@ export interface CharacterCreateRequest {
   notes?: string | null
   origin: "integrated" | "born"
   raceId: string
-  classId: string
-  professionId?: string
+  // `classId` is required (a nonempty string) for an enlightened race and must
+  // be null for a monster; the authoritative per-raceType rule is enforced by
+  // the service layer, which knows the resolved race config.
+  classId: string | null
+  // `professionId` is optional for an enlightened race and must be null for a
+  // monster (see classId: enforcement lives in the service layer).
+  professionId?: string | null
   specialAbilities?: SpecialAbilitiesSelection
   draftVersion?: number
 }
@@ -608,6 +621,8 @@ export interface AssociationRequest {
   definitionId: string
   operation: "add" | "remove"
   version: number
+  /** Self-reported qualifying reason. Required for a ranked title add. */
+  reason?: string
 }
 
 export interface AssociationResponse {
@@ -758,6 +773,13 @@ export interface DraftData {
   name?: string
   description?: string | null
   origin?: "integrated" | "born"
+  /**
+   * Draft-only branch choice captured before a race is selected, so the wizard
+   * can resume the correct branch. NOT part of the final character create - the
+   * server derives the race type from the selected catalog race, so a client can
+   * never spoof it.
+   */
+  raceType?: "enlightened" | "monster"
   raceId?: string
   classId?: string
   professionId?: string | null

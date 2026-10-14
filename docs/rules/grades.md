@@ -13,16 +13,16 @@
 A grade is a band of levels on the grade ladder. The grade table below is taken
 verbatim from the `Race Level` page (the only source we could retrieve in full):
 
-| Grade | Levels | Notes |
-| --- | --- | --- |
-| G-grade | 0-9 | Applies only to newly integrated races |
-| F-grade | 0-24 | First grade for all born into the system |
-| E-grade | 25-99 | |
-| D-grade | 100-199 | |
+| Grade   | Levels  | Notes                                               |
+| ------- | ------- | --------------------------------------------------- |
+| G-grade | 0-9     | Applies only to newly integrated races              |
+| F-grade | 0-24    | First grade for all born into the system            |
+| E-grade | 25-99   |                                                     |
+| D-grade | 100-199 |                                                     |
 | C-grade | 200-349 | Evolving to C-grade requires a quest for most races |
-| B-grade | 350-499 | |
-| A-grade | 500-749 | |
-| S-grade | 750-999 | The last rank before godhood for mortals |
+| B-grade | 350-499 |                                                     |
+| A-grade | 500-749 |                                                     |
+| S-grade | 750-999 | The last rank before godhood for mortals            |
 
 Verified behaviors from the same page:
 
@@ -66,16 +66,23 @@ their level is unknown. `Race_Level` notes that concerning the immortal grades
 - The precise level at which a character becomes "divine" is not given; only that
   it is beyond S-grade (S is "the last rank before godhood for mortals").
 - The G/F overlap (G covers 0-9, F covers 0-24) is intentional: G applies only to
-  newly integrated races, F applies to anyone born into the system. It is not a
-  contradiction, but it requires interpretation for an engine (see below).
+  newly integrated races, and F applies to a born race whose natural grade is F
+  (e.g. Human). It is not a contradiction, but it requires interpretation for an
+  engine (see below), and the F band is not universal: a born race starts at its
+  own `naturalGrade`, so the overlap resolves differently for a race that does
+  not start at F.
 
 ## House assumption / engine note
 
 The grade/level bands are used as-is from the source. To keep the engine
 deterministic, the transition is modeled as data, not as a derived formula:
+
 - A newly integrated participant is assigned **G-grade** at integration, then
   auto-advances to **F-grade at level 10** (source-verified).
-- For a participant born into the system, the starting grade is **F-grade**.
+- A participant born into the system starts at the **selected race's
+  `naturalGrade`** (legacy fallback **F-grade**), not universally at F. The
+  sourced "F-grade at birth" applies to a race whose natural grade is F (e.g.
+  Human); a race with a different natural grade starts there instead.
 
 We do not invent an XP curve to reach these bands; the bands are treated purely as
 level ranges. See `docs/architecture/calculation-engine.md` and

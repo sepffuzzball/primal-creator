@@ -44,8 +44,12 @@ const boundedString = (max: number, opts?: { nullable?: boolean }) => {
  * blessing/bloodline/transcendent selection (validated to the same bounds as the
  * final create) that a legacy `special: true` draft does NOT imply - the server
  * never grants a power from the boolean alone. `origin`/`raceId`/`classId`/
- * `professionId` mirror the final Character creation fields. The textual fields
- * map to the nullable `description`, `nickname`, `pronouns`, `ageDescription`,
+ * `professionId` mirror the final Character creation fields. `raceType` is the
+ * draft-only branch choice (`"enlightened"`/`"monster"`) that the wizard records
+ * BEFORE a race is selected, so it can resume the correct branch even though the
+ * final character create has no `raceType` field (the server derives it from the
+ * selected catalog race and cannot be spoofed). The textual fields map to the
+ * nullable `description`, `nickname`, `pronouns`, `ageDescription`,
  * `appearance`, `biography` and `notes` columns of the final creation step.
  */
 export const draftDataSchema = z
@@ -54,6 +58,7 @@ export const draftDataSchema = z
     name: boundedString(256),
     description: boundedString(8000, { nullable: true }),
     origin: z.enum(["integrated", "born"]).optional(),
+    raceType: z.enum(["enlightened", "monster"]).optional(),
     raceId: z.string().max(128).optional(),
     classId: z.string().max(128).optional(),
     professionId: z.string().max(128).nullable().optional(),

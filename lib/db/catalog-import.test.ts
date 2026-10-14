@@ -211,6 +211,54 @@ describe("catalog import (unit, mocked db)", () => {
     expect(dbMock.store.catalog.size).toBe(0)
   })
 
+  it("rejects a race manifest entry without raceType (legacy config) and writes nothing", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        kind: "races",
+        stableId: "legacy-race",
+        name: "Legacy Race",
+        description: "A legacy race with no raceType",
+        provenance: "inferred",
+        sourceUrl: "https://example.com/legacy-race",
+        config: {
+          naturalGrade: "F",
+          raceDefinitions: {
+            F: { id: "r:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+          },
+        },
+      },
+    ]
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a race manifest entry without naturalGrade (modern shape requires both) and writes nothing", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        kind: "races",
+        stableId: "no-grade-race",
+        name: "No Grade Race",
+        description: "A race that omits naturalGrade",
+        provenance: "inferred",
+        sourceUrl: "https://example.com/no-grade-race",
+        config: {
+          raceType: "enlightened",
+          raceDefinitions: {
+            F: { id: "r:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+          },
+        },
+      },
+    ]
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
   it("rejects a config that fails the per-kind schema (negative title flat)", async () => {
     const bad: WikiReviewedEntry[] = [
       {

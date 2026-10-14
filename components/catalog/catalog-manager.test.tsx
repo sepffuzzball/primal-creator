@@ -104,19 +104,41 @@ vi.mock("@/components/ui/dialog", () => ({
   ),
 }))
 
-vi.mock("@/components/ui/select", () => ({
-  Select: ({ children }: React.ComponentProps<"div">) => <div>{children}</div>,
-  SelectContent: ({ children }: React.ComponentProps<"div">) => (
-    <div>{children}</div>
-  ),
-  SelectItem: ({ children }: React.ComponentProps<"div">) => (
-    <div>{children}</div>
-  ),
-  SelectTrigger: ({ children }: React.ComponentProps<"button">) => (
-    <button>{children}</button>
-  ),
-  SelectValue: () => <span />,
-}))
+vi.mock("@/components/ui/select", () => {
+  const changes: Array<(value: string) => void> = []
+  return {
+    Select: ({
+      children,
+      onValueChange,
+      disabled,
+    }: React.ComponentProps<"div"> & {
+      onValueChange?: (value: string) => void
+      disabled?: boolean
+    }) => {
+      changes.length = 0
+      if (onValueChange) changes.push(onValueChange)
+      return <div data-disabled={disabled}>{children}</div>
+    },
+    SelectContent: ({ children }: React.ComponentProps<"div">) => (
+      <div>{children}</div>
+    ),
+    SelectItem: ({
+      children,
+      value,
+    }: React.ComponentProps<"div"> & { value?: string }) => (
+      <button
+        type="button"
+        onClick={() => changes.forEach((change) => change(value ?? ""))}
+      >
+        {children}
+      </button>
+    ),
+    SelectTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
+      <button {...props}>{children}</button>
+    ),
+    SelectValue: () => <span />,
+  }
+})
 
 vi.mock("@/components/ui/table", () => ({
   Table: ({ children }: React.ComponentProps<"table">) => (
@@ -256,6 +278,108 @@ describe("CatalogManager config omission on edit", () => {
     ) as Record<string, unknown>
     expect(body).toHaveProperty("config")
     expect((body.config as Record<string, unknown>).tier).toBe("Major")
+  })
+
+  it.each([
+    "Baptism",
+    "Minor",
+    "Lesser",
+    "Intermediate",
+    "Major",
+    "Greater",
+    "Divine",
+    "True",
+  ])(
+    "sets the blessing tier to %s while preserving other config keys",
+    async (tier) => {
+      const mock = setupMock()
+      await openEdit("Blessing One", mock)
+      fireEvent.click(screen.getByRole("button", { name: tier }))
+      const configField = screen.getByLabelText(
+        "Config (JSON)"
+      ) as HTMLTextAreaElement
+      const updated = JSON.parse(configField.value)
+      expect(updated).toEqual({ tier, effects: [] })
+      fireEvent.click(screen.getByText("Save"))
+      await flush()
+      const body = JSON.parse(
+        (patchCalls(mock)[0][1] as RequestInit).body as string
+      )
+      if (tier === "Minor") expect(body).not.toHaveProperty("config")
+      else expect(body.config).toEqual({ tier, effects: [] })
+    }
+  )
+
+  it("preserves extra modern config keys and effects when changing the tier", async () => {
+    const mock = setupMock()
+    const richer = {
+      ...item,
+      config: {
+        tier: "Minor",
+        effects: [{ type: "x" }],
+        patronGodStableId: "god-1",
+        note: "keep",
+      },
+    }
+    mock.mockImplementation(async (url: string, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? { item: richer }
+        : { kind: "blessings", items: [richer] }
+    )
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.click(screen.getByRole("button", { name: "Divine" }))
+    expect(
+      JSON.parse(
+        (screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement).value
+      )
+    ).toEqual({ ...richer.config, tier: "Divine" })
+  })
+
+  it("does not allow tier selection to overwrite invalid JSON or legacy config", async () => {
+    const mock = setupMock()
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    const field = screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement
+    fireEvent.change(field, { target: { value: '{ "pending":' } })
+    fireEvent.click(screen.getByRole("button", { name: "Major" }))
+    expect(field.value).toBe('{ "pending":')
+    expect(screen.getByText(/Correct Config JSON/)).toBeTruthy()
+    fireEvent.change(field, {
+      target: { value: '{"grade":"old","effect":"legacy"}' },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Major" }))
+    expect(field.value).toBe('{"grade":"old","effect":"legacy"}')
+    expect(screen.getByText(/Explicitly migrate/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Legacy" },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    expect(screen.getByText(/must be explicitly migrated/)).toBeTruthy()
+    expect(
+      mock.mock.calls.some(
+        ([url, init]) =>
+          String(url) === "/api/catalog/blessings" &&
+          (init as RequestInit)?.method === "POST"
+      )
+    ).toBe(false)
+  })
+
+  it("initializes narrative-only empty effects on first tier selection for a new blessing", async () => {
+    setupMock()
+    render(<CatalogManager kind="blessings" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.click(screen.getByRole("button", { name: "True" }))
+    expect(
+      JSON.parse(
+        (screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement).value
+      )
+    ).toEqual({ tier: "True", effects: [] })
+    expect(screen.getByText(/does not imply numeric effects/)).toBeTruthy()
   })
 
   it("bounds the edit dialog and keeps the config resizable", async () => {
