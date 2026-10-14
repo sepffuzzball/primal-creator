@@ -140,11 +140,14 @@ archived patron fails the whole transaction and rolls back every insert.
 
 - Required: `kind`, `stableId`, `name`, `config` (a JSON object).
 - Optional: `description` (string or null), `grade` (one of G/F/E/D/C/B/A/S or
-  null), `provenance` (accepted for backward compatibility and ignored),
+  null), `gradeDescriptions` (an object mapping G/F/E/D/C/B/A/S grade keys to
+  strings; see [docs/rules/grade-descriptions.md](../rules/grade-descriptions.md)),
+  `provenance` (accepted for backward compatibility and ignored),
   `sourceUrl` (https string or null).
 
 The accepted keys on an entry are a CLOSED set - only `kind`, `stableId`,
-`name`, `description`, `grade`, `provenance`, `sourceUrl`, and `config`. Any
+`name`, `description`, `grade`, `gradeDescriptions`, `provenance`,
+`sourceUrl`, and `config`. Any
 other own key is rejected with a 400 `validation` error reading
 `Bulk row N: unknown field "<key>"`. This is what prevents a typo (e.g.
 `descripton`) or an unsupported field (e.g. `archived`) from being silently
@@ -168,6 +171,7 @@ the row number.
     "name": "Bloodline of the Primal Hunter",
     "description": "A bloodline.",
     "grade": "F",
+    "gradeDescriptions": { "F": "A humble beginning." },
     "provenance": "inferred",
     "sourceUrl": "https://the-primal-hunter.fandom.com/wiki/Bloodline_of_the_Primal_Hunter",
     "config": { "effects": [], "gradeEffects": {} }
@@ -189,6 +193,15 @@ one of `track`/`milestone`, a bloodline missing `effects`, a transcendent missin
 complete class/profession path) is rejected with an `invalid_config` error, because
 the importer never copies an untrusted config into the database unvalidated.
 
+`gradeDescriptions`, when present, is a strict object whose keys must be from the
+closed grade set G/F/E/D/C/B/A/S and whose values must be non-blank strings of at
+most 8000 characters (leading/trailing whitespace is trimmed). An unknown grade
+key, an empty value, or an oversized value rejects the row with a 400 `validation`
+error. An empty object `{}` is valid and stores nothing (it is equivalent to the
+row being left without the field). It is optional and independent: it never
+populates or is populated from `description`, and never revalidates a legacy
+config. Old rows simply read back an empty `{}`.
+
 ## CSV format
 
 CSV must be RFC 4180, UTF-8 (a BOM is tolerated and stripped), with CRLF (or LF)
@@ -198,7 +211,8 @@ an array, not a bare string).
 
 Exact required headers (in any order): `kind`, `stableId`, `name`, `config`.
 
-Optional headers: `description`, `grade`, `provenance`, `sourceUrl`.
+Optional headers: `description`, `grade`, `gradeDescriptions`, `provenance`,
+`sourceUrl`.
 
 Parsing is strict RFC 4180. A duplicate header, an unknown header, a missing
 required header, or a data row whose field count does not match the header is a
@@ -209,9 +223,9 @@ unquoted field. The `row` reported for a data row is its 1-based physical starti
 line, so a quoted field containing a newline does not corrupt the reported line.
 
 ```csv
-kind,stableId,name,config,description,grade,provenance,sourceUrl
-skills,one-step-mile,"One Step Mile","{""effects"":[],""rarity"":""Common""}",A descriptive skill,,inferred,https://the-primal-hunter.fandom.com/wiki/One_Step_Mile
-titles,legendary-prodigy,"Legendary Prodigy","{""flat"":{""strength"":10},""percentBasisPoints"":{""strength"":1000}}","A title",C,house,
+kind,stableId,name,config,description,grade,gradeDescriptions,provenance,sourceUrl
+skills,one-step-mile,"One Step Mile","{""effects"":[],""rarity"":""Common""}",A descriptive skill,,,"{""D"":""A humble beginning.""}",inferred,https://the-primal-hunter.fandom.com/wiki/One_Step_Mile
+titles,legendary-prodigy,"Legendary Prodigy","{""flat"":{""strength"":10},""percentBasisPoints"":{""strength"":1000}}","A title",C,"{""C"":""A coming-of-age tale.""}",house,
 ```
 
 A new or config-changing `skill`/`equipment` config requires a `rarity`; an
@@ -231,7 +245,8 @@ A new or config-changing `skill`/`equipment` config requires a `rarity`; an
   the apply is a single Serializable transaction, so a failure rolls back
   everything.
 - **Closed key set.** A JSON entry may only carry `kind`, `stableId`, `name`,
-  `description`, `grade`, `provenance`, `sourceUrl`, and `config`; any other key -
+  `description`, `grade`, `gradeDescriptions`, `provenance`, `sourceUrl`, and
+  `config`; any other key -
   a typo such as `descripton`, or an unsupported `archived` - is rejected with a
   400 rather than being silently dropped. Bulk imports never create archived rows.
 - **Trusting only validated input.** Each row is run through `catalogCreateSchema`,

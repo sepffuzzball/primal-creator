@@ -60,6 +60,7 @@ import {
 import {
   catalogCreateSchema,
   catalogKindSchema,
+  gradeDescriptionsSchema,
   gradeSchema,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
@@ -108,6 +109,7 @@ export interface BulkCatalogEntry {
   grade: Grade | null
   sourceUrl: string | null
   config: Record<string, unknown>
+  gradeDescriptions: Partial<Record<Grade, string>>
 }
 
 /** Metadata read from the ACTUAL existing catalog row that occupies a key. */
@@ -169,6 +171,7 @@ interface RawBulkEntry {
   grade: unknown
   sourceUrl: unknown
   config: unknown
+  gradeDescriptions: unknown
 }
 
 // ------------------------------------------------------------------ //
@@ -316,6 +319,30 @@ function optionalGrade(value: unknown, row: number): Grade | null {
   )
 }
 
+/**
+ * Validate an optional `gradeDescriptions` map against `gradeDescriptionsSchema`.
+ * An omitted / null value yields an empty map (no authored grade text). The
+ * schema rejects an unknown grade key, a blank value, and an oversized value; a
+ * valid value is trimmed and returned.
+ */
+function validateGradeDescriptions(
+  value: unknown,
+  row: number
+): Partial<Record<Grade, string>> {
+  if (value === undefined || value === null) return {}
+  const parsed = gradeDescriptionsSchema.safeParse(value)
+  if (!parsed.success) {
+    const detail = parsed.error.issues.map((i) => i.message).join("; ")
+    throw badRequest(
+      "validation",
+      `Bulk row ${row}: gradeDescriptions is invalid${
+        detail ? `: ${detail}` : ""
+      }`
+    )
+  }
+  return parsed.data
+}
+
 function assertHttpsSource(source: string, row: number): void {
   let url: URL | null = null
   try {
@@ -439,6 +466,7 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     grade,
     sourceUrl: sourceUrl ?? null,
     config: parsedConfig,
+    gradeDescriptions: validateGradeDescriptions(raw.gradeDescriptions, row),
   }
 }
 
@@ -498,6 +526,7 @@ const ALLOWED_JSON_ENTRY_KEYS = new Set([
   "provenance",
   "sourceUrl",
   "config",
+  "gradeDescriptions",
 ])
 
 function parseJsonContent(content: string): RawBulkEntry[] {
@@ -539,6 +568,7 @@ function parseJsonContent(content: string): RawBulkEntry[] {
       grade: obj.grade,
       sourceUrl: obj.sourceUrl,
       config: obj.config,
+      gradeDescriptions: obj.gradeDescriptions,
     }
   })
 }
@@ -553,6 +583,7 @@ const OPTIONAL_CSV_HEADERS = new Set([
   "grade",
   "provenance",
   "sourceUrl",
+  "gradeDescriptions",
 ])
 
 interface CsvRecord {
@@ -706,6 +737,38 @@ function isBlankRecord(record: CsvRecord): boolean {
   return record.fields.length === 1 && record.fields[0] === ""
 }
 
+/**
+ * Parse an optional CSV `gradeDescriptions` cell into a JSON object. An absent or
+ * blank cell means no authored map (undefined). A non-blank cell must be valid
+ * JSON that is a plain object; anything else is rejected with a row-numbered 400.
+ * The numeric/string grade keys and value bounds are validated later by
+ * `validateGradeDescriptions`, so only the JSON parse is enforced here.
+ */
+function optionalGradeDescriptionsCsv(
+  value: string | undefined,
+  row: number
+): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined
+  const s = value.trim()
+  if (s.length === 0) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(s)
+  } catch {
+    throw badRequest(
+      "validation",
+      `Bulk CSV row ${row}: gradeDescriptions must be valid JSON`
+    )
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw badRequest(
+      "validation",
+      `Bulk CSV row ${row}: gradeDescriptions must be a JSON object`
+    )
+  }
+  return parsed as Record<string, unknown>
+}
+
 function parseCsvContent(content: string): RawBulkEntry[] {
   const records = parseCsvRecords(content).filter((r) => !isBlankRecord(r))
   if (records.length === 0) {
@@ -776,6 +839,10 @@ function parseCsvContent(content: string): RawBulkEntry[] {
       grade: get("grade"),
       sourceUrl: get("sourceUrl"),
       config,
+      gradeDescriptions: optionalGradeDescriptionsCsv(
+        get("gradeDescriptions"),
+        record.row
+      ),
     })
   }
   return rows
@@ -999,6 +1066,8 @@ export async function applyBulkImport(
               sourceUrl: entry.sourceUrl,
               archived: false,
               config: entry.config as Prisma.InputJsonValue,
+              gradeDescriptions:
+                entry.gradeDescriptions as Prisma.InputJsonValue,
               ...(await blessingPatronData(tx, entry, createdByKey, byKey)),
             },
           })

@@ -166,6 +166,42 @@ permanent-consumable gain is never re-capped (`remaining = max(0, newer cap - us
 The current house-rules version is surfaced as `rulesetVersion` on character details
 and list items when the row exists.
 
+### 5. Equipment flat + percentage bonus ordering (phase contract)
+
+An equipment entry may declare two live multipliers: a flat `bonus` vector and an
+optional `percentBasisPoints` vector (nonnegative integer basis points,
+10000 = 100%). Both are synthesized live from the current catalog config and never
+persisted. The engine applies them in a fixed order within the status trace so the
+outcome is deterministic and never depends on iteration order:
+
+1. The **flat equipment** bonus is computed and capped against the per-attribute
+   individual cap and the overall combined cap, using the value immediately before
+   any equipment application as the reference.
+2. The **percentage equipment** bonus is computed only for attributes that declared
+   a percent request: `floor((preEquipment[attr] + appliedFlat[attr]) * bp / 10000)`
+   (clamped to 0 for a negative base). It never compounds onto another item's
+   percent and deliberately uses the **capped** flat bonus as its base, so it is
+   bounded by the same budgets as the flat bonus.
+3. Percent requests share the **same** individual and combined equipment budgets as
+   flats. The remaining individual budget per attribute is
+   `max(0, floor(preEquipment[attr] * individualCapPercent / 100) - flatApplied[attr])`
+   and the remaining overall budget is
+   `max(0, floor(sum(preEquipment) * combinedCapPercent / 100) - sum(flatApplied))`.
+   Across multiple items, percent requests are capped with the same deterministic
+   largest-remainder tie ordering as flats.
+
+The status trace therefore exposes the phases in this order: ... `flat`, `percent`,
+`equipment`, `equipment-percent`, `temporary`. The `equipment-percent` phase is
+emitted **only** for an attribute whose percent request is nonzero, so equipment
+with no percent bonus (or an ineligible/archived percent) yields status output
+identical to the legacy zero-percent form - no `equipment-percent` phase at all.
+The combined `requested` / `applied` / `suppressed` figures in the equipment
+status include both flat and percent; an `equipment-percent` cap is reported
+through distinct `capUsage` names (`equipment-percent-individual` /
+`equipment-percent-overall`) while the flat cap reason strings are preserved
+verbatim. Ineligible or archived items contribute neither a flat nor a percent
+request, so nothing is reserved from the shared budgets.
+
 ## Verification status of inputs
 
 - **Verified:** grade/level bands; race-level = average of class/profession;
@@ -290,12 +326,15 @@ deliberately **not** authoritative character state. The contract is:
 ## Trusted-backup character export / import (contract)
 
 A saved character can be exported as a **trusted backup** JSON document (schema
-`primal-character/4`) and re-imported into any instance of the app. The document
+`primal-character/5`) and re-imported into any instance of the app. The document
 is a backup, **not** authoritative server-verified state: the contract is. The
-older `primal-character/3` document is still ACCEPTED on import (so existing
-backups keep working) but is never generated; a v3 backup carries no inventory and
-no grandfathering marker, so importing it restores zero stock and marks every
-equipment link as grandfathered.
+older `primal-character/4` and `primal-character/3` documents are still ACCEPTED on
+import (so existing backups keep working) but are never generated; a v3 backup
+carries no inventory and no grandfathering marker, so importing it restores zero
+stock and marks every equipment link as grandfathered. The current v5 backup
+carries owned inventory, the `legacyUnowned` marker, and a per-link ring
+`equipmentPosition` for `Ring`-slot equipment associations so a character's two
+ring positions round-trip.
 
 - **Stable identifiers, not internal ids.** The document carries `identity`
   (name, description, the nullable profile-metadata fields `nickname`,
@@ -354,6 +393,17 @@ equipment link as grandfathered.
   link (preserving the old backup behavior). Distinct inventory definitions are
   capped at 500 by the inventory adjustment route (a 409), so an exported character
   is always self-roundtrippable.
+- **Ring position on legacy v3/v4 imports.** A v3/v4 backup carries no per-link
+  `equipmentPosition`; the importer derives it from the CURRENT catalog's legacy
+  `Ring 1`/`Ring 2` slot. When the current catalog slot has been migrated to the
+  generic `Ring` (so the catalog row provides no position), the importer recovers it
+  from the backup's own `definition.config.slot` snapshot (a pre-migration catalog
+  still named `Ring 1`/`Ring 2`), never from the advisory `liveState`/`status`. If
+  neither the current row nor the snapshot yields a position (or the snapshot names
+  a non-ring slot), the import fails with `400 import_ring_position_required`. A v5
+  backup always carries the explicit position and never trusts the snapshot. The
+  `definition.config` snapshot is preserved on import solely for this recovery and
+  is never used as live catalog mechanics.
 - **No auto-created catalog content.** No identity, association, inventory, or
   offer-option definition is ever created on import; every reference must already
   exist.

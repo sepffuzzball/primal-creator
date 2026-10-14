@@ -30,7 +30,9 @@ import {
 } from "@/lib/db/service"
 import {
   IMPORT_RULESET_VERSION,
+  IMPORT_SCHEMA_V3,
   IMPORT_SCHEMA_V4,
+  IMPORT_SCHEMA_V5,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
 import { resolveDbIntegration } from "@/lib/test/db-integration"
@@ -337,7 +339,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const rawDoc = await exportCharacter(src.id, ownerUser)
     const doc = rawDoc as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/4")
+    expect(doc.schema).toBe("primal-character/5")
     expect(doc.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(doc.identity).toMatchObject({
       name: "Source Hero",
@@ -497,7 +499,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const raw = await exportCharacter(src.id, ownerUser)
     const doc = raw as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/4")
+    expect(doc.schema).toBe("primal-character/5")
     const v4 = doc as unknown as {
       inventory: Array<{
         definition: { kind: string; stableId: string }
@@ -553,7 +555,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       where: { characterId: imported.id, kind: "import" },
     })
     const payload = importEvent!.payload as Record<string, unknown>
-    expect(payload.backupSchema).toBe("primal-character/4")
+    expect(payload.backupSchema).toBe("primal-character/5")
     expect(payload.inventoryCount).toBe(2)
   })
 
@@ -1071,5 +1073,557 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       where: { kind: "BLESSING" },
     })
     expect(assocCount).toBeGreaterThanOrEqual(1) // only the source round-trip's link
+  })
+
+  /** Strip the per-link ring position from every equipment association in a doc. */
+  function stripRingPositions(
+    doc: CharacterImportDocument
+  ): CharacterImportDocument {
+    const associations = (
+      doc.associations as Array<Record<string, unknown>>
+    ).map((a) =>
+      a.kind === "equipment" ? { ...a, equipmentPosition: undefined } : a
+    )
+    return { ...doc, associations } as CharacterImportDocument
+  }
+
+  it("round-trips two distinct Ring 1 / Ring 2 links through v5 export/import preserving positions", async () => {
+    const src = await createCharacter(
+      {
+        name: "Ring Hero",
+        description: "two rings",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    await seedCatalog("catalog-ring-1", "equipment", "ring-1", "Band One", {
+      slot: "Ring",
+      bonus: { strength: 2 },
+    })
+    await seedCatalog("catalog-ring-2", "equipment", "ring-2", "Band Two", {
+      slot: "Ring",
+      bonus: { strength: 3 },
+    })
+
+    const inv1 = await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: "catalog-ring-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "seed",
+      },
+      ownerUser
+    )
+    const inv2 = await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: "catalog-ring-2",
+        quantity: 1,
+        version: inv1.version,
+        sourceNote: "seed",
+      },
+      ownerUser
+    )
+    const eq1 = await associateCharacter(
+      src.id,
+      {
+        kind: "equipment",
+        definitionId: "catalog-ring-1",
+        operation: "add",
+        version: inv2.version,
+        equipmentPosition: "Ring 1",
+      },
+      ownerUser
+    )
+    await associateCharacter(
+      src.id,
+      {
+        kind: "equipment",
+        definitionId: "catalog-ring-2",
+        operation: "add",
+        version: eq1.character.version,
+        equipmentPosition: "Ring 2",
+      },
+      ownerUser
+    )
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    expect(doc.schema).toBe("primal-character/5")
+    const ringAssocs = (
+      doc.associations as Array<{
+        kind: string
+        equipmentPosition?: string | null
+        definition: { stableId: string }
+      }>
+    ).filter((a) => a.kind === "equipment")
+    expect(ringAssocs).toHaveLength(2)
+    expect(
+      ringAssocs.find((a) => a.definition.stableId === "ring-1")
+        ?.equipmentPosition
+    ).toBe("Ring 1")
+    expect(
+      ringAssocs.find((a) => a.definition.stableId === "ring-2")
+        ?.equipmentPosition
+    ).toBe("Ring 2")
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    expect(imported.associations).toHaveLength(2)
+    const a1 = imported.associations.find(
+      (a) => a.definitionId === "catalog-ring-1"
+    )!
+    const a2 = imported.associations.find(
+      (a) => a.definitionId === "catalog-ring-2"
+    )!
+    expect(a1).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 1",
+    })
+    expect(a2).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 2",
+    })
+
+    const stored = await prisma.characterAssociation.findMany({
+      where: { characterId: imported.id, kind: "EQUIPMENT" },
+    })
+    expect(
+      stored.find((s) => s.definitionId === "catalog-ring-1")?.equipmentPosition
+    ).toBe("Ring 1")
+    expect(
+      stored.find((s) => s.definitionId === "catalog-ring-2")?.equipmentPosition
+    ).toBe("Ring 2")
+  })
+
+  it("rejects a v5 backup carrying two rings in the same active position (import_link_collision)", async () => {
+    const src = await createCharacter(
+      {
+        name: "Ring Collide",
+        description: "both at Ring 1",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    await seedCatalog("catalog-ring-a", "equipment", "ring-a", "Ring A", {
+      slot: "Ring",
+      bonus: { strength: 1 },
+    })
+    await seedCatalog("catalog-ring-b", "equipment", "ring-b", "Ring B", {
+      slot: "Ring",
+      bonus: { strength: 2 },
+    })
+    // Two rings occupying the SAME physical position (grandfathered, so no stock).
+    await prisma.characterAssociation.create({
+      data: {
+        characterId: src.id,
+        definitionId: "catalog-ring-a",
+        kind: "EQUIPMENT",
+        legacyUnowned: true,
+        equipmentPosition: "Ring 1",
+      },
+    })
+    await prisma.characterAssociation.create({
+      data: {
+        characterId: src.id,
+        definitionId: "catalog-ring-b",
+        kind: "EQUIPMENT",
+        legacyUnowned: true,
+        equipmentPosition: "Ring 1",
+      },
+    })
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    await expect(importCharacter(doc, adminUser)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+  })
+
+  it("rejects a backup carrying a Ring link with no position (import_ring_position_required)", async () => {
+    const src = await createCharacter(
+      {
+        name: "Ring No Pos",
+        description: "canonical Ring, no position",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    await seedCatalog(
+      "catalog-ring-nopos",
+      "equipment",
+      "ring-nopos",
+      "No Position Band",
+      { slot: "Ring", bonus: { strength: 2 } }
+    )
+    const inv = await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: "catalog-ring-nopos",
+        quantity: 1,
+        version: 0,
+        sourceNote: "seed",
+      },
+      ownerUser
+    )
+    await associateCharacter(
+      src.id,
+      {
+        kind: "equipment",
+        definitionId: "catalog-ring-nopos",
+        operation: "add",
+        version: inv.version,
+        equipmentPosition: "Ring 1",
+      },
+      ownerUser
+    )
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    const stripped = stripRingPositions(doc)
+    // Simulate a v3/v4 backup (no equipmentPosition field) exercising the trust-
+    // nothing-liveState rule: a generic Ring slot with no position is rejected.
+    const v3 = {
+      ...stripped,
+      schema: IMPORT_SCHEMA_V3,
+    } as CharacterImportDocument
+    await expect(importCharacter(v3, adminUser)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
+  })
+
+  it("derives a ring position from a legacy Ring 1 catalog slot on a v3/v4 backup with no position in the doc", async () => {
+    const src = await createCharacter(
+      {
+        name: "Ring Legacy Slot",
+        description: "legacy slot derives position",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    await seedCatalog(
+      "catalog-ring-legacy",
+      "equipment",
+      "ring-legacy",
+      "Legacy Band",
+      { slot: "Ring 1", bonus: { strength: 2 } }
+    )
+    // A grandfathered link with no persisted position: the export falls back to the
+    // legacy catalog slot, and the v3/v4 import path must derive the same position
+    // rather than trusting the advisory liveState.
+    await prisma.characterAssociation.create({
+      data: {
+        characterId: src.id,
+        definitionId: "catalog-ring-legacy",
+        kind: "EQUIPMENT",
+        legacyUnowned: true,
+        equipmentPosition: null,
+      },
+    })
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    // The export already recovered the position from the legacy slot.
+    const exportedRing = (
+      doc.associations as Array<{
+        kind: string
+        equipmentPosition?: string | null
+      }>
+    ).find((a) => a.kind === "equipment")
+    expect(exportedRing?.equipmentPosition).toBe("Ring 1")
+
+    // Simulate a v3 backup and a v4 backup (no per-link position field). Both must
+    // derive the position from the CURRENT catalog's legacy Ring 1 slot rather
+    // than trusting the advisory liveState.
+    const v4 = {
+      ...stripRingPositions(doc),
+      schema: IMPORT_SCHEMA_V4,
+    } as CharacterImportDocument
+    const importedV4 = await importCharacter(v4, adminUser)
+    createdCharacterIds.push(importedV4.id)
+    expect(importedV4.associations).toHaveLength(1)
+    expect(importedV4.associations[0]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 1",
+    })
+    const storedV4 = await prisma.characterAssociation.findFirst({
+      where: {
+        characterId: importedV4.id,
+        definitionId: "catalog-ring-legacy",
+      },
+    })
+    expect(storedV4?.equipmentPosition).toBe("Ring 1")
+
+    const v3 = {
+      ...stripRingPositions(doc),
+      schema: IMPORT_SCHEMA_V3,
+    } as CharacterImportDocument
+    const importedV3 = await importCharacter(v3, adminUser)
+    createdCharacterIds.push(importedV3.id)
+    expect(importedV3.associations).toHaveLength(1)
+    expect(importedV3.associations[0]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 1",
+    })
+    const storedV3 = await prisma.characterAssociation.findFirst({
+      where: {
+        characterId: importedV3.id,
+        definitionId: "catalog-ring-legacy",
+      },
+    })
+    expect(storedV3?.equipmentPosition).toBe("Ring 1")
+  })
+
+  it("recovers a Ring 2 position from a v4 backup definition.config.slot snapshot after the current catalog slot migrated to Ring", async () => {
+    // A pre-migration backup: the source catalog still named the slot "Ring 2"
+    // (the definition reference carries that config snapshot), but the CURRENT
+    // catalog slot has been migrated to the single canonical "Ring". The v3/v4
+    // import path must recover the position from the snapshot, not the advisory
+    // liveState, and the recovered position must survive a v5 export.
+    await seedCatalog(
+      "catalog-ring-snap-1",
+      "equipment",
+      "ring-snap-1",
+      "Ring Snap One",
+      { slot: "Ring", bonus: { strength: 2 } }
+    )
+
+    const doc = {
+      schema: IMPORT_SCHEMA_V4,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Ring Snap V4",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [
+        {
+          kind: "equipment",
+          definition: {
+            kind: "equipment",
+            stableId: "ring-snap-1",
+            config: { slot: "Ring 2" },
+          },
+          legacyUnowned: true,
+        },
+      ],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    expect(imported.associations).toHaveLength(1)
+    expect(imported.associations[0]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 2",
+    })
+    const stored = await prisma.characterAssociation.findFirst({
+      where: {
+        characterId: imported.id,
+        definitionId: "catalog-ring-snap-1",
+      },
+    })
+    expect(stored?.equipmentPosition).toBe("Ring 2")
+
+    // The recovered position survives a v5 re-export.
+    const exported = (await exportCharacter(
+      imported.id,
+      adminUser
+    )) as unknown as CharacterImportDocument
+    expect(exported.schema).toBe(IMPORT_SCHEMA_V5)
+    const eq = (
+      exported.associations as Array<{
+        kind: string
+        equipmentPosition?: string | null
+      }>
+    ).find((a) => a.kind === "equipment")
+    expect(eq?.equipmentPosition).toBe("Ring 2")
+  })
+
+  it("recovers a Ring 2 position from a v3 backup definition.config.slot snapshot after the current catalog slot migrated to Ring", async () => {
+    await seedCatalog(
+      "catalog-ring-snap-2",
+      "equipment",
+      "ring-snap-2",
+      "Ring Snap Two",
+      { slot: "Ring", bonus: { strength: 2 } }
+    )
+
+    const doc = {
+      schema: IMPORT_SCHEMA_V3,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Ring Snap V3",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [
+        {
+          kind: "equipment",
+          definition: {
+            kind: "equipment",
+            stableId: "ring-snap-2",
+            config: { slot: "Ring 2" },
+          },
+        },
+      ],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    expect(imported.associations).toHaveLength(1)
+    expect(imported.associations[0]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 2",
+    })
+    const stored = await prisma.characterAssociation.findFirst({
+      where: {
+        characterId: imported.id,
+        definitionId: "catalog-ring-snap-2",
+      },
+    })
+    expect(stored?.equipmentPosition).toBe("Ring 2")
+  })
+
+  it("rejects a Ring link with no position and no definition.config snapshot (import_ring_position_required)", async () => {
+    await seedCatalog(
+      "catalog-ring-snap-3",
+      "equipment",
+      "ring-snap-3",
+      "Ring Snap Three",
+      { slot: "Ring", bonus: { strength: 2 } }
+    )
+
+    const doc = {
+      schema: IMPORT_SCHEMA_V4,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Ring Snap No Snapshot",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "ring-snap-3" },
+          legacyUnowned: true,
+        },
+      ],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+
+    await expect(importCharacter(doc, adminUser)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
+  })
+
+  it("rejects a Ring link whose definition.config.slot snapshot is a non-ring slot (import_ring_position_required)", async () => {
+    await seedCatalog(
+      "catalog-ring-snap-4",
+      "equipment",
+      "ring-snap-4",
+      "Ring Snap Four",
+      { slot: "Ring", bonus: { strength: 2 } }
+    )
+
+    const doc = {
+      schema: IMPORT_SCHEMA_V4,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Ring Snap Forged Slot",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [
+        {
+          kind: "equipment",
+          definition: {
+            kind: "equipment",
+            stableId: "ring-snap-4",
+            config: { slot: "Head" },
+          },
+          legacyUnowned: true,
+        },
+      ],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+
+    await expect(importCharacter(doc, adminUser)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
   })
 })

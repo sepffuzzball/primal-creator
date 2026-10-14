@@ -306,6 +306,19 @@ export interface EquipmentBonus {
   slot: string
   source: string
   bonus: PartialVector
+  /**
+   * Optional per-attribute equipment percentage bonuses, expressed as nonnegative
+   * integer basis points (10000 = 100%). These apply AFTER the capped flat
+   * equipment bonuses but BEFORE temporary effects, and they SHARE the same
+   * per-attribute aggregate and overall equipment cap budgets as the flat bonus
+   * (a percent bonus only ever uses the budget that the capped flat bonus did not
+   * consume). Each item's percent request is computed as
+   * `floor((ref[attr] + flatApplied[attr]) * basisPoints / 10000)` and is NEVER
+   * compounded onto another item's percent; a negative base yields 0. The flat
+   * `bonus` is unchanged. Backward compatible: legacy stored states without this
+   * field contribute no percentage.
+   */
+  percentBasisPoints?: PartialVector
 }
 
 export type ResourceId = string

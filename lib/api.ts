@@ -161,6 +161,13 @@ export interface CatalogItem {
   sourceUrl: string | null
   archived: boolean
   config: Record<string, unknown>
+  /**
+   * Grade-specific prose descriptions keyed by the grade ladder (G..S), authored
+   * independently of the legacy `description` string and of the entry's own
+   * `grade` band. Always present; an entry with no authored grade text reads back
+   * as `{}`.
+   */
+  gradeDescriptions: Partial<Record<Grade, string>>
   createdAt: string
   updatedAt: string
 }
@@ -329,6 +336,14 @@ export interface CharacterAssociationView {
   upgradeGroup?: string
   /** Catalog grade of the linked definition (skills use this for tiers). */
   grade?: string
+  /**
+   * Authored grade-specific prose for the linked definition AT ITS OWN catalog
+   * `grade` band (never the character's race grade). Present only when the
+   * definition declares a grade AND has authored `gradeDescriptions` text for
+   * that grade; a null definition grade or an empty map yields an absent field.
+   * Never falls back to the legacy `description`.
+   */
+  gradeDescription?: string
   /** Ranked title progression metadata, when the linked title declares it. */
   improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
@@ -348,6 +363,13 @@ export interface CharacterAssociationView {
    * equipment bonus is not synthesized until the character qualifies.
    */
   equipmentEligibility?: { eligible: boolean; reason?: string }
+  /**
+   * The physical ring position occupied by this equipment link, present ONLY on a
+   * Ring-slot item (the single canonical "Ring" catalog slot is worn in two
+   * positions). Absent on non-ring equipment links. For UI; the catalog `slot`
+   * always shows "Ring".
+   */
+  equipmentPosition?: "Ring 1" | "Ring 2"
 }
 
 export interface SkillOfferOptionView {
@@ -444,6 +466,30 @@ export interface CharacterDetail {
   raceName: string | null
   className: string | null
   professionName: string | null
+  /**
+   * Authored grade-specific prose for the character's linked race definition at
+   * the character's current race grade (`state.race.grade`). `null` when the race
+   * definition is missing, carries no authored text for that grade, or the
+   * character has no race. Never falls back to the legacy `description`.
+   */
+  raceGradeDescription: string | null
+  /**
+   * Authored grade-specific prose for the character's linked class definition at
+   * the class track's OWN grade (`state.tracks.class.grade`). `null` when the
+   * class definition is missing, carries no authored text for that grade, or the
+   * legacy track has no explicit grade (no inference from the race grade). Never
+   * falls back to the legacy `description`.
+   */
+  classGradeDescription: string | null
+  /**
+   * Authored grade-specific prose for the character's linked profession
+   * definition at the profession track's OWN grade
+   * (`state.tracks.profession.grade`). `null` when the profession definition is
+   * missing, carries no authored text for that grade, or the legacy track has no
+   * explicit grade (no inference from the race grade). Never falls back to the
+   * legacy `description`.
+   */
+  professionGradeDescription: string | null
   state: CharacterState
   version: number
   archived: boolean
@@ -655,6 +701,13 @@ export interface AssociationRequest {
   version: number
   /** Self-reported qualifying reason. Required for a ranked title add. */
   reason?: string
+  /**
+   * The physical ring position, REQUIRED when adding a Ring-slot equipment item
+   * (the single canonical "Ring" catalog slot is worn in two positions). Forbidden
+   * on a non-ring equipment add and ignored on a remove. Never required on a
+   * non-equipment kind.
+   */
+  equipmentPosition?: "Ring 1" | "Ring 2"
 }
 
 export interface AssociationResponse {
@@ -727,6 +780,13 @@ export interface ExportAssociation {
    * on non-equipment links (they cannot be grandfathered).
    */
   legacyUnowned?: boolean
+  /**
+   * The physical ring position for a Ring-slot equipment link (`'Ring 1'` /
+   * `'Ring 2'`), and `null` for a non-ring equipment link (the single canonical
+   * "Ring" catalog slot is worn in two positions). Present only on equipment
+   * links in the current v5 backup; absent on the legacy v3/v4 shapes.
+   */
+  equipmentPosition?: "Ring 1" | "Ring 2" | null
   definition: ExportDefinitionSnapshot
 }
 
@@ -777,7 +837,7 @@ export interface SkillOfferExport {
 }
 
 export interface ExportResponse {
-  /** "primal-character/4" - the current trusted-backup schema. */
+  /** "primal-character/5" - the current trusted-backup schema. */
   schema: string
   rulesetVersion: string
   identity: CharacterIdentityExport

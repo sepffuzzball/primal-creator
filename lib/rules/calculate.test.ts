@@ -382,6 +382,231 @@ describe("equipment cap correctness (regression)", () => {
   })
 })
 
+describe("equipment percent bonuses", () => {
+  it("applies equipment percentage after capped flat, sharing the individual budget", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100 })
+    state.equipment.push({
+      id: "eq1",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 15 },
+      percentBasisPoints: { strength: 1000 }, // 10%
+    })
+    const cfg = config({
+      equipmentIndividualCapPercent: 20,
+      equipmentCombinedCapPercent: 30,
+    })
+    const result = calculateStatus(state, cfg)
+    // ref strength = 100 (no other attrs). flat 15 within individual 20.
+    const item = result.equipment.items.find((i) => i.id === "eq1")!
+    // percent request = floor((100 + 15) * 0.10) = 11.
+    // remaining individual = 20 - 15 = 5 -> apply 5, suppress 6.
+    expect(item.requested.strength).toBe(15 + 11)
+    expect(item.applied.strength).toBe(15 + 5)
+    expect(item.suppressed.strength).toBe(6)
+    // Aggregated status carries the combined flat + percent contribution.
+    expect(result.equipment.requested.strength).toBe(15 + 11)
+    expect(result.equipment.applied.strength).toBe(20)
+    expect(result.equipment.suppressed.strength).toBe(6)
+    // The percent cap is explicitly distinguished from the flat cap.
+    const pctIndiv = result.equipment.capUsage.find(
+      (c) => c.name === "equipment-percent-individual"
+    )
+    expect(pctIndiv).toBeDefined()
+    expect(pctIndiv?.attribute).toBe("strength")
+    expect(pctIndiv?.cap).toBe(5)
+    expect(pctIndiv?.requested).toBe(11)
+    expect(pctIndiv?.applied).toBe(5)
+    expect(pctIndiv?.suppressed).toBe(6)
+    expect(item.reasons.join(" ")).toContain("equipment-percent individual cap")
+    // The phase trace records flat then percent, before temporary.
+    const trace = result.traces.find((t) => t.attribute === "strength")
+    const phases = trace?.phases.map((p) => p.phase) ?? []
+    expect(phases).toEqual([
+      "initial",
+      "historical-fixed",
+      "allocation",
+      "permanent",
+      "flat",
+      "percent",
+      "equipment",
+      "equipment-percent",
+      "temporary",
+    ])
+    const eq = trace?.phases.find((p) => p.phase === "equipment")
+    const eqPct = trace?.phases.find((p) => p.phase === "equipment-percent")
+    expect(eq?.delta).toBe(15)
+    expect(eqPct?.delta).toBe(5)
+    expect(result.attributes.strength).toBe(100 + 15 + 5)
+  })
+
+  it("lets the individual cap bind when the flat bonus fills the budget", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100 })
+    state.equipment.push({
+      id: "eq1",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 20 },
+      percentBasisPoints: { strength: 1000 }, // 10%
+    })
+    const cfg = config({ equipmentCombinedCapPercent: 30 })
+    const result = calculateStatus(state, cfg)
+    // flat 20 fills the 20% individual cap, so the percent base is 120 -> request 12,
+    // but the remaining individual budget is 0 -> percent suppressed entirely.
+    const item = result.equipment.items.find((i) => i.id === "eq1")!
+    expect(item.requested.strength).toBe(20 + 12)
+    expect(item.applied.strength).toBe(20)
+    expect(item.suppressed.strength).toBe(12)
+    const pctIndiv = result.equipment.capUsage.find(
+      (c) => c.name === "equipment-percent-individual"
+    )
+    expect(pctIndiv).toBeDefined()
+    expect(pctIndiv?.applied).toBe(0)
+    expect(pctIndiv?.suppressed).toBe(12)
+    const trace = result.traces.find((t) => t.attribute === "strength")
+    const eqPct = trace?.phases.find((p) => p.phase === "equipment-percent")
+    expect(eqPct?.delta).toBe(0)
+    expect(result.attributes.strength).toBe(120)
+  })
+
+  it("lets the overall cap further suppress a percent bonus", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100 })
+    state.equipment.push({
+      id: "eq1",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 15 },
+      percentBasisPoints: { strength: 1000 }, // 10%
+    })
+    // Default caps: individual 20%, combined 15%. The flat 15 consumes the entire
+    // combined budget (15% of sum 100 = 15), so the percent request is suppressed.
+    const result = calculateStatus(state, config())
+    const item = result.equipment.items.find((i) => i.id === "eq1")!
+    expect(item.applied.strength).toBe(15)
+    expect(item.suppressed.strength).toBe(11)
+    const pctOverall = result.equipment.capUsage.find(
+      (c) => c.name === "equipment-percent-overall"
+    )
+    expect(pctOverall).toBeDefined()
+    expect(pctOverall?.cap).toBe(0)
+    expect(pctOverall?.requested).toBe(5)
+    expect(pctOverall?.applied).toBe(0)
+    expect(pctOverall?.suppressed).toBe(5)
+    expect(item.reasons.join(" ")).toContain("equipment-percent overall cap")
+    const trace = result.traces.find((t) => t.attribute === "strength")
+    const eqPct = trace?.phases.find((p) => p.phase === "equipment-percent")
+    expect(eqPct?.delta).toBe(0)
+    expect(result.attributes.strength).toBe(115)
+  })
+
+  it("allocates percent across multiple items on the same attribute deterministically", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100 })
+    state.equipment.push(
+      {
+        id: "eq1",
+        name: "Sword",
+        slot: "weapon",
+        source: "assumption",
+        bonus: { strength: 5 },
+        percentBasisPoints: { strength: 1000 }, // 10%
+      },
+      {
+        id: "eq2",
+        name: "Pauldron",
+        slot: "armor",
+        source: "assumption",
+        bonus: { strength: 5 },
+        percentBasisPoints: { strength: 1000 }, // 10%
+      }
+    )
+    const cfg = config({
+      equipmentIndividualCapPercent: 20,
+      equipmentCombinedCapPercent: 30,
+    })
+    const result = calculateStatus(state, cfg)
+    // flat 10 total (5 + 5). remaining individual = 20 - 10 = 10. Each item's
+    // percent request = floor((100 + 10) * 0.1) = 11 -> aggregate 22, capped to 10.
+    // Equal weights [11,11] apportion 10 as [5,5].
+    const eq1 = result.equipment.items.find((i) => i.id === "eq1")!
+    const eq2 = result.equipment.items.find((i) => i.id === "eq2")!
+    expect(eq1.applied.strength).toBe(5 + 5)
+    expect(eq2.applied.strength).toBe(5 + 5)
+    expect(eq1.suppressed.strength).toBe(6)
+    expect(eq2.suppressed.strength).toBe(6)
+    expect(result.equipment.applied.strength).toBe(20)
+    expect(result.attributes.strength).toBe(120)
+  })
+
+  it("contributes no percent when the equipment is disabled (zero caps)", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100 })
+    state.equipment.push({
+      id: "eq1",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 15 },
+      percentBasisPoints: { strength: 1000 }, // 10%
+    })
+    const cfg = config({
+      equipmentIndividualCapPercent: 0,
+      equipmentCombinedCapPercent: 0,
+    })
+    const result = calculateStatus(state, cfg)
+    const item = result.equipment.items.find((i) => i.id === "eq1")!
+    // No cap budget exists, so neither flat nor percent applies. The percent base
+    // is ref + flatApplied = 100 + 0 (flat is capped to zero), so request = 10.
+    expect(item.applied.strength).toBe(0)
+    expect(item.requested.strength).toBe(15 + 10)
+    expect(item.suppressed.strength).toBe(25)
+    expect(result.equipment.applied.strength).toBe(0)
+    expect(result.attributes.strength).toBe(100)
+  })
+
+  it("keeps legacy zero-percent status identical (no equipment-percent phase)", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100 })
+    state.equipment.push({
+      id: "eq1",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 15 },
+    })
+    const result = calculateStatus(
+      state,
+      config({ equipmentCombinedCapPercent: 30 })
+    )
+    const item = result.equipment.items.find((i) => i.id === "eq1")!
+    expect(item.requested.strength).toBe(15)
+    expect(item.applied.strength).toBe(15)
+    expect(item.suppressed.strength).toBe(0)
+    expect(result.equipment.requested.strength).toBe(15)
+    expect(result.equipment.applied.strength).toBe(15)
+    expect(result.equipment.suppressed.strength).toBe(0)
+    const trace = result.traces.find((t) => t.attribute === "strength")
+    const phases = trace?.phases.map((p) => p.phase) ?? []
+    expect(phases).toEqual([
+      "initial",
+      "historical-fixed",
+      "allocation",
+      "permanent",
+      "flat",
+      "percent",
+      "equipment",
+      "temporary",
+    ])
+    expect(result.attributes.strength).toBe(115)
+  })
+})
+
 describe("permanent race-grade cap", () => {
   it("rejects race-level gains that exceed the cumulative per-grade cap", () => {
     const state = character()

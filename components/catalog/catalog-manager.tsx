@@ -78,6 +78,7 @@ interface FormState {
   grade: string
   sourceUrl: string
   configText: string
+  gradeDescriptions: Record<string, string>
 }
 
 const EMPTY_FORM: FormState = {
@@ -86,6 +87,7 @@ const EMPTY_FORM: FormState = {
   grade: "",
   sourceUrl: "",
   configText: "{}",
+  gradeDescriptions: {},
 }
 
 interface ImportPreview {
@@ -140,6 +142,21 @@ function toForm(item: CatalogItem): FormState {
         : (item.grade ?? ""),
     sourceUrl: item.sourceUrl ?? "",
     configText: JSON.stringify(item.config ?? {}, null, 2),
+    gradeDescriptions: isRecord(
+      (item as CatalogItem & { gradeDescriptions?: unknown }).gradeDescriptions
+    )
+      ? Object.fromEntries(
+          Object.entries(
+            (
+              item as CatalogItem & {
+                gradeDescriptions: Record<string, unknown>
+              }
+            ).gradeDescriptions
+          ).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string"
+          )
+        )
+      : {},
   }
 }
 
@@ -173,6 +190,8 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [editing, setEditing] = React.useState<CatalogItem | null>(null)
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM)
+  const [descriptionGrade, setDescriptionGrade] =
+    React.useState<(typeof GRADES)[number]>("G")
   const blessingConfig = React.useMemo(() => {
     if (kind !== "blessings") return null
     try {
@@ -544,6 +563,7 @@ export function CatalogManager({ kind }: { kind: string }) {
   const openCreate = React.useCallback(() => {
     setEditing(null)
     setForm(EMPTY_FORM)
+    setDescriptionGrade("G")
     setFormError(null)
     setDialogOpen(true)
   }, [])
@@ -551,6 +571,7 @@ export function CatalogManager({ kind }: { kind: string }) {
   const openEdit = React.useCallback((item: CatalogItem) => {
     setEditing(item)
     setForm(toForm(item))
+    setDescriptionGrade("G")
     setFormError(null)
     setDialogOpen(true)
   }, [])
@@ -573,8 +594,36 @@ export function CatalogManager({ kind }: { kind: string }) {
       )
       return
     }
+    if (kind === "equipment") {
+      for (const [vectorKey, integer] of [
+        ["bonus", false],
+        ["percentBasisPoints", true],
+      ] as const) {
+        const vector = config[vectorKey]
+        if (vector === undefined) continue
+        if (
+          !isRecord(vector) ||
+          Object.entries(vector).some(
+            ([, value]) =>
+              typeof value !== "number" ||
+              !Number.isFinite(value) ||
+              value < 0 ||
+              (integer && !Number.isInteger(value))
+          )
+        ) {
+          setFormError(
+            integer
+              ? "Percent basis points must be nonnegative integers."
+              : "Flat equipment bonuses must be finite nonnegative numbers."
+          )
+          return
+        }
+      }
+    }
     if (
       kind === "blessings" &&
+      (!editing ||
+        stableStringify(config) !== stableStringify(editing.config ?? {})) &&
       (Object.hasOwn(config, "grade") || Object.hasOwn(config, "effect"))
     ) {
       setFormError(
@@ -709,7 +758,7 @@ export function CatalogManager({ kind }: { kind: string }) {
             const fixed = isRecord(rawRow.fixed) ? rawRow.fixed : null
             if (!fixed) {
               setFormError(
-                `${grade}-grade rows require a numeric value for every attribute.`
+                `${grade}-grade rows require a fixed attribute object.`
               )
               return
             }
@@ -748,6 +797,23 @@ export function CatalogManager({ kind }: { kind: string }) {
       return
     }
     if (
+      kind === "equipment" &&
+      editing &&
+      isRecord(editing.config) &&
+      typeof editing.config.slot === "string" &&
+      editing.config.slot !== "Ring" &&
+      ["ring1", "ring2"].includes(
+        editing.config.slot.toLowerCase().replace(/\s+/g, "")
+      ) &&
+      stableStringify(config) !== stableStringify(editing.config) &&
+      config.slot !== "Ring"
+    ) {
+      setFormError(
+        "Legacy Ring 1/Ring 2 equipment must be explicitly migrated to Ring before changing config."
+      )
+      return
+    }
+    if (
       kind === "skills" &&
       !editing &&
       !RARITIES.includes(String(config.rarity) as (typeof RARITIES)[number])
@@ -760,7 +826,25 @@ export function CatalogManager({ kind }: { kind: string }) {
     try {
       const body = {
         name: form.name,
-        ...(form.description.trim() ? { description: form.description } : {}),
+        ...(form.description !== (editing?.description ?? "")
+          ? { description: form.description }
+          : {}),
+        ...(stableStringify(form.gradeDescriptions) !==
+        stableStringify(
+          (
+            editing as
+              | (CatalogItem & { gradeDescriptions?: Record<string, string> })
+              | null
+          )?.gradeDescriptions ?? {}
+        )
+          ? {
+              gradeDescriptions: Object.fromEntries(
+                Object.entries(form.gradeDescriptions)
+                  .map(([grade, text]) => [grade, text.trim()])
+                  .filter(([, text]) => text !== "")
+              ),
+            }
+          : {}),
         ...(form.grade.trim() &&
         (kind !== "races" ||
           !editing ||
@@ -1007,16 +1091,99 @@ export function CatalogManager({ kind }: { kind: string }) {
                   }
                 />
               </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="cat-description">Description</Label>
-                <Textarea
-                  id="cat-description"
-                  value={form.description}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, description: e.target.value }))
-                  }
-                />
-              </div>
+              {!form.grade ||
+              ![...GRADES].includes(form.grade as (typeof GRADES)[number]) ? (
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="cat-description">Description</Label>
+                  <Textarea
+                    id="cat-description"
+                    maxLength={8000}
+                    value={form.description}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, description: e.target.value }))
+                    }
+                  />
+                </div>
+              ) : (
+                <details className="rounded-md border p-3">
+                  <summary className="cursor-pointer text-sm font-medium">
+                    Legacy general description (not displayed in grade tabs)
+                  </summary>
+                  <div className="mt-3 flex flex-col gap-1.5">
+                    <Label htmlFor="cat-description">
+                      Legacy general description
+                    </Label>
+                    <Textarea
+                      id="cat-description"
+                      maxLength={8000}
+                      value={form.description}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, description: e.target.value }))
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      This does not populate any grade-specific description.
+                    </p>
+                  </div>
+                </details>
+              )}
+              {!!form.grade ||
+              ["races", "classes", "professions", "skills"].includes(kind) ? (
+                <section
+                  aria-label="Grade descriptions"
+                  className="flex flex-col gap-2 rounded-md border p-3"
+                >
+                  <h3 className="text-sm font-medium">Descriptions by grade</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Optional grade-specific descriptions. Blank text removes
+                    that grade&apos;s description.
+                  </p>
+                  <div
+                    role="tablist"
+                    aria-label="Description grade"
+                    className="flex flex-wrap gap-1"
+                  >
+                    {GRADES.map((grade) => (
+                      <Button
+                        key={grade}
+                        type="button"
+                        role="tab"
+                        aria-selected={descriptionGrade === grade}
+                        variant={
+                          descriptionGrade === grade ? "secondary" : "outline"
+                        }
+                        size="sm"
+                        onClick={() => setDescriptionGrade(grade)}
+                      >
+                        {grade}
+                      </Button>
+                    ))}
+                  </div>
+                  <Label htmlFor="grade-description">
+                    {descriptionGrade}-grade description
+                  </Label>
+                  <Textarea
+                    id="grade-description"
+                    maxLength={8000}
+                    value={form.gradeDescriptions[descriptionGrade] ?? ""}
+                    placeholder="No description for this grade"
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        gradeDescriptions: {
+                          ...current.gradeDescriptions,
+                          [descriptionGrade]: event.target.value,
+                        },
+                      }))
+                    }
+                  />
+                  {!form.gradeDescriptions[descriptionGrade]?.trim() ? (
+                    <p className="text-xs text-muted-foreground">
+                      No description for this grade
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
               {structuredKind ? (
                 <div className="flex flex-col gap-2">
                   <Label htmlFor="cat-grade">
@@ -1467,6 +1634,11 @@ export function CatalogManager({ kind }: { kind: string }) {
                           {typeof structuredConfig?.slot === "string" &&
                           !EQUIPMENT_SLOTS.includes(
                             structuredConfig.slot as (typeof EQUIPMENT_SLOTS)[number]
+                          ) &&
+                          !["ring1", "ring2"].includes(
+                            structuredConfig.slot
+                              .toLowerCase()
+                              .replace(/\s+/g, "")
                           ) ? (
                             <option value={structuredConfig.slot}>
                               {structuredConfig.slot} (legacy)
@@ -1478,6 +1650,125 @@ export function CatalogManager({ kind }: { kind: string }) {
                             </option>
                           ))}
                         </select>
+                        {typeof structuredConfig?.slot === "string" &&
+                        ["ring1", "ring2"].includes(
+                          structuredConfig.slot
+                            .toLowerCase()
+                            .replace(/\s+/g, "")
+                        ) ? (
+                          <p role="alert" className="text-xs text-destructive">
+                            Legacy {structuredConfig.slot} config. Select Ring
+                            to explicitly migrate before changing configuration.
+                          </p>
+                        ) : null}
+                        <div className="flex flex-col gap-2">
+                          <p className="text-sm font-medium">Equipment stats</p>
+                          <p className="text-xs text-muted-foreground">
+                            Flat bonuses apply before percent bonuses; percent
+                            values are capped by game rules. Percent input is
+                            converted to integer basis points.
+                          </p>
+                          <div className="overflow-x-auto rounded-md border">
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead>Attribute</TableHead>
+                                  <TableHead>Flat</TableHead>
+                                  <TableHead>Percent (%)</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {ATTRIBUTE_KEYS.map((key) => {
+                                  const bonus = isRecord(
+                                    structuredConfig?.bonus
+                                  )
+                                    ? structuredConfig.bonus
+                                    : {}
+                                  const percent = isRecord(
+                                    structuredConfig?.percentBasisPoints
+                                  )
+                                    ? structuredConfig.percentBasisPoints
+                                    : {}
+                                  const changeVector = (
+                                    vectorKey: string,
+                                    attribute: string,
+                                    value: number | undefined
+                                  ) => {
+                                    const current = isRecord(
+                                      structuredConfig?.[vectorKey]
+                                    )
+                                      ? (structuredConfig[vectorKey] as Record<
+                                          string,
+                                          unknown
+                                        >)
+                                      : {}
+                                    const next = { ...current }
+                                    if (value === undefined)
+                                      delete next[attribute]
+                                    else next[attribute] = value
+                                    setConfigValue(vectorKey, next)
+                                  }
+                                  return (
+                                    <TableRow key={key}>
+                                      <TableHead scope="row">{key}</TableHead>
+                                      <TableCell>
+                                        <Input
+                                          aria-label={`${key} flat`}
+                                          type="number"
+                                          min="0"
+                                          step="any"
+                                          disabled={!structuredConfig}
+                                          value={
+                                            bonus[key] == null
+                                              ? ""
+                                              : String(bonus[key])
+                                          }
+                                          onChange={(event) =>
+                                            changeVector(
+                                              "bonus",
+                                              key,
+                                              event.target.value === ""
+                                                ? undefined
+                                                : Number(event.target.value)
+                                            )
+                                          }
+                                        />
+                                      </TableCell>
+                                      <TableCell>
+                                        <Input
+                                          aria-label={`${key} percent`}
+                                          type="number"
+                                          min="0"
+                                          step="0.01"
+                                          disabled={!structuredConfig}
+                                          value={
+                                            percent[key] == null
+                                              ? ""
+                                              : String(
+                                                  Number(percent[key]) / 100
+                                                )
+                                          }
+                                          onChange={(event) =>
+                                            changeVector(
+                                              "percentBasisPoints",
+                                              key,
+                                              event.target.value === ""
+                                                ? undefined
+                                                : Math.round(
+                                                    Number(event.target.value) *
+                                                      100
+                                                  )
+                                            )
+                                          }
+                                        />
+                                      </TableCell>
+                                    </TableRow>
+                                  )
+                                })}
+                              </TableBody>
+                            </Table>
+                          </div>
+                        </div>
                       </>
                     ) : null}
                     <Label htmlFor="cat-rarity">Rarity</Label>

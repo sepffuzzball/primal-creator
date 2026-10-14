@@ -11,6 +11,7 @@
  */
 
 import { z } from "zod"
+import type { Grade } from "@/lib/rules"
 
 // ------------------------------------------------------------------ //
 // Attribute / grade primitives
@@ -204,6 +205,10 @@ const equipmentBonusSchema = z.object({
   slot: z.string(),
   source: z.string(),
   bonus: partialVectorSchema,
+  // Optional per-attribute equipment percentage bonuses, expressed as nonnegative
+  // integer basis points (10000 = 100%). Absent on legacy states; the engine treats
+  // a missing field as no percentage contribution.
+  percentBasisPoints: nonnegativePartialVectorSchema.optional(),
 })
 
 export const characterStateSchema = z.object({
@@ -473,6 +478,17 @@ export const evolveSchema = z.union([
   evolveTrackPathSchema,
 ])
 
+/**
+ * A ring's physical position on the character. Ring is a SINGLE catalog slot
+ * (`"Ring"`) but a character may wear up to two rings, one in each position; the
+ * chosen position is persisted per-link on the association
+ * (`CharacterAssociation.equipmentPosition`), never on the catalog config. This
+ * schema is the only accepted vocabulary for that per-link position.
+ */
+export const equipmentPositionSchema = z.enum(["Ring 1", "Ring 2"])
+
+export type EquipmentPosition = z.infer<typeof equipmentPositionSchema>
+
 export const associationSchema = z.object({
   kind: z.enum(["title", "equipment", "blessing", "bloodline", "transcendent"]),
   definitionId: z.string().min(1),
@@ -483,6 +499,11 @@ export const associationSchema = z.object({
   // which knows whether the target title is ranked); optional and ignored
   // otherwise. Never a proof claim - just the player's account.
   reason: z.string().max(500).optional(),
+  // The physical ring position, REQUIRED for an `add` of a Ring-slot equipment
+  // item (a single catalog `Ring` slot but two wearable positions). Forbidden on
+  // any non-Ring equipment add and ignored on a remove. Never required on a
+  // non-equipment kind.
+  equipmentPosition: equipmentPositionSchema.optional(),
 })
 
 export const skillSelectSchema = z.object({
@@ -537,12 +558,44 @@ export const catalogKindSchema = z.enum([
   "transcendent_skills",
 ])
 
+/**
+ * Grade-specific prose descriptions for a catalog entry, keyed by the grade
+ * ladder (G..S). Authored independently of the legacy `description` string and of
+ * the entry's own `grade` band (a legacy race whose `grade` is null may still
+ * carry a description for its natural grade; a grade-cap row may carry text for
+ * any band). Never auto-populated from `description`.
+ *
+ * The map is optional and may be empty: an omitted or `{}` value means the entry
+ * carries no authored grade text (it reads back as an empty map). Keys are
+ * STRICT - only G..S are accepted, so a typo like `"H"` is rejected rather than
+ * silently dropped. Values are trimmed and must be nonempty and at most 8000
+ * characters; a blank or oversized value is rejected.
+ */
+export const gradeDescriptionsSchema = z
+  .record(z.string(), z.string().trim().min(1).max(8000))
+  .superRefine((map, ctx) => {
+    for (const [key] of Object.entries(map)) {
+      if (
+        !gradeSchema.options.includes(
+          key as (typeof gradeSchema.options)[number]
+        )
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `gradeDescriptions has an invalid grade key "${key}"`,
+          path: [key],
+        })
+      }
+    }
+  }) as z.ZodType<Partial<Record<Grade, string>>>
+
 const catalogBase = {
   name: z.string().min(1),
   description: z.string().nullable().optional(),
   grade: gradeSchema.nullable().optional(),
   sourceUrl: z.string().url().nullable().optional(),
   archived: z.boolean().optional(),
+  gradeDescriptions: gradeDescriptionsSchema.optional(),
 }
 
 export const catalogCreateSchema = z.object({
@@ -705,18 +758,39 @@ export const EQUIPMENT_SLOTS = [
   "Legs",
   "Feet",
   "Neck",
-  "Ring 1",
-  "Ring 2",
+  "Ring",
   "Weapon",
 ] as const
 
 export const equipmentSlotSchema = z.enum(EQUIPMENT_SLOTS)
 
 /**
+ * Derive a ring position from a legacy equipment `config.slot` value. Before the
+ * single-`Ring`-slot model, ring items were authored with the slot value
+ * `"Ring 1"`/`"Ring 2"` (including case/spacing aliases such as `"ring1"`,
+ * `"ring 2"`), so this recovers the position those rows encode. The canonical
+ * `"Ring"` slot carries no positional info and returns undefined (the position
+ * then comes from the persisted association link). Returns undefined for any
+ * non-ring slot.
+ */
+export function legacyRingPositionForConfig(
+  config: Record<string, unknown>
+): EquipmentPosition | undefined {
+  const slot = config.slot
+  if (typeof slot !== "string") return undefined
+  const key = slot.toLowerCase().replace(/\s+/g, "")
+  if (key === "ring1") return "Ring 1"
+  if (key === "ring2") return "Ring 2"
+  return undefined
+}
+
+/**
  * Documented legacy slot aliases -> canonical slot. These normalize ONLY for
  * slot-collision / replacement / import-integrity comparisons; a catalog write
  * stores the original config verbatim (no synonym coercion) unless the value is
- * already canonical.
+ * already canonical. Legacy ring slot values normalize to the canonical `"Ring"`
+ * slot for category comparisons; the specific position is the per-link
+ * `equipmentPosition`, never part of the canonical slot set.
  */
 const EQUIPMENT_SLOT_ALIASES: Record<string, string> = {
   head: "Head",
@@ -726,8 +800,10 @@ const EQUIPMENT_SLOT_ALIASES: Record<string, string> = {
   gloves: "Hands",
   boots: "Feet",
   necklace: "Neck",
-  ring1: "Ring 1",
-  ring2: "Ring 2",
+  ring1: "Ring",
+  ring2: "Ring",
+  "ring 1": "Ring",
+  "ring 2": "Ring",
 }
 
 /**
@@ -775,6 +851,10 @@ export const equipmentConfigSchema = z
   .object({
     slot: z.string().min(1).optional(),
     bonus: nonnegativePartialVectorSchema.optional(),
+    // Optional per-attribute equipment percentage bonuses, expressed as nonnegative
+    // integer basis points (10000 = 100%). The flat `bonus` is unchanged; a percent
+    // bonus shares the capped flat equipment budget. Absent on legacy entries.
+    percentBasisPoints: nonnegativePartialVectorSchema.optional(),
     rarity: equipmentRaritySchema.optional(),
     soulbound: z.boolean().optional(),
     minRaceLevel: z.number().int().nonnegative().optional(),

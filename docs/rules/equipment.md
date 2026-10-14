@@ -51,6 +51,42 @@ Equipment is attached to a saved character via a `CharacterAssociation` link
 equip** onto the character. The referenced definition is never deleted while a
 link points to it (`ON DELETE RESTRICT`).
 
+## Ring slot & physical position
+
+`Ring` is a **single catalog slot**, but a character may wear up to two rings, one
+in each physical position. The chosen position is a **per-link** value persisted on
+the association (`CharacterAssociation.equipmentPosition`, `"Ring 1"` or
+`"Ring 2"`), never on the catalog config: an `equipment` entry with `slot: "Ring"`
+is one catalog item, and exactly one link per definition is still allowed (the
+unique `(characterId, definitionId)` constraint is unchanged).
+
+- Equipping a Ring-slot item **requires** an explicit `equipmentPosition` on a NEW
+  add (`400 ring_position_required`); a remove never requires one, and a non-ring
+  equipment add forbids it (`400 position_not_allowed`).
+- Adding a different Ring item to an **occupied** position atomically replaces only
+  that position's link, leaving the other position untouched; a same-definition
+  duplicate is still rejected, and a remove ignores position entirely.
+- The catalog/item view always shows the canonical `Ring` slot; the worn position
+  is surfaced separately as `equipmentPosition`. The live status uses the persisted
+  position (or a legacy config-derived fallback) as the effective slot only to keep
+  two rings distinct in the synthesized equipment list - the engine never treats
+  the position as a separate cap.
+- Editing a linked Ring-slot item to a different equipment category (or vice versa)
+  is rejected with `409 equipment_position_conflict` until the item is unequipped.
+  A legacy `Ring 1`/`Ring 2` catalog slot -> canonical `Ring` is a same-category
+  edit that preserves each link's position (and rejects a collision with another
+  ring already occupying the same active position).
+- **Trusted-backup import (v3/v4).** A legacy v3/v4 backup carries no per-link
+  `equipmentPosition`; the importer derives one from the CURRENT catalog's legacy
+  `Ring 1`/`Ring 2` slot. When the current catalog slot has already been migrated
+  to the generic `Ring` (so the catalog row itself provides no position), the
+  importer recovers the position from the backup's own `definition.config.slot`
+  snapshot - a pre-migration catalog still named `Ring 1`/`Ring 2`. Never from the
+  advisory `liveState`/`status`. If neither the current catalog row nor the backup
+  snapshot yields a position (or the snapshot names a non-ring slot), the import is
+  rejected with `400 import_ring_position_required`; a v5 backup always carries the
+  explicit position and never trusts the snapshot.
+
 ## Inventory ownership (backend notes)
 
 Equipment is now backed by an owner-managed inventory quantity rather than item
@@ -89,6 +125,13 @@ are preserved) plus the new authoritative metadata:
   and new items. This is preserved verbatim on write (no synonym coercion).
 - `bonus?: PartialVector` - nonnegative-integer attribute bonuses. With `slot`
   absent, an entry contributes nothing.
+- `percentBasisPoints?: PartialVector` - nonnegative-integer **percentage**
+  attribute bonuses expressed in basis points (10000 = 100%). Like `bonus`, this
+  is a live-declared effect: when present on an eligible item it contributes a
+  percentage of the pre-equipment attribute value (after any capped flat
+  equipment bonus) on top of the flat `bonus`. It is never written into
+  `Character.state`, and an ineligible or archived item's percent is inert along
+  with its flat `bonus`.
 - `rarity?: string` - one of the canonical rarity tiers
   (`Inferior`/`Common`/`Uncommon`/`Rare`/`Epic`/`Ancient`/`Legendary`/`Mythical`/
   `Sacred`/`Divine`, or the incomparable `Unique`). Required for a NEW or
@@ -103,9 +146,13 @@ are preserved) plus the new authoritative metadata:
 
 Slot normalization is comparison-only. `normalizeEquipmentSlot` maps documented
 legacy aliases (`head`/`chest`/`cloak`/`bracers`/`gloves`/`boots`/`necklace`/
-`ring1`/`ring2`) and case-insensitive canonical values to a canonical slot purely
-for slot-collision / replacement / import-integrity comparisons and for the
-modern-shape completeness guard. The original `config.slot` is never rewritten.
+`ring1`/`ring2` and the spacing variants `ring 1`/`ring 2`) and case-insensitive
+canonical values to a canonical slot purely for slot-collision / replacement /
+import-integrity comparisons and for the modern-shape completeness guard. Legacy
+`Ring 1`/`Ring 2` slot values normalize to the single canonical `Ring` slot for
+category comparisons; the specific position is the per-link `equipmentPosition`,
+never part of the canonical slot set. The original `config.slot` is never
+rewritten.
 
 ## Eligibility & live bonus gating
 
@@ -117,9 +164,11 @@ total/class level.
 
 A linked item whose requirement is currently unmet is still linked and shown - the
 link, inventory stock and journal are untouched - but its bonus is NOT
-synthesized into the live status until the character qualifies. An ineligible
-item therefore adds no bonus (represented as an empty bonus) while it stays
-equipped and visible. On ADD, an unmet requirement is rejected with a 400
+synthesized into the live status until the character qualifies. This applies to
+both the flat `bonus` and the `percentBasisPoints` contribution: an ineligible
+item therefore adds no bonus of either kind (represented as an empty bonus /
+empty percent) while it stays equipped and visible. On ADD, an unmet requirement
+is rejected with a 400
 (`equipment_requirements_unmet`); the stock-owned add that consumes inventory is
 allowed only when the eligibility check passes (no partial mutation on denial).
 
@@ -132,11 +181,48 @@ soulbound / declared requirements) and a live `equipmentEligibility`
 (`{ eligible, reason? }`) so a client can show why a linked item contributes no
 bonus yet.
 
-Equipment bonuses are synthesized live from the **current, unarchived** catalog
-config at read time and never written into `Character.state`, so editing an item's
-config recalculates status without rewriting history. The caps (20% per-attribute
-aggregate / 15% overall) are house assumptions documented in
+Equipment bonuses (both the flat `bonus` and the `percentBasisPoints` contribution)
+are synthesized live from the **current, unarchived** catalog config at read time
+and never written into `Character.state`, so editing an item's config recalculates
+status without rewriting history. The caps (20% per-attribute aggregate / 15%
+overall) are house assumptions documented in
 `docs/rules/assumptions.md`.
+
+## Equipment percentage bonus & shared caps
+
+An eligible item may declare a `percentBasisPoints` vector alongside its flat
+`bonus`. The engine applies it **after** the capped flat equipment bonus and
+**before** temporary effects, so it never compounds onto another item's percent
+and never runs before the flat equipment caps have clamped the base.
+
+- The percent request for an attribute is
+  `floor((preEquipment[attr] + appliedFlat[attr]) * basisPoints / 10000)`, clamped
+  to at least 0 when the base is negative. Here `preEquipment[attr]` is the value
+  immediately before any equipment bonus (the same reference used to cap flat
+  bonuses), and `appliedFlat[attr]` is the **capped** flat bonus that was already
+  applied.
+- Percent requests share the **same individual and combined equipment budgets**
+  as flat bonuses. For each attribute, the remaining individual budget is
+  `max(0, floor(preEquipment[attr] * individualCapPercent / 100) - flatApplied[attr])`,
+  and the remaining overall budget is
+  `max(0, floor(sum(preEquipment) * combinedCapPercent / 100) - sum(flatApplied))`.
+  Percent requests across multiple items are capped with the same deterministic
+  largest-remainder tie ordering used for flat bonuses, so the outcome is stable
+  and never depends on attribute iteration order.
+- An item that is ineligible or archived contributes **neither** a flat bonus nor a
+  percent request; both are inert and nothing is reserved from the shared budgets.
+- The combined status (`requested` / `applied` / `suppressed`) for an item or the
+  equipment aggregate includes both the flat and the percent contribution. The
+  `capUsage` reasons explicitly distinguish an **equipment-percent** cap (names
+  `equipment-percent-individual` / `equipment-percent-overall`) from the flat
+  equipment caps, while the flat cap reason strings are preserved verbatim.
+- The live status trace exposes the percent contribution in its own
+  `equipment-percent` phase, emitted **only** for an attribute whose percent
+  request is nonzero. Consequently, equipment with no percent bonus (or no
+  eligible percent) produces status output identical to the legacy zero-percent
+  form: no `equipment-percent` phase at all, and no shape change for existing
+  imports. This phase is skipped entirely in the generic pre-equipment phase
+  (percentage effects are equipment-only).
 
 No equipment is silently auto-granted; only items a user explicitly equips produce
 bonuses.

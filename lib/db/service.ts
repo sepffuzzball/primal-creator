@@ -77,11 +77,13 @@ import {
   parseCatalogConfig,
   rarityOrderIndex,
   titleImprovementSchema,
+  legacyRingPositionForConfig,
   type TitleImprovement,
 } from "@/lib/server/schemas"
 import {
   IMPORT_RULESET_VERSION,
   IMPORT_SCHEMA_V4,
+  IMPORT_SCHEMA_V5,
   MAX_IMPORT_INVENTORY,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
@@ -119,6 +121,14 @@ export interface CharacterAssociationView {
   upgradeGroup?: string
   /** Catalog grade of the linked definition (skills use this for tiers). */
   grade?: string
+  /**
+   * Authored grade-specific prose for the linked definition AT ITS OWN catalog
+   * `grade` band (never the character's race grade). Present only when the
+   * definition declares a grade AND has authored `gradeDescriptions` text for
+   * that grade; a null definition grade or an empty map yields an absent field.
+   * Never falls back to the legacy `description`.
+   */
+  gradeDescription?: string
   /** Ranked title progression metadata, when the linked title declares it. */
   improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
@@ -138,6 +148,13 @@ export interface CharacterAssociationView {
    * equipment bonus is not synthesized until the character qualifies.
    */
   equipmentEligibility?: { eligible: boolean; reason?: string }
+  /**
+   * The physical ring position occupied by this equipment link, present ONLY on a
+   * Ring-slot item (the single canonical "Ring" catalog slot is worn in two
+   * positions). Absent on non-ring equipment links. For UI; the catalog `slot`
+   * always shows "Ring".
+   */
+  equipmentPosition?: "Ring 1" | "Ring 2"
 }
 
 /**
@@ -209,6 +226,30 @@ export interface CharacterDetail {
   raceName: string | null
   className: string | null
   professionName: string | null
+  /**
+   * Authored grade-specific prose for the character's linked race definition at
+   * the character's current race grade (`state.race.grade`). `null` when the race
+   * definition is missing, carries no authored text for that grade, or the
+   * character has no race. Never falls back to the legacy `description`.
+   */
+  raceGradeDescription: string | null
+  /**
+   * Authored grade-specific prose for the character's linked class definition at
+   * the class track's OWN grade (`state.tracks.class.grade`). `null` when the
+   * class definition is missing, carries no authored text for that grade, or the
+   * legacy track has no explicit grade (no inference from the race grade). Never
+   * falls back to the legacy `description`.
+   */
+  classGradeDescription: string | null
+  /**
+   * Authored grade-specific prose for the character's linked profession
+   * definition at the profession track's OWN grade
+   * (`state.tracks.profession.grade`). `null` when the profession definition is
+   * missing, carries no authored text for that grade, or the legacy track has no
+   * explicit grade (no inference from the race grade). Never falls back to the
+   * legacy `description`.
+   */
+  professionGradeDescription: string | null
   state: unknown
   version: number
   archived: boolean
@@ -278,6 +319,13 @@ export interface CatalogItem {
   sourceUrl: string | null
   archived: boolean
   config: Record<string, unknown>
+  /**
+   * Grade-specific prose descriptions keyed by the grade ladder (G..S), authored
+   * independently of the legacy `description` string and of the entry's own
+   * `grade` band. Always present; an entry with no authored grade text reads back
+   * as `{}`.
+   */
+  gradeDescriptions: Partial<Record<Grade, string>>
   createdAt: string
   updatedAt: string
 }
@@ -772,13 +820,29 @@ function liveState(character: CharacterWithCatalog): CharacterState {
         state,
         character
       ).eligible
+      // Ring is ONE catalog slot ("Ring") but a character may wear two rings, one
+      // per position, so the live state uses the persisted per-link position (or
+      // the legacy config-derived fallback) as the effective slot. This keeps a
+      // Ring 1 and a Ring 2 item distinct in the synthesized equipment list.
+      let liveSlot = slot
+      if (normalizeEquipmentSlot(slot) === "Ring") {
+        const pos =
+          link.equipmentPosition ?? legacyRingPositionForConfig(config)
+        if (pos) liveSlot = pos
+      }
       equipment.push({
         id: def.id,
         name: def.name,
-        slot,
+        slot: liveSlot,
         source: def.name,
         bonus: eligible
           ? makeVector((config.bonus ?? {}) as PartialVector)
+          : {},
+        // The equipment percentage bonus is synthesized from the CURRENT catalog
+        // config exactly like the flat bonus and only when the item is currently
+        // eligible. An ineligible/archived item keeps BOTH contributions inert.
+        percentBasisPoints: eligible
+          ? makeVector((config.percentBasisPoints ?? {}) as PartialVector)
           : {},
       })
     } else if (def.kind === "titles") {
@@ -1015,6 +1079,37 @@ function equipmentViewMetadata(
   return metadata
 }
 
+/**
+ * Resolve the authored grade-specific prose for a linked catalog definition at
+ * the definition's OWN `grade` band. Returns undefined when the definition has no
+ * grade, or when it has no authored text for that grade (an empty or partial map
+ * reads back as no prose). Never uses the character's race grade.
+ */
+function associationGradeDescription(def: {
+  grade?: string | null
+  gradeDescriptions?: unknown
+}): string | undefined {
+  if (def.grade == null) return undefined
+  const map = normalizeGradeDescriptions(def.gradeDescriptions)
+  return map[def.grade as Grade] ?? undefined
+}
+
+/**
+ * Resolve the authored grade-specific prose for a character's linked race/class/
+ * profession definition at an explicit grade, or null. A missing row, a null
+ * `grade` (a legacy ungraded track), or an empty/partial `gradeDescriptions` map
+ * all read back as null - no inference from another grade and never a fallback to
+ * the legacy `description`.
+ */
+function gradeDescriptionAt(
+  def: { gradeDescriptions?: unknown } | null | undefined,
+  grade: string | undefined
+): string | null {
+  if (def == null || grade == null) return null
+  const map = normalizeGradeDescriptions(def.gradeDescriptions)
+  return map[grade as Grade] ?? null
+}
+
 function associationView(
   link: CharacterWithCatalog["associations"][number],
   character: EquipmentViewContext
@@ -1033,7 +1128,23 @@ function associationView(
   }
   if (kind === "equipment") {
     const slot = config.slot as string | undefined
-    if (slot) view.slot = slot
+    if (slot) {
+      // The catalog/item view always lists the canonical slot. Ring is ONE
+      // catalog slot; the worn position is surfaced separately via
+      // `equipmentPosition`, never conflated with the slot itself.
+      const normalized = normalizeEquipmentSlot(slot)
+      view.slot = normalized === "Ring" ? "Ring" : slot
+    }
+    // A Ring-slot link exposes its physical position for the UI. The persisted
+    // per-link value wins; a legacy config that still names Ring 1 / Ring 2 is
+    // the read-time fallback. Non-ring links carry no position.
+    const position =
+      link.equipmentPosition ?? legacyRingPositionForConfig(config)
+    if (normalizeEquipmentSlot(config.slot as string | undefined) === "Ring") {
+      if (position === "Ring 1" || position === "Ring 2") {
+        view.equipmentPosition = position
+      }
+    }
     const metadata = equipmentViewMetadata(config, character)
     if (metadata.rarity != null) view.rarity = metadata.rarity
     if (metadata.soulbound != null) view.soulbound = metadata.soulbound
@@ -1066,6 +1177,11 @@ function associationView(
     const rarity = config.rarity as string | undefined
     if (rarity) view.rarity = rarity
   }
+  // Authored grade prose at the definition's OWN grade band, for any graded
+  // linked definition (skills/equipment/titles/etc). Never the character race
+  // grade; a null definition grade or an empty map leaves the field absent.
+  const associationGrade = associationGradeDescription(link.definition)
+  if (associationGrade != null) view.gradeDescription = associationGrade
   return view
 }
 
@@ -1142,6 +1258,23 @@ function toDetail(
   rulesetVersion?: number
 ): CharacterDetail {
   const consumableInfo = permanentConsumableInfo(character, config)
+  // Decode the stored engine state once so the authored grade prose can be resolved
+  // at the character's OWN grades (race grade; the class/profession track grades).
+  // The stored `state` JSON is returned verbatim below; this parse is only for the
+  // grade-description lookup and never mutates or re-derives the state.
+  const state = deserializeState(character.state)
+  const raceGradeDescription = gradeDescriptionAt(
+    character.race,
+    state.race.grade
+  )
+  const classGradeDescription = gradeDescriptionAt(
+    character.class,
+    state.tracks.class?.grade
+  )
+  const professionGradeDescription = gradeDescriptionAt(
+    character.profession,
+    state.tracks.profession?.grade
+  )
   return {
     id: character.id,
     name: character.name,
@@ -1159,6 +1292,9 @@ function toDetail(
     raceName: character.race?.name ?? null,
     className: character.class?.name ?? null,
     professionName: character.profession?.name ?? null,
+    raceGradeDescription,
+    classGradeDescription,
+    professionGradeDescription,
     state: character.state,
     version: character.version,
     archived: character.archived,
@@ -4688,6 +4824,9 @@ export async function associateCharacter(
     operation: "add" | "remove"
     version: number
     reason?: string
+    // The physical ring position, required on an add of a Ring-slot equipment
+    // item, forbidden on a non-ring add and ignored on a remove.
+    equipmentPosition?: "Ring 1" | "Ring 2"
   },
   user: SessionUser
 ): Promise<{ character: CharacterDetail }> {
@@ -4731,6 +4870,11 @@ export async function associateCharacter(
           kind: string
         }> = []
 
+        // Hoisted to the outer scope so the journal payload below can record a
+        // chosen ring position (only meaningful on an add; inert on a remove).
+        let isRingEquipment = false
+        let ringPosition: "Ring 1" | "Ring 2" | undefined = undefined
+
         if (body.operation === "add") {
           // An archived catalog entry cannot be newly attached.
           if (definition.archived) {
@@ -4750,6 +4894,30 @@ export async function associateCharacter(
             definition.kind,
             definition.config ?? {}
           )
+
+          // Ring is ONE catalog slot but a character may wear two rings, one per
+          // position. The chosen position MUST be supplied explicitly on a NEW add
+          // of a Ring-slot item (never guessed from the config) and is FORBIDDEN on
+          // any non-ring equipment add. A remove never requires it.
+          const equipmentSlot = normalizeEquipmentSlot(config.slot)
+          isRingEquipment =
+            body.kind === "equipment" && equipmentSlot === "Ring"
+          ringPosition = body.equipmentPosition
+          if (body.operation === "add" && body.kind === "equipment") {
+            if (isRingEquipment) {
+              if (!ringPosition) {
+                throw badRequest(
+                  "ring_position_required",
+                  `Ring equipment "${definition.name}" requires an explicit position (Ring 1 or Ring 2) when equipping`
+                )
+              }
+            } else if (ringPosition != null) {
+              throw badRequest(
+                "position_not_allowed",
+                `Equipment position "${ringPosition}" is only valid for a Ring-slot item`
+              )
+            }
+          }
 
           // Equipping is gated by the item's level / race-type requirements. An
           // add whose requirement is currently unmet is rejected (400
@@ -4832,19 +5000,35 @@ export async function associateCharacter(
             }
           }
 
-          // Equipment add replaces whatever currently occupies the SAME slot.
-          // Remove every such link atomically - never leave a second effective
-          // item in a slot. Slot matching is done on the NORMALIZED canonical
-          // slot so a legacy alias (`head`, `cloak`, ...) collides with its
-          // canonical counterpart (`Head`, `Back`, ...).
+          // Equipment add replaces whatever currently occupies the SAME slot. For a
+          // Ring-slot item, ONLY the link occupying the SAME physical position is
+          // removed - the other position is left untouched, so adding a Ring 1 item
+          // never disturbs an already-equipped Ring 2 item (or vice versa). Remove
+          // every matching link atomically - never leave a second effective item in
+          // a position. Slot matching is done on the NORMALIZED canonical slot so a
+          // legacy alias (`head`, `cloak`, ...) collides with its canonical
+          // counterpart (`Head`, `Back`, ...).
           if (body.kind === "equipment") {
             const slot = normalizeEquipmentSlot(config.slot)
             if (slot) {
-              const sameSlotLinks = existing.filter(
-                (l) =>
-                  l.kind === "EQUIPMENT" &&
-                  definitionSlot(l.definition) === slot
-              )
+              const sameSlotLinks = existing.filter((l) => {
+                if (l.kind !== "EQUIPMENT") return false
+                if (definitionSlot(l.definition) !== slot) return false
+                // For a ring, replace only the link whose persisted/derived
+                // position matches the requested position. For a non-ring slot the
+                // whole slot is the collision granularity.
+                if (slot === "Ring") {
+                  const otherConfig = parseCatalogConfig(
+                    l.definition.kind,
+                    l.definition.config ?? {}
+                  )
+                  const otherPos =
+                    l.equipmentPosition ??
+                    legacyRingPositionForConfig(otherConfig)
+                  return otherPos === ringPosition
+                }
+                return true
+              })
               for (const link of sameSlotLinks) {
                 displaced.push({
                   id: link.id,
@@ -4956,6 +5140,9 @@ export async function associateCharacter(
               // Only equipment requiring ownership is grandfathered on existing
               // links; every newly created association is owned, never ownerless.
               ...(body.kind === "equipment" ? { legacyUnowned: false } : {}),
+              // Persist the chosen ring position ONLY on a Ring-slot add. A
+              // non-ring equipment link stores null (the schema default).
+              ...(isRingEquipment ? { equipmentPosition: ringPosition } : {}),
             },
           })
         } else {
@@ -5020,6 +5207,11 @@ export async function associateCharacter(
                 ...(body.kind === "equipment"
                   ? {
                       slot: (config.slot as string | undefined) ?? null,
+                      // Record the chosen ring position on a Ring-slot add so the
+                      // journal is auditable; absent on a non-ring add.
+                      ...(isRingEquipment
+                        ? { equipmentPosition: ringPosition }
+                        : {}),
                     }
                   : {}),
                 ...(body.kind === "title" || body.kind === "bloodline"
@@ -5299,9 +5491,24 @@ export async function exportCharacter(
     definitionId: a.definitionId,
     kind: associationViewKind(a.kind),
     createdAt: a.createdAt.toISOString(),
-    // Only equipment links carry the grandfathered marker; non-equipment links
-    // never export the flag (they cannot be grandfathered).
-    ...(a.kind === "EQUIPMENT" ? { legacyUnowned: a.legacyUnowned } : {}),
+    // Only equipment links carry the grandfathered marker and the ring position;
+    // non-equipment links never export either (they cannot be grandfathered and
+    // have no position).
+    ...(a.kind === "EQUIPMENT"
+      ? {
+          legacyUnowned: a.legacyUnowned,
+          // The physical ring position for a Ring-slot item; null for a non-ring
+          // equipment link. The persisted per-link value wins; a legacy config that
+          // still names Ring 1 / Ring 2 is the read-time fallback so no position is
+          // ever silently dropped at export time.
+          equipmentPosition:
+            a.equipmentPosition ??
+            legacyRingPositionForConfig(
+              parseCatalogConfig(a.definition.kind, a.definition.config ?? {})
+            ) ??
+            null,
+        }
+      : {}),
     definition: {
       id: a.definition.id,
       name: a.definition.name,
@@ -5362,7 +5569,7 @@ export async function exportCharacter(
     }
   })
   return {
-    schema: IMPORT_SCHEMA_V4,
+    schema: IMPORT_SCHEMA_V5,
     rulesetVersion: IMPORT_RULESET_VERSION,
     identity,
     character: listItemFor(row, houseRules, true),
@@ -5518,6 +5725,14 @@ type ResolvedAssoc = {
    * Non-equipment links are always false.
    */
   legacyUnowned: boolean
+  /**
+   * The physical ring position for a Ring-slot EQUIPMENT link, or null for a
+   * non-ring equipment link. A ring link with no resolvable position is rejected
+   * before this point (no guessing); the position is sourced from the document
+   * (v5) or derived from the CURRENT catalog config's legacy Ring 1 / Ring 2 slot
+   * (v3/v4), never from the advisory liveState.
+   */
+  equipmentPosition: "Ring 1" | "Ring 2" | null
 }
 
 /**
@@ -5548,6 +5763,15 @@ type ResolveAssocOpts = {
    * grade exceeds the backup's race grade is rejected before any write.
    */
   raceGrade: Grade
+  /**
+   * Whether a missing ring position may be recovered from the backup's own
+   * `definition.config.slot` snapshot. True for a legacy v3/v4 document, whose
+   * definition reference carries no per-link `equipmentPosition` but MAY carry a
+   * pre-migration `definition.config.slot` naming `Ring 1`/`Ring 2`; false for a
+   * v5 document, which carries the position explicitly and never trusts the
+   * snapshot.
+   */
+  allowConfigSnapshotPosition: boolean
 }
 
 /**
@@ -5561,7 +5785,7 @@ async function resolveInventoryRefs(
   db: DbClient,
   inventory: Extract<
     CharacterImportDocument,
-    { schema: typeof IMPORT_SCHEMA_V4 }
+    { schema: typeof IMPORT_SCHEMA_V4 | typeof IMPORT_SCHEMA_V5 }
   >["inventory"]
 ): Promise<ResolvedInventoryItem[]> {
   const seen = new Set<string>()
@@ -5598,6 +5822,13 @@ function associationLegacyUnowned(
   a: CharacterImportDocument["associations"][number]
 ): boolean | undefined {
   return (a as { legacyUnowned?: boolean }).legacyUnowned
+}
+
+function associationEquipmentPosition(
+  a: CharacterImportDocument["associations"][number]
+): "Ring 1" | "Ring 2" | null | undefined {
+  return (a as { equipmentPosition?: "Ring 1" | "Ring 2" | null })
+    .equipmentPosition
 }
 
 async function resolveAssociationRefs(
@@ -5695,9 +5926,10 @@ async function resolveAssociationRefs(
     }
 
     let legacyUnowned: boolean
+    let equipmentPosition: "Ring 1" | "Ring 2" | null = null
     if (a.kind === "equipment") {
       // v3 backups have no inventory model and no marker: a grandfathered link may
-      // stay equipped regardless of stock. v4 carries the exported marker verbatim;
+      // stay equipped regardless of stock. v4/v5 carry the exported marker verbatim;
       // only a non-grandfathered (false) link REQUIRES owned stock.
       legacyUnowned = opts.enforceOwnership
         ? (associationLegacyUnowned(a) ?? false)
@@ -5710,6 +5942,49 @@ async function resolveAssociationRefs(
             `Equipment "${def.name}" (${def.stableId}) is linked but not grandfathered, and the backup owns no stock of it; add inventory or mark it legacyUnowned:true`
           )
         }
+      }
+      // Validate the category-position match against the CURRENT catalog. Ring is
+      // ONE slot but a character may wear two; the position MUST be explicit. A v5
+      // backup carries it verbatim and never trusts anything else - not the CURRENT
+      // catalog's legacy slot and not the backup's own definition.config.slot
+      // snapshot - so an explicit null (or a missing field) on a Ring link is a
+      // hard rejection. A v3/v4 backup carries no position, so derive one from the
+      // CURRENT catalog's legacy Ring 1 / Ring 2 slot first, and only when the
+      // current slot has been migrated to the generic "Ring" (so the catalog row
+      // itself provides no position) recover it from the backup's own
+      // definition.config.slot snapshot (a pre-migration catalog still named
+      // Ring 1 / Ring 2). Never from the advisory liveState/status. A Ring-slot
+      // link with no resolvable position is rejected with actionable guidance
+      // rather than guessed; a non-ring link carrying a ring position is rejected
+      // as a category mismatch.
+      const defConfig = parseCatalogConfig(def.kind, def.config ?? {})
+      const isRing = slotForConfig(defConfig) === "Ring"
+      const docPos = associationEquipmentPosition(a)
+      if (isRing) {
+        let derived: "Ring 1" | "Ring 2" | null | undefined
+        if (opts.allowConfigSnapshotPosition) {
+          // v3/v4 only: no per-link position exists in the document.
+          derived = docPos ?? legacyRingPositionForConfig(defConfig)
+          if (derived == null) {
+            derived = legacyRingPositionForConfig(a.definition.config ?? {})
+          }
+        } else {
+          // v5: the backup's own report is authoritative (null = explicit "no
+          // position"), so no fallback to the current catalog's legacy slot.
+          derived = docPos
+        }
+        if (!derived) {
+          throw badRequest(
+            "import_ring_position_required",
+            `Ring equipment "${def.name}" (${def.stableId}) has no ring position; re-export the backup as primal-character/5 with per-link equipmentPosition values (or set the catalog slot to "Ring 1"/"Ring 2")`
+          )
+        }
+        equipmentPosition = derived
+      } else if (docPos != null) {
+        throw badRequest(
+          "import_ring_position_mismatch",
+          `Equipment "${def.name}" (${def.stableId}) is not a Ring-slot item but carries ring position "${docPos}"`
+        )
       }
     } else {
       // Only equipment links can be grandfathered.
@@ -5728,6 +6003,7 @@ async function resolveAssociationRefs(
       definitionId: def.id,
       definition: def,
       legacyUnowned,
+      equipmentPosition,
     })
   }
   return resolved
@@ -5794,16 +6070,20 @@ function assertAssocCollisions(
       r.definition.config ?? {}
     )
     if (r.sourceKind === "equipment") {
-      const slot = slotForConfig(config)
-      if (slot) {
-        const existing = slots.get(slot)
+      // Ring is ONE catalog slot but a character may wear two rings, so the
+      // collision key is the physical position (Ring 1 / Ring 2), never the single
+      // "Ring" slot - two rings on distinct positions coexist, two on the same one
+      // collide. A non-ring item keeps the normalized slot as its key.
+      const key = equipmentCollisionKey(r.equipmentPosition, config)
+      if (key) {
+        const existing = slots.get(key)
         if (existing) {
           throw badRequest(
             "import_link_collision",
-            `Equipment slot "${slot}" is occupied by both "${existing}" and "${r.definition.name}"`
+            `Equipment slot "${key}" is occupied by both "${existing}" and "${r.definition.name}"`
           )
         }
-        slots.set(slot, r.definition.name)
+        slots.set(key, r.definition.name)
       }
     } else if (r.sourceKind === "title") {
       const group = upgradeGroupForConfig(config)
@@ -6332,14 +6612,15 @@ export async function importCharacter(
         raceType
       )
 
-      // A v3 doc has no inventory model; a v4 doc carries owned stock (which is
+      // A v3 doc has no inventory model; a v4/v5 doc carries owned stock (which is
       // validated and resolved before any DB write). The resolved stock map is what
       // the association resolver consults to enforce the ownership invariant on
       // non-grandfathered equipment links.
-      const isV4 = input.schema === IMPORT_SCHEMA_V4
+      const hasInventory =
+        input.schema === IMPORT_SCHEMA_V4 || input.schema === IMPORT_SCHEMA_V5
       let resolvedInventory: ResolvedInventoryItem[] = []
       let ownedStockByDefId = new Map<string, number>()
-      if (isV4) {
+      if (hasInventory) {
         resolvedInventory = await resolveInventoryRefs(tx, input.inventory)
         ownedStockByDefId = new Map(
           resolvedInventory.map((i) => [i.definitionId, i.quantity])
@@ -6350,10 +6631,14 @@ export async function importCharacter(
         tx,
         input.associations,
         {
-          enforceOwnership: isV4,
+          enforceOwnership: hasInventory,
           ownedStockByDefId,
           maxTranscendentSkills: houseRules.config.maxTranscendentSkills,
           raceGrade: state.race.grade,
+          // Only a legacy v3/v4 document may recover a ring position from its own
+          // definition.config.slot snapshot; a v5 document carries the position
+          // explicitly and never trusts the snapshot.
+          allowConfigSnapshotPosition: input.schema !== IMPORT_SCHEMA_V5,
         }
       )
       assertAssocCollisions(
@@ -6401,6 +6686,11 @@ export async function importCharacter(
             // re-imported grandfathered link stays grandfathered and vice versa.
             ...(a.sourceKind === "equipment"
               ? { legacyUnowned: a.legacyUnowned }
+              : {}),
+            // Persist the exact ring position for a Ring-slot item (null for a
+            // non-ring equipment link), so a v5 round-trip never loses the position.
+            ...(a.sourceKind === "equipment"
+              ? { equipmentPosition: a.equipmentPosition }
               : {}),
           },
         })
@@ -6569,6 +6859,34 @@ function isSerializationFailure(err: unknown): boolean {
   )
 }
 
+/**
+ * Normalize a stored `gradeDescriptions` JSON value into the public
+ * `Partial<Record<Grade, string>>` shape. A null/undefined/empty or non-object
+ * value (e.g. a legacy row or the empty DB default) reads back as an empty map.
+ * Entries whose key is not a recognized grade (G..S) or whose value is not a
+ * nonempty string are dropped defensively; valid string values are trimmed.
+ */
+function normalizeGradeDescriptions(
+  value: unknown
+): Partial<Record<Grade, string>> {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return {}
+  }
+  const out: Partial<Record<Grade, string>> = {}
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof raw !== "string") continue
+    if (
+      !gradeSchema.options.includes(key as (typeof gradeSchema.options)[number])
+    ) {
+      continue
+    }
+    const trimmed = raw.trim()
+    if (trimmed.length === 0) continue
+    out[key as Grade] = trimmed
+  }
+  return out
+}
+
 function catalogItem(row: {
   id: string
   kind: string
@@ -6579,6 +6897,7 @@ function catalogItem(row: {
   sourceUrl: string | null
   archived: boolean
   config: unknown
+  gradeDescriptions: unknown
   createdAt: Date
   updatedAt: Date
 }): CatalogItem {
@@ -6592,6 +6911,7 @@ function catalogItem(row: {
     sourceUrl: row.sourceUrl,
     archived: row.archived,
     config: (row.config ?? {}) as Record<string, unknown>,
+    gradeDescriptions: normalizeGradeDescriptions(row.gradeDescriptions),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }
@@ -6633,6 +6953,7 @@ export async function createCatalogItem(
     sourceUrl?: string | null
     archived?: boolean
     config?: Record<string, unknown>
+    gradeDescriptions?: Partial<Record<Grade, string>>
   }
 ): Promise<CatalogItem> {
   const config = parseConfigOr400(kind, input.config ?? {})
@@ -6716,7 +7037,7 @@ export async function createCatalogItem(
   if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
     throw badRequest(
       "invalid_config",
-      'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring 1/Ring 2/Weapon, or a documented legacy alias) and a valid "rarity"'
+      'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring/Weapon, or a documented legacy alias) and a valid "rarity"'
     )
   }
   let stableId = input.stableId
@@ -6755,6 +7076,12 @@ export async function createCatalogItem(
           sourceUrl: input.sourceUrl ?? null,
           archived: input.archived ?? false,
           config: config as Prisma.InputJsonValue,
+          ...(input.gradeDescriptions != null
+            ? {
+                gradeDescriptions:
+                  input.gradeDescriptions as Prisma.InputJsonValue,
+              }
+            : {}),
           ...patronData,
         },
       })
@@ -6960,6 +7287,19 @@ async function assertNoLinkCollision(
   for (const link of links) {
     const character = link.character
     if (!character) continue
+    // For equipment, the collision key is PER-LINK: a Ring-slot item's key is its
+    // physical position (a character may wear two rings in distinct positions), so
+    // the effective key cannot be derived from the config alone and must read the
+    // persisted position on the link. Non-equipment keeps the single group value.
+    const editedValue =
+      kind === "equipment"
+        ? equipmentCollisionKey(
+            (link as { equipmentPosition?: "Ring 1" | "Ring 2" | null })
+              .equipmentPosition,
+            finalConfig
+          )
+        : value
+    if (!editedValue) continue
     for (const other of character.associations ?? []) {
       if (other.definitionId === definitionId) continue
       if (other.kind !== expectedAssocKind) continue
@@ -6968,9 +7308,13 @@ async function assertNoLinkCollision(
       const otherConfig = parseCatalogConfig(def.kind, def.config ?? {})
       const otherValue =
         kind === "equipment"
-          ? slotForConfig(otherConfig)
+          ? equipmentCollisionKey(
+              (other as { equipmentPosition?: "Ring 1" | "Ring 2" | null })
+                .equipmentPosition,
+              otherConfig
+            )
           : upgradeGroupForConfig(otherConfig)
-      if (otherValue === value) {
+      if (otherValue === editedValue) {
         throw conflict(
           "link_collision",
           `Catalog edit would put "${character.name}" in conflict: "${def.name}" already occupies the same ${kind === "equipment" ? "slot" : "upgrade group"}`
@@ -6982,6 +7326,28 @@ async function assertNoLinkCollision(
 
 function slotForConfig(config: Record<string, unknown>): string | undefined {
   return normalizeEquipmentSlot(config.slot)
+}
+
+/**
+ * The collision key for an equipment link. For a non-ring item this is the
+ * normalized slot (so two items cannot share a slot). For a Ring-slot item it is
+ * the PHYSICAL position (`Ring:<pos>`), because Ring is ONE catalog slot but a
+ * character may wear two rings, one per position - two distinct positions never
+ * collide, only the same position does. When the position cannot be resolved
+ * (defensive; after the migration it is always present) the whole "Ring" slot is
+ * used as the key so an unresolvable ring never silently coexists with another.
+ */
+function equipmentCollisionKey(
+  equipmentPosition: "Ring 1" | "Ring 2" | null | undefined,
+  config: Record<string, unknown>
+): string | undefined {
+  const slot = slotForConfig(config)
+  if (!slot) return undefined
+  if (slot === "Ring") {
+    const pos = equipmentPosition ?? legacyRingPositionForConfig(config)
+    return pos ? `Ring:${pos}` : "Ring"
+  }
+  return slot
 }
 
 function upgradeGroupForConfig(
@@ -7002,6 +7368,7 @@ export async function updateCatalogItem(
     sourceUrl?: string | null
     archived?: boolean
     config?: Record<string, unknown>
+    gradeDescriptions?: Partial<Record<Grade, string>>
   }
 ): Promise<CatalogItem> {
   // A god stableId change, a race `raceType` change, every blessing / bloodline
@@ -7152,7 +7519,7 @@ export async function updateCatalogItem(
         if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
           throw badRequest(
             "invalid_config",
-            'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring 1/Ring 2/Weapon, or a documented legacy alias) and a valid "rarity"'
+            'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring/Weapon, or a documented legacy alias) and a valid "rarity"'
           )
         }
       }
@@ -7211,6 +7578,32 @@ export async function updateCatalogItem(
         kind === "blessings" && config != null
           ? { patronId: await resolveBlessingPatronId(tx, config) }
           : {}
+      // A Ring-slot item may not be converted to/from a different equipment
+      // category while any character still links it: a linked ring has no slot to
+      // fall back to on a non-Ring item, and a linked non-Ring item cannot carry a
+      // ring position. Allowed once the item is unequipped (no links). Ring legacy
+      // ("Ring 1"/"Ring 2") -> canonical "Ring" is a same-category edit and is NOT
+      // blocked here; it preserves each link's position and is checked for
+      // duplicate active occupied positions by assertNoLinkCollision below.
+      if (kind === "equipment") {
+        const existingConfig = parseCatalogConfig(
+          "equipment",
+          existing.config ?? {}
+        )
+        const existingIsRing = slotForConfig(existingConfig) === "Ring"
+        const finalIsRing = slotForConfig(finalConfig) === "Ring"
+        if (existingIsRing !== finalIsRing) {
+          const links = await tx.characterAssociation.findMany({
+            where: { definitionId: id },
+          })
+          if (links.length > 0) {
+            throw conflict(
+              "equipment_position_conflict",
+              `Catalog "${existing.name}" would change from ${existingIsRing ? "a Ring slot" : "a non-Ring slot"} to ${finalIsRing ? "a Ring slot" : "a non-Ring slot"} but is equipped by ${links.length} character(s); unequip it first`
+            )
+          }
+        }
+      }
       await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
       if (kind === "titles") {
         await assertTitleImprovementStable(
@@ -7241,6 +7634,12 @@ export async function updateCatalogItem(
           ...(patch.archived != null ? { archived: patch.archived } : {}),
           ...(config != null
             ? { config: config as Prisma.InputJsonValue }
+            : {}),
+          ...(patch.gradeDescriptions !== undefined
+            ? {
+                gradeDescriptions:
+                  patch.gradeDescriptions as Prisma.InputJsonValue,
+              }
             : {}),
           ...patronData,
         },

@@ -295,20 +295,17 @@ export function applyEquipmentCaps(
   ref: AttributeVector,
   items: EquipmentBonus[],
   config: RulesConfig
-): { applied: AttributeVector; status: EquipmentStatus } {
-  const requested = zeroVector()
-  const applied = zeroVector()
-  const suppressed = zeroVector()
-  const itemStatus: EquipmentItemStatus[] = []
-  const capUsage: CapUsage[] = []
-  const reasonsByItem = new Map<string, Map<Attribute, string[]>>()
-  // Per-attribute, per-source applied contribution (populated from the actual
-  // apportionment so per-item status is internally consistent).
-  const sourceApplied = new Map<
-    Attribute,
-    Map<string, { requested: number; applied: number; name: string }>
-  >()
+): {
+  applied: AttributeVector
+  flatApplied: AttributeVector
+  percentApplied: AttributeVector
+  percentRequested: AttributeVector
+  status: EquipmentStatus
+} {
+  const individualPct = config.equipmentIndividualCapPercent
+  const overallPct = config.equipmentCombinedCapPercent
 
+  const reasonsByItem = new Map<string, Map<Attribute, string[]>>()
   const pushReason = (itemId: string, attr: Attribute, reason: string) => {
     let m = reasonsByItem.get(itemId)
     if (!m) {
@@ -320,12 +317,15 @@ export function applyEquipmentCaps(
     else m.set(attr, [reason])
   }
 
-  const individualPct = config.equipmentIndividualCapPercent
-  const overallPct = config.equipmentCombinedCapPercent
+  const capUsage: CapUsage[] = []
 
-  // Collect the raw requested contribution per attribute, keyed by item so the
-  // apportionment can be attributed back for per-item status.
-  const contributions: Array<
+  /* ------------------------------------------------------------------ *
+   * Flat equipment contribution (existing capping logic, preserved).
+   * ------------------------------------------------------------------ */
+
+  const flatRequested = zeroVector()
+  // Per-attribute, per-source flat requested contribution (for apportionment).
+  const flatContributions: Array<
     Array<{ id: string; name: string; amount: number }>
   > = ATTRIBUTES.map(() => [])
   for (const item of items) {
@@ -333,12 +333,12 @@ export function applyEquipmentCaps(
       const amount =
         typeof item.bonus[attr] === "number" ? (item.bonus[attr] as number) : 0
       if (amount === 0) continue
-      contributions[ATTRIBUTES.indexOf(attr)].push({
+      flatContributions[ATTRIBUTES.indexOf(attr)].push({
         id: item.id,
         name: item.name,
         amount,
       })
-      requested[attr] += amount
+      flatRequested[attr] += amount
     }
   }
 
@@ -348,20 +348,24 @@ export function applyEquipmentCaps(
 
   // Per-attribute aggregate cap (20%): the SUM of equipment bonuses on a single
   // attribute may not exceed 20% of that attribute's pre-equipment value. This is
-  // NOT a per-item cap. Items are never individually clamped.
+  // NOT a per-item cap. Items are never individually clamped. `indivCap` is
+  // computed for EVERY attribute (even ones with no flat request) so the percent
+  // phase can use the per-attribute budget that flat did not consume.
   const cappedAttr = zeroVector()
   const indivCap = zeroVector()
   for (const attr of ATTRIBUTES) {
-    if (requested[attr] === 0) continue
     indivCap[attr] = Math.floor((ref[attr] * individualPct) / 100)
-    cappedAttr[attr] = Math.min(requested[attr], indivCap[attr])
+  }
+  for (const attr of ATTRIBUTES) {
+    if (flatRequested[attr] === 0) continue
+    cappedAttr[attr] = Math.min(flatRequested[attr], indivCap[attr])
     capUsage.push({
       name: "equipment-individual",
       attribute: attr,
       cap: indivCap[attr],
-      requested: requested[attr],
+      requested: flatRequested[attr],
       applied: cappedAttr[attr],
-      suppressed: requested[attr] - cappedAttr[attr],
+      suppressed: flatRequested[attr] - cappedAttr[attr],
     })
   }
 
@@ -391,13 +395,17 @@ export function applyEquipmentCaps(
     })
   }
 
-  // Distribute each attribute's applied budget across the items that contributed
-  // to it, using the same deterministic largest-remainder apportionment. Ties are
-  // broken by equipment array order (stable).
+  // Per-attribute, per-source flat applied contribution (populated from the actual
+  // apportionment so per-item status is internally consistent).
+  const sourceApplied = new Map<
+    Attribute,
+    Map<string, { requested: number; applied: number; name: string }>
+  >()
+  const flatApplied = zeroVector()
   for (const attr of ATTRIBUTES) {
-    const list = contributions[ATTRIBUTES.indexOf(attr)]
+    const list = flatContributions[ATTRIBUTES.indexOf(attr)]
     if (list.length === 0) continue
-    const attrRequested = requested[attr]
+    const attrRequested = flatRequested[attr]
     const attrBudget = attrApplied[attr]
     const itemApplied = apportionLargestRemainder(
       attrBudget,
@@ -434,24 +442,174 @@ export function applyEquipmentCaps(
         )
       }
     }
-    applied[attr] = attrBudget
-    suppressed[attr] = attrRequested - attrBudget
+    flatApplied[attr] = attrBudget
   }
 
-  // Build per-item status from the per-attribute per-source applied map.
+  /* ------------------------------------------------------------------ *
+   * Percent equipment contribution (shares the flat cap budgets).
+   *
+   * Each item's per-attribute percent request is
+   *   floor((ref[attr] + flatApplied[attr]) * basisPoints / 10000)
+   * (never compounded onto another item's percent, clamped to >= 0 when the base
+   * is negative). The requests are capped by the REMAINING per-attribute and
+   * overall budgets - the flat applied portion of each budget is consumed first -
+   * using the same deterministic largest-remainder apportionment and tie ordering
+   * as the flat phase. This intentionally does NOT run as a generic pre-equipment
+   * percent phase, which would bypass the equipment caps entirely.
+   * ------------------------------------------------------------------ */
+
+  const percentRequested = zeroVector()
+  const percentContributions: Array<
+    Array<{ id: string; name: string; amount: number }>
+  > = ATTRIBUTES.map(() => [])
+  for (const item of items) {
+    const pct = item.percentBasisPoints ?? {}
+    for (const attr of ATTRIBUTES) {
+      const bp = typeof pct[attr] === "number" ? (pct[attr] as number) : 0
+      if (bp === 0) continue
+      const base = ref[attr] + flatApplied[attr]
+      const amount = Math.max(0, Math.floor((base * bp) / 10000))
+      if (amount === 0) continue
+      percentContributions[ATTRIBUTES.indexOf(attr)].push({
+        id: item.id,
+        name: item.name,
+        amount,
+      })
+      percentRequested[attr] += amount
+    }
+  }
+
+  // Remaining budgets after the flat phase consumed its share.
+  const remIndividualCap = zeroVector()
+  for (const attr of ATTRIBUTES) {
+    remIndividualCap[attr] = Math.max(0, indivCap[attr] - flatApplied[attr])
+  }
+  const remOverallCap = Math.max(0, overallCap - vectorSum(flatApplied))
+
+  const percentCappedAttr = zeroVector()
+  for (const attr of ATTRIBUTES) {
+    if (percentRequested[attr] === 0) continue
+    percentCappedAttr[attr] = Math.min(
+      percentRequested[attr],
+      remIndividualCap[attr]
+    )
+    capUsage.push({
+      name: "equipment-percent-individual",
+      attribute: attr,
+      cap: remIndividualCap[attr],
+      requested: percentRequested[attr],
+      applied: percentCappedAttr[attr],
+      suppressed: percentRequested[attr] - percentCappedAttr[attr],
+    })
+  }
+
+  const percentSumCapped = vectorSum(percentCappedAttr)
+  const percentAttrApplied = zeroVector()
+  if (percentSumCapped <= remOverallCap) {
+    for (const attr of ATTRIBUTES)
+      percentAttrApplied[attr] = percentCappedAttr[attr]
+  } else {
+    const dist = apportionLargestRemainder(
+      remOverallCap,
+      ATTRIBUTES.map((attr) => percentCappedAttr[attr]),
+      (i) => i
+    )
+    for (let i = 0; i < ATTRIBUTES.length; i++)
+      percentAttrApplied[ATTRIBUTES[i]] = dist[i]
+    capUsage.push({
+      name: "equipment-percent-overall",
+      attribute: null,
+      cap: remOverallCap,
+      requested: percentSumCapped,
+      applied: remOverallCap,
+      suppressed: percentSumCapped - remOverallCap,
+    })
+  }
+
+  const percentSourceApplied = new Map<
+    Attribute,
+    Map<string, { requested: number; applied: number; name: string }>
+  >()
+  const percentApplied = zeroVector()
+  for (const attr of ATTRIBUTES) {
+    const list = percentContributions[ATTRIBUTES.indexOf(attr)]
+    if (list.length === 0) continue
+    const attrRequested = percentRequested[attr]
+    const attrBudget = percentAttrApplied[attr]
+    const itemApplied = apportionLargestRemainder(
+      attrBudget,
+      list.map((c) => c.amount),
+      (i) => i
+    )
+    const individualSuppressed = attrRequested - percentCappedAttr[attr]
+    const overallSuppressed = percentCappedAttr[attr] - percentAttrApplied[attr]
+    let per = percentSourceApplied.get(attr)
+    if (!per) {
+      per = new Map()
+      percentSourceApplied.set(attr, per)
+    }
+    for (let i = 0; i < list.length; i++) {
+      per.set(list[i].id, {
+        requested: list[i].amount,
+        applied: itemApplied[i],
+        name: list[i].name,
+      })
+      if (individualSuppressed > 0) {
+        pushReason(
+          list[i].id,
+          attr,
+          `equipment-percent individual cap ${individualPct}% per-attribute aggregate remaining (${remIndividualCap[attr]}) applied`
+        )
+      }
+      if (overallSuppressed > 0) {
+        pushReason(
+          list[i].id,
+          attr,
+          `equipment-percent overall cap ${overallPct}% of total remaining (${remOverallCap}) applied`
+        )
+      }
+    }
+    percentApplied[attr] = attrBudget
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Combine the flat + percent contributions into a single status.
+   * ------------------------------------------------------------------ */
+
+  const requested = zeroVector()
+  const applied = zeroVector()
+  const suppressed = zeroVector()
+  for (const attr of ATTRIBUTES) {
+    requested[attr] = flatRequested[attr] + percentRequested[attr]
+    applied[attr] = flatApplied[attr] + percentApplied[attr]
+    suppressed[attr] = requested[attr] - applied[attr]
+  }
+
+  // Build per-item combined status (flat + percent) from both applied maps.
+  const itemStatus: EquipmentItemStatus[] = []
   for (const item of items) {
     const req = zeroVector()
     const app = zeroVector()
     const sup = zeroVector()
+    const pct = item.percentBasisPoints ?? {}
     for (const attr of ATTRIBUTES) {
-      const r =
+      const flatR =
         typeof item.bonus[attr] === "number" ? (item.bonus[attr] as number) : 0
-      req[attr] = r
-      const per = sourceApplied.get(attr)
-      const entry = per?.get(item.id)
-      const a = entry?.applied ?? 0
-      app[attr] = a
-      sup[attr] = r - a
+      const flatEntry = sourceApplied.get(attr)?.get(item.id)
+      const flatA = flatEntry?.applied ?? 0
+      const bp = typeof pct[attr] === "number" ? (pct[attr] as number) : 0
+      const percentR =
+        bp === 0
+          ? 0
+          : Math.max(
+              0,
+              Math.floor(((ref[attr] + flatApplied[attr]) * bp) / 10000)
+            )
+      const percentEntry = percentSourceApplied.get(attr)?.get(item.id)
+      const percentA = percentEntry?.applied ?? 0
+      req[attr] = flatR + percentR
+      app[attr] = flatA + percentA
+      sup[attr] = req[attr] - app[attr]
     }
 
     const reasons: string[] = []
@@ -473,15 +631,20 @@ export function applyEquipmentCaps(
     })
   }
 
+  const status: EquipmentStatus = {
+    requested,
+    applied,
+    suppressed,
+    items: itemStatus,
+    capUsage,
+  }
+
   return {
     applied,
-    status: {
-      requested,
-      applied,
-      suppressed,
-      items: itemStatus,
-      capUsage,
-    },
+    flatApplied,
+    percentApplied,
+    percentRequested,
+    status,
   }
 }
 
@@ -637,9 +800,19 @@ export function calculateStatus(
     value = percentVals[attr]
     phases.push({ phase: "percent", value, delta: pctDelta })
 
-    const eqApplied = equipment.applied[attr]
-    value += eqApplied
-    phases.push({ phase: "equipment", value, delta: eqApplied })
+    const eqFlat = equipment.flatApplied[attr]
+    value += eqFlat
+    phases.push({ phase: "equipment", value, delta: eqFlat })
+
+    // The equipment-percent phase follows the capped flat equipment phase and
+    // precedes temporary effects. It is emitted only when an equipment item
+    // declared a percent bonus for this attribute, so legacy zero-percent status
+    // output stays identical (no phase for an attribute with no percent request).
+    if (equipment.percentRequested[attr] !== 0) {
+      const eqPct = equipment.percentApplied[attr]
+      value += eqPct
+      phases.push({ phase: "equipment-percent", value, delta: eqPct })
+    }
 
     let tempDelta = consumables.applied[attr]
     for (const e of otherTemporaryEffects) {

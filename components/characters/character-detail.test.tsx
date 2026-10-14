@@ -129,7 +129,7 @@ vi.mock("@/components/ui/tabs", () => {
       </TabsContext.Provider>
     ),
     TabsList: ({ children }: React.ComponentProps<"div">) => (
-      <div>{children}</div>
+      <div role="tablist">{children}</div>
     ),
     TabsContent: ({ children }: React.ComponentProps<"div">) => (
       <div>{children}</div>
@@ -143,6 +143,7 @@ vi.mock("@/components/ui/tabs", () => {
       const onValueChange = React.useContext(TabsContext)
       return (
         <button
+          role="tab"
           {...props}
           onClick={(event) => {
             onClick?.(event)
@@ -998,7 +999,7 @@ describe("equipment eligibility and skill upgrades", () => {
       skills: [skill("target", "Ember II", "Rare")],
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     expect(
       (apiFetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some(
@@ -1030,7 +1031,7 @@ describe("equipment eligibility and skill upgrades", () => {
       skills: [skill("target", "Higher", "Divine")],
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     expect(screen.getByText(/Unique rarity is incomparable/)).toBeTruthy()
     cleanup()
@@ -1042,7 +1043,7 @@ describe("equipment eligibility and skill upgrades", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     expect(screen.getByText(/No active higher-rarity variant/)).toBeTruthy()
     cleanup()
@@ -1051,7 +1052,7 @@ describe("equipment eligibility and skill upgrades", () => {
       skills: [skill("target", "Higher", "Divine")],
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     expect(screen.getByText(/Source rarity metadata unavailable/)).toBeTruthy()
     cleanup()
@@ -1060,7 +1061,7 @@ describe("equipment eligibility and skill upgrades", () => {
       skills: [skill("target", "Higher", "Rare")],
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     expect(screen.getByRole("button", { name: "Upgrade skill" })).toBeTruthy()
   })
@@ -1072,7 +1073,7 @@ describe("equipment eligibility and skill upgrades", () => {
       upgradeError: new Error("Version conflict"),
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
     fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
@@ -1142,7 +1143,7 @@ describe("equipment eligibility and skill upgrades", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Inventory" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
     expect(screen.getAllByText("Soulbound").length).toBeGreaterThan(0)
     expect(screen.getAllByText("Requires level 30").length).toBeGreaterThan(0)
@@ -1229,17 +1230,60 @@ describe("CharacterDetail race-only progression", () => {
       screen.queryByRole("button", { name: /Evolve profession/ })
     ).toBeNull()
 
-    // Open the identity tab: no class/profession sub-tabs, and no
-    // class/profession track history panels.
-    fireEvent.click(
-      screen.getByRole("button", { name: "Race / Class / Profession" })
-    )
+    // A monster (independent race mode) has no class/profession: no top-level
+    // Class or Profession tabs, and no class/profession track history panels.
+    expect(screen.queryByRole("tab", { name: "Class" })).toBeNull()
+    expect(screen.queryByRole("tab", { name: "Profession" })).toBeNull()
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
     await flush()
-    expect(screen.queryByRole("button", { name: "Class" })).toBeNull()
-    expect(screen.queryByRole("button", { name: "Profession" })).toBeNull()
     expect(screen.queryByLabelText("class history")).toBeNull()
     expect(screen.queryByLabelText("profession history")).toBeNull()
     expect(screen.getByLabelText("race history")).toBeTruthy()
+  })
+})
+
+describe("CharacterDetail progression tabs and grade descriptions", () => {
+  it("renders the Race/Class/Profession top-level tabs and no legacy identity tab", async () => {
+    setupMock()
+    await renderDetail()
+    expect(screen.getByRole("tab", { name: "Race" })).toBeTruthy()
+    expect(screen.getByRole("tab", { name: "Class" })).toBeTruthy()
+    expect(screen.getByRole("tab", { name: "Profession" })).toBeTruthy()
+    // The old combined "Race / Class / Profession" identity tab is gone.
+    expect(
+      screen.queryByRole("tab", { name: "Race / Class / Profession" })
+    ).toBeNull()
+  })
+
+  it("renders configured race/class/profession grade descriptions on their tabs", async () => {
+    setupMock({
+      character: {
+        ...character,
+        raceGradeDescription: "A towering human lineage.",
+        classGradeDescription: "Precise archer training.",
+        professionGradeDescription: "Masterful profession lore.",
+      },
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
+    await flush()
+    expect(screen.getByText("A towering human lineage.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Class" }))
+    await flush()
+    expect(screen.getByText("Precise archer training.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
+    await flush()
+    expect(screen.getByText("Masterful profession lore.")).toBeTruthy()
+  })
+
+  it("shows the grade description fallback when no description is configured", async () => {
+    setupMock()
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
+    await flush()
+    expect(
+      screen.getAllByText("No description for this grade").length
+    ).toBeGreaterThan(0)
   })
 })
 
@@ -1273,9 +1317,7 @@ describe("CharacterDetail profession assignment and track history", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getByRole("button", { name: "Race / Class / Profession" })
-    )
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
     await flush()
     expect(screen.getByText("G profession")).toBeTruthy()
     expect(screen.queryByText("E profession")).toBeNull()
@@ -1317,9 +1359,7 @@ describe("CharacterDetail profession assignment and track history", () => {
       professionError: new Error("Version conflict"),
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getByRole("button", { name: "Race / Class / Profession" })
-    )
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
     await flush()
     fireEvent.click(screen.getByText("G profession"))
     fireEvent.click(screen.getByRole("button", { name: "Assign profession" }))
@@ -1361,9 +1401,7 @@ describe("CharacterDetail profession assignment and track history", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getByRole("button", { name: "Race / Class / Profession" })
-    )
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
     await flush()
     // Only the entry whose row grade AND config agree with the current grade.
     expect(screen.getByText("Valid profession")).toBeTruthy()
@@ -1390,9 +1428,7 @@ describe("CharacterDetail profession assignment and track history", () => {
     ]
     setupMock({ events })
     await renderDetail()
-    fireEvent.click(
-      screen.getByRole("button", { name: "Race / Class / Profession" })
-    )
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
     await flush()
     const raceHistory = screen.getByLabelText("race history")
     expect(raceHistory.textContent).toContain("evolve")
@@ -1419,9 +1455,7 @@ describe("CharacterDetail profession assignment and track history", () => {
       events: initial,
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getByRole("button", { name: "Race / Class / Profession" })
-    )
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
     await flush()
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
     const exportBefore = mock.mock.calls.filter(
@@ -1437,6 +1471,8 @@ describe("CharacterDetail profession assignment and track history", () => {
         createdAt: "two",
       },
     ]
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
+    await flush()
     fireEvent.click(screen.getByText("G profession"))
     fireEvent.click(screen.getByRole("button", { name: "Assign profession" }))
     await flush()
@@ -1528,7 +1564,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Bloodlines" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Bloodlines" }))
     const add = screen
       .getAllByRole("button", { name: "Add" })
       .find((button) =>
@@ -1566,7 +1602,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Transcendent skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Transcendent skills" }))
     expect(screen.getByText("Selected 1 / maximum 1")).toBeTruthy()
     const attach = screen.getByRole("button", {
       name: "Attach",
@@ -1588,7 +1624,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Transcendent skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Transcendent skills" }))
     expect(screen.getByText(/rules offline/)).toBeTruthy()
     expect(
       (screen.getByRole("button", { name: "Attach" }) as HTMLButtonElement)
@@ -1665,7 +1701,7 @@ describe("CharacterDetail power associations", () => {
     // character can open the association sheet.
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Blessings" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
     await flush()
 
@@ -1746,7 +1782,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Blessings" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
     await flush()
 
@@ -1804,7 +1840,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Blessings" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
     await flush()
 
@@ -1843,7 +1879,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Bloodlines" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Bloodlines" }))
     fireEvent.click(screen.getByText("Remove"))
     await flush()
 
@@ -1893,7 +1929,7 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Blessings" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
     await flush()
 
@@ -1993,7 +2029,7 @@ describe("CharacterDetail transcendent skills", () => {
     await renderDetail()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
-    fireEvent.click(screen.getByRole("button", { name: "Transcendent skills" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Transcendent skills" }))
     fireEvent.click(screen.getAllByText("Remove")[0])
     await flush()
 
@@ -2239,7 +2275,7 @@ describe("CharacterDetail inventory", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Inventory" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
 
     const ownedConsumables = within(screen.getByLabelText("Owned consumables"))
@@ -2321,7 +2357,7 @@ describe("CharacterDetail inventory", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Powers" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Powers" }))
     await flush()
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
@@ -2330,7 +2366,7 @@ describe("CharacterDetail inventory", () => {
       .getByText("Character associations")
       .closest("div")!.parentElement!
     fireEvent.click(
-      within(sheetContent).getByRole("button", { name: "Equipment" })
+      within(sheetContent).getByRole("tab", { name: "Equipment" })
     )
     await flush()
 
@@ -2396,7 +2432,7 @@ describe("CharacterDetail inventory", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Inventory" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
 
     const ownedEquip = within(screen.getByLabelText("Owned equipment"))
@@ -2436,7 +2472,7 @@ describe("CharacterDetail inventory", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByRole("button", { name: "Inventory" }))
+    fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
 
     const ownedEquip = within(screen.getByLabelText("Owned equipment"))
@@ -2683,5 +2719,330 @@ describe("CharacterDetail profile metadata", () => {
     expect(
       (screen.getByLabelText("Biography") as HTMLTextAreaElement).value
     ).toBe("New bio")
+  })
+})
+
+describe("CharacterDetail ring equipment position and gating", () => {
+  it("sheet: a Ring-1-slot ring equipped with position Ring 2 posts equipmentPosition Ring 2", async () => {
+    setupMock({
+      character: {
+        ...character,
+        inventory: [
+          inventoryItem({
+            id: "inv-ring",
+            definitionId: "ring-1",
+            name: "Ring of Power",
+            kind: "equipment",
+            quantity: 1,
+            slot: "Ring 1",
+          }),
+        ],
+      },
+      equipmentCatalog: [
+        catalogItem({
+          id: "ring-1",
+          name: "Ring of Power",
+          kind: "equipment",
+          config: { slot: "Ring 1" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    const sheetContent = screen
+      .getByText("Character associations")
+      .closest("div")!.parentElement!
+    fireEvent.click(
+      within(sheetContent).getByRole("tab", { name: "Equipment" })
+    )
+    await flush()
+    fireEvent.change(
+      within(sheetContent).getByLabelText("Equip position for Ring of Power"),
+      { target: { value: "Ring 2" } }
+    )
+    await flush()
+    fireEvent.click(within(sheetContent).getByRole("button", { name: "Equip" }))
+    await flush()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const post = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(post).toBeTruthy()
+    const body = JSON.parse((post![1] as RequestInit).body as string) as {
+      kind: string
+      definitionId: string
+      operation: string
+      version: number
+      equipmentPosition?: string
+    }
+    expect(body).toEqual({
+      kind: "equipment",
+      definitionId: "ring-1",
+      operation: "add",
+      version: 3,
+      equipmentPosition: "Ring 2",
+    })
+  })
+
+  it("inventory: a legacy lowercase ring1 inventory slot is a ring and posts Ring 1 position", async () => {
+    setupMock({
+      character: {
+        ...character,
+        inventory: [
+          inventoryItem({
+            id: "inv-ring",
+            definitionId: "ring-legacy",
+            name: "Legacy Ring",
+            kind: "equipment",
+            quantity: 1,
+            slot: "ring1",
+          }),
+        ],
+      },
+      // No equipment catalog entry for this legacy definition, so the ring
+      // determination falls back to the normalized inventory slot.
+      equipmentCatalog: [],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
+    await flush()
+    const ownedEquip = within(screen.getByLabelText("Owned equipment"))
+    // The normalized inventory slot alone identifies this as a ring and offers
+    // the position selector.
+    fireEvent.change(
+      ownedEquip.getByLabelText("Equip position for Legacy Ring"),
+      { target: { value: "Ring 1" } }
+    )
+    await flush()
+    fireEvent.click(ownedEquip.getByRole("button", { name: "Equip" }))
+    await flush()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const post = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(post).toBeTruthy()
+    const body = JSON.parse((post![1] as RequestInit).body as string) as {
+      kind: string
+      definitionId: string
+      operation: string
+      version: number
+      equipmentPosition?: string
+    }
+    expect(body).toEqual({
+      kind: "equipment",
+      definitionId: "ring-legacy",
+      operation: "add",
+      version: 3,
+      equipmentPosition: "Ring 1",
+    })
+  })
+
+  it("omits equipmentPosition when equipping a non-ring item", async () => {
+    setupMock({
+      character: {
+        ...character,
+        inventory: [
+          inventoryItem({
+            id: "inv-sword",
+            definitionId: "sword",
+            name: "Iron Sword",
+            kind: "equipment",
+            quantity: 1,
+            slot: "weapon",
+          }),
+        ],
+      },
+      equipmentCatalog: [
+        catalogItem({
+          id: "sword",
+          name: "Iron Sword",
+          kind: "equipment",
+          config: { slot: "weapon" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
+    await flush()
+    const ownedEquip = within(screen.getByLabelText("Owned equipment"))
+    expect(
+      ownedEquip.queryByLabelText("Equip position for Iron Sword")
+    ).toBeNull()
+    fireEvent.click(ownedEquip.getByRole("button", { name: "Equip" }))
+    await flush()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const post = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(post).toBeTruthy()
+    const body = JSON.parse((post![1] as RequestInit).body as string) as Record<
+      string,
+      unknown
+    >
+    expect(body).toEqual({
+      kind: "equipment",
+      definitionId: "sword",
+      operation: "add",
+      version: 3,
+    })
+    expect("equipmentPosition" in body).toBe(false)
+  })
+
+  it("sheet: zero stock and unmet requirements disable Equip, but an ineligible linked item stays removable", async () => {
+    const helm = catalogItem({
+      id: "helm",
+      name: "Helm",
+      kind: "equipment",
+      config: { slot: "head" },
+    })
+    const mail = catalogItem({
+      id: "mail",
+      name: "Mail",
+      kind: "equipment",
+      config: { slot: "chest" },
+    })
+    const blade = catalogItem({
+      id: "blade",
+      name: "Blade",
+      kind: "equipment",
+      config: { slot: "hand" },
+    })
+    setupMock({
+      character: {
+        ...character,
+        inventory: [
+          inventoryItem({
+            id: "inv-mail",
+            definitionId: "mail",
+            name: "Mail",
+            kind: "equipment",
+            quantity: 1,
+            equipmentEligibility: {
+              eligible: false,
+              reason: "Requires level 40",
+            },
+          }),
+        ],
+        associations: [
+          association({
+            id: "blade-link",
+            kind: "equipment",
+            definitionId: "blade",
+            name: "Blade",
+            equipmentEligibility: {
+              eligible: false,
+              reason: "Requires level 40",
+            },
+          }),
+        ],
+      },
+      equipmentCatalog: [helm, mail, blade],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    const sheetContent = screen
+      .getByText("Character associations")
+      .closest("div")!.parentElement!
+    fireEvent.click(
+      within(sheetContent).getByRole("tab", { name: "Equipment" })
+    )
+    await flush()
+
+    // Zero owned stock: Equip is replaced by a disabled "Add stock first".
+    const noStock = within(sheetContent).getByRole("button", {
+      name: "Add stock first",
+    }) as HTMLButtonElement
+    expect(noStock.disabled).toBe(true)
+
+    // Owned but unmet requirements: Equip is disabled and carries the reason.
+    const unmet = within(sheetContent).getByRole("button", {
+      name: "Equip",
+    }) as HTMLButtonElement
+    expect(unmet.disabled).toBe(true)
+    expect(unmet.title).toBe("Requires level 40")
+
+    // A linked-but-ineligible item is still removable (Remove is busy-gated only).
+    const remove = within(sheetContent).getByRole("button", {
+      name: "Remove",
+    }) as HTMLButtonElement
+    expect(remove.disabled).toBe(false)
+  })
+})
+
+describe("CharacterDetail linked grade descriptions", () => {
+  it("renders link grade description, its missing fallback, and a formatted equip percent", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "title-c",
+            kind: "title",
+            definitionId: "title-c",
+            name: "Tier C Title",
+            grade: "C",
+            gradeDescription: "Tier C prose.",
+          }),
+          association({
+            id: "title-b",
+            kind: "title",
+            definitionId: "title-b",
+            name: "Tier B Title",
+            grade: "B",
+          }),
+          association({
+            id: "staff-link",
+            kind: "equipment",
+            definitionId: "staff",
+            name: "Staff",
+            grade: "F",
+            gradeDescription: "Equipment tier F prose.",
+          }),
+        ],
+      },
+      titles: [
+        catalogItem({ id: "title-c", name: "Tier C Title", kind: "titles" }),
+      ],
+      equipmentCatalog: [
+        catalogItem({
+          id: "staff",
+          name: "Staff",
+          kind: "equipment",
+          config: { slot: "weapon", percentBasisPoints: { strength: 1250 } },
+        }),
+      ],
+    })
+    await renderDetail()
+
+    // The linked title's configured grade description and the missing-grade
+    // fallback both render; the catalog description is never used as a fallback.
+    expect(screen.getAllByText("Tier C prose.").length).toBeGreaterThan(0)
+    expect(
+      screen.getAllByText("No description for this grade").length
+    ).toBeGreaterThan(0)
+
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    const sheetContent = screen
+      .getByText("Character associations")
+      .closest("div")!.parentElement!
+    fireEvent.click(
+      within(sheetContent).getByRole("tab", { name: "Equipment" })
+    )
+    await flush()
+    // Active catalog equipment row uses the linked association's grade description.
+    expect(
+      within(sheetContent).getByText("Equipment tier F prose.")
+    ).toBeTruthy()
+    // The equipment percent is formatted from basis points (12.50%).
+    expect(within(sheetContent).getByText(/strength:12\.50%/)).toBeTruthy()
   })
 })

@@ -806,6 +806,44 @@ describe("structured catalog editor legacy and sparse rows", () => {
     expect((body.config as Record<string, unknown>).raceType).toBe("monster")
   })
 
+  it("edits a graded row's legacy description without using it as a grade fallback", async () => {
+    const graded = {
+      ...item,
+      kind: "classes",
+      id: "class-graded",
+      stableId: "class-graded",
+      name: "Graded Class",
+      grade: "F",
+      description: "Legacy overview",
+      config: { grades: { F: { fixed: {}, free: 0 } } },
+      gradeDescriptions: {},
+    }
+    const mock = useEditMock("classes", graded)
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+
+    expect(screen.queryByLabelText("Description")).toBeNull()
+    fireEvent.click(
+      screen.getByText(
+        "Legacy general description (not displayed in grade tabs)"
+      )
+    )
+    const legacyField = screen.getByLabelText("Legacy general description")
+    expect((legacyField as HTMLTextAreaElement).value).toBe("Legacy overview")
+    const gradeField = screen.getByLabelText("G-grade description")
+    expect((gradeField as HTMLTextAreaElement).value).toBe("")
+    fireEvent.change(legacyField, { target: { value: "Updated legacy text" } })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+
+    const calls = patchCallsFor(mock, "classes")
+    const body = JSON.parse((calls[0][1] as RequestInit).body as string)
+    expect(body.description).toBe("Updated legacy text")
+    expect(body).not.toHaveProperty("gradeDescriptions")
+  })
+
   it("permits a metadata-only edit of a legacy class with a sparse fixed row and omits config", async () => {
     const legacyClass = {
       ...item,
@@ -821,8 +859,9 @@ describe("structured catalog editor legacy and sparse rows", () => {
     await flush()
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
-    fireEvent.change(screen.getByLabelText("Description"), {
-      target: { value: "Updated description" },
+    fireEvent.click(screen.getByRole("tab", { name: "F" }))
+    fireEvent.change(screen.getByLabelText("F-grade description"), {
+      target: { value: "Updated grade text" },
     })
     fireEvent.click(screen.getByText("Save"))
     await flush()
@@ -832,7 +871,7 @@ describe("structured catalog editor legacy and sparse rows", () => {
       (calls[0][1] as RequestInit).body as string
     ) as Record<string, unknown>
     expect(body).not.toHaveProperty("config")
-    expect(body.description).toBe("Updated description")
+    expect(body.gradeDescriptions).toEqual({ F: "Updated grade text" })
   })
 
   it("creates a race entering only free points, serializing a sparse perLevel vector", async () => {
@@ -1565,5 +1604,230 @@ describe("CatalogManager bulk imports", () => {
         ([url]) => !String(url).includes("/api/admin/catalog-import/bulk/")
       )
     ).toBe(true)
+  })
+})
+
+describe("grade descriptions and equipment stats", () => {
+  afterEach(() => cleanup())
+
+  const catalogItem = (kind: string, extra: Record<string, unknown> = {}) => ({
+    ...item,
+    id: `${kind}-one`,
+    kind,
+    stableId: `${kind}-one`,
+    name: `${kind} one`,
+    ...extra,
+  })
+
+  function mockKind(
+    kind: string,
+    fixture: Record<string, unknown> | null = null
+  ) {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH" || init?.method === "POST")
+        return { item: fixture ?? catalogItem(kind) }
+      if (url === `/api/catalog/${kind}`)
+        return { kind, items: fixture ? [fixture] : [] }
+      throw new Error(`unexpected URL ${url}`)
+    })
+    return mock
+  }
+
+  const bodyOf = (mock: ReturnType<typeof vi.fn>, method: string) => {
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === method
+    )
+    return JSON.parse((call?.[1] as RequestInit).body as string)
+  }
+
+  it.each(["races", "skills"])(
+    "POSTs grade descriptions for %s",
+    async (kind) => {
+      const mock = mockKind(kind)
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+      fireEvent.change(screen.getByLabelText(/Name/), {
+        target: { value: "New entry" },
+      })
+      if (kind === "races")
+        fireEvent.click(screen.getByRole("radio", { name: "G" }))
+      fireEvent.change(screen.getByLabelText("G-grade description"), {
+        target: { value: "  Grade G copy  " },
+      })
+      fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+        target: {
+          value:
+            kind === "races"
+              ? JSON.stringify({
+                  naturalGrade: "G",
+                  raceType: "enlightened",
+                  raceDefinitions: {
+                    G: { id: "g", perLevel: {}, freePerLevel: 0 },
+                  },
+                })
+              : JSON.stringify({ rarity: "Common" }),
+        },
+      })
+      fireEvent.click(screen.getByRole("button", { name: "Save" }))
+      await flush()
+      expect(bodyOf(mock, "POST").gradeDescriptions).toEqual({
+        G: "Grade G copy",
+      })
+    }
+  )
+
+  it.each(["skills", "blessings"])(
+    "PATCHes only gradeDescriptions on legacy %s without config",
+    async (kind) => {
+      const legacy = catalogItem(kind, {
+        grade: "B",
+        description: "legacy general",
+        config:
+          kind === "blessings"
+            ? { grade: "old", effect: "legacy" }
+            : { rarity: "Common", legacy: true },
+      })
+      const mock = mockKind(kind, legacy)
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Edit"))
+      await flush()
+      fireEvent.change(screen.getByLabelText("G-grade description"), {
+        target: { value: "G text" },
+      })
+      fireEvent.click(screen.getByRole("button", { name: "Save" }))
+      await flush()
+      expect(bodyOf(mock, "PATCH")).toMatchObject({
+        gradeDescriptions: { G: "G text" },
+      })
+      expect(bodyOf(mock, "PATCH")).not.toHaveProperty("config")
+    }
+  )
+
+  it("renders eight grade tabs without general-description fallback and hides the general field when graded", async () => {
+    const graded = catalogItem("skills", {
+      grade: "A",
+      description: "general text",
+      gradeDescriptions: { A: "A text" },
+    })
+    mockKind("skills", graded)
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    expect(screen.getAllByRole("tab")).toHaveLength(8)
+    expect(screen.queryByLabelText("Description")).toBeNull()
+    expect(
+      (screen.getByLabelText("G-grade description") as HTMLTextAreaElement)
+        .value
+    ).toBe("")
+    expect(screen.getByText("No description for this grade")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "A" }))
+    expect(
+      (screen.getByLabelText("A-grade description") as HTMLTextAreaElement)
+        .value
+    ).toBe("A text")
+  })
+
+  it("clears a grade description by sending an empty map and keeps the general field for ungraded items", async () => {
+    const legacy = catalogItem("skills", {
+      grade: null,
+      description: "General",
+      gradeDescriptions: { G: "text" },
+    })
+    const mock = mockKind("skills", legacy)
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    expect(screen.getByLabelText("Description")).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("G-grade description"), {
+      target: { value: "   " },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(bodyOf(mock, "PATCH").gradeDescriptions).toEqual({})
+  })
+
+  it("edits flat/percent stats sparsely, retains unknown keys, and rejects invalid values", async () => {
+    const equipment = catalogItem("equipment", {
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        bonus: { agility: 2 },
+        percentBasisPoints: { vitality: 500 },
+        note: "keep",
+      },
+    })
+    const mock = mockKind("equipment", equipment)
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    fireEvent.change(screen.getByLabelText("strength flat"), {
+      target: { value: "3" },
+    })
+    fireEvent.change(screen.getByLabelText("strength percent"), {
+      target: { value: "12.5" },
+    })
+    fireEvent.change(screen.getByLabelText("agility flat"), {
+      target: { value: "" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(bodyOf(mock, "PATCH").config).toMatchObject({
+      bonus: {},
+      percentBasisPoints: { strength: 1250, vitality: 500 },
+      note: "keep",
+    })
+    cleanup()
+    const second = mockKind("equipment", equipment)
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    fireEvent.change(screen.getByLabelText("strength flat"), {
+      target: { value: "-1" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(screen.getByRole("alert").textContent).toMatch(/finite nonnegative/)
+    expect(
+      second.mock.calls.some(
+        ([, init]) => (init as RequestInit)?.method === "PATCH"
+      )
+    ).toBe(false)
+  })
+
+  it("only offers Ring and warns for normalized legacy Ring 1 config while permitting metadata-only edit", async () => {
+    const equipment = catalogItem("equipment", {
+      config: { slot: "Ring 1", rarity: "Common", custom: true },
+    })
+    const mock = mockKind("equipment", equipment)
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    const options = screen.getByLabelText("Slot").querySelectorAll("option")
+    expect(
+      [...options].some((option) => option.textContent?.includes("Ring1"))
+    ).toBe(false)
+    expect([...options].some((option) => option.textContent === "Ring")).toBe(
+      true
+    )
+    expect(
+      screen
+        .getAllByRole("alert")
+        .some((alert) => alert.textContent?.includes("Legacy Ring 1"))
+    ).toBe(true)
+    fireEvent.change(screen.getByLabelText(/Description/), {
+      target: { value: "metadata" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(bodyOf(mock, "PATCH")).not.toHaveProperty("config")
   })
 })

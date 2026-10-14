@@ -100,7 +100,7 @@ evolution_choice_required`).
   consumables, caps, ...), so numbers are transparent rather than opaque.
 - **Immutable history & trusted-backup export/import**: every progression event is
   written to an append-only journal, and a character (state + live status + skill
-  offers + journal) can be exported as a `primal-character/4` JSON backup keyed by
+  offers + journal) can be exported as a `primal-character/5` JSON backup keyed by
   stable catalog identifiers. A backup can be re-imported (`POST
 /api/characters/import`) as a NEW character owned by the current user; it is a
   trusted-but-unverified backup, so it is marked `imported` in the UI and its
@@ -108,11 +108,13 @@ evolution_choice_required`).
   treated as server-verified. The live status is recomputed from the current
   catalog, catalog references are resolved by `kind` + `stableId` (no catalog
   content is auto-created), and any required definition that is missing, archived,
-  or the wrong kind rejects the whole import. The v4 backup also carries owned
+  or the wrong kind rejects the whole import. The v5 backup also carries owned
   inventory quantities and a `legacyUnowned` marker on equipment associations
-  (grandfathered links may round-trip with zero stock); the legacy
-  `primal-character/3` backup is still accepted and imports no stock, marking every
-  equipment link as grandfathered. No sample characters are created.
+  (grandfathered links may round-trip with zero stock), and a per-link ring
+  `equipmentPosition` so a character's two `Ring`-slot rings round-trip their
+  physical positions; the legacy `primal-character/4` and `primal-character/3`
+  backups are still accepted (v4 imports stock, v3 imports none and marks every
+  equipment link grandfathered). No sample characters are created.
 - **Admin-managed catalog**: a polymorphic catalog for all of the kinds above.
   Admins can create and edit entries, attach a source URL, and store per-kind
   `config`. With

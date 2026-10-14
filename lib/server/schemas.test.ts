@@ -4,14 +4,17 @@ import {
   blessingConfigSchema,
   bloodlineConfigSchema,
   characterCreateSchema,
+  characterStateSchema,
   characterUpdateSchema,
   EQUIPMENT_RARITIES,
   EQUIPMENT_SLOTS,
   EQUIPMENT_UNIQUE_RARITY,
   equipmentConfigSchema,
+  equipmentPositionSchema,
   equipmentRaritySchema,
   evolveSchema,
   godConfigSchema,
+  gradeDescriptionsSchema,
   hasInvalidNaturalGradeConfig,
   hasInvalidRaceTypeConfig,
   inventoryPostSchema,
@@ -22,6 +25,7 @@ import {
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
+  legacyRingPositionForConfig,
   normalizeEquipmentSlot,
   professionSetSchema,
   raceConfigSchema,
@@ -811,7 +815,7 @@ describe("equipment metadata (rarity / slot / soulbound / requirements)", () => 
     ).toBe(false)
   })
 
-  it("EQUIPMENT_SLOTS lists exactly the canonical slots", () => {
+  it("EQUIPMENT_SLOTS lists exactly the canonical slots (Ring is a single slot)", () => {
     expect(EQUIPMENT_SLOTS).toEqual([
       "Head",
       "Chest",
@@ -821,8 +825,7 @@ describe("equipment metadata (rarity / slot / soulbound / requirements)", () => 
       "Legs",
       "Feet",
       "Neck",
-      "Ring 1",
-      "Ring 2",
+      "Ring",
       "Weapon",
     ])
   })
@@ -836,14 +839,44 @@ describe("equipment metadata (rarity / slot / soulbound / requirements)", () => 
     expect(normalizeEquipmentSlot("gloves")).toBe("Hands")
     expect(normalizeEquipmentSlot("boots")).toBe("Feet")
     expect(normalizeEquipmentSlot("necklace")).toBe("Neck")
-    expect(normalizeEquipmentSlot("ring1")).toBe("Ring 1")
-    expect(normalizeEquipmentSlot("ring2")).toBe("Ring 2")
+    // Legacy ring per-position slots all normalize to the single canonical Ring slot.
+    expect(normalizeEquipmentSlot("Ring")).toBe("Ring")
+    expect(normalizeEquipmentSlot("ring1")).toBe("Ring")
+    expect(normalizeEquipmentSlot("ring2")).toBe("Ring")
+    expect(normalizeEquipmentSlot("ring 1")).toBe("Ring")
+    expect(normalizeEquipmentSlot("ring 2")).toBe("Ring")
     // A lowercased canonical value maps to the canonical slot too.
     expect(normalizeEquipmentSlot("feet")).toBe("Feet")
     expect(normalizeEquipmentSlot("weapon")).toBe("Weapon")
-    expect(normalizeEquipmentSlot("ring 1")).toBe("Ring 1")
     expect(normalizeEquipmentSlot("body")).toBeUndefined()
     expect(normalizeEquipmentSlot(undefined)).toBeUndefined()
+  })
+
+  it("equipmentPositionSchema accepts only the two physical ring positions", () => {
+    expect(equipmentPositionSchema.safeParse("Ring 1").success).toBe(true)
+    expect(equipmentPositionSchema.safeParse("Ring 2").success).toBe(true)
+    // The canonical catalog slot is NOT a position; only the two physical positions.
+    expect(equipmentPositionSchema.safeParse("Ring").success).toBe(false)
+    expect(equipmentPositionSchema.safeParse("ring 1").success).toBe(false)
+    expect(equipmentPositionSchema.safeParse("Head").success).toBe(false)
+    expect(equipmentPositionSchema.safeParse(undefined).success).toBe(false)
+  })
+
+  it("legacyRingPositionForConfig derives a position from a legacy Ring 1/2 slot only", () => {
+    expect(legacyRingPositionForConfig({ slot: "Ring 1" })).toBe("Ring 1")
+    expect(legacyRingPositionForConfig({ slot: "Ring 2" })).toBe("Ring 2")
+    // Case/spacing aliases are recognized.
+    expect(legacyRingPositionForConfig({ slot: "ring1" })).toBe("Ring 1")
+    expect(legacyRingPositionForConfig({ slot: "ring 2" })).toBe("Ring 2")
+    expect(legacyRingPositionForConfig({ slot: "RING1" })).toBe("Ring 1")
+    // The canonical slot carries no positional info.
+    expect(legacyRingPositionForConfig({ slot: "Ring" })).toBeUndefined()
+    // Non-ring slots are not positions.
+    expect(legacyRingPositionForConfig({ slot: "Head" })).toBeUndefined()
+    expect(legacyRingPositionForConfig({ slot: "weapon" })).toBeUndefined()
+    // A missing/invalid slot yields no position either.
+    expect(legacyRingPositionForConfig({})).toBeUndefined()
+    expect(legacyRingPositionForConfig({ slot: 42 })).toBeUndefined()
   })
 
   it("isCanonicalEquipmentSlot accepts only canonical values", () => {
@@ -870,6 +903,126 @@ describe("equipment metadata (rarity / slot / soulbound / requirements)", () => 
     expect(
       isIncompleteEquipmentConfig({ slot: "Head", rarity: "Commoner" })
     ).toBe(true)
+  })
+})
+
+describe("equipment percent basis points", () => {
+  it("equipmentConfigSchema accepts a valid nonnegative-integer percentBasisPoints", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      bonus: { strength: 10 },
+      percentBasisPoints: { strength: 1000, agility: 500 },
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({
+        percentBasisPoints: { strength: 1000, agility: 500 },
+      })
+    }
+  })
+
+  it("equipmentConfigSchema rejects a negative percentBasisPoints value", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      percentBasisPoints: { strength: -5 },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("equipmentConfigSchema rejects a fractional percentBasisPoints value", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      percentBasisPoints: { strength: 10.5 },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("accepts an equipment config with no percentBasisPoints (legacy readable)", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Common",
+      bonus: { strength: 5 },
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("characterStateSchema round-trips an equipment bonus carrying percentBasisPoints", () => {
+    const state = {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [
+        {
+          id: "gear-1",
+          name: "Sword",
+          slot: "Weapon",
+          source: "s",
+          bonus: { strength: 10 },
+          percentBasisPoints: { strength: 1000 },
+        },
+      ],
+      currentResources: {},
+      turn: 0,
+    }
+    const parsed = characterStateSchema.safeParse(state)
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.equipment[0].percentBasisPoints).toEqual({
+        strength: 1000,
+      })
+    }
+  })
+
+  it("characterStateSchema accepts a legacy equipment bonus without percentBasisPoints", () => {
+    const state = {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [
+        {
+          id: "gear-1",
+          name: "Sword",
+          slot: "Weapon",
+          source: "s",
+          bonus: { strength: 10 },
+        },
+      ],
+      currentResources: {},
+      turn: 0,
+    }
+    const parsed = characterStateSchema.safeParse(state)
+    expect(parsed.success).toBe(true)
   })
 })
 
@@ -964,5 +1117,41 @@ describe("skill rarity (shared vocabulary + monotonic ordering)", () => {
         reason: "x",
       }).success
     ).toBe(false)
+  })
+})
+
+describe("gradeDescriptionsSchema (catalog grade-specific prose)", () => {
+  it("accepts a valid grade-keyed map and trims values", () => {
+    const res = gradeDescriptionsSchema.safeParse({
+      G: "  hello  ",
+      S: "world",
+    })
+    expect(res.success).toBe(true)
+    if (res.success) expect(res.data).toEqual({ G: "hello", S: "world" })
+  })
+
+  it("accepts an empty map ({} means no authored grade text)", () => {
+    const res = gradeDescriptionsSchema.safeParse({})
+    expect(res.success).toBe(true)
+    if (res.success) expect(res.data).toEqual({})
+  })
+
+  it("rejects an unknown grade key", () => {
+    const res = gradeDescriptionsSchema.safeParse({ H: "nope" })
+    expect(res.success).toBe(false)
+  })
+
+  it("rejects a blank (whitespace-only) value", () => {
+    expect(gradeDescriptionsSchema.safeParse({ G: "   " }).success).toBe(false)
+  })
+
+  it("rejects an oversized value (over 8000 characters)", () => {
+    expect(
+      gradeDescriptionsSchema.safeParse({ G: "x".repeat(8001) }).success
+    ).toBe(false)
+  })
+
+  it("rejects a non-object / array value", () => {
+    expect(gradeDescriptionsSchema.safeParse([]).success).toBe(false)
   })
 })

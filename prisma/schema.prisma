@@ -209,6 +209,13 @@ model CatalogDefinition {
   sourceUrl   String?
   archived    Boolean     @default(false)
   config      Json        @default("{}")
+  // Grade-specific prose descriptions keyed by the grade ladder (G..S). Authored
+  // independently of the legacy `description` string and of the entry's own
+  // `grade` band (a legacy race whose `grade` is null may still carry a
+  // description for its natural grade; a grade-cap row may carry text for any
+  // band). Never auto-populated from `description`. The `{}` default means an
+  // entry with no authored grade text reads back as an empty map.
+  gradeDescriptions Json     @default("{}")
   // The patron god for a `blessings` entry. Set only when the blessing config
   // declares a `patronGodStableId`; the FK is resolved to the matching unarchived
   // `gods` definition so the JSON stableId and the FK never diverge. RESTRICT
@@ -268,6 +275,14 @@ model CharacterAssociation {
   // Ownership is per-definition house bookkeeping, not canon - a single item
   // instance is never tracked (no uniqueness/instance/capacity).
   legacyUnowned Boolean         @default(false)
+  // The physical ring position occupied by a linked EQUIPMENT item, set only
+  // when the linked catalog definition is a Ring-slot item. Ring is ONE catalog
+  // slot ("Ring") but a character may wear two rings, one per position, so the
+  // chosen position is persisted HERE (per-link), never on the catalog config.
+  // Null for non-ring equipment links and for ring links whose position has yet
+  // to be resolved (the migration backfills it from the legacy `Ring 1`/`Ring 2`
+  // catalog slot; a read derives it from that legacy config as a fallback).
+  equipmentPosition String?
   createdAt    DateTime        @default(now())
 
   @@unique([characterId, definitionId])

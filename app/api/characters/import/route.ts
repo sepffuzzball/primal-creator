@@ -5,6 +5,7 @@ import {
   characterImportDocumentSchema,
   IMPORT_SCHEMA_V3,
   IMPORT_SCHEMA_V4,
+  IMPORT_SCHEMA_V5,
 } from "@/lib/server/import-schema"
 import { importCharacter } from "@/lib/db/service"
 
@@ -86,11 +87,12 @@ export async function POST(req: Request) {
     const SUPPORTED_SCHEMAS = new Set<string>([
       IMPORT_SCHEMA_V3,
       IMPORT_SCHEMA_V4,
+      IMPORT_SCHEMA_V5,
     ])
     if (!SUPPORTED_SCHEMAS.has(String(schemaValue))) {
       throw badRequest(
         "unsupported_schema",
-        `Unsupported schema "${String(schemaValue)}"; expected "${IMPORT_SCHEMA_V3}" or "${IMPORT_SCHEMA_V4}"`
+        `Unsupported schema "${String(schemaValue)}"; expected "${IMPORT_SCHEMA_V3}", "${IMPORT_SCHEMA_V4}" or "${IMPORT_SCHEMA_V5}"`
       )
     }
 

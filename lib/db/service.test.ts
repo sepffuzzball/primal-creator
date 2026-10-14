@@ -34,9 +34,12 @@ import {
 import {
   IMPORT_SCHEMA_V3,
   IMPORT_SCHEMA_V4,
+  IMPORT_SCHEMA_V5,
   IMPORT_RULESET_VERSION,
+  characterImportDocumentSchema,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
+import { associationSchema } from "@/lib/server/schemas"
 import { DEFAULT_HOUSE_RULES_CONFIG } from "./ruleset"
 import {
   createCharacterState,
@@ -2251,6 +2254,87 @@ describe("associateCharacter (titles / equipment)", () => {
     expect(items[0].suppressed.strength).toBe(0)
   })
 
+  it("synthesizes the combined flat + percent live bonus when the item is eligible", async () => {
+    seedCharacterWithBase({ strength: 100 })
+    seedEquipment("gear-pct", {
+      slot: "head",
+      bonus: { strength: 10 },
+      percentBasisPoints: { strength: 1000 }, // 10%
+    })
+    seedStock("gear-pct")
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-pct",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const items = res.character.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    // flat request 10; percent request floor((100 + 10) * 0.1) = 11.
+    expect(items[0].requested.strength).toBe(21)
+    // flat 10 caps within the 20% individual budget; the percent shares the
+    // remaining individual budget (10) but the overall 15% budget has only 5 left
+    // (15 - 10 already consumed by flat), so the combined applied is 15.
+    expect(items[0].applied.strength).toBe(15)
+    expect(items[0].suppressed.strength).toBe(6)
+    // The equipment-percent cap is surfaced explicitly in the status aggregate.
+    const aggregate = res.character.status?.equipment
+    expect(aggregate?.requested.strength).toBe(21)
+    expect(aggregate?.applied.strength).toBe(15)
+    expect(aggregate?.suppressed.strength).toBe(6)
+    const pctOverall = aggregate?.capUsage.find(
+      (c) => c.name === "equipment-percent-overall"
+    )
+    expect(pctOverall).toBeDefined()
+    // The trace records the percent contribution in its own phase.
+    const strengthTrace = res.character.status?.traces.find(
+      (t) => t.attribute === "strength"
+    )
+    const phases = strengthTrace?.phases.map((p) => p.phase) ?? []
+    expect(phases).toContain("equipment-percent")
+    const pctPhase = strengthTrace?.phases.find(
+      (p) => p.phase === "equipment-percent"
+    )
+    expect(pctPhase?.delta).toBe(5)
+  })
+
+  it("does not synthesize an equipment percent bonus while the item is ineligible", async () => {
+    seedCharacterWithBase({ strength: 100 })
+    // The character's race level is 0, below the declared requirement.
+    seedEquipment("gear-inel", {
+      slot: "head",
+      bonus: { strength: 10 },
+      percentBasisPoints: { strength: 1000 },
+      minRaceLevel: 5,
+    })
+    seedStock("gear-inel")
+    // Link the item directly (bypassing the associateCharacter add gate, which
+    // rejects an unmet requirement with a 400) so the ineligible link can be read
+    // live and proven inert.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-inel",
+      kind: "EQUIPMENT",
+    })
+    const detail = await getCharacter("chr-1", user)
+    const items = detail.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    // Ineligible => both flat and percent are inert (no request, no contribution).
+    expect(items[0].requested.strength).toBe(0)
+    expect(items[0].applied.strength).toBe(0)
+    expect(items[0].suppressed.strength).toBe(0)
+    // No equipment-percent trace phase is emitted for an inert percent request.
+    const strengthTrace = detail.status?.traces.find(
+      (t) => t.attribute === "strength"
+    )
+    const phases = strengthTrace?.phases.map((p) => p.phase) ?? []
+    expect(phases).not.toContain("equipment-percent")
+  })
+
   it("equipment add replaces the item currently equipped in the same slot", async () => {
     seedCharacterWithBase({ strength: 100 })
     seedEquipment("gear-1", { slot: "head", bonus: { strength: 10 } })
@@ -2568,6 +2652,242 @@ describe("associateCharacter (titles / equipment)", () => {
     expect(
       res.character.associations.every((a) => a.definitionArchived === false)
     ).toBe(true)
+  })
+
+  it("Ring add requires an explicit position (400 ring_position_required)", async () => {
+    seedCharacterWithBase()
+    seedEquipment("ring-a", { slot: "Ring", bonus: { strength: 5 } })
+    seedStock("ring-a")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "ring-a",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "ring_position_required" })
+    // Nothing was linked.
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("Ring add rejects an invalid position value via the schema", async () => {
+    seedCharacterWithBase()
+    seedEquipment("ring-a", { slot: "Ring", bonus: { strength: 5 } })
+    seedStock("ring-a")
+    // The associationSchema itself rejects a position that is not Ring 1 / Ring 2.
+    expect(
+      associationSchema.safeParse({
+        kind: "equipment",
+        definitionId: "ring-a",
+        operation: "add",
+        version: 0,
+        equipmentPosition: "Ring",
+      }).success
+    ).toBe(false)
+  })
+
+  it("non-Ring equipment add forbids a ring position (400 position_not_allowed)", async () => {
+    seedCharacterWithBase()
+    seedEquipment("neck-1", { slot: "Neck", bonus: { strength: 5 } })
+    seedStock("neck-1")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "neck-1",
+          operation: "add",
+          version: 0,
+          equipmentPosition: "Ring 1",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "position_not_allowed" })
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("adding a Ring 1 then a Ring 2 item keeps both distinct rings", async () => {
+    seedCharacterWithBase({ strength: 100 })
+    seedEquipment("ring-a", { slot: "Ring", bonus: { strength: 10 } })
+    seedEquipment("ring-b", { slot: "Ring", bonus: { strength: 20 } })
+    seedStock("ring-a")
+    seedStock("ring-b")
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-a",
+        operation: "add",
+        version: 0,
+        equipmentPosition: "Ring 1",
+      },
+      user
+    )
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-b",
+        operation: "add",
+        version: 1,
+        equipmentPosition: "Ring 2",
+      },
+      user
+    )
+    expect(res.character.associations).toHaveLength(2)
+    // The single canonical "Ring" slot is shown on both; the worn position is the
+    // per-link equipmentPosition, never conflated with the slot.
+    const byId = Object.fromEntries(
+      res.character.associations.map((a) => [a.definitionId, a])
+    )
+    expect(byId["ring-a"]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 1",
+    })
+    expect(byId["ring-b"]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 2",
+    })
+    expect(res.character.version).toBe(2)
+  })
+
+  it("adding a different Ring in an occupied position replaces only that position", async () => {
+    seedCharacterWithBase({ strength: 100 })
+    seedEquipment("ring-a", { slot: "Ring", bonus: { strength: 10 } })
+    seedEquipment("ring-b", { slot: "Ring", bonus: { strength: 20 } })
+    seedStock("ring-a")
+    seedStock("ring-b")
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-a",
+        operation: "add",
+        version: 0,
+        equipmentPosition: "Ring 1",
+      },
+      user
+    )
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-b",
+        operation: "add",
+        version: 1,
+        equipmentPosition: "Ring 1",
+      },
+      user
+    )
+    // Only the new item remains linked - the old ring at the same position was
+    // displaced, and the event records it.
+    expect(res.character.associations.map((a) => a.definitionId)).toEqual([
+      "ring-b",
+    ])
+    expect(res.character.associations[0]).toMatchObject({
+      equipmentPosition: "Ring 1",
+    })
+    const event = dbMock.store.events[dbMock.store.events.length - 1]
+    const removed = (
+      event.payload as {
+        removed: Array<{ definitionId: string }>
+      }
+    ).removed
+    expect(removed.map((r) => r.definitionId)).toEqual(["ring-a"])
+  })
+
+  it("rejects a duplicate same-definition Ring add even when the other position is free", async () => {
+    seedCharacterWithBase()
+    seedEquipment("ring-a", { slot: "Ring", bonus: { strength: 10 } })
+    seedStock("ring-a")
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-a",
+        operation: "add",
+        version: 0,
+        equipmentPosition: "Ring 1",
+      },
+      user
+    )
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "ring-a",
+          operation: "add",
+          version: 1,
+          equipmentPosition: "Ring 2",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "duplicate" })
+    // The original link is untouched.
+    expect(dbMock.store.associations).toHaveLength(1)
+  })
+
+  it("Ring remove ignores the supplied position (position is add-only)", async () => {
+    seedCharacterWithBase()
+    seedEquipment("ring-a", { slot: "Ring", bonus: { strength: 5 } })
+    seedStock("ring-a")
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-a",
+        operation: "add",
+        version: 0,
+        equipmentPosition: "Ring 1",
+      },
+      user
+    )
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-a",
+        operation: "remove",
+        version: 1,
+        equipmentPosition: "Ring 2",
+      },
+      user
+    )
+    expect(res.character.associations).toHaveLength(0)
+    expect(res.character.version).toBe(2)
+  })
+
+  it("synthesizes the combined flat + percent live bonus for a Ring-slot item", async () => {
+    seedCharacterWithBase({ strength: 100 })
+    seedEquipment("ring-pct", {
+      slot: "Ring",
+      bonus: { strength: 10 },
+      percentBasisPoints: { strength: 1000 }, // 10%
+    })
+    seedStock("ring-pct")
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "ring-pct",
+        operation: "add",
+        version: 0,
+        equipmentPosition: "Ring 1",
+      },
+      user
+    )
+    const items = res.character.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    expect(items[0].requested.strength).toBe(21)
+    expect(items[0].applied.strength).toBe(15)
+    expect(items[0].suppressed.strength).toBe(6)
   })
 })
 
@@ -5048,7 +5368,7 @@ describe("exportCharacter (associations / live state)", () => {
       user
     )
     const portable = await exportCharacter("chr-1", user)
-    expect(portable.schema).toBe("primal-character/4")
+    expect(portable.schema).toBe("primal-character/5")
     expect(portable.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(portable.identity).toMatchObject({
       name: "Test",
@@ -8324,7 +8644,7 @@ describe("importCharacter (trusted backup v3)", () => {
         "chr-r",
         user
       )) as CharacterImportDocument
-      expect(portable.schema).toBe("primal-character/4")
+      expect(portable.schema).toBe("primal-character/5")
       const inv = (portable as { inventory: Array<{ quantity: number }> })
         .inventory
       expect(inv).toHaveLength(2)
@@ -8348,6 +8668,341 @@ describe("importCharacter (trusted backup v3)", () => {
       )
       expect(storedAssoc?.legacyUnowned).toBe(false)
     })
+
+    it("recovers a Ring 2 position from a v4 backup definition.config.slot snapshot when the current catalog slot is Ring", async () => {
+      seedRaceClass()
+      addImportCatalog(
+        "equipment",
+        "ring-snap",
+        { slot: "Ring" },
+        { name: "Ring Snap" }
+      )
+      const doc = v4Doc({
+        associations: [
+          {
+            kind: "equipment",
+            definition: {
+              kind: "equipment",
+              stableId: "ring-snap",
+              config: { slot: "Ring 2" },
+            },
+            legacyUnowned: true,
+          },
+        ],
+        inventory: [],
+      })
+      const result = await importCharacter(doc, user)
+      expect(result.associations).toHaveLength(1)
+      expect(result.associations[0]).toMatchObject({
+        kind: "equipment",
+        slot: "Ring",
+        equipmentPosition: "Ring 2",
+      })
+      const stored = dbMock.store.associations.find(
+        (a) => a.characterId === result.id
+      )
+      expect(stored?.equipmentPosition).toBe("Ring 2")
+      // The recovered position survives a v5 export.
+      const exported = (await exportCharacter(
+        result.id,
+        user
+      )) as CharacterImportDocument
+      const eq = (
+        exported.associations as Array<{
+          kind: string
+          equipmentPosition?: string | null
+        }>
+      ).find((a) => a.kind === "equipment")
+      expect(eq?.equipmentPosition).toBe("Ring 2")
+    })
+  })
+
+  it("recovers a Ring 2 position from a v3 backup definition.config.slot snapshot when the current catalog slot is Ring", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "equipment",
+      "ring-snap",
+      { slot: "Ring" },
+      { name: "Ring Snap" }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "equipment",
+          definition: {
+            kind: "equipment",
+            stableId: "ring-snap",
+            config: { slot: "Ring 2" },
+          },
+        },
+      ],
+    })
+    const result = await importCharacter(doc, user)
+    expect(result.associations).toHaveLength(1)
+    expect(result.associations[0]).toMatchObject({
+      kind: "equipment",
+      slot: "Ring",
+      equipmentPosition: "Ring 2",
+    })
+    const stored = dbMock.store.associations.find(
+      (a) => a.characterId === result.id
+    )
+    expect(stored?.equipmentPosition).toBe("Ring 2")
+    // The recovered position survives a v5 export.
+    const exported = (await exportCharacter(
+      result.id,
+      user
+    )) as CharacterImportDocument
+    const eq = (
+      exported.associations as Array<{
+        kind: string
+        equipmentPosition?: string | null
+      }>
+    ).find((a) => a.kind === "equipment")
+    expect(eq?.equipmentPosition).toBe("Ring 2")
+  })
+
+  it("rejects a v3 Ring link with no position and no definition.config snapshot (import_ring_position_required)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "equipment",
+      "ring-snap",
+      { slot: "Ring" },
+      { name: "Ring Snap" }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "ring-snap" },
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
+  })
+
+  it("rejects a v3 Ring link whose definition.config.slot snapshot is a non-ring slot (import_ring_position_required)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "equipment",
+      "ring-snap",
+      { slot: "Ring" },
+      { name: "Ring Snap" }
+    )
+    const doc = importDoc({
+      associations: [
+        {
+          kind: "equipment",
+          definition: {
+            kind: "equipment",
+            stableId: "ring-snap",
+            config: { slot: "Head" },
+          },
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
+  })
+
+  it("v5 uses the explicit position and never trusts the definition.config.slot snapshot", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "equipment",
+      "ring-snap",
+      { slot: "Ring" },
+      { name: "Ring Snap" }
+    )
+    // A v5 document carries no per-link equipmentPosition, but DOES carry a
+    // definition.config.slot snapshot naming Ring 2. The v5 import must NOT derive
+    // from the snapshot - only the explicit position counts - so it is rejected.
+    const base = v4Doc({
+      associations: [
+        {
+          kind: "equipment",
+          definition: {
+            kind: "equipment",
+            stableId: "ring-snap",
+            config: { slot: "Ring 2" },
+          },
+          legacyUnowned: true,
+        },
+      ],
+      inventory: [],
+    })
+    const doc = {
+      ...base,
+      schema: IMPORT_SCHEMA_V5,
+    } as CharacterImportDocument
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
+  })
+
+  it("rejects a v5 backup whose equipment link omits equipmentPosition at the schema layer (Zod 400, no write)", () => {
+    // The v5 equipment schema REQUIRES equipmentPosition; a backup that omits it
+    // must fail Zod validation (the route maps this to a 400) before any write.
+    // The rest of the document is a valid v5 shape, so the rejection is purely the
+    // missing per-link position.
+    const doc = {
+      ...v4Doc({ inventory: [] }),
+      schema: IMPORT_SCHEMA_V5,
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "ring-1" },
+          legacyUnowned: true,
+        },
+      ],
+    } as unknown as CharacterImportDocument
+    const parsed = characterImportDocumentSchema.safeParse(doc)
+    expect(parsed.success).toBe(false)
+    if (!parsed.success) {
+      expect(
+        parsed.error.issues.some((i) => i.path.includes("equipmentPosition"))
+      ).toBe(true)
+    }
+  })
+
+  it("rejects a v5 Ring link with an explicit null position even when the current catalog slot is legacy Ring 1 (import_ring_position_required)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "equipment",
+      "ring-legacy-1",
+      { slot: "Ring 1" },
+      { name: "Legacy Band" }
+    )
+    // v5 must never fall back to the CURRENT catalog's legacy Ring 1 slot: an
+    // explicit null in the backup means "no position", so it is rejected.
+    const doc = {
+      ...v4Doc({ inventory: [] }),
+      schema: IMPORT_SCHEMA_V5,
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "ring-legacy-1" },
+          legacyUnowned: true,
+          equipmentPosition: null,
+        },
+      ],
+    } as unknown as CharacterImportDocument
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_ring_position_required",
+    })
+  })
+
+  it("imports a v5 non-ring equipment link with an explicit null position (never a category mismatch)", async () => {
+    seedRaceClass()
+    addImportCatalog("equipment", "helm-1", { slot: "Head" }, { name: "Helm" })
+    const doc = {
+      ...v4Doc({ inventory: [] }),
+      schema: IMPORT_SCHEMA_V5,
+      associations: [
+        {
+          kind: "equipment",
+          definition: { kind: "equipment", stableId: "helm-1" },
+          legacyUnowned: true,
+          equipmentPosition: null,
+        },
+      ],
+    } as unknown as CharacterImportDocument
+    const result = await importCharacter(doc, user)
+    expect(result.associations).toHaveLength(1)
+    expect(result.associations[0]).toMatchObject({
+      kind: "equipment",
+      slot: "Head",
+    })
+    // A non-ring link stores null position in the DB.
+    const stored = dbMock.store.associations.find(
+      (a) => a.characterId === result.id
+    )
+    expect(stored?.equipmentPosition).toBeNull()
+  })
+
+  it("exporting a v5 non-ring equipment link serializes equipmentPosition:null and survives a real JSON round-trip + schema parse", async () => {
+    seedRaceClass()
+    addImportCatalog("equipment", "helm-1", { slot: "Head" }, { name: "Helm" })
+    addImportCatalog("equipment", "ring-1", { slot: "Ring" }, { name: "Band" })
+    const state = createInitialState("integrated", null, null)
+    dbMock.store.addCharacter({
+      id: "chr-nr",
+      ownerId: user.id,
+      name: "Non-ring",
+      raceId: "human",
+      classId: "archer",
+      state: serializeState(state),
+    })
+    // Owned stock for the non-ring helmet (non-grandfathered), plus a
+    // grandfathered ring that owns no stock.
+    dbMock.store.addInventoryItem({
+      characterId: "chr-nr",
+      definitionId: "helm-1",
+      quantity: 2,
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-nr",
+      definitionId: "helm-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: false,
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-nr",
+      definitionId: "ring-1",
+      kind: "EQUIPMENT",
+      legacyUnowned: true,
+      equipmentPosition: "Ring 2",
+    })
+
+    const portable = (await exportCharacter(
+      "chr-nr",
+      user
+    )) as CharacterImportDocument
+    expect(portable.schema).toBe("primal-character/5")
+
+    // A real wire round-trip. JSON.stringify drops undefined values, which is what
+    // used to delete equipmentPosition from a non-ring link and make the strict v5
+    // schema reject the backup. The position must now serialize as explicit null.
+    const wire = JSON.parse(JSON.stringify(portable)) as CharacterImportDocument
+    const parsed = characterImportDocumentSchema.parse(wire)
+    const eqAssocs = (
+      parsed.associations as Array<{
+        kind: string
+        equipmentPosition?: string | null
+        definition: { stableId: string }
+      }>
+    ).filter((a) => a.kind === "equipment")
+    const helm = eqAssocs.find((a) => a.definition.stableId === "helm-1")
+    expect(helm?.equipmentPosition).toBeNull()
+    const ring = eqAssocs.find((a) => a.definition.stableId === "ring-1")
+    expect(ring?.equipmentPosition).toBe("Ring 2")
+
+    // The parsed backup imports with stock and grandfathered markers preserved and
+    // the ring position unchanged.
+    const imported = await importCharacter(wire, user)
+    expect(imported.associations).toHaveLength(2)
+    const storedHelm = dbMock.store.associations.find(
+      (a) => a.characterId === imported.id && a.definitionId === "helm-1"
+    )
+    expect(storedHelm?.legacyUnowned).toBe(false)
+    expect(storedHelm?.equipmentPosition).toBeNull()
+    const storedRing = dbMock.store.associations.find(
+      (a) => a.characterId === imported.id && a.definitionId === "ring-1"
+    )
+    expect(storedRing?.legacyUnowned).toBe(true)
+    expect(storedRing?.equipmentPosition).toBe("Ring 2")
+    expect(
+      imported.inventory.find((i) => i.definitionId === "helm-1")?.quantity
+    ).toBe(2)
+    expect(
+      imported.inventory.find((i) => i.definitionId === "ring-1")
+    ).toBeUndefined()
   })
 })
 
@@ -12422,5 +13077,448 @@ describe("equipment requirements / rarity / soulbound metadata", () => {
       requiredRaceType: "enlightened",
     })
     expect(item?.equipmentEligibility).toMatchObject({ eligible: false })
+  })
+})
+
+describe("catalog grade-specific descriptions (create/update/clear/preserve)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function validRaceConfig(): Record<string, unknown> {
+    return {
+      raceType: "enlightened",
+      naturalGrade: "B",
+      raceDefinitions: {
+        B: { id: "r:B", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    }
+  }
+
+  function seedLegacyRace(): void {
+    dbMock.store.addCatalog({
+      id: "legacy-race",
+      kind: "races",
+      stableId: "legacy-race",
+      name: "Legacy Race",
+      config: {
+        raceDefinitions: {
+          F: { id: "r:F", perLevel: {}, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  it("createCatalogItem persists authored gradeDescriptions and reads them back", async () => {
+    const item = await createCatalogItem("races", {
+      name: "Graded Race",
+      stableId: "graded-race",
+      grade: "B",
+      sourceUrl: "https://example.com/graded-race",
+      config: validRaceConfig(),
+      gradeDescriptions: { G: "A G-grade blurb", S: "An S-grade blurb" },
+    })
+    expect(item.gradeDescriptions).toEqual({
+      G: "A G-grade blurb",
+      S: "An S-grade blurb",
+    })
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "graded-race"
+    )!
+    expect(row.gradeDescriptions).toEqual({
+      G: "A G-grade blurb",
+      S: "An S-grade blurb",
+    })
+  })
+
+  it("createCatalogItem without gradeDescriptions stores an empty map (reads back {})", async () => {
+    const item = await createCatalogItem("races", {
+      name: "Plain Race",
+      stableId: "plain-race",
+      grade: "B",
+      sourceUrl: "https://example.com/plain-race",
+      config: validRaceConfig(),
+    })
+    expect(item.gradeDescriptions).toEqual({})
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "plain-race"
+    )!
+    expect(row.gradeDescriptions).toEqual({})
+  })
+
+  it("updateCatalogItem sets gradeDescriptions only when the PATCH includes it", async () => {
+    const created = await createCatalogItem("races", {
+      name: "Race",
+      stableId: "race-x",
+      grade: "B",
+      sourceUrl: "https://example.com/race-x",
+      config: validRaceConfig(),
+    })
+    const updated = await updateCatalogItem("races", created.id, {
+      gradeDescriptions: { G: "hello" },
+    })
+    expect(updated.gradeDescriptions).toEqual({ G: "hello" })
+  })
+
+  it("updateCatalogItem preserves gradeDescriptions when the PATCH omits it", async () => {
+    const created = await createCatalogItem("races", {
+      name: "Race",
+      stableId: "race-y",
+      grade: "B",
+      sourceUrl: "https://example.com/race-y",
+      config: validRaceConfig(),
+      gradeDescriptions: { G: "keep me" },
+    })
+    // A metadata-only PATCH (name change) must not touch gradeDescriptions.
+    const updated = await updateCatalogItem("races", created.id, {
+      name: "Renamed Race",
+    })
+    expect(updated.gradeDescriptions).toEqual({ G: "keep me" })
+  })
+
+  it("updateCatalogItem clears gradeDescriptions when the PATCH sends {}", async () => {
+    const created = await createCatalogItem("races", {
+      name: "Race",
+      stableId: "race-z",
+      grade: "B",
+      sourceUrl: "https://example.com/race-z",
+      config: validRaceConfig(),
+      gradeDescriptions: { G: "clear me" },
+    })
+    const updated = await updateCatalogItem("races", created.id, {
+      gradeDescriptions: {},
+    })
+    expect(updated.gradeDescriptions).toEqual({})
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.id === created.id
+    )!
+    expect(row.gradeDescriptions).toEqual({})
+  })
+
+  it("an old row without gradeDescriptions reads back an empty map", async () => {
+    seedLegacyRace()
+    const item = await getCatalogItem("races", "legacy-race")
+    expect(item.gradeDescriptions).toEqual({})
+  })
+
+  it("a metadata-only PATCH on a legacy config does not revalidate the config", async () => {
+    seedLegacyRace()
+    const updated = await updateCatalogItem("races", "legacy-race", {
+      gradeDescriptions: { G: "added without touching config" },
+    })
+    expect(updated.gradeDescriptions).toEqual({
+      G: "added without touching config",
+    })
+    // The legacy config is untouched: no raceType was injected or required.
+    const row = dbMock.store.catalog.get("legacy-race")!
+    expect((row.config as Record<string, unknown>).raceType).toBeUndefined()
+    expect((row.config as Record<string, unknown>).naturalGrade).toBeUndefined()
+  })
+})
+
+describe("character detail grade-description exposure (owner-authorized detail)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  type SeededTrack = {
+    level: number
+    quarter: number
+    definitionId: string
+    grade?: Grade
+  }
+
+  function seedDefinition(
+    id: string,
+    kind: string,
+    stableId: string,
+    name: string,
+    opts: {
+      grade?: string | null
+      description?: string | null
+      archived?: boolean
+      gradeDescriptions?: Record<string, string>
+    } = {}
+  ): void {
+    dbMock.store.addCatalog({
+      id,
+      kind,
+      stableId,
+      name,
+      description: opts.description ?? null,
+      grade: opts.grade,
+      archived: opts.archived ?? false,
+      gradeDescriptions: opts.gradeDescriptions ?? {},
+    })
+  }
+
+  function characterStateWith(opts: {
+    raceGrade: Grade
+    classGrade?: Grade
+    professionGrade?: Grade
+    classUngraded?: boolean
+    professionUngraded?: boolean
+  }): unknown {
+    const tracks: Record<string, SeededTrack> = {}
+    if (opts.classGrade != null || opts.classUngraded) {
+      tracks.class = {
+        level: 0,
+        quarter: 0,
+        definitionId: opts.classGrade ? `class:${opts.classGrade}` : "",
+        ...(opts.classGrade != null ? { grade: opts.classGrade } : {}),
+      }
+    }
+    if (opts.professionGrade != null || opts.professionUngraded) {
+      tracks.profession = {
+        level: 0,
+        quarter: 0,
+        definitionId: opts.professionGrade
+          ? `prof:${opts.professionGrade}`
+          : "",
+        ...(opts.professionGrade != null
+          ? { grade: opts.professionGrade }
+          : {}),
+      }
+    }
+    const state = createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks,
+      race: { level: 0, grade: opts.raceGrade, mode: "derived" },
+    })
+    return serializeState(state)
+  }
+
+  function seedCharacterWith(opts: {
+    raceId?: string
+    classId?: string
+    professionId?: string
+    raceGrade: Grade
+    classGrade?: Grade
+    professionGrade?: Grade
+    classUngraded?: boolean
+    professionUngraded?: boolean
+  }): unknown {
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      raceId: opts.raceId ?? null,
+      classId: opts.classId ?? null,
+      professionId: opts.professionId ?? null,
+      state: characterStateWith(opts),
+      version: 0,
+    })
+  }
+
+  function seedAssociation(
+    definitionId: string,
+    kind: "SKILL" | "TITLE" | "EQUIPMENT" | "TRANSCENDENT"
+  ): void {
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId,
+      kind,
+    })
+  }
+
+  it("surfaces authored grade prose for race/class/profession at the character's own grades", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { G: "Human G-grade prose", F: "Human F-grade prose" },
+    })
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      gradeDescriptions: {
+        F: "Archer F-grade prose",
+        E: "Archer E-grade prose",
+      },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      gradeDescriptions: {
+        E: "Alchemist E-grade prose",
+        D: "Alchemist D-grade prose",
+      },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.raceGradeDescription).toBe("Human G-grade prose")
+    expect(detail.classGradeDescription).toBe("Archer F-grade prose")
+    expect(detail.professionGradeDescription).toBe("Alchemist E-grade prose")
+  })
+
+  it("returns null for a legacy ungraded class/profession track, never inferring from the race grade", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { G: "Human G-grade prose" },
+    })
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      gradeDescriptions: {
+        G: "Archer G-grade prose",
+        F: "Archer F-grade prose",
+      },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      gradeDescriptions: {
+        G: "Alchemist G-grade prose",
+        E: "Alchemist E-grade prose",
+      },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classUngraded: true,
+      professionUngraded: true,
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.raceGradeDescription).toBe("Human G-grade prose")
+    // No class/profession track grade -> null; the race-grade (G) prose the
+    // definitions DO author is not used as an inference.
+    expect(detail.classGradeDescription).toBeNull()
+    expect(detail.professionGradeDescription).toBeNull()
+  })
+
+  it("resolves each track at ITS OWN grade, never the race grade", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { G: "Human G prose" },
+    })
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      gradeDescriptions: {
+        G: "Archer-at-race-G",
+        F: "Archer-class-F prose",
+        E: "Archer E prose",
+      },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      gradeDescriptions: {
+        G: "Alchemist-at-race-G",
+        E: "Alchemist-prof-E prose",
+      },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.raceGradeDescription).toBe("Human G prose")
+    expect(detail.classGradeDescription).toBe("Archer-class-F prose")
+    expect(detail.professionGradeDescription).toBe("Alchemist-prof-E prose")
+  })
+
+  it("still exposes grade prose for archived race/class/profession definitions owned by the character", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      archived: true,
+      gradeDescriptions: { G: "Archived Human G prose" },
+    })
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      archived: true,
+      gradeDescriptions: { F: "Archived Archer F prose" },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      archived: true,
+      gradeDescriptions: { E: "Archived Alchemist E prose" },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.raceGradeDescription).toBe("Archived Human G prose")
+    expect(detail.classGradeDescription).toBe("Archived Archer F prose")
+    expect(detail.professionGradeDescription).toBe("Archived Alchemist E prose")
+  })
+
+  it("returns null for an empty / non-matching map and never falls back to the legacy description", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      description: "Human general description",
+      gradeDescriptions: {}, // old row reads back {}
+    })
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      description: "Archer general description",
+      // Class track grade is F; only a G key exists -> no match.
+      gradeDescriptions: { G: "Archer G prose" },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      grade: "B",
+      gradeDescriptions: { D: "Alchemist D prose" },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.raceGradeDescription).toBeNull()
+    expect(detail.classGradeDescription).toBeNull()
+    expect(detail.professionGradeDescription).toBeNull()
+  })
+
+  it("surfaces gradeDescription on a graded linked association at the definition's own grade", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    seedDefinition("sk-1", "skills", "fireball", "Fireball", {
+      grade: "D",
+      gradeDescriptions: { D: "Fireball D prose" },
+    })
+    seedDefinition("tt-1", "titles", "pioneer", "Pioneer", {
+      grade: "B",
+      gradeDescriptions: { B: "Pioneer B prose" },
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-1", "SKILL")
+    seedAssociation("tt-1", "TITLE")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-1")!
+    const title = detail.associations.find((a) => a.definitionId === "tt-1")!
+    expect(skill.gradeDescription).toBe("Fireball D prose")
+    expect(title.gradeDescription).toBe("Pioneer B prose")
+  })
+
+  it("leaves gradeDescription absent for a linked definition with a null catalog grade", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    seedDefinition("sk-2", "skills", "arrow", "Arrow", {
+      grade: null,
+      gradeDescriptions: { C: "Arrow C prose" },
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-2", "SKILL")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-2")!
+    expect(skill.gradeDescription).toBeUndefined()
+    expect("gradeDescription" in skill).toBe(false)
+  })
+
+  it("resolves an association gradeDescription from the definition's own grade, not the character's race grade", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    seedDefinition("sk-3", "skills", "beam", "Beam", {
+      grade: "F",
+      gradeDescriptions: { C: "Beam-at-race-C prose", F: "Beam-F prose" },
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-3", "SKILL")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-3")!
+    expect(skill.gradeDescription).toBe("Beam-F prose")
   })
 })

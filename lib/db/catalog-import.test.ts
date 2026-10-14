@@ -6,6 +6,7 @@ import {
   type WikiReviewedEntry,
 } from "@/lib/db/catalog-import"
 import { WIKI_REVIEWED_ENTRIES } from "@/prisma/catalog/wiki-reviewed"
+import type { Grade } from "@/lib/rules"
 
 // Real unit tests against the in-memory Prisma mock. The mock backs the
 // `@/lib/db/client` export so the importer's Prisma calls are exercised without a
@@ -408,6 +409,56 @@ describe("catalog import (unit, mocked db)", () => {
     } finally {
       spy.mockRestore()
     }
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("apply persists an authored gradeDescriptions map for an entry that carries one", async () => {
+    const entry: WikiReviewedEntry = {
+      kind: "races",
+      stableId: "graded-race",
+      name: "Graded Race",
+      description: "A race with independently authored grade descriptions",
+      grade: null,
+      sourceUrl: "https://example.com/graded-race",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "B",
+        raceDefinitions: {
+          B: { id: "r:B", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+      gradeDescriptions: {
+        G: "A G-grade blurb",
+        S: "An S-grade blurb",
+      },
+    }
+    await applyWikiReviewedImport([entry])
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "graded-race"
+    )!
+    expect(row.gradeDescriptions).toEqual({
+      G: "A G-grade blurb",
+      S: "An S-grade blurb",
+    })
+  })
+
+  it("a manifest entry that omits gradeDescriptions stores an empty map (legacy rows)", async () => {
+    await applyWikiReviewedImport([skillEntry("plain-skill")])
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "plain-skill"
+    )!
+    expect(row.gradeDescriptions).toEqual({})
+  })
+
+  it("rejects a manifest entry with an invalid gradeDescriptions key and writes nothing", async () => {
+    const entry: WikiReviewedEntry = {
+      ...skillEntry("bad-grade"),
+      gradeDescriptions: { H: "nope" } as Partial<Record<Grade, string>>,
+    }
+    await expect(applyWikiReviewedImport([entry])).rejects.toMatchObject({
+      status: 400,
+      code: "validation",
+    })
     expect(dbMock.store.catalog.size).toBe(0)
   })
 })

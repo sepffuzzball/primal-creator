@@ -94,6 +94,7 @@ function csvContent(
     "grade",
     "provenance",
     "sourceUrl",
+    "gradeDescriptions",
   ]
   const lines = [
     header.join(","),
@@ -269,6 +270,51 @@ describe("bulk JSON parsing and validation", () => {
       /Bulk row 1: unknown field "archived"/
     )
   })
+
+  it("parses an authored gradeDescriptions map from JSON and trims values", () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        {
+          ...skill("skills", "a"),
+          gradeDescriptions: { G: "  hello  ", S: "world" },
+        },
+      ])
+    )
+    expect(entries[0].gradeDescriptions).toEqual({ G: "hello", S: "world" })
+  })
+
+  it("defaults a JSON row without gradeDescriptions to an empty map (legacy rows)", () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([skill("skills", "a")])
+    )
+    expect(entries[0].gradeDescriptions).toEqual({})
+  })
+
+  it("rejects a JSON row with an invalid gradeDescriptions key", () => {
+    const bad = { ...skill("skills", "a"), gradeDescriptions: { H: "nope" } }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "validation" })
+    )
+  })
+
+  it("rejects a JSON row with a blank gradeDescriptions value", () => {
+    const bad = { ...skill("skills", "a"), gradeDescriptions: { G: "   " } }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "validation" })
+    )
+  })
+
+  it("rejects a JSON row with an oversized gradeDescriptions value", () => {
+    const bad = {
+      ...skill("skills", "a"),
+      gradeDescriptions: { G: "x".repeat(8001) },
+    }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "validation" })
+    )
+  })
 })
 
 // ------------------------------------------------------------------ //
@@ -392,6 +438,63 @@ describe("bulk CSV parsing and validation", () => {
     )
     expect(() => parseBulkEntries("csv", content)).toThrowError(
       expect.objectContaining({ status: 400, code: "validation" })
+    )
+  })
+
+  it("parses an authored gradeDescriptions JSON object cell from CSV and trims values", () => {
+    const content = csvContent([
+      {
+        kind: "skills",
+        stableId: "a",
+        name: "A",
+        config: '{"effects":[],"rarity":"Common"}',
+        gradeDescriptions: '{"G":"  hello  ","S":"world"}',
+      },
+    ])
+    const entries = parseBulkEntries("csv", content)
+    expect(entries[0].gradeDescriptions).toEqual({ G: "hello", S: "world" })
+  })
+
+  it("defaults a CSV row without a gradeDescriptions cell to an empty map (legacy rows)", () => {
+    const content = csvContent([
+      {
+        kind: "skills",
+        stableId: "a",
+        name: "A",
+        config: '{"effects":[],"rarity":"Common"}',
+      },
+    ])
+    const entries = parseBulkEntries("csv", content)
+    expect(entries[0].gradeDescriptions).toEqual({})
+  })
+
+  it("rejects a CSV row with a malformed gradeDescriptions JSON cell", () => {
+    const content = csvContent([
+      {
+        kind: "skills",
+        stableId: "a",
+        name: "A",
+        config: '{"effects":[],"rarity":"Common"}',
+        gradeDescriptions: "{not json",
+      },
+    ])
+    expect(() => parseBulkEntries("csv", content)).toThrowError(
+      /Bulk CSV row 2: gradeDescriptions must be valid JSON/
+    )
+  })
+
+  it("rejects a CSV row whose gradeDescriptions cell is a non-object JSON value", () => {
+    const content = csvContent([
+      {
+        kind: "skills",
+        stableId: "a",
+        name: "A",
+        config: '{"effects":[],"rarity":"Common"}',
+        gradeDescriptions: "42",
+      },
+    ])
+    expect(() => parseBulkEntries("csv", content)).toThrowError(
+      /Bulk CSV row 2: gradeDescriptions must be a JSON object/
     )
   })
 })
@@ -640,5 +743,52 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       /Bulk row 2: unknown field "archived"/
     )
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("apply persists an authored gradeDescriptions map for a created row", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        {
+          ...skill("skills", "gd-skill"),
+          gradeDescriptions: { G: "A grade G blurb" },
+        },
+      ])
+    )
+    await applyBulkImport(entries, "digest")
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "gd-skill"
+    )!
+    expect(row.gradeDescriptions).toEqual({ G: "A grade G blurb" })
+  })
+
+  it("apply stores an empty map for a created row that omitted gradeDescriptions", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([skill("skills", "plain-skill")])
+    )
+    await applyBulkImport(entries, "digest")
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "plain-skill"
+    )!
+    expect(row.gradeDescriptions).toEqual({})
+  })
+
+  it("apply persists gradeDescriptions from a CSV upload", async () => {
+    const content = csvContent([
+      {
+        kind: "skills",
+        stableId: "csv-gd",
+        name: "Csv Gd",
+        config: '{"effects":[],"rarity":"Common"}',
+        gradeDescriptions: '{"B":"A B-grade blurb"}',
+      },
+    ])
+    const entries = parseBulkEntries("csv", content)
+    await applyBulkImport(entries, "digest")
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "csv-gd"
+    )!
+    expect(row.gradeDescriptions).toEqual({ B: "A B-grade blurb" })
   })
 })

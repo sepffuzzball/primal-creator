@@ -1,8 +1,8 @@
 /**
- * Zod schema for the trusted-backup character import document (v3 and v4).
+ * Zod schema for the trusted-backup character import document (v3, v4 and v5).
  *
- * The v4 document is the output of `exportCharacter` (schema
- * `primal-character/4`) plus `skillOffers`. It is a *trusted backup*, NOT
+ * The v5 document is the output of `exportCharacter` (schema
+ * `primal-character/5`) plus `skillOffers`. It is a *trusted backup*, NOT
  * authoritative server-verified state: the `state` is validated against the
  * engine `characterStateSchema`, but `liveState` and `status` are advisory and
  * are recomputed server-side on import. Catalog references (identity race/class/
@@ -10,14 +10,25 @@
  * skill-offer option) are resolved by `kind` + `stableId` to EXISTING catalog
  * definitions - no catalog content is ever auto-created, and a
  * missing/mismatched/archived required definition is rejected with an actionable
- * error.
+ * error. Every v5 equipment association carries the ring `equipmentPosition` so a
+ * Ring-slot character round-trips its two physical ring positions.
  *
- * The v3 document (schema `primal-character/3`) is the previous backup shape.
- * It is still ACCEPTED on import (so existing backups continue to work) but is
- * never generated: v3 carried no inventory quantities and no
- * `legacyUnowned` marker, so an imported v3 backup imports zero stock and marks
- * every equipment association `legacyUnowned: true` (grandfathered - the link
- * predates the inventory-ownership model and stays equipped regardless of stock).
+ * The v4 document (schema `primal-character/4`) adds the `inventory` array and the
+ * `legacyUnowned` equipment marker and is still accepted on import; it carries no
+ * ring position, so a Ring-slot link's position is derived from the CURRENT
+ * catalog slot (legacy `Ring 1`/`Ring 2`) or, when the current slot has been
+ * migrated to the generic `Ring`, from the backup's own
+ * `definition.config.slot` snapshot (a pre-migration catalog still named
+ * `Ring 1`/`Ring 2`), or rejected with an actionable `import_ring_position_required`
+ * when neither provides a position. The `definition.config` snapshot is preserved
+ * on import solely for this recovery - never used as live catalog mechanics.
+ *
+ * The v3 document (schema `primal-character/3`) is the previous backup shape. It
+ * is still ACCEPTED on import (so existing backups continue to work) but is never
+ * generated: v3 carried no inventory quantities and no `legacyUnowned` marker, so
+ * an imported v3 backup imports zero stock and marks every equipment association
+ * `legacyUnowned: true` (grandfathered - the link predates the inventory-ownership
+ * model and stays equipped regardless of stock).
  *
  * The document is strictly bounded so a huge / malformed payload is rejected
  * quickly (the request body itself is capped at 2 MiB before parsing, see the
@@ -29,8 +40,9 @@ import { characterStateSchema } from "@/lib/server/schemas"
 
 export const IMPORT_SCHEMA_V3 = "primal-character/3" as const
 export const IMPORT_SCHEMA_V4 = "primal-character/4" as const
+export const IMPORT_SCHEMA_V5 = "primal-character/5" as const
 /** The current trusted-backup schema (what `exportCharacter` emits). */
-export const IMPORT_SCHEMA = IMPORT_SCHEMA_V4
+export const IMPORT_SCHEMA = IMPORT_SCHEMA_V5
 
 export const IMPORT_RULESET_VERSION = "house-2026-10-12-v1" as const
 
@@ -63,10 +75,22 @@ const identitySchema = z.object({
   profession: stableRefSchema.nullable(),
 })
 
-/** A referenced catalog definition for an association / offer option. */
+/**
+ * A referenced catalog definition for an association / offer option.
+ *
+ * A trusted-backup reference may additionally carry a `config` snapshot of the
+ * definition as it existed at EXPORT time. It is NOT live catalog mechanics: the
+ * CURRENT catalog row always wins for how an imported link behaves. It exists so
+ * a legacy v3/v4 backup whose `definition.config.slot` still names `Ring 1` /
+ * `Ring 2` (an old, pre-migration catalog) can recover a ring position that the
+ * current catalog no longer exposes after its slot was migrated to the single
+ * canonical `Ring`. Optional for backward compatibility - old backups and
+ * non-equipment links omit it.
+ */
 const definitionRefSchema = z.object({
   kind: z.string().min(1),
   stableId: z.string().min(1),
+  config: z.record(z.string(), z.unknown()).optional(),
 })
 
 const ASSOC_KINDS = [
@@ -113,6 +137,29 @@ const nonEquipmentAssociationSchema = z.object({
 })
 const v4AssociationSchema = z.discriminatedUnion("kind", [
   equipmentAssociationSchema,
+  ...NON_EQUIPMENT_KINDS.map((kind) =>
+    nonEquipmentAssociationSchema.extend({ kind: z.literal(kind) })
+  ),
+])
+
+/**
+ * v5 equipment association references. Adds the physical ring position to every
+ * equipment link: `equipmentPosition` is `'Ring 1'`/`'Ring 2'` for a Ring-slot
+ * item, and `null` for any non-ring equipment link (Ring is ONE catalog slot, but
+ * the wearable position is per-link). The field is REQUIRED (a v5 backup is
+ * expected to report it explicitly on every equipment link - `null` for non-ring,
+ * an exact position for a ring) so a missing position is a Zod rejection rather
+ * than a silent guess; `null` is the explicit "not a ring" report. Non-equipment
+ * links carry no position field, mirroring v4.
+ */
+const equipmentAssociationSchemaV5 = z.object({
+  kind: z.literal("equipment"),
+  definition: definitionRefSchema,
+  legacyUnowned: z.boolean(),
+  equipmentPosition: z.enum(["Ring 1", "Ring 2"]).nullable(),
+})
+const v5AssociationSchema = z.discriminatedUnion("kind", [
+  equipmentAssociationSchemaV5,
   ...NON_EQUIPMENT_KINDS.map((kind) =>
     nonEquipmentAssociationSchema.extend({ kind: z.literal(kind) })
   ),
@@ -183,7 +230,7 @@ const v3DocumentSchema = z.object({
 })
 
 /**
- * The current v4 trusted-backup document. Adds the `inventory` array and the
+ * The v4 trusted-backup document. Adds the `inventory` array and the
  * `legacyUnowned` equipment marker so a backup captures both owned stock and the
  * grandfathering status of equipment links, guaranteeing exported characters
  * round-trip (a grandfathered link may import with zero stock).
@@ -196,7 +243,22 @@ const v4DocumentSchema = z.object({
 })
 
 /**
- * The full trusted-backup document: either the current v4 shape or the legacy v3
+ * The current v5 trusted-backup document. Everything v4 carries plus, on every
+ * equipment association, the ring `equipmentPosition` (a per-link physical ring
+ * position for a Ring-slot item, null for non-ring equipment). This is what
+ * `exportCharacter` emits; the importer validates the category-position match
+ * against the CURRENT catalog and preserves the exact position. Non-equipment
+ * associations carry no position field.
+ */
+const v5DocumentSchema = z.object({
+  schema: z.literal(IMPORT_SCHEMA_V5),
+  ...documentBase,
+  associations: z.array(v5AssociationSchema).max(MAX_IMPORT_ASSOCIATIONS),
+  inventory: z.array(inventoryRefSchema).max(MAX_IMPORT_INVENTORY),
+})
+
+/**
+ * The full trusted-backup document: the current v5 shape, or a legacy v4/v3
  * shape. `state` is the only authoritative field used to build the new character;
  * `liveState` / `status` are advisory and are validated loosely (they are ignored
  * on import, status is recomputed). The arrays are bounded so a pathological
@@ -205,6 +267,7 @@ const v4DocumentSchema = z.object({
 export const characterImportDocumentSchema = z.discriminatedUnion("schema", [
   v3DocumentSchema,
   v4DocumentSchema,
+  v5DocumentSchema,
 ])
 
 /** The validated import document type (v3 or v4). */

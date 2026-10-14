@@ -79,6 +79,8 @@ export interface WikiReviewedEntry {
   grade?: Grade | null
   sourceUrl: string
   config: Record<string, unknown>
+  /** Optional grade-specific prose keyed by G..S; omitted means none authored. */
+  gradeDescriptions?: Partial<Record<Grade, string>>
 }
 
 /** A validated manifest entry (grade normalized to `Grade | null`). */
@@ -90,6 +92,7 @@ interface ValidatedEntry {
   grade: Grade | null
   sourceUrl: string
   config: Record<string, unknown>
+  gradeDescriptions: Partial<Record<Grade, string>>
 }
 
 /**
@@ -200,6 +203,7 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     grade: entry.grade ?? null,
     sourceUrl: entry.sourceUrl,
     config: entry.config,
+    gradeDescriptions: entry.gradeDescriptions,
   })
   if (!parsed.success) {
     throw badRequest(
@@ -227,6 +231,7 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     grade: entry.grade ?? null,
     sourceUrl: entry.sourceUrl,
     config,
+    gradeDescriptions: parsed.data.gradeDescriptions ?? {},
   }
 }
 
@@ -302,7 +307,7 @@ export function assertModernConfig(
   if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
     throw badRequest(
       "invalid_config",
-      'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring 1/Ring 2/Weapon, or a documented legacy alias) and a valid "rarity"'
+      'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring/Weapon, or a documented legacy alias) and a valid "rarity"'
     )
   }
 }
@@ -486,6 +491,8 @@ export async function applyWikiReviewedImport(
               sourceUrl: entry.sourceUrl,
               archived: false,
               config: entry.config as Prisma.InputJsonValue,
+              gradeDescriptions:
+                entry.gradeDescriptions as Prisma.InputJsonValue,
               ...(await blessingPatronData(tx, entry)),
             },
           })

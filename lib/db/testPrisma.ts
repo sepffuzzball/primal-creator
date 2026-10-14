@@ -32,6 +32,9 @@ export interface TestCatalogRow {
   grade?: string | null
   sourceUrl?: string | null
   archived?: boolean
+  // Grade-specific prose descriptions keyed by G..S (the DB JSON column). Absent
+  // / null reads back as an empty map.
+  gradeDescriptions?: Record<string, string> | null
   // The resolved patron-god FK for a `blessings` entry (self-FK to another
   // catalog definition). Null for every non-blessing kind.
   patronId?: string | null
@@ -48,6 +51,10 @@ export interface TestAssociationRow {
   // True only for equipment links that predate the inventory-ownership model.
   // New associations default to false.
   legacyUnowned: boolean
+  // The physical ring position for a Ring-slot EQUIPMENT link ("Ring 1"/"Ring 2"),
+  // null for a non-ring equipment link and for a ring link whose position is not
+  // yet resolved.
+  equipmentPosition: string | null
   createdAt: Date
   // Relation, only set on the object returned by findUnique/create.
   definition?: TestCatalogRow | null
@@ -891,6 +898,9 @@ export function createTestPrisma(): TestPrismaInstance {
           grade: (data.grade as string | null) ?? null,
           sourceUrl: (data.sourceUrl as string | null) ?? null,
           archived: (data.archived as boolean) ?? false,
+          gradeDescriptions:
+            (data.gradeDescriptions as Record<string, string> | undefined) ??
+            {},
           patronId: (data.patronId as string | null) ?? null,
           createdAt: now,
           updatedAt: now,
@@ -920,6 +930,12 @@ export function createTestPrisma(): TestPrismaInstance {
           updated.config = data.config as Record<string, unknown>
         if (data.patronId !== undefined)
           updated.patronId = data.patronId as string | null
+        if (data.gradeDescriptions !== undefined) {
+          updated.gradeDescriptions = data.gradeDescriptions as Record<
+            string,
+            string
+          >
+        }
         updated.updatedAt = new Date()
         catalog.set(where.id, updated)
         return updated
@@ -976,6 +992,7 @@ export function createTestPrisma(): TestPrismaInstance {
             | "BLOODLINE"
             | "TRANSCENDENT",
           legacyUnowned: (data.legacyUnowned as boolean) ?? false,
+          equipmentPosition: (data.equipmentPosition as string | null) ?? null,
           createdAt: new Date(),
           definition: catalog.get(data.definitionId as string) ?? null,
         }
@@ -1438,6 +1455,7 @@ export function createTestPrisma(): TestPrismaInstance {
           grade: row.grade ?? null,
           sourceUrl: row.sourceUrl ?? null,
           archived: row.archived ?? false,
+          gradeDescriptions: row.gradeDescriptions ?? {},
           patronId: row.patronId ?? null,
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -1519,6 +1537,7 @@ export function createTestPrisma(): TestPrismaInstance {
           definitionId: row.definitionId,
           kind: row.kind,
           legacyUnowned: row.legacyUnowned ?? false,
+          equipmentPosition: row.equipmentPosition ?? null,
           createdAt: row.createdAt ?? new Date(),
           definition: catalog.get(row.definitionId) ?? null,
         }
