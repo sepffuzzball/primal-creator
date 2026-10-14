@@ -18,7 +18,7 @@ into what is shipped and what is scaffolded but not yet wired to the UI/API.
   races, grades, classes, professions, skills, titles, blessings, bloodlines,
   consumables and evolution. The client never supplies an award; every value is
   derived server-side from the catalog.
-- **Character creation & lifecycle**: create a character through an eight-step
+- **Character creation & lifecycle**: create a character through a seven-step
   questionnaire (name/description, origin, and race/class/profession picked from
   the catalog), advance class/profession, allocate attribute points, evolve the
   race grade, edit name, description and all six narrative profile fields (nickname, pronouns, age description, appearance, biography and notes), archive and restore.
@@ -49,7 +49,10 @@ evolution_choice_required`).
   authenticated, owner-scoped draft (one per user) so work is never lost. A draft
   stores only validated, whitelisted fields (`step`, name/description, origin,
   race/class/profession, an explicit `specialAbilities` selection of catalog ids -
-  at most one blessing, up to 8 bloodlines and up to 8 transcendent skills - plus
+  at most one blessing, at most one bloodline and up to 8 transcendent skills
+  (the `transcendentSkillIds` array is bounded at 8 by the transport/request
+  schema; the effective per-character cap is the admin-configurable
+  `maxTranscendentSkills`, default 3, bounded 0..8) - plus
   a legacy `special` boolean kept read-only (always normalized to `false` from the
   wizard) and an equipment list, plus optional narrative fields), bounded and
   capped at 256KiB - no uploaded binaries and no stat/award/effect fields. Drafts
@@ -66,8 +69,9 @@ evolution_choice_required`).
   and the optional narrative fields are draft-only and never persisted to the
   character as fake powers. Each selected `specialAbilities` id is resolved by its
   catalog kind, required to be unarchived (active) and the right kind, and checked
-  for overlap/collision (one blessing, no two bloodlines sharing a nonempty
-  `upgradeGroup`, distinct transcendents), and the resulting `BLESSING` /
+  for overlap/collision (one blessing, one bloodline, at most
+  `maxTranscendentSkills` transcendent skills, distinct ids with no cross-field
+  overlap), and the resulting `BLESSING` /
   `BLOODLINE` / `TRANSCENDENT` associations are inserted atomically inside the
   same transaction as the character row, the `create` event and the optional draft
   delete - a missing/archived/wrong-kind/duplicate/collision selection rejects the
@@ -165,7 +169,10 @@ evolution_choice_required`).
   and consumable (F3/E5/D15/C45) defaults are NOT hard-coded. They are served from
   a single server-wide `house_rules` row and edited by an admin from the Settings
   page (`GET`/`PATCH /api/admin/rules`, optimistic-concurrency versioned - a stale
-  write 409s and never silently clobbers a concurrent edit). A change takes effect
+  write 409s and never silently clobbers a concurrent edit). The same config also
+  carries `maxTranscendentSkills` (default 3, bounded 0..8) - the maximum number
+  of transcendent skills a character may carry, enforced at create, on
+  association add, and on backup import. A change takes effect
   on the next read or mutation (live status is always re-derived from the current
   config) and never rewrites historically awarded stats or the persisted state;
   the current version is exposed as `rulesetVersion` on character reads. Non-admin
@@ -182,9 +189,12 @@ evolution_choice_required`).
   group never stacks superseded tiers.
 - **Transcendent skills**: transcendents are no longer encyclopedia-only. A
   `transcendent_skills` catalog kind and a `transcendent` character association
-  kind let an owner/admin explicitly link one or more distinct transcendent skills
-  to a character (no automatic reward, no blessing singleton, no `upgradeGroup`
-  replacement). Each entry declares a modern `passiveEffects` list (typed
+  kind let an owner/admin explicitly link distinct transcendent skills to a
+  character (no automatic reward, no blessing singleton, no `upgradeGroup`
+  replacement). A character may carry at most `maxTranscendentSkills` such links
+  (admin-configurable, default 3); an add is rejected (`link_limit`) once the cap
+  is reached and a create/import over the cap is rejected before any write. Each
+  entry declares a modern `passiveEffects` list (typed
   flat/percent with per-effect stacking group + condition, using the shared skill
   effect schema) and optional prose `costDescription` / `acquisitionNotes` that
   are surfaced but never treated as a mechanical cost or triggered power. The
@@ -218,14 +228,17 @@ evolution_choice_required`).
 
 The engine and schema already account for these, but they are not fully wired up:
 
-- **Catalog auto-creation**: the catalog is populated by `db:seed`. A reviewed,
-  version-controlled manifest (`prisma/catalog/wiki-reviewed.ts`) can be applied
-  by an admin as an explicit opt-in (`POST /api/admin/catalog-import`) - see
-  `docs/catalog/wiki-reviewed.md` - and an admin can bulk-upload JSON/CSV content
-  (`POST /api/admin/catalog-import/bulk/preview` and `/bulk/apply`) - see
-  `docs/catalog/bulk-import.md`. Both are explicit opt-ins; nothing auto-creates
-  catalog content at startup or seed. Character backups are imported, but external
-  catalog content is never created implicitly.
+- **Catalog auto-creation**: `db:seed` seeds a curated Jake Thayne catalog
+  (`prisma/catalog/jake-seed.ts`) - the Human race table, Jake's five class and
+  five profession progression definitions, and the fifteen god names. A reviewed,
+  version-controlled manifest (`prisma/catalog/wiki-reviewed.ts`) can additionally
+  be applied by an admin as an explicit opt-in (`POST /api/admin/catalog-import`) -
+  see `docs/catalog/wiki-reviewed.md` - and an admin can bulk-upload JSON/CSV
+  content (`POST /api/admin/catalog-import/bulk/preview` and `/bulk/apply`) - see
+  `docs/catalog/bulk-import.md`. The manifest and bulk upload are explicit opt-ins
+  and are never run by `db:seed` or app startup; nothing auto-creates catalog
+  content at startup. Character backups are imported, but external catalog content
+  is never created implicitly outside the curated seed and the admin opt-ins.
 
 ## Fan project disclaimer & attribution
 
@@ -294,7 +307,7 @@ pnpm build
 
 The authenticated character lifecycle is covered by a Playwright Chromium E2E
 test (`e2e/character-flow.spec.ts`). It logs in through the UI, asserts the
-dashboard starts empty, walks the eight-step questionnaire (born / Human /
+dashboard starts empty, walks the seven-step questionnaire (born / Human /
 Archer / no profession), creates a uniquely-named character, advances the class
 track four quarters, allocates one attribute point, and archives the character.
 
@@ -384,6 +397,12 @@ The app container waits for Postgres to be healthy before starting
 (`depends_on` + healthcheck) and is itself health-checked against
 `/api/health`.
 
+Behind a reverse proxy, set `APP_ORIGIN` to the real public origin (for this
+deployment, `APP_ORIGIN=https://primalcreator.fuzzball.enterprises`) so the
+strict, exact-origin CSRF check accepts the browser's origin; without it sign-in
+writes fail with `403 bad_origin`. The optional `TRUST_PROXY_HEADERS` and
+`APP_BIND_ADDRESS` variants are described in `docs/deployment.md`.
+
 ## Environment variables
 
 | Variable                                              | Required                                                     | Default                                    | Purpose                                                                                                                                                                |
@@ -395,6 +414,9 @@ The app container waits for Postgres to be healthy before starting
 | `CATALOG_PUBLIC`                                      | no                                                           | `false`                                    | Whether catalog reads are public                                                                                                                                       |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `POSTGRES_PASSWORD` required by compose; the others optional | `postgres` / `postgres` / `primal_creator` | Compose Postgres only. The default `postgres` password is a dev-only value; production must set a real one (see `docs/deployment.md`)                                  |
 | `APP_PORT`                                            | no                                                           | `3000`                                     | Host port published by compose                                                                                                                                         |
+| `APP_BIND_ADDRESS`                                    | no                                                           | `0.0.0.0`                                  | Host interface the published port binds to. Set `127.0.0.1` for a same-host reverse proxy (see `docs/deployment.md`)                                                   |
+| `APP_ORIGIN`                                          | no (recommended behind a reverse proxy)                      | unset                                      | Real public browser origin for the strict CSRF same-origin check; the immediate fix for `403 bad_origin` behind a proxy (see `docs/deployment.md`)                     |
+| `TRUST_PROXY_HEADERS`                                 | no                                                           | `false`                                    | Opt-in: rebuild the expected origin from exactly one `X-Forwarded-Proto`/`X-Forwarded-Host` when `APP_ORIGIN` is unset (see `docs/deployment.md`)                      |
 | `DOCKER_TAG`                                          | no                                                           | `latest`                                   | Image tag referenced by compose                                                                                                                                        |
 
 No real credentials are committed. The defaults above are safe development

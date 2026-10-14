@@ -908,6 +908,23 @@ export function createTestPrisma(): TestPrismaInstance {
             }
           }
         }
+        // Enforce the partial-unique bloodline singleton (at most one BLOODLINE
+        // link per character, active or archived) exactly as the migration's
+        // `character_associations_characterId_bloodline_key` index would. The
+        // associateCharacter bloodline-add deletes all old BLOODLINE links first,
+        // so the normal replace flow never false-positives here.
+        if (kind === "BLOODLINE") {
+          const existing = associations.find(
+            (a) => a.characterId === characterId && a.kind === "BLOODLINE"
+          )
+          if (existing) {
+            throw {
+              name: "PrismaClientKnownRequestError",
+              code: "P2002",
+              meta: { target: ["characterId"] },
+            }
+          }
+        }
         const id = (data.id as string) ?? `asc-${++associationCounter}`
         const row: TestAssociationRow = {
           id,

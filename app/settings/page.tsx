@@ -752,6 +752,21 @@ function HouseRulesCard() {
               </div>
             </div>
 
+            <div className="grid gap-3 sm:grid-cols-2">
+              <HouseRuleInput
+                label="Max transcendent skills per character"
+                value={config.maxTranscendentSkills}
+                onChange={(value) =>
+                  setConfig((prev) =>
+                    prev ? { ...prev, maxTranscendentSkills: value } : prev
+                  )
+                }
+                min={0}
+                max={8}
+                hint="Maximum transcendent skills a character may carry (default 3). Enforced on create, association add and backup import."
+              />
+            </div>
+
             <div className="flex items-center justify-between gap-2">
               <div className="text-xs text-muted-foreground">
                 Ruleset version: <span className="font-mono">{version}</span>

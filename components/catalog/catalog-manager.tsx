@@ -740,7 +740,7 @@ export function CatalogManager({ kind }: { kind: string }) {
       )}
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{editing ? "Edit entry" : "New entry"}</DialogTitle>
             <DialogDescription>
@@ -748,88 +748,90 @@ export function CatalogManager({ kind }: { kind: string }) {
               rejected before saving.
             </DialogDescription>
           </DialogHeader>
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cat-name">
-                Name <span className="text-destructive">*</span>
-              </Label>
-              <Input
-                id="cat-name"
-                value={form.name}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, name: e.target.value }))
-                }
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cat-description">Description</Label>
-              <Textarea
-                id="cat-description"
-                value={form.description}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, description: e.target.value }))
-                }
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
+          <div className="min-h-0 overflow-y-auto overscroll-contain pr-1">
+            <div className="flex flex-col gap-3">
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="cat-grade">Grade</Label>
+                <Label htmlFor="cat-name">
+                  Name <span className="text-destructive">*</span>
+                </Label>
                 <Input
-                  id="cat-grade"
-                  value={form.grade}
+                  id="cat-name"
+                  value={form.name}
                   onChange={(e) =>
-                    setForm((f) => ({ ...f, grade: e.target.value }))
+                    setForm((f) => ({ ...f, name: e.target.value }))
                   }
                 />
               </div>
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="cat-provenance">Provenance</Label>
-                <Select
-                  value={form.provenance}
-                  onValueChange={(value) =>
-                    setForm((f) => ({
-                      ...f,
-                      provenance: value ?? f.provenance,
-                    }))
+                <Label htmlFor="cat-description">Description</Label>
+                <Textarea
+                  id="cat-description"
+                  value={form.description}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, description: e.target.value }))
                   }
-                >
-                  <SelectTrigger id="cat-provenance" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PROVENANCE_OPTIONS.map((opt) => (
-                      <SelectItem key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                />
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="cat-grade">Grade</Label>
+                  <Input
+                    id="cat-grade"
+                    value={form.grade}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, grade: e.target.value }))
+                    }
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="cat-provenance">Provenance</Label>
+                  <Select
+                    value={form.provenance}
+                    onValueChange={(value) =>
+                      setForm((f) => ({
+                        ...f,
+                        provenance: value ?? f.provenance,
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="cat-provenance" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PROVENANCE_OPTIONS.map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="cat-source">Source URL</Label>
+                <Input
+                  id="cat-source"
+                  value={form.sourceUrl}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, sourceUrl: e.target.value }))
+                  }
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="cat-config">Config (JSON)</Label>
+                <Textarea
+                  id="cat-config"
+                  className="max-h-[40vh] min-h-28 resize-y font-mono text-[0.6875rem]"
+                  value={form.configText}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, configText: e.target.value }))
+                  }
+                />
+              </div>
+              {formError ? (
+                <Alert variant="destructive">{formError}</Alert>
+              ) : null}
             </div>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cat-source">Source URL</Label>
-              <Input
-                id="cat-source"
-                value={form.sourceUrl}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, sourceUrl: e.target.value }))
-                }
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cat-config">Config (JSON)</Label>
-              <Textarea
-                id="cat-config"
-                className="min-h-28 font-mono text-[0.6875rem]"
-                value={form.configText}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, configText: e.target.value }))
-                }
-              />
-            </div>
-            {formError ? (
-              <Alert variant="destructive">{formError}</Alert>
-            ) : null}
           </div>
           <DialogFooter showCloseButton>
             <Button

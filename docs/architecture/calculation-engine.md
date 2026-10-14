@@ -184,8 +184,11 @@ deliberately **not** authoritative character state. The contract is:
   uploaded binaries and never stores stat vectors, awards or effects - those
   belong to the engine, not the draft. It does not derive any numbers.
   `specialAbilities` carries the explicit blessing `blessingId` and
-  `bloodlineIds`/`transcendentSkillIds` arrays (each at most 8 unique nonempty
-  ids, no id overlap) as resumable state only; the legacy `special` boolean stays
+  `bloodlineIds`/`transcendentSkillIds` arrays (`bloodlineIds` at most 1 unique
+  nonempty id, `transcendentSkillIds` at most 8 unique nonempty ids - the
+  transport/request bound, not the effective cap; the per-character limit is the
+  admin-configurable `maxTranscendentSkills` - no id overlap) as resumable state
+  only; the legacy `special` boolean stays
   readable but has no award semantics - a `special: true` draft never grants a
   power unless an explicit `specialAbilities` selection is submitted at create.
 - **Concurrency.** The draft row carries an optimistic-concurrency `version`.
@@ -220,24 +223,24 @@ deliberately **not** authoritative character state. The contract is:
   `transcendentSkillIds`). When supplied, `createCharacter` resolves each id by
   its corresponding catalog kind (`blessings` / `bloodlines` /
   `transcendent_skills`), requires the definition to be unarchived, enforces the
-  invariants (at most one blessing; no two selected bloodlines sharing the same
-  nonempty `upgradeGroup`; transcendent skills distinct and never
-  duplicate/overlapping), and inserts the `BLESSING` / `BLOODLINE` /
-  `TRANSCENDENT` CharacterAssociations atomically inside the SAME transaction as
-  the character row, the `create` event, and the draft delete. A wrong-kind,
-  archived, missing, duplicate or upgrade-group-collision selection rejects the
-  whole create with a 400 and a stale `draftVersion` rejects with a 409 - either
-  way no character, event, link or draft deletion is committed. The `create`
-  journal records a snapshot and `provenance` of each selected definition. No
-  ability is ever auto-selected and no numeric bonus is fabricated: a link only
-  synthesizes effects declared in the catalog, and the legacy `special` boolean
-  never grants a power on its own.
+  invariants (at most one blessing; at most one bloodline; at most
+  `maxTranscendentSkills` transcendent skills - the admin-configurable HouseRules
+  cap, default 3; no duplicate/overlapping ids), and inserts the `BLESSING` /
+  `BLOODLINE` / `TRANSCENDENT` CharacterAssociations atomically inside the SAME
+  transaction as the character row, the `create` event, and the draft delete. A
+  wrong-kind, archived, missing, duplicate, upgrade-group-collision or over-cap
+  selection rejects the whole create with a 400 and a stale `draftVersion`
+  rejects with a 409 - either way no character, event, link or draft deletion is
+  committed. The `create` journal records a snapshot and `provenance` of each
+  selected definition. No ability is ever auto-selected and no numeric bonus is
+  fabricated: a link only synthesizes effects declared in the catalog, and the
+  legacy `special` boolean never grants a power on its own.
 - **Profile metadata is persisted, not just drafted.** The optional
   `nickname`, `pronouns`, `ageDescription`, `appearance`, `biography`, `notes`
   fields are stored as nullable columns on the final `Character` (each bounded
   by Zod at the API boundary, matching the draft bounds). The `create` journal
-  records only *which* of them were supplied; the `update` journal records only
-  the *changed field names* plus the acting user id, never the long prose - so a
+  records only _which_ of them were supplied; the `update` journal records only
+  the _changed field names_ plus the acting user id, never the long prose - so a
   detailed biography/private note is not duplicated into the journal.
 - **One blessing link per character, enforced at the database layer.** A
   character may hold AT MOST ONE `BLESSING` association (active or archived). A
@@ -247,6 +250,33 @@ deliberately **not** authoritative character state. The contract is:
   but still occupies the single slot until replaced (add a new blessing) or
   removed, and an import backup carrying more than one total blessing link is
   rejected with 400 `import_link_collision` before any write.
+- **At most one bloodline link per character, enforced at the database layer.**
+  A character may hold AT MOST ONE `BLOODLINE` association (active or archived),
+  the same singleton backstop migration 0011 built for blessings. The partial
+  unique index at migration 0012 enforces it; `associateCharacter` runs the add
+  under SERIALIZABLE + CAS and maps a concurrent singleton-race `P2002` to a 409
+  `bloodline_singleton_conflict`. A bloodline add atomically replaces EVERY
+  existing bloodline link (active or archived); an import backup carrying more
+  than one total bloodline link is rejected with 400 `import_link_collision`.
+  Migration 0012 also reconciles pre-existing duplicate bloodline links
+  deterministically (unarchived before archived, newest `createdAt`, then highest
+  link id) and appends a `bloodline_singleton_reconcile` progression event per
+  removed link.
+- **Configurable transcendent-skill cap.** A character may carry at most
+  `maxTranscendentSkills` `TRANSCENDENT` associations (admin-configurable
+  HouseRules field, default 3, bounded 0..8). `associateCharacter` rejects an add
+  with 400 `link_limit` once the count reaches the cap (the count includes
+  archived links, so an over-cap grandfathered character can still remove but not
+  add); a create or import that exceeds the cap is rejected with
+  `link_collision` / `import_link_collision` before any write. Removal is always
+  allowed. Import enforces the CURRENT configured cap rather than a fixed bound:
+  a backup `associations` array may carry up to 8 transcendent refs (the same
+  transport bound as the create/draft payload, and the cap itself is bounded
+  0..8), but the importer rejects any document carrying more transcendent links
+  than the present cap. A backup exported under an older, larger cap (or before
+  the cap was lowered) is still exportable - export never drops a link - but the
+  import rejects with `import_link_collision` until the cap is raised or the
+  surplus links are removed.
 
 ## Trusted-backup character export / import (contract)
 

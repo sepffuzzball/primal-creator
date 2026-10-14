@@ -923,7 +923,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     expect(dbMock.store.associations).toHaveLength(0)
   })
 
-  it("rejects an id selected more than once in a single array (duplicate)", async () => {
+  it("rejects a duplicate bloodline selection as a link_collision (two bloodline slots)", async () => {
     seedCreateBase()
     seedBloodline("blood-1", { effects: [] })
     await expect(
@@ -937,13 +937,13 @@ describe("createCharacter special abilities (atomic selection)", () => {
         },
         user
       )
-    ).rejects.toMatchObject({ status: 400, code: "duplicate" })
+    ).rejects.toMatchObject({ status: 400, code: "link_collision" })
     expect(dbMock.store.characters.size).toBe(0)
     expect(dbMock.store.events).toHaveLength(0)
     expect(dbMock.store.associations).toHaveLength(0)
   })
 
-  it("rejects two selected bloodlines sharing a nonempty upgrade group", async () => {
+  it("rejects selecting two bloodlines (at most one may be linked)", async () => {
     seedCreateBase()
     seedBloodline("blood-1", { effects: [], upgradeGroup: "primal" })
     seedBloodline("blood-2", { effects: [], upgradeGroup: "primal" })
@@ -955,6 +955,30 @@ describe("createCharacter special abilities (atomic selection)", () => {
           raceId: "race-1",
           classId: "cls-1",
           specialAbilities: { bloodlineIds: ["blood-1", "blood-2"] },
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "link_collision" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  it("rejects a create that selects more than the configured transcendent cap", async () => {
+    seedCreateBase()
+    for (let i = 1; i <= 4; i++) {
+      seedTranscendent(`trans-${i}`, { passiveEffects: [] })
+    }
+    await expect(
+      createCharacter(
+        {
+          name: "Kael",
+          origin: "integrated",
+          raceId: "race-1",
+          classId: "cls-1",
+          specialAbilities: {
+            transcendentSkillIds: ["trans-1", "trans-2", "trans-3", "trans-4"],
+          },
         },
         user
       )
@@ -2167,7 +2191,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     expect(res.character.associations).toHaveLength(0)
   })
 
-  it("lets two bloodlines with no upgrade group coexist (they stack as separate effects)", async () => {
+  it("adding a second bloodline replaces the first (at most one bloodline)", async () => {
     seedCharacter({ strength: 100 })
     seedBloodline("blood-1", {
       effects: [{ phase: "flat", amount: { strength: 3 } }],
@@ -2195,15 +2219,17 @@ describe("associateCharacter (blessings / bloodlines)", () => {
       },
       user
     )
+    // The singleton rule means the second bloodline supersedes the first, so only
+    // blood-2 remains linked.
     expect(
       res.character.associations.map((a) => a.definitionId).sort()
-    ).toEqual(["blood-1", "blood-2"])
-    // Both effects apply (flat +3 and +4 on strength).
-    expect(flatDelta(res.character.status, "strength")).toBe(7)
+    ).toEqual(["blood-2"])
+    // Only the surviving bloodline's +4 applies (blood-1's +3 is superseded).
+    expect(flatDelta(res.character.status, "strength")).toBe(4)
     expect(dbMock.store.events).toHaveLength(2)
   })
 
-  it("bloodline add with the same upgradeGroup replaces every bloodline link in that group", async () => {
+  it("bloodline add replaces every existing bloodline link, not just a shared group", async () => {
     seedCharacter({ strength: 100 })
     seedBloodline("blood-1", {
       upgradeGroup: "primal",
@@ -2246,21 +2272,20 @@ describe("associateCharacter (blessings / bloodlines)", () => {
       },
       user
     )
+    // A bloodline add displaces EVERY existing bloodline link (active or archived),
+    // not only those sharing an upgrade group, so blood-1 and blood-3 are removed.
     expect(
       res.character.associations.map((a) => a.definitionId).sort()
-    ).toEqual(["blood-2", "blood-3"])
+    ).toEqual(["blood-2"])
     const event = dbMock.store.events[dbMock.store.events.length - 1]
     const removed = (
       event.payload as {
         removed: Array<{ definitionId: string }>
       }
     ).removed
-    expect(removed.map((r) => r.definitionId)).toEqual(["blood-1"])
-    // The group is NOT an effect stacking group: only the replacing bloodline's
-    // +9 in the "primal" group applies, not blood-1's +3. The surviving
-    // blood-3 has a different (empty) group so it coexists and its +1 also
-    // applies (9 + 1).
-    expect(flatDelta(res.character.status, "strength")).toBe(10)
+    expect(removed.map((r) => r.definitionId)).toEqual(["blood-3"])
+    // Only the replacing bloodline's +9 applies.
+    expect(flatDelta(res.character.status, "strength")).toBe(9)
   })
 
   it("synthesizes typed flat, percent and condition on a blessing, honoring the condition", async () => {
@@ -2645,6 +2670,60 @@ describe("transcendent skills (associations / derived quality / live effects)", 
     // Both distinct skills apply independently.
     expect(flatDelta(after1.character.status, "strength")).toBe(3)
     expect(flatDelta(after1.character.status, "agility")).toBe(2)
+  })
+
+  it("rejects adding a transcendent skill once the configured cap is reached", async () => {
+    seedCharacter()
+    for (const id of ["trans-a", "trans-b", "trans-c", "trans-d"]) {
+      seedTranscendent(id, { passiveEffects: [] })
+    }
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-a",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-b",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "transcendent",
+        definitionId: "trans-c",
+        operation: "add",
+        version: 2,
+      },
+      user
+    )
+    // The cap (default 3) is reached; a fourth add is rejected before any write.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "transcendent",
+          definitionId: "trans-d",
+          operation: "add",
+          version: 3,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "link_limit" })
+    expect(dbMock.store.associations.map((a) => a.definitionId).sort()).toEqual(
+      ["trans-a", "trans-b", "trans-c"]
+    )
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(3)
   })
 
   it("removes an archived linked transcendent (only add is blocked)", async () => {
@@ -5060,6 +5139,33 @@ describe("importCharacter (trusted backup v3)", () => {
     ).toEqual([])
   })
 
+  it("rejects an import carrying more than the configured transcendent cap", async () => {
+    seedRaceClass()
+    for (let i = 1; i <= 4; i++) {
+      addImportCatalog(
+        "transcendent_skills",
+        `trans-${i}`,
+        { passiveEffects: [] },
+        { name: `Transcendent ${i}` }
+      )
+    }
+    const doc = importDoc({
+      associations: [1, 2, 3, 4].map((i) => ({
+        kind: "transcendent",
+        definition: { kind: "transcendent_skills", stableId: `trans-${i}` },
+      })),
+    })
+    // A backup carrying more than the cap (default 3) is rejected before any write.
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "import_link_collision",
+    })
+    // No character, event or link is written.
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
   it("rejects an association whose definition kind does not match a transcendent link kind", async () => {
     seedRaceClass()
     addImportCatalog(
@@ -5176,7 +5282,7 @@ describe("importCharacter (trusted backup v3)", () => {
     })
   })
 
-  it("rejects two active bloodlines sharing an upgrade group on import", async () => {
+  it("rejects two bloodlines on import (at most one bloodline link)", async () => {
     seedRaceClass()
     addImportCatalog(
       "bloodlines",
@@ -5208,7 +5314,7 @@ describe("importCharacter (trusted backup v3)", () => {
     })
   })
 
-  it("ignores archived definitions when checking import collisions for non-blessing kinds", async () => {
+  it("ignores archived definitions when checking import collisions for non-singleton kinds", async () => {
     seedRaceClass()
     // A single blessing (an archived one would still count toward the singleton).
     addImportCatalog(
@@ -5218,16 +5324,16 @@ describe("importCharacter (trusted backup v3)", () => {
       { name: "Bless One" }
     )
     addImportCatalog(
-      "bloodlines",
-      "blood-1",
-      { upgradeGroup: "primal", effects: [] },
-      { name: "Blood One" }
+      "titles",
+      "title-1",
+      { upgradeGroup: "hero", effects: [] },
+      { name: "Title One" }
     )
     addImportCatalog(
-      "bloodlines",
-      "blood-arch",
-      { upgradeGroup: "primal", effects: [] },
-      { name: "Blood Arch", archived: true }
+      "titles",
+      "title-arch",
+      { upgradeGroup: "hero", effects: [] },
+      { name: "Title Arch", archived: true }
     )
     const doc = importDoc({
       associations: [
@@ -5236,15 +5342,17 @@ describe("importCharacter (trusted backup v3)", () => {
           definition: { kind: "blessings", stableId: "bless-1" },
         },
         {
-          kind: "bloodline",
-          definition: { kind: "bloodlines", stableId: "blood-1" },
+          kind: "title",
+          definition: { kind: "titles", stableId: "title-1" },
         },
         {
-          kind: "bloodline",
-          definition: { kind: "bloodlines", stableId: "blood-arch" },
+          kind: "title",
+          definition: { kind: "titles", stableId: "title-arch" },
         },
       ],
     })
+    // The archived title-arch shares the "hero" group with title-1 but is inert,
+    // so it is ignored by the active-only collision check and imports cleanly.
     const result = await importCharacter(doc, user)
     expect(result.associations).toHaveLength(3)
   })

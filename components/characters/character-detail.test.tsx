@@ -291,6 +291,8 @@ let inventoryPosts: Array<{
 let patchPosts: Array<Record<string, unknown>> = []
 /** Thrown when PATCH /api/characters/chr-1 is called (a failed profile save). */
 let profileSaveError: unknown = null
+let creationRulesError: unknown = null
+let maxTranscendentSkills = 3
 let activeCharacter: import("@/lib/api").CharacterDetail = character
 
 /** Build a blessing/bloodline catalog item with documented defaults. */
@@ -403,7 +405,16 @@ function applyAssociation(
       ...(item ? { definitionArchived: item.archived } : {}),
       ...(item?.provenance ? { provenance: item.provenance } : {}),
     })
-    return { ...current, associations: [...current.associations, assoc] }
+    return {
+      ...current,
+      associations: [
+        ...current.associations.filter(
+          (existing) =>
+            !(body.kind === "bloodline" && existing.kind === "bloodline")
+        ),
+        assoc,
+      ],
+    }
   }
   return {
     ...current,
@@ -511,6 +522,8 @@ function setupMock(options?: {
   inventoryError?: unknown
   /** Thrown when PATCH /api/characters/chr-1 is called (a failed profile save). */
   profileSaveError?: unknown
+  creationRulesError?: unknown
+  maxTranscendentSkills?: number
 }) {
   activeCharacter = options?.character ?? character
   associationsError = options?.associationsError ?? null
@@ -521,6 +534,8 @@ function setupMock(options?: {
   consumablesCatalog = options?.consumablesCatalog ?? []
   inventoryError = options?.inventoryError ?? null
   profileSaveError = options?.profileSaveError ?? null
+  creationRulesError = options?.creationRulesError ?? null
+  maxTranscendentSkills = options?.maxTranscendentSkills ?? 3
   inventoryPosts = []
   patchPosts = []
 
@@ -528,6 +543,10 @@ function setupMock(options?: {
   mock.mockReset()
   mock.mockImplementation(async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET"
+    if (url === "/api/rules/creation") {
+      if (creationRulesError) throw creationRulesError
+      return { maxTranscendentSkills }
+    }
     if (url === "/api/characters/chr-1" && method === "GET") {
       return { character: activeCharacter }
     }
@@ -671,6 +690,100 @@ describe("CharacterDetail evolution options error state", () => {
 })
 
 describe("CharacterDetail power associations", () => {
+  it("confirms replacing the sole bloodline and names archived displaced links", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true)
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "old",
+            kind: "bloodline",
+            definitionId: "old",
+            name: "Old active",
+          }),
+          association({
+            id: "old-archived",
+            kind: "bloodline",
+            definitionId: "old-archived",
+            name: "Old archived",
+            definitionArchived: true,
+          }),
+        ],
+      },
+      bloodlines: [catalogItem({ id: "new", name: "New bloodline" })],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Bloodlines" }))
+    const add = screen
+      .getAllByRole("button", { name: "Add" })
+      .find((button) =>
+        button.closest("div")?.textContent?.includes("New bloodline")
+      )
+    fireEvent.click(add!)
+    await flush()
+    expect(confirmSpy).toHaveBeenCalledWith(
+      "New bloodline will replace Old active, Old archived (archived, inert). Continue?"
+    )
+  })
+
+  it("shows the configured transcendent cap and disables Add at capacity", async () => {
+    setupMock({
+      maxTranscendentSkills: 1,
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "linked",
+            kind: "transcendent",
+            definitionId: "linked",
+            name: "Linked skill",
+          }),
+        ],
+      },
+      transcendentSkills: [
+        catalogItem({
+          id: "available",
+          name: "Available skill",
+          kind: "transcendent_skills",
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Transcendent skills" }))
+    expect(screen.getByText("Selected 1 / maximum 1")).toBeTruthy()
+    const attach = screen.getByRole("button", {
+      name: "Attach",
+    }) as HTMLButtonElement
+    expect(attach.disabled).toBe(true)
+  })
+
+  it("surfaces a failed cap load and blocks Add instead of assuming a default", async () => {
+    setupMock({
+      creationRulesError: new Error("rules offline"),
+      transcendentSkills: [
+        catalogItem({
+          id: "available",
+          name: "Available skill",
+          kind: "transcendent_skills",
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Transcendent skills" }))
+    expect(screen.getByText(/rules offline/)).toBeTruthy()
+    expect(
+      (screen.getByRole("button", { name: "Attach" }) as HTMLButtonElement)
+        .disabled
+    ).toBe(true)
+  })
+
   it("Powers tab lists active blessing and bloodline and marks an archived blessing inert", async () => {
     setupMock({
       character: {

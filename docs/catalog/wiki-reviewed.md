@@ -14,11 +14,12 @@ manifest conservatively marks anything derived from it as `inferred` rather than
 asserting it as canon.
 
 That is a choice about this manifest's own entries; it makes no claim about the
-rest of the catalog. Rows seeded earlier (for example, the Human race row, which
-carries `provenance: verified`) have their own provenance, and that is
-independent of this manifest. Because the import never overwrites an existing
-row, a pre-existing row's provenance is never silently rewritten to `inferred`:
-whatever provenance a row was seeded with is preserved.
+rest of the catalog. Rows from other sources (for example, a row created through
+the admin catalog UI, or the curated rows the seed writes) carry their own
+provenance, and that is independent of this manifest. Because the import never
+overwrites an existing row, a pre-existing row's provenance is never rewritten to
+`inferred` by the import itself: whatever provenance a row was seeded with is
+preserved.
 
 There is **no scraping** here. The Fandom wiki returns HTTP 403 to most direct
 page fetches, so the project never fetches a URL at import time. An admin edits
@@ -126,6 +127,20 @@ auto-offered at a milestone.
 
 The values are an inferred reading and are stored as `flat` / `percentBasisPoints`
 so an admin can correct them against the source.
+
+## Relationship to the seeded Jake catalog
+
+The reviewed manifest above is the **admin opt-in** import, not what `db:seed`
+runs. `pnpm db:seed` separately seeds a curated Jake Thayne catalog
+(`prisma/catalog/jake-seed.ts`): the Human race table, Jake's five class
+progression definitions, his five alchemist profession progression definitions,
+and the fifteen god names (each god a metadata-only row with an empty `config`,
+backed by its own wiki page). That seed and this manifest share exactly one
+stableId - the F-grade profession `alchemist-of-the-malefic-viper` - so whichever
+applies first creates the row and the other preserves it: the seed never
+overwrites an existing row, and the import skips existing rows. See
+`docs/rules/races.md`, `docs/rules/classes.md` and `docs/rules/professions.md` for
+the seeded definitions.
 
 ## What is deliberately not asserted
 

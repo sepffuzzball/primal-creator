@@ -269,6 +269,9 @@ function AssociationSheet({
   blessings,
   bloodlines,
   transcendentSkills,
+  maxTranscendentSkills,
+  creationRulesError,
+  onRetryCreationRules,
   loading,
   busy,
   consumeBusy,
@@ -287,6 +290,9 @@ function AssociationSheet({
   blessings: CatalogItem[]
   bloodlines: CatalogItem[]
   transcendentSkills: CatalogItem[]
+  maxTranscendentSkills: number | null
+  creationRulesError: string | null
+  onRetryCreationRules: () => void
   loading: boolean
   busy: boolean
   consumeBusy: boolean
@@ -814,6 +820,32 @@ function AssociationSheet({
             )
           })}
           <TabsContent value="transcendent" className="pt-3">
+            <div className="mb-3 flex flex-col gap-2">
+              <p className="text-xs text-muted-foreground">
+                Selected{" "}
+                {
+                  character.associations.filter(
+                    (a) => a.kind === "transcendent"
+                  ).length
+                }{" "}
+                / maximum {maxTranscendentSkills ?? "unavailable"}
+              </p>
+              {creationRulesError ? (
+                <Alert variant="destructive">
+                  <div className="flex flex-col gap-2">
+                    <span>{creationRulesError}</span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={onRetryCreationRules}
+                    >
+                      Retry rules
+                    </Button>
+                  </div>
+                </Alert>
+              ) : null}
+            </div>
             {loading ? (
               <p className="text-xs text-muted-foreground">
                 Loading transcendent skills...
@@ -890,7 +922,13 @@ function AssociationSheet({
                         <Button
                           variant="outline"
                           size="sm"
-                          disabled={busy}
+                          disabled={
+                            busy ||
+                            maxTranscendentSkills == null ||
+                            character.associations.filter(
+                              (a) => a.kind === "transcendent"
+                            ).length >= maxTranscendentSkills
+                          }
                           onClick={() => onPowerAdd("transcendent", item.id)}
                         >
                           Attach
@@ -975,6 +1013,12 @@ export function CharacterDetail({
   const [transcendentCatalog, setTranscendentCatalog] = React.useState<
     CatalogItem[]
   >([])
+  const [maxTranscendentSkills, setMaxTranscendentSkills] = React.useState<
+    number | null
+  >(null)
+  const [creationRulesError, setCreationRulesError] = React.useState<
+    string | null
+  >(null)
   const [catalogLoading, setCatalogLoading] = React.useState(false)
   const [assocBusy, setAssocBusy] = React.useState(false)
   const [consumeBusy, setConsumeBusy] = React.useState(false)
@@ -1462,8 +1506,30 @@ export function CharacterDetail({
     []
   )
 
+  const loadCreationRules = React.useCallback(async () => {
+    try {
+      const result = await apiFetch<{ maxTranscendentSkills: number }>(
+        "/api/rules/creation"
+      )
+      if (
+        !Number.isInteger(result.maxTranscendentSkills) ||
+        result.maxTranscendentSkills < 0 ||
+        result.maxTranscendentSkills > 8
+      )
+        throw new Error("Invalid transcendent skill maximum.")
+      setMaxTranscendentSkills(result.maxTranscendentSkills)
+      setCreationRulesError(null)
+    } catch (err) {
+      setMaxTranscendentSkills(null)
+      setCreationRulesError(
+        err instanceof Error ? err.message : "Could not load creation rules."
+      )
+    }
+  }, [])
+
   const openAssociations = React.useCallback(() => {
     setAssociationsOpen(true)
+    void loadCreationRules()
     if (titlesCatalog.length === 0) void loadCatalog("titles")
     if (equipmentCatalog.length === 0) void loadCatalog("equipment")
     if (consumablesCatalog.length === 0) void loadCatalog("consumables")
@@ -1479,6 +1545,7 @@ export function CharacterDetail({
     bloodlinesCatalog.length,
     transcendentCatalog.length,
     loadCatalog,
+    loadCreationRules,
   ])
 
   const addAssociation = React.useCallback(
@@ -3366,6 +3433,9 @@ export function CharacterDetail({
         blessings={blessingsCatalog}
         bloodlines={bloodlinesCatalog}
         transcendentSkills={transcendentCatalog}
+        maxTranscendentSkills={maxTranscendentSkills}
+        creationRulesError={creationRulesError}
+        onRetryCreationRules={() => void loadCreationRules()}
         loading={catalogLoading}
         busy={assocBusy}
         consumeBusy={consumeBusy}
@@ -3389,26 +3459,13 @@ export function CharacterDetail({
               void addAssociation(kind, definitionId)
             return
           }
-          const displaced =
-            kind === "blessing"
-              ? character.associations.filter(
-                  (a) => a.kind === kind && a.definitionId !== definitionId
-                )
-              : []
+          const displaced = character.associations.filter(
+            (a) => a.kind === kind && a.definitionId !== definitionId
+          )
           const item = [...blessingsCatalog, ...bloodlinesCatalog].find(
             (entry) => entry.id === definitionId
           )
-          const group = item?.config?.upgradeGroup
-          const replacements =
-            kind === "bloodline" && typeof group === "string"
-              ? character.associations.filter(
-                  (a) =>
-                    a.kind === kind &&
-                    a.definitionId !== definitionId &&
-                    a.upgradeGroup === group
-                )
-              : []
-          const names = [...displaced, ...replacements].map((a) =>
+          const names = displaced.map((a) =>
             a.definitionArchived ? `${a.name} (archived, inert)` : a.name
           )
           if (

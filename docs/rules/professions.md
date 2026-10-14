@@ -56,3 +56,25 @@ per-level config (`grades.F`) for it - the service refuses to create such a
 profession otherwise. Profession evolution is then a catalog-driven per-track
 path choice with **no** grade-only legacy fallback (see
 `docs/rules/evolution.md`).
+
+## Seeded profession definitions (`db:seed`)
+
+`pnpm db:seed` seeds Jake Thayne's five alchemist profession progression
+definitions (`prisma/catalog/jake-seed.ts`), sourced from
+`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Profession`, each labelled
+`provenance: inferred` with exactly one `grades.<grade>` entry:
+
+| Grade | Name | stableId |
+| ----- | ---- | -------- |
+| F | Alchemist of the Malefic Viper | `alchemist-of-the-malefic-viper` |
+| E | Prodigious Alchemist of the Malefic Viper | `prodigious-alchemist-of-the-malefic-viper` |
+| D | Heretic-Chosen Alchemist of the Malefic Viper | `heretic-chosen-alchemist-of-the-malefic-viper-d` |
+| C | Heretic-Chosen Alchemist of the Malefic Viper | `heretic-chosen-alchemist-of-the-malefic-viper-c` |
+| B | Primeval Alchemist of Malefic Origins | `primeval-alchemist-of-malefic-origins` |
+
+The F-grade stableId deliberately matches the reviewed manifest
+(`prisma/catalog/wiki-reviewed.ts`), so if an admin imports the manifest first the
+existing row is preserved. The source documents the same display name at both D
+and C, so those two entries are disambiguated by the `-d` / `-c` stableId
+suffixes. All five are create-only: an existing row is never overwritten and a
+repeated seed is idempotent.

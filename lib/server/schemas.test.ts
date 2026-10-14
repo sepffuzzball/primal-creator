@@ -356,7 +356,7 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
     ).toBe(true)
   })
 
-  it("accepts an explicit selection of a blessing, bloodlines and transcendent skills", () => {
+  it("accepts an explicit selection of a blessing, a bloodline and a transcendent skill", () => {
     const parsed = characterCreateSchema.safeParse({
       name: "Kael",
       origin: "integrated",
@@ -364,7 +364,7 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
       classId: "cls-1",
       specialAbilities: {
         blessingId: "bless-1",
-        bloodlineIds: ["blood-1", "blood-2"],
+        bloodlineIds: ["blood-1"],
         transcendentSkillIds: ["trans-1"],
       },
     })
@@ -377,8 +377,8 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
     )
   })
 
-  it("rejects a bloodline array with more than 8 ids", () => {
-    const ids = Array.from({ length: 9 }, (_, i) => `blood-${i}`)
+  it("rejects a bloodline array with more than 1 id", () => {
+    const ids = Array.from({ length: 2 }, (_, i) => `blood-${i}`)
     expect(
       specialAbilitiesSchema.safeParse({ bloodlineIds: ids }).success
     ).toBe(false)

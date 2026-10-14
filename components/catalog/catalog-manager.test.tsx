@@ -87,8 +87,8 @@ vi.mock("@/components/ui/dialog", () => ({
         <button onClick={() => onOpenChange?.(false)}>Mock close</button>
       </div>
     ) : null,
-  DialogContent: ({ children }: React.ComponentProps<"div">) => (
-    <div>{children}</div>
+  DialogContent: ({ children, ...props }: React.ComponentProps<"div">) => (
+    <div {...props}>{children}</div>
   ),
   DialogDescription: ({ children }: React.ComponentProps<"p">) => (
     <p>{children}</p>
@@ -256,6 +256,19 @@ describe("CatalogManager config omission on edit", () => {
     ) as Record<string, unknown>
     expect(body).toHaveProperty("config")
     expect((body.config as Record<string, unknown>).tier).toBe("Major")
+  })
+
+  it("bounds the edit dialog and keeps the config resizable", async () => {
+    const mock = setupMock()
+    await openEdit("Blessing One", mock)
+    const dialog = screen.getByText("Edit entry").parentElement?.parentElement
+    expect(dialog?.className).toContain("max-h-[calc(100dvh-2rem)]")
+    expect(dialog?.className).toContain("overflow-hidden")
+    const configField = screen.getByLabelText("Config (JSON)")
+    expect(configField.className).toContain("max-h-[40vh]")
+    expect(configField.className).toContain("resize-y")
+    expect(screen.getByText("Save")).toBeTruthy()
+    expect(screen.getByText("Mock close")).toBeTruthy()
   })
 
   it("loads archived entries only after an admin enables Show archived", async () => {

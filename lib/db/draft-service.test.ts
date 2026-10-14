@@ -181,7 +181,7 @@ describe("draft data schema (whitelist / bounds)", () => {
       special: true,
       specialAbilities: {
         blessingId: "bless-1",
-        bloodlineIds: ["blood-1", "blood-2"],
+        bloodlineIds: ["blood-1"],
         transcendentSkillIds: ["trans-1"],
       },
     })
@@ -197,11 +197,11 @@ describe("draft data schema (whitelist / bounds)", () => {
     expect(parsed.success).toBe(true)
   })
 
-  it("rejects a draft whose specialAbilities arrays exceed the 8-id cap", () => {
+  it("rejects a draft whose bloodlineIds exceed the 1-id cap", () => {
     const parsed = draftDataSchema.safeParse({
       step: 4,
       specialAbilities: {
-        bloodlineIds: Array.from({ length: 9 }, (_, i) => `blood-${i}`),
+        bloodlineIds: ["blood-1", "blood-2"],
       },
     })
     expect(parsed.success).toBe(false)

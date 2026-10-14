@@ -43,6 +43,49 @@ describe("houseRulesConfigSchema", () => {
     ).toThrow()
   })
 
+  it("rejects a maxTranscendentSkills below 0", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse({
+        equipmentIndividualCapPercent: 20,
+        equipmentCombinedCapPercent: 15,
+        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
+        maxTranscendentSkills: -1,
+      })
+    ).toThrow()
+  })
+
+  it("rejects a maxTranscendentSkills above 8", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse({
+        equipmentIndividualCapPercent: 20,
+        equipmentCombinedCapPercent: 15,
+        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
+        maxTranscendentSkills: 9,
+      })
+    ).toThrow()
+  })
+
+  it("rejects a non-integer maxTranscendentSkills", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse({
+        equipmentIndividualCapPercent: 20,
+        equipmentCombinedCapPercent: 15,
+        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
+        maxTranscendentSkills: 2.5,
+      })
+    ).toThrow()
+  })
+
+  it("accepts the documented default maxTranscendentSkills", () => {
+    const parsed = houseRulesConfigSchema.parse({
+      equipmentIndividualCapPercent: 20,
+      equipmentCombinedCapPercent: 15,
+      consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
+      maxTranscendentSkills: 3,
+    })
+    expect(parsed.maxTranscendentSkills).toBe(3)
+  })
+
   it("rejects a grade rate above 100000", () => {
     expect(() =>
       houseRulesConfigSchema.parse({

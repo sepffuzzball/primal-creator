@@ -1044,13 +1044,17 @@ type ResolvedSpecialAbilities = {
  *   definition must be unarchived (an archived entry is inert and cannot be
  *   newly linked).
  * - A blessing is limited to one by the single `blessingId` field.
- * - Two selected bloodlines may not share the same nonempty `upgradeGroup`
- *   (group replacement semantics would silently collapse them).
- * - Transcendent skills are distinct; no id may appear in more than one field.
+ * - A character may carry at most ONE bloodline link. Selecting more than one
+ *   bloodline is a `link_collision` (the two no longer coexist; the second is
+ *   rejected so the single-link invariant holds at create).
+ * - Transcendent skills are distinct and limited to `maxTranscendentSkills` (the
+ *   admin-configurable HouseRules cap, default 3). Selecting more than the cap
+ *   is a `link_collision`. No id may appear in more than one field.
  */
 async function resolveSpecialAbilities(
   tx: DbClient,
-  selection: SpecialAbilitiesSelection | undefined
+  selection: SpecialAbilitiesSelection | undefined,
+  maxTranscendentSkills: number
 ): Promise<ResolvedSpecialAbilities> {
   if (!selection) return { associations: [], journal: null }
 
@@ -1119,10 +1123,22 @@ async function resolveSpecialAbilities(
     associations.push({ definitionId: blessing.id, kind: "BLESSING" })
   }
 
-  // Bloodlines - distinct and never sharing a nonempty upgradeGroup.
+  // Bloodlines - at most one per character. Selecting two is a collision: the
+  // second is rejected so the single-link invariant holds (the DB partial unique
+  // index also rejects a concurrent duplicate writer with `bloodline_singleton_conflict`).
+  // The upgradeGroup logic is retained for a single selection so a bloodline that
+  // declares a group is still reported in the journal, but with only one link no
+  // two selections can share a group.
   const bloodlineGroups = new Map<string, string>()
   const bloodlines: Array<Record<string, unknown>> = []
-  for (const id of selection.bloodlineIds ?? []) {
+  const bloodlineIds = selection.bloodlineIds ?? []
+  if (bloodlineIds.length > 1) {
+    throw badRequest(
+      "link_collision",
+      `A character may carry at most one bloodline; selected ${bloodlineIds.length}`
+    )
+  }
+  for (const id of bloodlineIds) {
     const def = await resolve(id, "bloodlines", "Bloodline")
     const config = parseCatalogConfig("bloodlines", def.config)
     const upgradeGroup =
@@ -1147,9 +1163,19 @@ async function resolveSpecialAbilities(
   }
   journal.bloodlines = bloodlines
 
-  // Transcendent skills - distinct, coexisting with no singleton or group rule.
+  // Transcendent skills - distinct and bounded by the admin-configured cap. A
+  // request that selects more than the cap is rejected before any write; the
+  // count reflects the selections on this create only (a new character has no
+  // pre-existing transcendent links).
   const transcendents: Array<Record<string, unknown>> = []
-  for (const id of selection.transcendentSkillIds ?? []) {
+  const transcendentIds = selection.transcendentSkillIds ?? []
+  if (transcendentIds.length > maxTranscendentSkills) {
+    throw badRequest(
+      "link_collision",
+      `A character may carry at most ${maxTranscendentSkills} transcendent skills; selected ${transcendentIds.length}`
+    )
+  }
+  for (const id of transcendentIds) {
     const def = await resolve(id, "transcendent_skills", "Transcendent skill")
     associations.push({ definitionId: def.id, kind: "TRANSCENDENT" })
     transcendents.push(specialAbilitySnapshot(def))
@@ -1293,7 +1319,11 @@ export async function createCharacter(
     // wrong-kind / archived / collision / missing failure rolls back the whole
     // create (no character, no event, no links, no draft deletion). Omitted or
     // empty grants nothing (no inferred power from a legacy `special` bool).
-    const special = await resolveSpecialAbilities(tx, input.specialAbilities)
+    const special = await resolveSpecialAbilities(
+      tx,
+      input.specialAbilities,
+      houseRules.config.maxTranscendentSkills
+    )
 
     const created = await tx.character.create({
       data: {
@@ -3741,14 +3771,16 @@ function labelForKind(
  * - **blessing**: exactly one ACTIVE unarchived blessing may exist at a time, so
  *   an add atomically replaces EVERY existing blessing link on the character
  *   (including archived links), and a remove detaches only the named link.
- * - **bloodline**: bloodlines coexist. An add with NO `upgradeGroup` appends
- *   without displacing anything; an add that DOES declare an `upgradeGroup`
- *   atomically replaces every existing bloodline link sharing that group. The
- *   group is only an add/select replacement group - never an effect stacking
- *   group.
- * - **transcendent**: transcendent skills coexist freely. There is no blessing
- *   singleton and no `upgradeGroup` replacement, so an add simply appends a new
- *   distinct skill link and a remove detaches only the named link.
+ * - **bloodline**: at most ONE bloodline link may exist on a character. An add
+ *   atomically replaces EVERY existing bloodline link on the character (active or
+ *   archived) with the new one - the DB partial unique index enforces the
+ *   singleton, and a concurrent duplicate writer surfaces as a
+ *   `bloodline_singleton_conflict`. A remove detaches only the named link.
+ * - **transcendent**: a character may carry at most `maxTranscendentSkills`
+ *   (admin-configurable, default 3). An add is rejected with `link_limit` once
+ *   the character already holds that many transcendent links (including archived
+ *   ones); transcendent skills otherwise coexist freely, so a remove detaches
+ *   only the named link.
  *
  * A duplicate add is rejected; an archived catalog entry can never be newly
  * attached but an archived linked entry can always be removed. The mutation runs
@@ -3771,6 +3803,9 @@ export async function associateCharacter(
       async (tx) => {
         const row = await assertOwner(tx, id, user)
         const houseRules = await loadHouseRules(tx)
+        // The configured transcendent-skill cap (default 3) is read here, through
+        // the SAME tx, so an add is rejected before any write.
+        const maxTranscendentSkills = houseRules.config.maxTranscendentSkills
 
         const definition = await tx.catalogDefinition.findUnique({
           where: { id: body.definitionId },
@@ -3899,33 +3934,42 @@ export async function associateCharacter(
             }
           }
 
-          // Bloodlines coexist: a new bloodline with NO upgradeGroup is added
-          // without displacing anything. One that DOES declare an upgradeGroup
-          // atomically replaces every existing bloodline link sharing that group
-          // (the group is only an add/select replacement group, never an effect
-          // stacking group).
+          // A character may carry at most one bloodline. Adding one atomically
+          // replaces EVERY existing bloodline link (active or archived) with the
+          // new one - the same "supersede" semantics a blessing uses for its
+          // singleton, so a character never holds two bloodlines.
           if (body.kind === "bloodline") {
-            const upgradeGroup = config.upgradeGroup as string | undefined
-            if (upgradeGroup) {
-              const sameGroupLinks = existing.filter(
-                (l) =>
-                  l.kind === "BLOODLINE" &&
-                  definitionUpgradeGroup(l.definition) === upgradeGroup
-              )
-              for (const link of sameGroupLinks) {
-                displaced.push({
-                  id: link.id,
+            const sameKindLinks = existing.filter((l) => l.kind === "BLOODLINE")
+            for (const link of sameKindLinks) {
+              displaced.push({
+                id: link.id,
+                definitionId: link.definitionId,
+                name: link.definition.name,
+                kind: link.kind,
+              })
+              await tx.characterAssociation.deleteMany({
+                where: {
+                  characterId: id,
                   definitionId: link.definitionId,
-                  name: link.definition.name,
-                  kind: link.kind,
-                })
-                await tx.characterAssociation.deleteMany({
-                  where: {
-                    characterId: id,
-                    definitionId: link.definitionId,
-                  },
-                })
-              }
+                },
+              })
+            }
+          }
+
+          // A character may carry at most `maxTranscendentSkills` transcendent
+          // skills (admin-configurable HouseRules cap, default 3). Adding one when
+          // the count already equals (or exceeds) the cap is rejected before any
+          // write; the count includes archived links so a grandfathered character
+          // that exceeds the cap cannot add yet more, but can still remove.
+          if (body.kind === "transcendent") {
+            const transcendentCount = existing.filter(
+              (l) => l.kind === "TRANSCENDENT"
+            ).length
+            if (transcendentCount >= maxTranscendentSkills) {
+              throw badRequest(
+                "link_limit",
+                `This character already carries ${transcendentCount} transcendent skills (max ${maxTranscendentSkills})`
+              )
             }
           }
 
@@ -4058,11 +4102,11 @@ export async function associateCharacter(
         )
       }
       // A unique-constraint violation is ambiguous across association kinds, so
-      // do NOT assume it is a blessing singleton. Only a BLESSING `add` (the one
-      // operation under a partial-unique index that enforces the single-slot
-      // invariant) is a blessing singleton conflict; the partial index itself is
-      // the other signal. Any OTHER association unique race (e.g. a concurrent
-      // title/equipment/bloodline link already occupying a slot) becomes a
+      // do NOT assume it is a blessing or bloodline singleton. Only a BLESSING or
+      // BLOODLINE `add` (the two operations under a partial-unique index that
+      // enforce the single-link invariant) is a singleton conflict; the partial
+      // index itself is the other signal. Any OTHER association unique race (e.g.
+      // a concurrent title/equipment link already occupying a slot) becomes a
       // generic 409 `association_conflict` the client can retry.
       if (isUniqueViolation(err)) {
         const isBlessingAdd =
@@ -4072,6 +4116,15 @@ export async function associateCharacter(
           throw conflict(
             "blessing_singleton_conflict",
             "A blessing is already attached to this character; add a new blessing to replace it"
+          )
+        }
+        const isBloodlineAdd =
+          body.kind === "bloodline" && body.operation === "add"
+        const bloodlineIndex = isBloodlinePartialIndexViolation(err)
+        if (isBloodlineAdd || bloodlineIndex) {
+          throw conflict(
+            "bloodline_singleton_conflict",
+            "A bloodline is already attached to this character; add a new bloodline to replace it"
           )
         }
         throw conflict(
@@ -4345,6 +4398,12 @@ type ResolveAssocOpts = {
   enforceOwnership: boolean
   /** Resolved owned stock keyed by local catalog definition id (v4 only). */
   ownedStockByDefId: Map<string, number>
+  /**
+   * The admin-configurable transcendent-skill cap (default 3). An imported
+   * document carrying more transcendent links than this is rejected with
+   * `import_link_collision` before any write.
+   */
+  maxTranscendentSkills: number
 }
 
 /**
@@ -4414,6 +4473,30 @@ async function resolveAssociationRefs(
     throw badRequest(
       "import_link_collision",
       `More than one blessing: "${blessingRefs[0].definition.stableId}" and "${blessingRefs[1].definition.stableId}"`
+    )
+  }
+
+  // A character may hold AT MOST ONE bloodline link (active or archived), the
+  // same singleton the partial unique index enforces at write time. Count every
+  // bloodline ref first so a >1 total is always a link collision, never a generic
+  // duplicate-link error (same rationale as the blessing guard above).
+  const bloodlineRefs = assocs.filter((a) => a.kind === "bloodline")
+  if (bloodlineRefs.length > 1) {
+    throw badRequest(
+      "import_link_collision",
+      `More than one bloodline: "${bloodlineRefs[0].definition.stableId}" and "${bloodlineRefs[1].definition.stableId}"`
+    )
+  }
+
+  // A character may import at most `maxTranscendentSkills` transcendent links.
+  // A backup that exceeds the configured cap is rejected before any write; the
+  // imported document is a NEW character, so the count is simply the number of
+  // transcendent refs (no pre-existing links to add to).
+  const transcendentRefs = assocs.filter((a) => a.kind === "transcendent")
+  if (transcendentRefs.length > opts.maxTranscendentSkills) {
+    throw badRequest(
+      "import_link_collision",
+      `Imported character has ${transcendentRefs.length} transcendent skills, but the cap is ${opts.maxTranscendentSkills}`
     )
   }
 
@@ -4491,17 +4574,30 @@ async function resolveAssociationRefs(
  * upgrade group, and more than one active blessing all collide. Archived
  * definitions are inert and never collide. This mirrors the runtime invariant
  * enforced by `associateCharacter` and `assertNoLinkCollision`.
+ *
+ * The bloodline singleton and transcendent cap are counted across ALL references
+ * (active or archived): a character may hold at most one bloodline link and at
+ * most `maxTranscendentSkills` transcendent links, regardless of archive state.
  */
-function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
+function assertAssocCollisions(
+  resolved: ResolvedAssoc[],
+  maxTranscendentSkills: number
+): void {
   const slots = new Map<string, string>()
   const titleGroups = new Map<string, string>()
   const skillGroups = new Map<string, string>()
-  const bloodlineGroups = new Map<string, string>()
   // A character may hold AT MOST ONE total BLESSING link (active OR archived).
   // Count every blessing BEFORE the archived-inert skip so an active+archived
   // pair is rejected: an archived blessing still occupies the single slot until
   // it is replaced or removed. All other kinds keep the archived-inert skip.
   let blessingName: string | null = null
+  // A character may hold AT MOST ONE total BLOODLINE link (active OR archived),
+  // the singleton enforced by the DB partial unique index.
+  let bloodlineName: string | null = null
+  // A character may hold at most `maxTranscendentSkills` transcendent links
+  // (active OR archived); count everything so a grandfathered over-cap character
+  // is still rejected on import.
+  let transcendentCount = 0
   for (const r of resolved) {
     if (r.sourceKind === "blessing") {
       if (blessingName != null) {
@@ -4511,6 +4607,20 @@ function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
         )
       }
       blessingName = r.definition.name
+      continue
+    }
+    if (r.sourceKind === "bloodline") {
+      if (bloodlineName != null) {
+        throw badRequest(
+          "import_link_collision",
+          `More than one bloodline: "${bloodlineName}" and "${r.definition.name}"`
+        )
+      }
+      bloodlineName = r.definition.name
+      continue
+    }
+    if (r.sourceKind === "transcendent") {
+      transcendentCount++
       continue
     }
     if (r.definition.archived) continue
@@ -4554,19 +4664,15 @@ function assertAssocCollisions(resolved: ResolvedAssoc[]): void {
         }
         skillGroups.set(group, r.definition.name)
       }
-    } else if (r.sourceKind === "bloodline") {
-      const group = upgradeGroupForConfig(config)
-      if (group) {
-        const existing = bloodlineGroups.get(group)
-        if (existing) {
-          throw badRequest(
-            "import_link_collision",
-            `Bloodline upgrade group "${group}" is occupied by both "${existing}" and "${r.definition.name}"`
-          )
-        }
-        bloodlineGroups.set(group, r.definition.name)
-      }
     }
+  }
+  // Report the transcendent over-cap BEFORE ending, so a grandfather-exceeding
+  // backup fails the import with an actionable `import_link_collision`.
+  if (transcendentCount > maxTranscendentSkills) {
+    throw badRequest(
+      "import_link_collision",
+      `Imported character has ${transcendentCount} transcendent skills, but the cap is ${maxTranscendentSkills}`
+    )
   }
 }
 
@@ -4975,9 +5081,13 @@ export async function importCharacter(
       {
         enforceOwnership: isV4,
         ownedStockByDefId,
+        maxTranscendentSkills: houseRules.config.maxTranscendentSkills,
       }
     )
-    assertAssocCollisions(resolvedAssocs)
+    assertAssocCollisions(
+      resolvedAssocs,
+      houseRules.config.maxTranscendentSkills
+    )
     const resolvedOffers = await resolveSkillOfferRefs(tx, input.skillOffers)
 
     const serialized = serializeState(state)
@@ -5142,6 +5252,24 @@ function isBlessingPartialIndexViolation(err: unknown): boolean {
     )
   }
   return target === "character_associations_characterId_blessing_key"
+}
+
+/**
+ * Detect a P2002 whose `meta.target` names the BLOODLINE singleton partial unique
+ * index. Even when the caller did not pass kind/bloodline (defensive),
+ * `character_associations_characterId_bloodline_key` is the single-link invariant
+ * index and can only be a bloodline singleton conflict, never a generic one.
+ */
+function isBloodlinePartialIndexViolation(err: unknown): boolean {
+  if (!isUniqueViolation(err)) return false
+  const meta = (err as { meta?: { target?: unknown } }).meta
+  const target = meta?.target
+  if (Array.isArray(target)) {
+    return target.some(
+      (t) => t === "character_associations_characterId_bloodline_key"
+    )
+  }
+  return target === "character_associations_characterId_bloodline_key"
 }
 
 /**

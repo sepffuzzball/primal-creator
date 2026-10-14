@@ -6,9 +6,13 @@
  *      password with bcryptjs. No secrets are committed - the defaults here are
  *      dev placeholders, override via a local env file or the deployment secret
  *      store.
- *   2. Seeds the catalog: the verified Human race (per-grade definitions) and an
- *      F-grade Archer class as a clearly-labeled house placeholder (the wiki does
- *      not document Archer's exact per-level gains).
+ *   2. Seeds the curated Jake Thayne catalog via `seedJakeCatalog`
+ *      (`prisma/catalog/jake-seed.ts`): the Human race table, Jake's five class
+ *      progression definitions, his five alchemist profession progression
+ *      definitions, and the fifteen god names. The two legacy rows seeded by the
+ *      0.0.2 seed (`races/human`, `classes/archer`) are updated only when they
+ *      still match that baseline; the rest are create-only, so an admin-customized
+ *      row is never overwritten and a repeated seed is idempotent.
  *
  * The reviewed wiki-derived manifest (`prisma/catalog/wiki-reviewed.ts`) is NOT
  * imported here - it is an explicit, admin-opt-in operation via
@@ -17,8 +21,9 @@
  * It deliberately creates NO sample characters - characters are user-created.
  */
 
-import { PrismaClient, type CatalogKind, type Provenance } from "@prisma/client"
+import { PrismaClient } from "@prisma/client"
 import bcrypt from "bcryptjs"
+import { seedJakeCatalog } from "./catalog/jake-seed.ts"
 
 const prisma = new PrismaClient()
 
@@ -56,53 +61,6 @@ function validateAdminPassword(password: string): void {
   }
 }
 
-const ATTRIBUTES = [
-  "strength",
-  "agility",
-  "endurance",
-  "vitality",
-  "toughness",
-  "wisdom",
-  "intelligence",
-  "perception",
-  "willpower",
-] as const
-
-function allEqual(value: number): Record<string, number> {
-  const out: Record<string, number> = {}
-  for (const attr of ATTRIBUTES) out[attr] = value
-  return out
-}
-
-async function upsertCatalog(
-  kind: CatalogKind,
-  stableId: string,
-  data: {
-    name: string
-    description?: string | null
-    grade?: string | null
-    provenance: Provenance
-    sourceUrl?: string | null
-    archived?: boolean
-    config: Record<string, unknown>
-  }
-): Promise<void> {
-  const base = {
-    name: data.name,
-    description: data.description ?? null,
-    grade: data.grade ?? null,
-    provenance: data.provenance,
-    sourceUrl: data.sourceUrl ?? null,
-    archived: data.archived ?? false,
-    config: data.config as object,
-  }
-  await prisma.catalogDefinition.upsert({
-    where: { kind_stableId: { kind, stableId } },
-    update: base,
-    create: { kind, stableId, ...base },
-  })
-}
-
 async function main(): Promise<void> {
   // ------------------------------------------------------------------ //
   // Admin bootstrap
@@ -125,50 +83,9 @@ async function main(): Promise<void> {
   }
 
   // ------------------------------------------------------------------ //
-  // Race: Human (verified per-grade definitions)
+  // Jake Thayne catalog
   // ------------------------------------------------------------------ //
-  await upsertCatalog("races", "human", {
-    name: "Human",
-    description:
-      "Balanced/most numerous race. Humans possess both a class and a profession. Per-grade race gains are verified for F/E/D/C/B; G is an explicit house zero (unknown), see config.houseGrades.",
-    grade: "F",
-    provenance: "verified",
-    sourceUrl: "https://the-primal-hunter.fandom.com/wiki/Human",
-    config: {
-      naturalGrade: "F",
-      verifiedGrades: ["F", "E", "D", "C", "B"],
-      // G is not source-confirmed; configured explicitly at zero and labeled house.
-      houseGrades: ["G"],
-      raceDefinitions: {
-        G: { id: "human:G", perLevel: allEqual(0), freePerLevel: 0 },
-        F: { id: "human:F", perLevel: allEqual(1), freePerLevel: 5 },
-        E: { id: "human:E", perLevel: allEqual(2), freePerLevel: 5 },
-        D: { id: "human:D", perLevel: allEqual(6), freePerLevel: 15 },
-        C: { id: "human:C", perLevel: allEqual(18), freePerLevel: 45 },
-        B: { id: "human:B", perLevel: allEqual(54), freePerLevel: 135 },
-      },
-    },
-  })
-
-  // ------------------------------------------------------------------ //
-  // Class: Archer (F-grade starter; house placeholder)
-  // ------------------------------------------------------------------ //
-  await upsertCatalog("classes", "archer", {
-    name: "Archer",
-    description:
-      "F-grade primary class. HOUSE PLACEHOLDER - the wiki does not document Archer's exact per-level stat gains, so config.grades.F is editable. Replace with a sourced value when available.",
-    grade: "F",
-    provenance: "house",
-    sourceUrl: "https://the-primal-hunter.fandom.com/wiki/Classes",
-    config: {
-      grades: {
-        F: {
-          fixed: { agility: 2, perception: 1 },
-          free: 1,
-        },
-      },
-    },
-  })
+  await seedJakeCatalog(prisma)
 }
 
 main()

@@ -145,6 +145,7 @@ describe("api/admin/rules (unit, mocked db)", () => {
       equipmentIndividualCapPercent: 25,
       equipmentCombinedCapPercent: 20,
       consumableGradeRates: { F: 4, E: 6, D: 18, C: 50 },
+      maxTranscendentSkills: 5,
     }
     const res = await PATCH(
       authed(rulesReq("PATCH", { version: 0, config: nextConfig }), token)
@@ -212,6 +213,7 @@ describe("api/admin/rules (unit, mocked db)", () => {
       equipmentIndividualCapPercent: 25,
       equipmentCombinedCapPercent: 20,
       consumableGradeRates: { F: 4, E: 6, D: 18, C: 50 },
+      maxTranscendentSkills: 5,
     }
     const first = await PATCH(
       authed(rulesReq("PATCH", { version: 0, config: firstConfig }), token)
@@ -230,6 +232,7 @@ describe("api/admin/rules (unit, mocked db)", () => {
       equipmentIndividualCapPercent: 30,
       equipmentCombinedCapPercent: 25,
       consumableGradeRates: { F: 5, E: 7, D: 20, C: 55 },
+      maxTranscendentSkills: 6,
     }
     const second = await PATCH(
       authed(

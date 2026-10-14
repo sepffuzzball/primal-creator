@@ -20,6 +20,7 @@ process.env.AUTH_SECRET = "x".repeat(40)
 beforeEach(() => {
   dbMock.store.reset()
   delete process.env.APP_ORIGIN
+  delete process.env.TRUST_PROXY_HEADERS
 })
 
 const BASE_URL = "http://localhost/api/test"
@@ -34,6 +35,23 @@ function req(
   if (origin !== null) headers.origin = origin
   if (cookie) headers.cookie = cookie
   return new Request(url, { method, headers })
+}
+
+function reqFwd(
+  method: string,
+  origin: string | null,
+  forwarded: { proto?: string | null; host?: string | null },
+  url: string = BASE_URL
+): Request {
+  const headers: Record<string, string> = {}
+  if (origin !== null) headers.origin = origin
+  if (forwarded.proto != null) headers["x-forwarded-proto"] = forwarded.proto
+  if (forwarded.host != null) headers["x-forwarded-host"] = forwarded.host
+  return new Request(url, { method, headers })
+}
+
+function enableTrust(): void {
+  process.env.TRUST_PROXY_HEADERS = "true"
 }
 
 function expectSyncError(fn: () => void, status: number, code: string): void {
@@ -94,6 +112,245 @@ describe("assertOrigin", () => {
     ).not.toThrow()
     expectSyncError(
       () => assertOrigin(req("POST", "https://sub.app.example.com")),
+      403,
+      "bad_origin"
+    )
+  })
+})
+
+describe("forwarded proxy trust mode (TRUST_PROXY_HEADERS=true)", () => {
+  it("accepts a same-origin request when the public origin is reconstructed from forwarded headers", () => {
+    enableTrust()
+    expect(() =>
+      assertOrigin(
+        reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+          proto: "https",
+          host: "primalcreator.fuzzball.enterprises",
+        })
+      )
+    ).not.toThrow()
+  })
+
+  it("accepts a bracketed IPv6 forwarded host (with and without a port)", () => {
+    enableTrust()
+    expect(() =>
+      assertOrigin(
+        reqFwd("POST", "http://[2001:db8::1]", {
+          proto: "http",
+          host: "[2001:db8::1]",
+        })
+      )
+    ).not.toThrow()
+    expect(() =>
+      assertOrigin(
+        reqFwd("POST", "http://[2001:db8::1]:8080", {
+          proto: "http",
+          host: "[2001:db8::1]:8080",
+        })
+      )
+    ).not.toThrow()
+  })
+
+  it("ignores forwarded headers when TRUST_PROXY_HEADERS is unset and uses the request URL", () => {
+    // Trust is disabled (default): forwarded headers are ignored entirely, so the
+    // request's own URL origin is what matters.
+    expect(() =>
+      assertOrigin(
+        reqFwd("POST", "http://localhost", {
+          proto: "https",
+          host: "primalcreator.fuzzball.enterprises",
+        })
+      )
+    ).not.toThrow()
+    // The forwarded public origin is NOT the expected one while trust is off.
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+            proto: "https",
+            host: "primalcreator.fuzzball.enterprises",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+  })
+
+  it("prefers APP_ORIGIN over forwarded headers (highest priority)", () => {
+    process.env.APP_ORIGIN = "https://primalcreator.fuzzball.enterprises"
+    enableTrust()
+    // A malicious forwarded pair elsewhere must not override APP_ORIGIN.
+    expect(() =>
+      assertOrigin(
+        reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+          proto: "http",
+          host: "evil.internal",
+        })
+      )
+    ).not.toThrow()
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "http://localhost", {
+            proto: "http",
+            host: "evil.internal",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+  })
+
+  it("fails closed when forwarded headers are missing in trust mode", () => {
+    enableTrust()
+    expectSyncError(
+      () => assertOrigin(reqFwd("POST", "http://localhost", {})),
+      403,
+      "bad_origin"
+    )
+  })
+
+  it("fails closed on whitespace in forwarded headers", () => {
+    enableTrust()
+    // `Headers` trims leading/trailing HTTP whitespace (OWS) from a header value
+    // before `Request` exposes it, so " https" / "host " is normalized to
+    // "https" / "host" and never reaches the guard's whitespace check. Only
+    // whitespace embedded inside the value (which survives normalization) is
+    // observable, so use that to exercise the rejection.
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+            proto: "ht tps",
+            host: "primalcreator.fuzzball.enterprises",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+            proto: "https",
+            host: "primalcreator .fuzzball.enterprises",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+  })
+
+  it("rejects ambiguous comma-separated forwarded values", () => {
+    enableTrust()
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+            proto: "https, http",
+            host: "primalcreator.fuzzball.enterprises",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+            proto: "https",
+            host: "a.example.com, b.example.com",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+  })
+
+  it("rejects malformed forwarded hosts (credentials, path, query, fragment, unbracketed IPv6)", () => {
+    enableTrust()
+    const malformed = [
+      "user:pass@primalcreator.fuzzball.enterprises",
+      "primalcreator.fuzzball.enterprises/path",
+      "primalcreator.fuzzball.enterprises?x=1",
+      "primalcreator.fuzzball.enterprises#frag",
+      "2001:db8::1",
+    ]
+    for (const host of malformed) {
+      expectSyncError(
+        () =>
+          assertOrigin(
+            reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+              proto: "https",
+              host,
+            })
+          ),
+        403,
+        "bad_origin"
+      )
+    }
+  })
+
+  it("rejects invalid forwarded host ports", () => {
+    enableTrust()
+    const invalidPorts = [
+      "primalcreator.fuzzball.enterprises:abc",
+      "primalcreator.fuzzball.enterprises:",
+      "primalcreator.fuzzball.enterprises:70000",
+      "primalcreator.fuzzball.enterprises:65536",
+    ]
+    for (const host of invalidPorts) {
+      expectSyncError(
+        () =>
+          assertOrigin(
+            reqFwd("POST", "https://primalcreator.fuzzball.enterprises", {
+              proto: "https",
+              host,
+            })
+          ),
+        403,
+        "bad_origin"
+      )
+    }
+  })
+
+  it("accepts a forwarded host with a valid non-default port", () => {
+    enableTrust()
+    expect(() =>
+      assertOrigin(
+        reqFwd("POST", "https://primalcreator.fuzzball.enterprises:8443", {
+          proto: "https",
+          host: "primalcreator.fuzzball.enterprises:8443",
+        })
+      )
+    ).not.toThrow()
+  })
+
+  it("rejects a sibling subdomain in trust mode (exact origin, no wildcard)", () => {
+    enableTrust()
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", "https://sub.primalcreator.fuzzball.enterprises", {
+            proto: "https",
+            host: "primalcreator.fuzzball.enterprises",
+          })
+        ),
+      403,
+      "bad_origin"
+    )
+  })
+
+  it("rejects a missing Origin header even in trust mode", () => {
+    enableTrust()
+    expectSyncError(
+      () =>
+        assertOrigin(
+          reqFwd("POST", null, {
+            proto: "https",
+            host: "primalcreator.fuzzball.enterprises",
+          })
+        ),
       403,
       "bad_origin"
     )

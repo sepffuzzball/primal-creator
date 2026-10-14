@@ -82,11 +82,16 @@ The project implements this as:
   readable and metadata-only-PATCHable; only a NEW/CONFIG-CHANGED write requires
   the modern shape.
 - A **character association kind `transcendent`** (DB `TRANSCENDENT`) pointing at
-  a `transcendent_skills` definition. Multiple **distinct** transcendent skills
-  coexist on a character - there is no blessing singleton and no `upgradeGroup`
-  replacement. Adding is an explicit user action (no automatic reward);
-  removing unlinks only the named skill. An archived definition can never be
-  newly attached but an archived linked one can always be removed.
+  a `transcendent_skills` definition. A character may carry at most
+  `maxTranscendentSkills` such links (admin-configurable via HouseRules, default
+  3, bounded 0..8). Adding is an explicit user action (no automatic reward) and is
+  rejected with `link_limit` once the cap is reached (the count includes archived
+  links, so an over-cap grandfathered character can still remove but not add);
+  removing unlinks only the named skill. Transcendent skills otherwise coexist -
+  there is no blessing singleton and no `upgradeGroup` replacement. An archived
+  definition can never be newly attached but an archived linked one can always be
+  removed. Creating a character or importing a backup with more than the cap is
+  rejected (`link_collision` / `import_link_collision`).
 - A **derived `isTranscendent` boolean** on the character detail. Never persisted:
   it is recomputed at read time from whether at least one linked, **unarchived**
   `transcendent_skills` definition exists. Archiving the last active definition

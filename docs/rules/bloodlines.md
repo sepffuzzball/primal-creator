@@ -97,10 +97,12 @@ so catalog edits recalculate live effects and never mutate historical awards.
 Archived bloodlines are inert: a linked but archived definition contributes no
 effect.
 
-Bloodlines coexist: adding a bloodline with no `upgradeGroup` appends without
-displacing anything, and one that declares an `upgradeGroup` atomically replaces
-every existing bloodline link on the character that shares that group. The
-`upgradeGroup` is only an add/select replacement group - it is never an effect
-stacking group. Adding a bloodline that shares a group with a link already on
-the character is not accepted as a duplicate; declaring the group with the new
-add is how it is replaced.
+At most ONE bloodline link may exist on a character (active or archived),
+enforced server-side, by the partial unique index at migration 0012, and across
+create / association / import. Adding a bloodline atomically replaces EVERY
+existing bloodline link on the character (active or archived), so a character
+never holds two bloodlines. Selecting two bloodlines at create is a
+`link_collision`; a concurrent duplicate writer surfaces as a
+`bloodline_singleton_conflict`. A remove detaches only the named link. The
+`upgradeGroup` remains part of the catalog config but is no longer an
+add/select replacement criterion - the singleton is.

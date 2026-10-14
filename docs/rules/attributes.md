@@ -17,7 +17,7 @@
 - Every stat line on the wiki is written as "Stat bonuses per level: +X <Stat>,
   +Y <Stat>, ..., +N Free points."
 
-Examples (source-verified stat lines):
+Example Human stat lines (fan-wiki **inferred**, not source-verified canon):
 
 - Human (G): +1 to all stats, +1 Free Point.
 - Human (F): +1 to all stats, +5 Free Points.
@@ -26,7 +26,12 @@ Examples (source-verified stat lines):
 - Human (C): +18 to all stats, +45 Free Points.
 - Human (B): +54 to all stats, +135 Free Points.
 
-(Source for the Human lines: `https://the-primal-hunter.fandom.com/wiki/Human` and
+The seeded Human row stores these with `inferred` provenance (see
+`prisma/catalog/jake-seed.ts`): the fan wiki never publishes a formal attribute
+table, so the numbers are configurable data, not lore canon. The **G** row is
+inferred in particular - it models the born-into-system overlap grade and is not
+drawn from a verified source table - so it must not be presented as source-verified
+canon. (Sources consulted: `https://the-primal-hunter.fandom.com/wiki/Human` and
 `https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Race`.)
 
 ## Inferred attribute names (wiki-uncertain)

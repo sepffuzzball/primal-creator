@@ -274,15 +274,19 @@ export const adminUserPatchSchema = z
  * Every field is optional so an omitted/empty selection is valid; the server
  * never infers a special ability or auto-selects one. Bounds:
  *   - `blessingId` is a single optional `string | null` (at most one blessing).
- *   - `bloodlineIds` / `transcendentSkillIds` are optional arrays of at most 8
- *     nonempty, unique ids.
+ *   - `bloodlineIds` is an optional array of at most one nonempty id (a
+ *     character may carry at most one bloodline link, enforced server-side and
+ *     by a partial unique index; see docs/rules/bloodlines.md).
+ *   - `transcendentSkillIds` is an optional array of at most 8 nonempty, unique
+ *     ids (the transport-level upper bound; the effective per-character limit is
+ *     the admin-configurable `maxTranscendentSkills` from HouseRules, default 3).
  *   - No id may appear in more than one field (no overlap across kinds), and
  *     each array must itself be internally unique.
  */
 export const specialAbilitiesSchema = z
   .object({
     blessingId: z.string().min(1).nullable().optional(),
-    bloodlineIds: z.array(z.string().min(1)).max(8).optional(),
+    bloodlineIds: z.array(z.string().min(1)).max(1).optional(),
     transcendentSkillIds: z.array(z.string().min(1)).max(8).optional(),
   })
   .superRefine((data, ctx) => {

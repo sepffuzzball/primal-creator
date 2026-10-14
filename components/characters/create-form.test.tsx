@@ -81,7 +81,7 @@ vi.mock("@/components/ui/questionnaire", () => {
       <p>{children}</p>
     ),
     QuestionnaireInput: (props: React.ComponentProps<"input">) => (
-      <input {...props} />
+      <input data-slot="questionnaire-input" {...props} />
     ),
     QuestionnaireItem: div,
     QuestionnaireNext: ({ children }: React.ComponentProps<"button">) => (
@@ -188,6 +188,8 @@ type Options = {
   abilityCatalogError?: unknown
   /** Thrown when ANY base catalog GET (races / classes / professions) is called. */
   baseCatalogError?: unknown
+  rulesError?: unknown
+  maxTranscendentSkills?: number
 }
 
 type CatalogKind =
@@ -256,6 +258,8 @@ let catalog: Record<CatalogKind, CatalogItem[]> = {
 }
 let abilityCatalogError: unknown = null
 let baseCatalogError: unknown = null
+let rulesError: unknown = null
+let maxTranscendentSkills = 3
 
 function setupMock(options: Options) {
   serverDraft = options.serverDraft ?? null
@@ -274,11 +278,17 @@ function setupMock(options: Options) {
   }
   abilityCatalogError = options.abilityCatalogError ?? null
   baseCatalogError = options.baseCatalogError ?? null
+  rulesError = options.rulesError ?? null
+  maxTranscendentSkills = options.maxTranscendentSkills ?? 3
 
   const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
   mock.mockReset()
   mock.mockImplementation(async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET"
+    if (url === "/api/rules/creation") {
+      if (rulesError) throw rulesError
+      return { maxTranscendentSkills }
+    }
     if (url.startsWith("/api/catalog/")) {
       if (ABILITY_CATALOG_URLS.has(url) && abilityCatalogError) {
         throw abilityCatalogError
@@ -915,8 +925,9 @@ describe("CreateCharacterForm special abilities", () => {
       screen.getAllByText(/Select optional catalog entries/).length
     ).toBeGreaterThan(0)
     expect(screen.getAllByText("None").length).toBeGreaterThan(0)
-    expect(screen.getByText("Bloodlines (up to 8)")).toBeTruthy()
-    expect(screen.getByText("Transcendent skills (up to 8)")).toBeTruthy()
+    expect(screen.getByText("Bloodline (choose one)")).toBeTruthy()
+    expect(screen.getByText(/Selected 0 \/ maximum 3/)).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "Blessings" })).toBeTruthy()
   })
 
   it("warns about a legacy special-abilities flag and never submits special=true", async () => {
@@ -1060,6 +1071,9 @@ describe("CreateCharacterForm special abilities", () => {
     await renderForm()
     await flush()
 
+    fireEvent.click(screen.getByText("Keep Bloodline One"))
+    await flush()
+
     fireEvent.submit(screen.getByTestId("questionnaire"))
     await flush()
 
@@ -1067,7 +1081,7 @@ describe("CreateCharacterForm special abilities", () => {
     const post = createPostBodies()[0]
     expect(post.specialAbilities).toEqual({
       blessingId: "bless-1",
-      bloodlineIds: ["blood-1", "blood-2"],
+      bloodlineIds: ["blood-1"],
       transcendentSkillIds: ["trans-1"],
     })
   })
@@ -1145,9 +1159,9 @@ describe("CreateCharacterForm special abilities", () => {
     await renderForm()
     await flush()
 
-    expect(
-      screen.getAllByText(/both occupy upgrade group "g1"/).length
-    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(/multiple bloodlines/i).length).toBeGreaterThan(
+      0
+    )
     const submitBtn = screen.getByText("Create character").closest("button")
     expect(submitBtn?.disabled).toBe(true)
     fireEvent.submit(screen.getByTestId("questionnaire"))
@@ -1193,7 +1207,11 @@ describe("CreateCharacterForm special abilities", () => {
     expect(createCalls).toBe(0)
 
     // Removing the stale id clears the error and unblocks the create.
-    fireEvent.click(orphan)
+    fireEvent.click(
+      screen.getByLabelText("None", {
+        selector: 'input[name="create-bloodline"]',
+      })
+    )
     await flush()
     expect(screen.queryAllByText(/no longer in the catalog/).length).toBe(0)
     const submitBtn2 = screen.getByText("Create character").closest("button")
@@ -1203,8 +1221,8 @@ describe("CreateCharacterForm special abilities", () => {
     expect(createCalls).toBe(1)
   })
 
-  it("disables selection of a 9th bloodline once 8 are selected", async () => {
-    const selected = Array.from({ length: 8 }, (_, i) => `blood-${i}`)
+  it("offers one radio bloodline rather than multiple selections", async () => {
+    const selected = ["blood-0"]
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(
@@ -1231,11 +1249,9 @@ describe("CreateCharacterForm special abilities", () => {
     await renderForm()
     await flush()
 
-    // The 9th (unselected) bloodline is disabled; the selection cannot exceed 8.
     const ninth = screen.getByLabelText(/Bloodline 8/) as HTMLInputElement
-    expect(ninth.checked).toBe(false)
-    expect(ninth.disabled).toBe(true)
-    // The 8 stored selections remain checked.
+    expect(ninth.type).toBe("radio")
+    expect(ninth.disabled).toBe(false)
     expect(
       (screen.getByLabelText(/Bloodline 0/) as HTMLInputElement).checked
     ).toBe(true)
@@ -1297,6 +1313,165 @@ describe("CreateCharacterForm special abilities", () => {
     fireEvent.submit(screen.getByTestId("questionnaire"))
     await flush()
     expect(createCalls).toBe(1)
+  })
+
+  it.each([0, 3, 8])(
+    "uses the configured transcendent maximum %i",
+    async (maximum) => {
+      const selectedIds = Array.from(
+        { length: maximum },
+        (_, i) => `trans-${i}`
+      )
+      window.localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify(
+          localDraft({
+            name: "Cap test",
+            specialAbilities: {
+              blessingId: null,
+              bloodlineIds: [],
+              transcendentSkillIds: selectedIds,
+            },
+          })
+        )
+      )
+      setupMock({
+        serverDraft: null,
+        maxTranscendentSkills: maximum,
+        catalog: {
+          transcendentSkills: Array.from(
+            { length: Math.max(1, maximum + 1) },
+            (_, i) => makeItem(`trans-${i}`, { name: `Transcendent ${i}` })
+          ),
+        },
+      })
+      await renderForm()
+      expect(
+        screen.getByText(`Selected ${maximum} / maximum ${maximum}`)
+      ).toBeTruthy()
+      if (maximum < 8) {
+        const next = screen
+          .getByText(`Transcendent ${maximum}`)
+          .closest("label")!
+          .querySelector("input") as HTMLInputElement
+        expect(next.disabled).toBe(true)
+      }
+    }
+  )
+
+  it("blocks a selected transcendent skill until creation rules load and retries", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Cap test",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: [],
+            transcendentSkillIds: ["trans-1"],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      rulesError: new Error("rules offline"),
+      catalog: {
+        transcendentSkills: [makeItem("trans-1", { name: "Transcendent One" })],
+      },
+    })
+    await renderForm()
+    expect(
+      screen.getAllByText(/Creation rules could not be loaded/).length
+    ).toBeGreaterThan(0)
+    expect(
+      (
+        screen
+          .getByText("Create character")
+          .closest("button") as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(0)
+    rulesError = null
+    fireEvent.click(screen.getByText("Retry rules"))
+    await flush()
+    expect(screen.queryByText(/Creation rules could not be loaded/)).toBeNull()
+    expect(screen.getByText("Create character").closest("button")).toBeTruthy()
+  })
+
+  it("blocks recovered transcendent selections above the configured maximum", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          name: "Over cap",
+          specialAbilities: {
+            blessingId: null,
+            bloodlineIds: [],
+            transcendentSkillIds: ["t1", "t2", "t3", "t4"],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      maxTranscendentSkills: 3,
+      catalog: {
+        transcendentSkills: ["t1", "t2", "t3", "t4"].map((id) => makeItem(id)),
+      },
+    })
+    await renderForm()
+    expect(
+      screen.getAllByText(/exceeds the transcendent maximum of 3/).length
+    ).toBeGreaterThan(0)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(0)
+  })
+
+  it("allows a no-selection create when creation rules are unavailable", async () => {
+    setupMock({ serverDraft: null, rulesError: new Error("rules offline") })
+    await renderForm()
+    expect(screen.getByText("Create character").closest("button")).toBeTruthy()
+    expect(
+      (
+        screen
+          .getByText("Create character")
+          .closest("button") as HTMLButtonElement
+      ).disabled
+    ).toBe(false)
+    fireEvent.submit(screen.getByTestId("questionnaire"))
+    await flush()
+    expect(createCalls).toBe(1)
+  })
+
+  it("resumes legacy equipment and review step indexes at review with seven items", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ step: "equipment", name: "Resume me" }))
+    )
+    setupMock({ serverDraft: null })
+    await renderForm()
+    expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
+      "review"
+    )
+    expect(screen.getByText(/A seven-step questionnaire/)).toBeTruthy()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const put = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/drafts" && (init as RequestInit)?.method === "PUT"
+    )
+    expect(JSON.parse((put![1] as RequestInit).body as string).data.step).toBe(
+      6
+    )
+    cleanup()
+    setupMock({ serverDraft: { data: serverData({ step: 6 }), version: 2 } })
+    await renderForm()
+    expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
+      "review"
+    )
   })
 
   it("proceeds with a legacy special=true draft that selected no abilities", async () => {
@@ -1717,6 +1892,27 @@ describe("CreateCharacterForm profile metadata", () => {
     })
     fillMetadata()
 
+    for (const label of [
+      "Age description (optional)",
+      "Appearance (optional)",
+      "Biography (optional)",
+      "Notes (optional)",
+    ]) {
+      const field = screen.getByLabelText(label)
+      expect(field.tagName).toBe("INPUT")
+      expect((field as HTMLInputElement).value).not.toBe("")
+      expect(field.getAttribute("data-slot")).toBe("questionnaire-input")
+      expect((field as HTMLInputElement).placeholder).toBe(label)
+    }
+    for (const label of ["Nickname", "Pronouns"]) {
+      expect(screen.getByLabelText(label).getAttribute("data-slot")).toBe(
+        "questionnaire-input"
+      )
+    }
+    expect(
+      screen.getByPlaceholderText("Character name").getAttribute("data-slot")
+    ).toBe("questionnaire-input")
+
     // The debounced autosave PUTs the draft with every metadata field VERBATIM.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 900))
@@ -1839,22 +2035,17 @@ describe("CreateCharacterForm profile metadata", () => {
       META.pronouns
     )
     expect(
-      (
-        screen.getByLabelText(
-          "Age description (optional)"
-        ) as HTMLTextAreaElement
-      ).value
+      (screen.getByLabelText("Age description (optional)") as HTMLInputElement)
+        .value
     ).toBe(META.ageDescription)
     expect(
-      (screen.getByLabelText("Appearance (optional)") as HTMLTextAreaElement)
-        .value
+      (screen.getByLabelText("Appearance (optional)") as HTMLInputElement).value
     ).toBe(META.appearance)
     expect(
-      (screen.getByLabelText("Biography (optional)") as HTMLTextAreaElement)
-        .value
+      (screen.getByLabelText("Biography (optional)") as HTMLInputElement).value
     ).toBe(META.biography)
     expect(
-      (screen.getByLabelText("Notes (optional)") as HTMLTextAreaElement).value
+      (screen.getByLabelText("Notes (optional)") as HTMLInputElement).value
     ).toBe(META.notes)
 
     // The chosen device snapshot is now the live draft - the server metadata was

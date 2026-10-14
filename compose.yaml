@@ -26,7 +26,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-3000}:3000"
     environment:
       NODE_ENV: "production"
       HOSTNAME: "0.0.0.0"
@@ -48,8 +48,15 @@ services:
       # Public browser origin for the CSRF same-origin check. Optional: when run
       # behind a reverse proxy, set it to the real browser origin (e.g.
       # "https://app.example.com", HTTPS in production) so the app can reject
-      # cross-origin writes; leave unset for a direct, non-proxied deploy.
+      # cross-origin writes; leave unset for a direct, non-proxied deploy. This is
+      # the highest-priority source and the recommended fix behind a proxy.
       APP_ORIGIN: "${APP_ORIGIN:-}"
+      # Opt-in forwarded-header trust. Only consulted when APP_ORIGIN is unset:
+      # with "true" the expected origin is rebuilt from exactly one
+      # X-Forwarded-Proto (http/https) and exactly one X-Forwarded-Host; the pair
+      # must be unambiguous or the request is rejected (fail closed). With "false"
+      # forwarded headers are ignored and the request's own URL origin is used.
+      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-false}"
     depends_on:
       postgres:
         condition: service_healthy

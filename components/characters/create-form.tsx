@@ -63,7 +63,6 @@ const ITEMS = [
   { name: "class", required: true },
   { name: "profession", required: false },
   { name: "special", required: false },
-  { name: "equipment", required: false },
   { name: "review", required: false },
 ] as const
 
@@ -167,6 +166,8 @@ function normalizeSpecialAbilities(raw: unknown): Draft["specialAbilities"] {
  */
 function normalizeDraft(partial: Partial<Draft>): Draft {
   const merged: Draft = { ...EMPTY_DRAFT, ...partial }
+  if (merged.step === "equipment") merged.step = "review"
+  if (!STEP_NAMES.includes(merged.step)) merged.step = "name"
   merged.specialAbilities = normalizeSpecialAbilities(merged.specialAbilities)
   return merged
 }
@@ -183,6 +184,7 @@ function stepIndexToName(index: number): string {
   if (Number.isInteger(index) && index >= 0 && index < STEP_NAMES.length) {
     return STEP_NAMES[index]
   }
+  if (Number.isInteger(index) && index >= 6) return "review"
   return STEP_NAMES[0]
 }
 
@@ -415,6 +417,9 @@ function specialValidationError(
   const selectedBloodlines = bloodlineIds.map((id) =>
     bloodlines.find((b) => b.id === id)
   )
+  if (bloodlineIds.length > 1) {
+    return "This draft has multiple bloodlines. Select one bloodline again before continuing."
+  }
   for (let i = 0; i < bloodlineIds.length; i++) {
     const id = bloodlineIds[i]
     const def = selectedBloodlines[i]
@@ -473,6 +478,12 @@ export function CreateCharacterForm() {
   // catalogs from loading, so a no-selection draft can still be created, but it
   // MUST block submission once a selection exists (see `specialValidationError`).
   const [abilityCatalogError, setAbilityCatalogError] = React.useState<
+    string | null
+  >(null)
+  const [maxTranscendentSkills, setMaxTranscendentSkills] = React.useState<
+    number | null
+  >(null)
+  const [creationRulesError, setCreationRulesError] = React.useState<
     string | null
   >(null)
   const [submitting, setSubmitting] = React.useState(false)
@@ -622,6 +633,28 @@ export function CreateCharacterForm() {
     }
   }, [])
 
+  const loadCreationRules = React.useCallback(async (): Promise<boolean> => {
+    try {
+      const result = await apiFetch<{ maxTranscendentSkills: number }>(
+        "/api/rules/creation"
+      )
+      if (
+        !Number.isInteger(result.maxTranscendentSkills) ||
+        result.maxTranscendentSkills < 0 ||
+        result.maxTranscendentSkills > 8
+      )
+        throw new Error("Invalid transcendent skill maximum.")
+      setMaxTranscendentSkills(result.maxTranscendentSkills)
+      setCreationRulesError(null)
+      return true
+    } catch (err) {
+      setCreationRulesError(
+        err instanceof Error ? err.message : "Could not load creation rules."
+      )
+      return false
+    }
+  }, [])
+
   React.useEffect(() => {
     let active = true
     async function loadBaseCatalogs() {
@@ -654,11 +687,14 @@ export function CreateCharacterForm() {
     void loadBaseCatalogs()
     // Defer the ability load off the synchronous effect body so no setState runs
     // inline before the awaited catalog fetches resolve.
-    Promise.resolve().then(() => void loadAbilityCatalogs())
+    Promise.resolve().then(() => {
+      void loadAbilityCatalogs()
+      void loadCreationRules()
+    })
     return () => {
       active = false
     }
-  }, [loadAbilityCatalogs])
+  }, [loadAbilityCatalogs, loadCreationRules])
 
   // A recovery copy persisted by a previous session means a local vs server draft
   // choice is still unresolved, so `localRecoverDraft` / `showRecoverLocal` are
@@ -982,12 +1018,16 @@ export function CreateCharacterForm() {
   // bloodline upgrade-group collision). Used to disable the submit button and to
   // abort before flushSave/POST so an invalid selection is never silently
   // dropped. With no selection the error is always null (see the helper).
-  const specialError = specialValidationError(
-    draft,
-    blessings,
-    bloodlines,
-    transcendentSkills
-  )
+  const specialError =
+    specialValidationError(draft, blessings, bloodlines, transcendentSkills) ??
+    (draft.specialAbilities.transcendentSkillIds.length > 0 &&
+    maxTranscendentSkills == null
+      ? "Creation rules could not be loaded. Retry to validate transcendent selections."
+      : maxTranscendentSkills != null &&
+          draft.specialAbilities.transcendentSkillIds.length >
+            maxTranscendentSkills
+        ? `This draft exceeds the transcendent maximum of ${maxTranscendentSkills}. Remove selections before continuing.`
+        : null)
 
   // Stored ids that are no longer in the loaded ability catalog. They are still
   // rendered (checked) so the user can remove them, rather than being invisible
@@ -1122,7 +1162,7 @@ export function CreateCharacterForm() {
       <div>
         <h1 className="font-heading text-lg font-medium">Create a character</h1>
         <p className="text-xs text-muted-foreground">
-          An eight-step questionnaire. Your progress is saved to the server and
+          A seven-step questionnaire. Your progress is saved to the server and
           locally so a refresh will not lose it.
         </p>
       </div>
@@ -1266,30 +1306,30 @@ export function CreateCharacterForm() {
               value={draft.pronouns ?? ""}
               onChange={(e) => setField("pronouns", e.target.value)}
             />
-            <label htmlFor="create-age">Age description (optional)</label>
-            <textarea
-              id="create-age"
+            <QuestionnaireInput
+              aria-label="Age description (optional)"
+              placeholder="Age description (optional)"
               maxLength={4000}
               value={draft.ageDescription ?? ""}
               onChange={(e) => setField("ageDescription", e.target.value)}
             />
-            <label htmlFor="create-appearance">Appearance (optional)</label>
-            <textarea
-              id="create-appearance"
+            <QuestionnaireInput
+              aria-label="Appearance (optional)"
+              placeholder="Appearance (optional)"
               maxLength={8000}
               value={draft.appearance ?? ""}
               onChange={(e) => setField("appearance", e.target.value)}
             />
-            <label htmlFor="create-biography">Biography (optional)</label>
-            <textarea
-              id="create-biography"
+            <QuestionnaireInput
+              aria-label="Biography (optional)"
+              placeholder="Biography (optional)"
               maxLength={8000}
               value={draft.biography ?? ""}
               onChange={(e) => setField("biography", e.target.value)}
             />
-            <label htmlFor="create-notes">Notes (optional)</label>
-            <textarea
-              id="create-notes"
+            <QuestionnaireInput
+              aria-label="Notes (optional)"
+              placeholder="Notes (optional)"
               maxLength={4000}
               value={draft.notes ?? ""}
               onChange={(e) => setField("notes", e.target.value)}
@@ -1469,6 +1509,21 @@ export function CreateCharacterForm() {
             {specialError ? (
               <Alert variant="destructive">{specialError}</Alert>
             ) : null}
+            {creationRulesError ? (
+              <Alert variant="destructive">
+                <div className="flex flex-col gap-2">
+                  <span>{creationRulesError}</span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void loadCreationRules()}
+                  >
+                    Retry rules
+                  </Button>
+                </div>
+              </Alert>
+            ) : null}
             {!blessings || !bloodlines || !transcendentSkills ? (
               <div className="flex flex-col gap-2 text-xs text-muted-foreground">
                 <span>
@@ -1493,55 +1548,130 @@ export function CreateCharacterForm() {
                 and can be navigated past even when the ability catalogs fail (a
                 no-selection draft gains nothing that needs validating). The
                 catalog-loaded blessing choices are kept in the same group. */}
-            <QuestionnaireChoices>
-              <QuestionnaireChoice
-                value=""
-                checked={!draft.specialAbilities.blessingId}
-                onChange={() =>
-                  setDraft((d) => ({
-                    ...d,
-                    specialAbilities: {
-                      ...d.specialAbilities,
-                      blessingId: null,
-                    },
-                  }))
-                }
-              >
-                None
-              </QuestionnaireChoice>
-              {blessings
-                ?.filter(
-                  (x) =>
-                    !x.archived || x.id === draft.specialAbilities.blessingId
-                )
-                .map((x) => (
-                  <QuestionnaireChoice
-                    key={x.id}
-                    value={x.id}
-                    checked={draft.specialAbilities.blessingId === x.id}
+            <section
+              aria-labelledby="create-blessings-heading"
+              className="flex flex-col gap-2 rounded-lg border p-3"
+            >
+              <h4 id="create-blessings-heading" className="text-sm font-medium">
+                Blessings
+              </h4>
+              <QuestionnaireChoices>
+                <QuestionnaireChoice
+                  value=""
+                  checked={!draft.specialAbilities.blessingId}
+                  onChange={() =>
+                    setDraft((d) => ({
+                      ...d,
+                      specialAbilities: {
+                        ...d.specialAbilities,
+                        blessingId: null,
+                      },
+                    }))
+                  }
+                >
+                  None
+                </QuestionnaireChoice>
+                {blessings
+                  ?.filter(
+                    (x) =>
+                      !x.archived || x.id === draft.specialAbilities.blessingId
+                  )
+                  .map((x) => (
+                    <QuestionnaireChoice
+                      key={x.id}
+                      value={x.id}
+                      checked={draft.specialAbilities.blessingId === x.id}
+                      onChange={() =>
+                        setDraft((d) => ({
+                          ...d,
+                          specialAbilities: {
+                            ...d.specialAbilities,
+                            blessingId: x.id,
+                          },
+                        }))
+                      }
+                    >
+                      {x.name}
+                      {x.archived
+                        ? " (Unavailable - re-select required)"
+                        : null}
+                      <QuestionnaireChoiceDescription>
+                        {[x.provenance, x.grade, x.description]
+                          .filter(Boolean)
+                          .join(" - ")}
+                      </QuestionnaireChoiceDescription>
+                    </QuestionnaireChoice>
+                  ))}
+              </QuestionnaireChoices>
+            </section>
+            {blessings && bloodlines && transcendentSkills ? (
+              <>
+                <p className="text-xs font-medium">Bloodline (choose one)</p>
+                <label className="flex gap-2 rounded-md border p-2 text-sm">
+                  <input
+                    type="radio"
+                    name="create-bloodline"
+                    checked={draft.specialAbilities.bloodlineIds.length === 0}
                     onChange={() =>
                       setDraft((d) => ({
                         ...d,
                         specialAbilities: {
                           ...d.specialAbilities,
-                          blessingId: x.id,
+                          bloodlineIds: [],
                         },
                       }))
                     }
-                  >
-                    {x.name}
-                    {x.archived ? " (Unavailable - re-select required)" : null}
-                    <QuestionnaireChoiceDescription>
-                      {[x.provenance, x.grade, x.description]
-                        .filter(Boolean)
-                        .join(" - ")}
-                    </QuestionnaireChoiceDescription>
-                  </QuestionnaireChoice>
-                ))}
-            </QuestionnaireChoices>
-            {blessings && bloodlines && transcendentSkills ? (
-              <>
-                <p className="text-xs font-medium">Bloodlines (up to 8)</p>
+                  />
+                  <span>None</span>
+                </label>
+                {draft.specialAbilities.bloodlineIds.length > 1 ? (
+                  <Alert variant="destructive">
+                    <div className="flex flex-col gap-2">
+                      <span>
+                        This recovered draft has multiple bloodlines. Explicitly
+                        choose one to continue.
+                      </span>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            setDraft((d) => ({
+                              ...d,
+                              specialAbilities: {
+                                ...d.specialAbilities,
+                                bloodlineIds: [],
+                              },
+                            }))
+                          }
+                        >
+                          Choose None
+                        </Button>
+                        {draft.specialAbilities.bloodlineIds.map((id) => (
+                          <Button
+                            key={id}
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              setDraft((d) => ({
+                                ...d,
+                                specialAbilities: {
+                                  ...d.specialAbilities,
+                                  bloodlineIds: [id],
+                                },
+                              }))
+                            }
+                          >
+                            Keep{" "}
+                            {bloodlines.find((b) => b.id === id)?.name ?? id}
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
+                  </Alert>
+                ) : null}
                 {bloodlines
                   .filter(
                     (x) =>
@@ -1566,24 +1696,16 @@ export function CreateCharacterForm() {
                         className="flex gap-2 rounded-md border p-2 text-sm"
                       >
                         <input
-                          type="checkbox"
+                          type="radio"
+                          name="create-bloodline"
                           checked={checked}
-                          disabled={
-                            !checked &&
-                            (conflict ||
-                              draft.specialAbilities.bloodlineIds.length >= 8 ||
-                              x.archived)
-                          }
+                          disabled={x.archived}
                           onChange={(e) =>
                             setDraft((d) => ({
                               ...d,
                               specialAbilities: {
                                 ...d.specialAbilities,
-                                bloodlineIds: e.target.checked
-                                  ? [...d.specialAbilities.bloodlineIds, x.id]
-                                  : d.specialAbilities.bloodlineIds.filter(
-                                      (id) => id !== x.id
-                                    ),
+                                bloodlineIds: e.target.checked ? [x.id] : [],
                               },
                             }))
                           }
@@ -1615,18 +1737,15 @@ export function CreateCharacterForm() {
                     className="flex gap-2 rounded-md border p-2 text-sm"
                   >
                     <input
-                      type="checkbox"
+                      type="radio"
+                      name="create-bloodline"
                       checked={draft.specialAbilities.bloodlineIds.includes(id)}
                       onChange={(e) =>
                         setDraft((d) => ({
                           ...d,
                           specialAbilities: {
                             ...d.specialAbilities,
-                            bloodlineIds: e.target.checked
-                              ? [...d.specialAbilities.bloodlineIds, id]
-                              : d.specialAbilities.bloodlineIds.filter(
-                                  (bid) => bid !== id
-                                ),
+                            bloodlineIds: e.target.checked ? [id] : [],
                           },
                         }))
                       }
@@ -1639,8 +1758,10 @@ export function CreateCharacterForm() {
                     </span>
                   </label>
                 ))}
-                <p className="text-xs font-medium">
-                  Transcendent skills (up to 8)
+                <p className="text-xs font-medium">Transcendent skills</p>
+                <p className="text-xs text-muted-foreground">
+                  Selected {draft.specialAbilities.transcendentSkillIds.length}{" "}
+                  / maximum {maxTranscendentSkills ?? "not loaded"}
                 </p>
                 {transcendentSkills
                   .filter(
@@ -1663,7 +1784,7 @@ export function CreateCharacterForm() {
                             x.id
                           ) &&
                           (draft.specialAbilities.transcendentSkillIds.length >=
-                            8 ||
+                            (maxTranscendentSkills ?? 0) ||
                             x.archived)
                         }
                         onChange={(e) =>
@@ -1730,25 +1851,6 @@ export function CreateCharacterForm() {
                 ))}
               </>
             ) : null}
-          </QuestionnaireItem>
-
-          <QuestionnaireItem name="equipment">
-            <QuestionnaireTitle>Equipment</QuestionnaireTitle>
-            <QuestionnaireDescription>
-              Equipment is configured after the character is created, so nothing
-              is recorded here and no numbers are affected yet.
-            </QuestionnaireDescription>
-            <p className="text-xs text-muted-foreground">
-              Assign equipment on the character page after creation.
-            </p>
-            {/* Same as the special-abilities step: nothing to record, so a
-                default-checked continuation choice registers the step as
-                answered and permits advancing and final submission. */}
-            <QuestionnaireChoices className="hidden">
-              <QuestionnaireChoice value="none" defaultChecked>
-                Continue
-              </QuestionnaireChoice>
-            </QuestionnaireChoices>
           </QuestionnaireItem>
 
           <QuestionnaireItem name="review">
@@ -1836,10 +1938,6 @@ export function CreateCharacterForm() {
                 ]
                   .filter(Boolean)
                   .join(", ") || "None"}
-              </div>
-              <div>
-                <span className="text-muted-foreground">Equipment: </span>
-                Configure after character creation
               </div>
             </div>
             <p className="text-xs text-muted-foreground">

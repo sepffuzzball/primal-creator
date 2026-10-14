@@ -7,7 +7,7 @@ import { test, expect, type Page } from "@playwright/test"
  * playwright.config.ts). It logs in through the UI, asserts the persisted
  * dashboard starts empty because the suite is required to run against a freshly
  * seeded, isolated test database (no active characters, no resumable draft),
- * then walks the official eight-step questionnaire (born / Human / Archer / no
+ * then walks the official seven-step questionnaire (born / Human / Archer / no
  * profession), creates a uniquely-named character, advances the class track
  * four quarters (reaching level 1 and gaining a free point), allocates one
  * attribute point, and archives the character through the confirmation dialog.
@@ -130,6 +130,27 @@ test.describe("character lifecycle", () => {
       "The E2E test DB must start with no resumable draft for the test admin " +
         "(found one). Drop/reseed a fresh isolated test database and re-run."
     ).toBeNull()
+
+    // Creation-rules sanity check: the wizard's creation-rules endpoint must
+    // report a valid, admin-configurable transcendent-skill cap. The seed applies
+    // the default of 3 (migration 0012 + seed), but an admin may have reconfigured
+    // the cap anywhere in 0..8, so running against a reused DB this assertion only
+    // requires an integer inside that bound. The default of 3 is verified by the
+    // ruleset and route unit/PG tests, not here. This is an assertion, not a
+    // mutation: a non-integer or out-of-range cap (or a missing rules row) means
+    // the DB is not freshly migrated/seeded, so fail loudly rather than running
+    // the wizard against a malformed ruleset.
+    const rulesRes = await page.request.get("/api/rules/creation")
+    expect(rulesRes.ok()).toBeTruthy()
+    const rules = (await rulesRes.json()) as { maxTranscendentSkills: number }
+    expect(
+      Number.isInteger(rules.maxTranscendentSkills),
+      "The E2E test DB must be freshly migrated and seeded so the creation-rules " +
+        "endpoint reports an integer maxTranscendentSkills within 0..8 (found " +
+        `${rules.maxTranscendentSkills}).`
+    ).toBeTruthy()
+    expect(rules.maxTranscendentSkills).toBeGreaterThanOrEqual(0)
+    expect(rules.maxTranscendentSkills).toBeLessThanOrEqual(8)
 
     await page.reload()
     await waitForHydrated(page)
@@ -263,7 +284,7 @@ test.describe("character lifecycle", () => {
     const name = `E2E-${Date.now()}`
 
     // ------------------------------------------------------------------ //
-    // Walk the eight-step questionnaire.
+    // Walk the seven-step questionnaire.
     // ------------------------------------------------------------------ //
     await page.getByRole("link", { name: "Create a character" }).click()
     await page.waitForURL(/\/characters\/new$/)
@@ -293,23 +314,21 @@ test.describe("character lifecycle", () => {
     // Step 6 - special abilities. The curated wiki manifest ships a blessing
     // (True Blessing of the Malefic Viper) and a bloodline (Bloodline of the
     // Primal Hunter) but no transcendent skill, so select the blessing +
-    // bloodline and leave the transcendent section unselected.
+    // bloodline and leave the transcendent section unselected. The wizard's
+    // bloodline picker is a single-select radio group (a character may carry at
+    // most one bloodline link), so it is chosen with the same `choose` radio
+    // helper as the race/class/profession steps, never checked as a checkbox.
     await expect(
       page.getByRole("radio", { name: /True Blessing of the Malefic Viper/ })
     ).toBeVisible()
     await choose(page, /True Blessing of the Malefic Viper/)
     await expect(
-      page.getByRole("checkbox", { name: /Bloodline of the Primal Hunter/ })
+      page.getByRole("radio", { name: /Bloodline of the Primal Hunter/ })
     ).toBeVisible()
-    await page
-      .getByRole("checkbox", { name: /Bloodline of the Primal Hunter/ })
-      .check()
+    await choose(page, /Bloodline of the Primal Hunter/)
     await next(page)
 
-    // Step 7 - equipment (nothing to choose).
-    await next(page)
-
-    // Step 8 - review. Confirm and submit. There is no Next button on the
+    // Step 7 - review. Confirm and submit. There is no Next button on the
     // review step - it is replaced by the Submit button - so submit directly.
     await page.getByRole("button", { name: "Create character" }).click()
     // `new` also matches `[^/]+`, so exclude it explicitly: the create page keeps
@@ -422,9 +441,12 @@ test.describe("character lifecycle", () => {
     await expect(page.getByText("Allocated: 1", { exact: true })).toBeVisible()
     // The attribute name cell is `text-transform: capitalize` (CSS) but the DOM
     // text is the lowercase attribute key, so match case-insensitively (the row
-    // textContent is also concatenated without whitespace between cells).
+    // textContent is also concatenated without whitespace between cells). The
+    // sourced Archer F config grants `strength: 1` per level, so advancing the
+    // class track to level 1 leaves Strength at 1 before allocation; the single
+    // allocated free point brings the final value to 2.
     const strengthRow = page.locator("tbody tr").filter({ hasText: "strength" })
-    await expect(strengthRow.locator("td").nth(1)).toHaveText("1")
+    await expect(strengthRow.locator("td").nth(1)).toHaveText("2")
 
     // ------------------------------------------------------------------ //
     // Archive through the confirmation dialog.

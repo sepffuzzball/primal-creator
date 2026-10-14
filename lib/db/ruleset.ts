@@ -32,6 +32,14 @@ export interface HouseRulesConfig {
     D: number
     C: number
   }
+  /**
+   * The maximum number of transcendent skills a character may hold at once
+   * (default 3). Bounded 0..8 - the same upper bound the transport-imposed
+   * `transcendentSkillIds` array has, so a house cap can never exceed what a
+   * create payload can carry. Enforced by the service across creation,
+   * association edits and backup import, never relaxed.
+   */
+  maxTranscendentSkills: number
 }
 
 /**
@@ -51,17 +59,20 @@ export const houseRulesConfigSchema = z
         C: z.number().int().min(0).max(100_000),
       })
       .strict(),
+    maxTranscendentSkills: z.number().int().min(0).max(8),
   })
   .strict()
 
 /**
  * The documented default house config. Matches exactly what migration 0007
- * inserts; kept here for tests and for describing the startup defaults.
+ * inserts (plus the `maxTranscendentSkills` default added by migration 0012);
+ * kept here for tests and for describing the startup defaults.
  */
 export const DEFAULT_HOUSE_RULES_CONFIG: HouseRulesConfig = {
   equipmentIndividualCapPercent: 20,
   equipmentCombinedCapPercent: 15,
   consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
+  maxTranscendentSkills: 3,
 }
 
 /** A loaded (validated) house-rules row. */

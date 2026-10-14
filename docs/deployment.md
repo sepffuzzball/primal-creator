@@ -47,14 +47,32 @@ request handling" contract.
   from `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`.
 - `APP_ORIGIN` is **optional** but strongly recommended behind a reverse proxy.
   It is the real public browser origin (scheme + host + optional port, no path,
-  e.g. `https://app.example.com`, always HTTPS in production). Every
-  cookie-authenticated state-changing (POST/PUT/PATCH/DELETE) API call must carry
-  an `Origin` header that exactly matches `APP_ORIGIN` (or, when it is unset, the
-  request's own origin) - this is the CSRF same-origin defence in
-  `lib/auth/guard.ts`. A mismatch, missing header, or a sibling subdomain is
-  rejected with `403 bad_origin`. Leave it unset only when the app is served
-  directly (no proxy), because in that case the request's URL origin is the real
-  browser origin.
+  always HTTPS in production). Every cookie-authenticated state-changing
+  (POST/PUT/PATCH/DELETE) API call must carry an `Origin` header that exactly
+  matches `APP_ORIGIN` (or, when it is unset, the expected origin described
+  below) - this is the CSRF same-origin defence in `lib/auth/guard.ts`. A
+  mismatch, missing header, or a sibling subdomain is rejected with
+  `403 bad_origin`. `APP_ORIGIN` is the highest-priority source of truth and is
+  _never_ ignored, even if forwarded headers disagree. It is read at runtime, so
+  fixing it never requires an image rebuild - only a container restart. For the
+  canonical deployment set it in the git-ignored local `.env`:
+  ```bash
+  APP_ORIGIN="https://primalcreator.fuzzball.enterprises"
+  ```
+- `TRUST_PROXY_HEADERS` is an **opt-in** alternative to `APP_ORIGIN`, consulted
+  only when `APP_ORIGIN` is unset. With `true` the app rebuilds the expected
+  origin from _exactly one_ `X-Forwarded-Proto` (`https` or `http`) and _exactly
+  one_ `X-Forwarded-Host` (DNS host or bracketed IPv6 with optional valid port).
+  Any ambiguous pair - missing header, comma-separated list, whitespace,
+  userinfo credentials, a path/query/fragment, or an invalid port - **fails
+  closed** with `403 bad_origin` rather than falling back to the un-proxied
+  request URL. With `false` (default) forwarded headers are ignored and the
+  request's own URL origin is used. Use it only when a proxy overwrites BOTH the
+  forwarded proto and host headers _and_ the app port is not reachable otherwise.
+- `APP_BIND_ADDRESS` controls the interface the published container port binds
+  to (default `0.0.0.0`, current behaviour). For a same-host reverse proxy, set
+  `APP_BIND_ADDRESS="127.0.0.1"` so the app port is only reachable through the
+  proxy; for a proxy on a different host, keep `0.0.0.0` and firewall the port.
 
 ### 1.3 Migrate and seed
 
@@ -126,15 +144,70 @@ The app runs as `nextjs` (`uid 1001`) and expects to write uploads under
 The image listens on `HOSTNAME=0.0.0.0:3000`. Put it behind a reverse proxy that
 terminates TLS (e.g. Traefik, Caddy, nginx). The session cookie is set
 `Secure` when `NODE_ENV=production`, so TLS is required for auth cookies to be
-sent in production.
+sent in production. The app is a standard next-server with no CORS `Access-
+Control-Allow-Origin: *` wildcard - it enforces a strict, exact same-origin CSRF
+check, so the proxy must present the real browser origin to the browser, not
+its own host.
 
-When the app is behind a reverse proxy, set `APP_ORIGIN` to the real, public
-browser origin (always HTTPS in production). Without it the CSRF same-origin
-check in `lib/auth/guard.ts` compares `Origin` against the request's own origin,
-which behind a proxy is the proxy's origin (for example
-`http://proxy.internal:3000`), not the browser origin, so legitimate browser
-writes would be rejected with `403 bad_origin`. Keep it unset only for a direct,
-non-proxied deployment.
+**The immediate fix for sign-in being rejected (`403 bad_origin`) behind a
+proxy is to set `APP_ORIGIN`.** The app never rebuilds the image to pick up an
+environment change - `APP_ORIGIN`, `TRUST_PROXY_HEADERS` and `APP_BIND_ADDRESS`
+are read at runtime, so you only recreate the container. In the git-ignored
+local `.env` (never commit secrets) set:
+
+```bash
+# .env (local, git-ignored)
+APP_ORIGIN="https://primalcreator.fuzzball.enterprises"
+```
+
+Then restart the app service (the service name is `app` in `compose.yaml`;
+
+no rebuild needed):
+
+```bash
+docker compose up -d --force-recreate app
+```
+
+Without `APP_ORIGIN`, the CSRF same-origin check in `lib/auth/guard.ts` compares
+`Origin` against the request's own origin, which behind a proxy is the proxy's
+origin (for example `http://proxy.internal:3000`), not the browser origin, so
+legitimate browser writes would be rejected with `403 bad_origin`. Keep it unset
+only for a direct, non-proxied deployment.
+
+**Alternative opt-in `TRUST_PROXY_HEADERS`.** Use this only when (a) the reverse
+proxy is guaranteed to _overwrite both_ `X-Forwarded-Proto` and
+`X-Forwarded-Host` headers on every request (so the app never sees a
+stale/absent pair), and (b) the app port is not reachable from the browser (so
+a direct hit could never present a mismatched origin). With `true` the app
+rebuilds the expected origin from exactly one forwarded proto (`https`/`http`)
+and one forwarded host; an ambiguous pair fails closed with `403 bad_origin`
+rather than silently falling back. Note that outer whitespace (OWS) around a
+header value - e.g. a proxy emitting `X-Forwarded-Proto: " https"` - is trimmed
+by the web header layer before the check, so only whitespace _inside_ the value
+is rejected; still, always overwrite (never append to) both forwarded headers on
+every request. This is a workaround, not the default - the recommended,
+always-correct setting is a fixed `APP_ORIGIN`. When disabling trust mode again,
+set it back to `false` (the default) and restore the plain `req.url` fallback.
+
+A generic nginx TLS-terminating proxy location (adjust the `upstream`/ports for
+your setup) that forwards the headers trust mode depends on and keeps the
+public host the browser sees:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Note the `Host` header the proxy forwards matters only when trust mode is on (it
+is ignored otherwise). If the app publishes a non-standard port, ensure that
+`X-Forwarded-Host` carries the port (e.g. `app.example.com:8443`) when you need
+it to match the browser origin. For a same-host proxy, set
+`APP_BIND_ADDRESS="127.0.0.1"` so the app port is only reachable through the
+proxy; for a proxy on another host, keep `0.0.0.0` and rely on the firewall.
 
 ### 4.3 Scaling
 

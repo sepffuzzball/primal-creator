@@ -126,6 +126,12 @@ export interface AdminHouseRulesConfig {
     D: number
     C: number
   }
+  /**
+   * The maximum number of transcendent skills a single character may carry,
+   * configured by an admin (default 3, bounded 0..8). Enforced at create, on
+   * association add, and on backup import - not just in the UI.
+   */
+  maxTranscendentSkills: number
 }
 
 /** GET /api/admin/rules - current validated house rules plus the CAS version. */

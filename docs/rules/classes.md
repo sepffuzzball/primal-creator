@@ -59,3 +59,25 @@ a `stableId:F` definition, so the catalog must define an `F`-grade per-level
 config (`grades.F`) for it - the service refuses to create such a class
 otherwise. Class evolution is then a catalog-driven per-track path choice with
 **no** grade-only legacy fallback (see `docs/rules/evolution.md`).
+
+## Seeded class definitions (`db:seed`)
+
+`pnpm db:seed` seeds the curated Jake Thayne class progression
+(`prisma/catalog/jake-seed.ts`), sourced from
+`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Class`. Every row is
+labelled `provenance: inferred` (secondary fan-wiki source) and carries exactly
+one `grades.<grade>` entry for its own grade:
+
+| Grade | Name | stableId |
+| ----- | ---- | -------- |
+| F | Archer | `archer` |
+| E | Ambitious Hunter | `ambitious-hunter` |
+| D | Avaricious Arcane Hunter | `avaricious-arcane-hunter` |
+| C | Arcane Hunter of Horizon's Edge | `arcane-hunter-of-horizons-edge` |
+| B | Arcane Hunter of the Boundless Horizon | `arcane-hunter-of-the-boundless-horizon` |
+
+The legacy `classes/archer` row (a house placeholder granting only agility +
+perception) is updated to the sourced F-grade Archer values only when it still
+matches the 0.0.2 baseline; an admin-modified row is preserved. The E/D/C/B
+definitions are create-only, so a repeated seed is idempotent and never
+overwrites an admin-customized row.
