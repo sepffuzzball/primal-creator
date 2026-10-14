@@ -30,7 +30,6 @@ export interface TestCatalogRow {
   config: Record<string, unknown>
   description?: string | null
   grade?: string | null
-  provenance?: string
   sourceUrl?: string | null
   archived?: boolean
   // The resolved patron-god FK for a `blessings` entry (self-FK to another
@@ -890,7 +889,6 @@ export function createTestPrisma(): TestPrismaInstance {
           config: (data.config ?? {}) as Record<string, unknown>,
           description: (data.description as string | null) ?? null,
           grade: (data.grade as string | null) ?? null,
-          provenance: (data.provenance as string) ?? "house",
           sourceUrl: (data.sourceUrl as string | null) ?? null,
           archived: (data.archived as boolean) ?? false,
           patronId: (data.patronId as string | null) ?? null,
@@ -915,8 +913,6 @@ export function createTestPrisma(): TestPrismaInstance {
         if (data.description !== undefined)
           updated.description = data.description as string | null
         if (data.grade != null) updated.grade = data.grade as string | null
-        if (data.provenance != null)
-          updated.provenance = data.provenance as string
         if (data.sourceUrl != null)
           updated.sourceUrl = data.sourceUrl as string | null
         if (data.archived != null) updated.archived = data.archived as boolean
@@ -1440,7 +1436,6 @@ export function createTestPrisma(): TestPrismaInstance {
           config: row.config ?? {},
           description: row.description ?? null,
           grade: row.grade ?? null,
-          provenance: row.provenance ?? "house",
           sourceUrl: row.sourceUrl ?? null,
           archived: row.archived ?? false,
           patronId: row.patronId ?? null,

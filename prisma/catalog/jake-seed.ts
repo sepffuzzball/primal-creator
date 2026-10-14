@@ -9,10 +9,9 @@
  * `docs/rules/{races,classes,professions}.md`.
  *
  * Provenance policy:
- *   - Every entry is `inferred`, not `verified`: the source is the fan-maintained
+ *   - The seed carries no provenance taxonomy: the source is the fan-maintained
  *     The Primal Hunter Wiki (Fandom) - a secondary source - so nothing here is
- *     asserted as canon. (The reviewed import manifest deliberately uses the same
- *     label; this module follows the same policy.)
+ *     asserted as canon, and no verified/inferred/house label is stored.
  *   - The gods list (name + category) is sourced from the Gods page
  *     `https://the-primal-hunter.fandom.com/wiki/Gods`; each individual sourceUrl
  *     points at the god's own wiki page. God config is left as `{}` - a god
@@ -32,7 +31,7 @@
  *     repeated seed is idempotent.
  *   - The two legacy rows, Human (`races/human`) and Archer (`classes/archer`), are
  *     updated ONLY when every seed-owned field still equals the 0.0.2 baseline
- *     captured in the old `prisma/seed.ts` (name, description, grade, provenance,
+ *     captured in the old `prisma/seed.ts` (name, description, grade,
  *     sourceUrl, archived, config - never timestamps). The find-and-update runs in
  *     a SERIALIZABLE transaction, so a concurrent admin edit that commits between
  *     the seed's read and write cannot be invisibly clobbered: the loser aborts
@@ -46,12 +45,7 @@
  *     first, the existing row is preserved; otherwise it is created.
  */
 
-import {
-  Prisma,
-  PrismaClient,
-  type CatalogKind,
-  type Provenance,
-} from "@prisma/client"
+import { Prisma, PrismaClient, type CatalogKind } from "@prisma/client"
 
 /** A single curated catalog entry the seed applies. */
 export interface JakeCatalogEntry {
@@ -60,7 +54,6 @@ export interface JakeCatalogEntry {
   name: string
   description: string
   grade: string | null
-  provenance: "inferred"
   sourceUrl: string
   config: Record<string, unknown>
 }
@@ -106,7 +99,6 @@ export const LEGACY_HUMAN_BASELINE = {
   description:
     "Balanced/most numerous race. Humans possess both a class and a profession. Per-grade race gains are verified for F/E/D/C/B; G is an explicit house zero (unknown), see config.houseGrades.",
   grade: "F",
-  provenance: "verified" as Provenance,
   sourceUrl: "https://the-primal-hunter.fandom.com/wiki/Human",
   archived: false,
   config: {
@@ -138,7 +130,6 @@ export const LEGACY_HUMAN_BASELINE_V3 = {
   description:
     "Balanced/most numerous race. Humans possess both a class and a profession. Per-grade race gains are documented for G/F/E/D/C/B; see config.raceDefinitions.",
   grade: "F",
-  provenance: "inferred" as Provenance,
   sourceUrl: JAKE_RACE_URL,
   archived: false,
   config: {
@@ -167,7 +158,6 @@ export const HUMAN_ENTRY: JakeCatalogEntry = {
   description:
     "Balanced/most numerous race. Humans possess both a class and a profession. Per-grade race gains are documented for G/F/E/D/C/B; see config.raceDefinitions.",
   grade: "F",
-  provenance: "inferred",
   sourceUrl: JAKE_RACE_URL,
   config: {
     // Human is an enlightened race: it selects an exact class/profession and its
@@ -203,7 +193,6 @@ export const LEGACY_ARCHER_BASELINE = {
   description:
     "F-grade primary class. HOUSE PLACEHOLDER - the wiki does not document Archer's exact per-level stat gains, so config.grades.F is editable. Replace with a sourced value when available.",
   grade: "F",
-  provenance: "house" as Provenance,
   sourceUrl: "https://the-primal-hunter.fandom.com/wiki/Classes",
   archived: false,
   config: {
@@ -233,7 +222,6 @@ export const JAKE_CLASSES: readonly JakeCatalogEntry[] = [
     description:
       "An F-grade primary class built around ranged combat with bows, fast and flexible, favoring agility over strength. Its per-level gains are stored in config.grades.F (inferred from Jake Thayne's class progression).",
     grade: "F",
-    provenance: "inferred",
     sourceUrl: JAKE_CLASS_URL,
     config: {
       grades: {
@@ -251,7 +239,6 @@ export const JAKE_CLASSES: readonly JakeCatalogEntry[] = [
     description:
       "An E-grade hunter class that seeks ever-stronger prey. Fast and flexible ranged combat favoring agility; per-level gains are stored in config.grades.E (inferred from Jake Thayne's class progression).",
     grade: "E",
-    provenance: "inferred",
     sourceUrl: JAKE_CLASS_URL,
     config: {
       grades: {
@@ -269,7 +256,6 @@ export const JAKE_CLASSES: readonly JakeCatalogEntry[] = [
     description:
       "A D-grade hunter class that fuses the pure Hunter path with arcane magic, driven by an endless hunger for power. Per-level gains are stored in config.grades.D (inferred from Jake Thayne's class progression).",
     grade: "D",
-    provenance: "inferred",
     sourceUrl: JAKE_CLASS_URL,
     config: {
       grades: {
@@ -295,7 +281,6 @@ export const JAKE_CLASSES: readonly JakeCatalogEntry[] = [
     description:
       "A C-grade hunter class chasing an ever-receding horizon, wielding a bow alongside arcane and close-combat techniques. Per-level gains are stored in config.grades.C (inferred from Jake Thayne's class progression).",
     grade: "C",
-    provenance: "inferred",
     sourceUrl: JAKE_CLASS_URL,
     config: {
       grades: {
@@ -321,7 +306,6 @@ export const JAKE_CLASSES: readonly JakeCatalogEntry[] = [
     description:
       "A B-grade hunter class pursuing the Event Horizon itself, using every means available to close in on it. Per-level gains are stored in config.grades.B (inferred from Jake Thayne's class progression).",
     grade: "B",
-    provenance: "inferred",
     sourceUrl: JAKE_CLASS_URL,
     config: {
       grades: {
@@ -366,7 +350,6 @@ export const JAKE_PROFESSIONS: readonly JakeCatalogEntry[] = [
     description:
       "An F-grade poison-focused alchemy profession. Its per-level gains are stored in config.grades.F (inferred from Jake Thayne's profession progression).",
     grade: "F",
-    provenance: "inferred",
     sourceUrl: JAKE_PROFESSION_URL,
     config: {
       grades: {
@@ -384,7 +367,6 @@ export const JAKE_PROFESSIONS: readonly JakeCatalogEntry[] = [
     description:
       "An E-grade alchemist line distinguished by prodigal talent, specializing in poisons. Per-level gains are stored in config.grades.E (inferred from Jake Thayne's profession progression).",
     grade: "E",
-    provenance: "inferred",
     sourceUrl: JAKE_PROFESSION_URL,
     config: {
       grades: {
@@ -408,7 +390,6 @@ export const JAKE_PROFESSIONS: readonly JakeCatalogEntry[] = [
     description:
       "A D-grade alchemist line walking the paradox of the Malefic Viper's chosen yet heretic. Per-level gains are stored in config.grades.D (inferred from Jake Thayne's profession progression).",
     grade: "D",
-    provenance: "inferred",
     sourceUrl: JAKE_PROFESSION_URL,
     config: {
       grades: {
@@ -432,7 +413,6 @@ export const JAKE_PROFESSIONS: readonly JakeCatalogEntry[] = [
     description:
       "A C-grade continuation of the Heretic-Chosen alchemist path, further along the same paradoxical course. Per-level gains are stored in config.grades.C (inferred from Jake Thayne's profession progression).",
     grade: "C",
-    provenance: "inferred",
     sourceUrl: JAKE_PROFESSION_URL,
     config: {
       grades: {
@@ -456,7 +436,6 @@ export const JAKE_PROFESSIONS: readonly JakeCatalogEntry[] = [
     description:
       "A B-grade alchemist line that moves beyond the Viper's legacy to explore primeval origins. Per-level gains are stored in config.grades.B (inferred from Jake Thayne's profession progression).",
     grade: "B",
-    provenance: "inferred",
     sourceUrl: JAKE_PROFESSION_URL,
     config: {
       grades: {
@@ -568,7 +547,6 @@ export const JAKE_TITLES: readonly JakeCatalogEntry[] =
         `effect, the cumulative all-attribute bonus is sourced into config.flat ` +
         `(${total} to every attribute). Requires race grade ${spec.minRaceGrade} or higher.`,
       grade: spec.grade,
-      provenance: "inferred",
       sourceUrl: DUNGEON_PIONEER_URL,
       config: {
         upgradeGroup: "dungeon-pioneer",
@@ -698,7 +676,6 @@ export const JAKE_GODS: readonly JakeCatalogEntry[] = GOD_SEEDS.map((god) => ({
   name: god.name,
   description: god.description,
   grade: null,
-  provenance: "inferred",
   sourceUrl: `${FANDOM_BASE}${god.page}`,
   config: {},
 }))
@@ -723,7 +700,6 @@ function createData(
     name: entry.name,
     description: entry.description,
     grade: entry.grade,
-    provenance: entry.provenance,
     sourceUrl: entry.sourceUrl,
     archived: false,
     config: entry.config as Prisma.InputJsonValue,
@@ -737,7 +713,6 @@ function updateData(
     name: entry.name,
     description: entry.description,
     grade: entry.grade,
-    provenance: entry.provenance,
     sourceUrl: entry.sourceUrl,
     archived: false,
     config: entry.config as Prisma.InputJsonValue,
@@ -773,7 +748,6 @@ interface SeedBaseline {
   name: string
   description: string
   grade: string
-  provenance: Provenance
   sourceUrl: string
   archived: boolean
   config: Record<string, unknown>
@@ -783,7 +757,6 @@ interface ComparableCatalogRow {
   name: string
   description: string | null
   grade: string | null
-  provenance: string | null
   sourceUrl: string | null
   archived: boolean
   config: unknown
@@ -793,7 +766,6 @@ function comparableRow(row: {
   name: string
   description?: string | null
   grade?: string | null
-  provenance?: string | null
   sourceUrl?: string | null
   archived?: boolean
   config: unknown
@@ -802,7 +774,6 @@ function comparableRow(row: {
     name: row.name,
     description: row.description ?? null,
     grade: row.grade ?? null,
-    provenance: row.provenance ?? null,
     sourceUrl: row.sourceUrl ?? null,
     archived: row.archived ?? false,
     config: row.config,
@@ -814,7 +785,6 @@ function normBaseline(baseline: SeedBaseline): ComparableCatalogRow {
     name: baseline.name,
     description: baseline.description,
     grade: baseline.grade,
-    provenance: baseline.provenance,
     sourceUrl: baseline.sourceUrl,
     archived: baseline.archived,
     config: baseline.config,

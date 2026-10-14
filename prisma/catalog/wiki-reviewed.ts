@@ -10,9 +10,9 @@
  * by `db:seed` or app startup.
  *
  * Provenance policy:
- *   - Every entry is `inferred` (not `verified`): a fan wiki is a secondary
- *     source, and the project deliberately labels anything sourced from it as
- *     inferred rather than canon.
+ *   - The wiki is a secondary source, so none of this is asserted as canon; the
+ *     manifest deliberately carries no provenance taxonomy. The reviewed catalog
+ *     simply stores the source URL and the vetted entry config.
  *   - Entry kinds: `professions`, `blessings`, `bloodlines`, `skills`, `titles`.
  *   - Blessings / bloodlines / skills that carry no numeric effect in the source
  *     are stored with `effects: []` rather than a fabricated universal bonus.
@@ -40,7 +40,6 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     description:
       "An F-grade profession built around potion-craft and alchemy. Per the wiki it grants fixed vitality, wisdom, willpower and toughness plus free points at F grade; the exact per-level numbers are an inferred reading of the source and are stored as config.grades.F so an admin can correct them.",
     grade: "F",
-    provenance: "inferred",
     sourceUrl:
       "https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Profession",
     config: {
@@ -58,7 +57,6 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     name: "True Blessing of the Malefic Viper",
     description:
       "The True-tier blessing of the Malefic Viper. Its effects are recorded as narrative-only here: blessing tiers evolve in the source and the numerical stage at this tier is not pinned by a reliable table, so no numeric bonus is invented (effects stays an empty list).",
-    provenance: "inferred",
     sourceUrl:
       "https://the-primal-hunter.fandom.com/wiki/True_Blessing_of_the_Malefic_Viper",
     config: {
@@ -72,7 +70,6 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     name: "Bloodline of the Primal Hunter",
     description:
       "The bloodline of the Primal Hunter. Grade-specific effects are deliberately empty because the wiki documents only fragmentary grade evidence; no general numeric default is inferred and the gradeEffects map stays empty for future curation.",
-    provenance: "inferred",
     sourceUrl:
       "https://the-primal-hunter.fandom.com/wiki/Bloodline_of_the_Primal_Hunter",
     config: {
@@ -86,10 +83,10 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     name: "One Step Mile",
     description:
       "A descriptive speed skill. It carries no configured track/milestone, so the offer generator never auto-offers it at a class/profession milestone; it is metadata-only until an admin adds a milestone.",
-    provenance: "inferred",
     sourceUrl: "https://the-primal-hunter.fandom.com/wiki/One_Step_Mile",
     config: {
       effects: [],
+      rarity: "Ancient",
     },
   },
   {
@@ -98,11 +95,11 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     name: "Gaze of the Apex Hunter",
     description:
       "A descriptive skill of the Apex Hunter. Like One Step Mile it has no configured track/milestone, so it is never auto-offered at a milestone.",
-    provenance: "inferred",
     sourceUrl:
       "https://the-primal-hunter.fandom.com/wiki/Gaze_of_the_Apex_Hunter",
     config: {
       effects: [],
+      rarity: "Legendary",
     },
   },
   {
@@ -111,7 +108,6 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     name: "Legendary Prodigy",
     description:
       "A title granting a flat +10 and a +10% boost to all nine attributes. The values are an inferred reading and are stored as config flat/percentBasisPoints so an admin can correct them against the source.",
-    provenance: "inferred",
     sourceUrl: "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy",
     config: {
       flat: {

@@ -35,9 +35,9 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
   // database is touched.
   const runSuffix = randomUUID()
 
-  // Clone the production manifest with each stableId run-suffixed. kind, config,
-  // sourceUrl and provenance are preserved exactly, so validation and the
-  // modern-shape guards behave identically to the real manifest.
+  // Clone the production manifest with each stableId run-suffixed. kind, config
+  // and sourceUrl are preserved exactly, so validation and the modern-shape
+  // guards behave identically to the real manifest.
   const clonedEntries = WIKI_REVIEWED_ENTRIES.map((entry) => ({
     ...entry,
     stableId: `${entry.stableId}__${runSuffix}`,
@@ -71,7 +71,6 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
       where: { OR: clonedRows },
     })
     expect(persisted).toHaveLength(6)
-    expect(persisted.every((row) => row.provenance === "inferred")).toBe(true)
     expect(persisted.every((row) => row.archived === false)).toBe(true)
 
     const reapply = await applyWikiReviewedImport(clonedEntries)
@@ -109,7 +108,6 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
         kind: "titles",
         stableId: houseStableId,
         name: "House Title",
-        provenance: "house",
         config: { houseStub: true },
       },
     })
@@ -140,14 +138,12 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
     // ...and reports the ACTUAL existing house row metadata, never the manifest.
     expect(skipped.existing).toMatchObject({
       name: "House Title",
-      provenance: "house",
     })
 
     const row = await prisma.catalogDefinition.findUnique({
       where: { kind_stableId: { kind: "titles", stableId: houseStableId } },
     })
     expect(row?.name).toBe("House Title")
-    expect(row?.provenance).toBe("house")
     expect(row?.config).toEqual({ houseStub: true })
   })
 
@@ -164,16 +160,14 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
         stableId: preSkillId,
         name: "PG Pre",
         description: "d",
-        provenance: "inferred",
         sourceUrl: "https://example.com/pre",
-        config: { effects: [] },
+        config: { effects: [], rarity: "Common" },
       },
       {
         kind: "blessings",
         stableId: `pg-ghost-bless__${runSuffix}`,
         name: "Ghost",
         description: "d",
-        provenance: "inferred",
         sourceUrl: "https://example.com/ghost",
         config: {
           tier: "Minor",

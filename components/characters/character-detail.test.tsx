@@ -113,18 +113,48 @@ vi.mock("@/components/ui/separator", () => ({
   Separator: () => <hr />,
 }))
 
-vi.mock("@/components/ui/tabs", () => ({
-  Tabs: ({ children }: React.ComponentProps<"div">) => <div>{children}</div>,
-  TabsList: ({ children }: React.ComponentProps<"div">) => (
-    <div>{children}</div>
-  ),
-  TabsContent: ({ children }: React.ComponentProps<"div">) => (
-    <div>{children}</div>
-  ),
-  TabsTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
-    <button {...props}>{children}</button>
-  ),
-}))
+vi.mock("@/components/ui/tabs", () => {
+  const TabsContext = React.createContext<
+    ((value: string) => void) | undefined
+  >(undefined)
+  return {
+    Tabs: ({
+      children,
+      onValueChange,
+    }: React.ComponentProps<"div"> & {
+      onValueChange?: (value: string) => void
+    }) => (
+      <TabsContext.Provider value={onValueChange}>
+        <div>{children}</div>
+      </TabsContext.Provider>
+    ),
+    TabsList: ({ children }: React.ComponentProps<"div">) => (
+      <div>{children}</div>
+    ),
+    TabsContent: ({ children }: React.ComponentProps<"div">) => (
+      <div>{children}</div>
+    ),
+    TabsTrigger: ({
+      children,
+      value,
+      onClick,
+      ...props
+    }: React.ComponentProps<"button"> & { value?: string }) => {
+      const onValueChange = React.useContext(TabsContext)
+      return (
+        <button
+          {...props}
+          onClick={(event) => {
+            onClick?.(event)
+            onValueChange?.(value ?? "")
+          }}
+        >
+          {children}
+        </button>
+      )
+    },
+  }
+})
 
 vi.mock("@/components/ui/sheet", () => ({
   Sheet: ({ children }: React.ComponentProps<"div">) => <div>{children}</div>,
@@ -249,7 +279,7 @@ const character = {
     },
     tracks: {
       class: { level: 20, quarter: 0, definitionId: "" },
-      profession: { level: 0, quarter: 0, definitionId: "" },
+      profession: null,
     },
     race: { level: 25, grade: "G", mode: "derived", origin: "integrated" },
     historicalLevelAwards: [],
@@ -297,6 +327,13 @@ let maxTranscendentSkills = 3
 let activeCharacter: import("@/lib/api").CharacterDetail = character
 let advanceError: unknown = null
 let advancePosts: Array<Record<string, unknown>> = []
+let professionCatalog: import("@/lib/api").CatalogItem[] = []
+let historyEvents: import("@/lib/api").ExportResponse["events"] = []
+let professionPostError: unknown = null
+let professionPosts: Array<Record<string, unknown>> = []
+let skillsCatalogForTest: import("@/lib/api").CatalogItem[] = []
+let upgradeErrorForTest: unknown = null
+let upgradePostsForTest: Array<Record<string, unknown>> = []
 
 /** Build a blessing/bloodline catalog item with documented defaults. */
 function catalogItem(
@@ -313,7 +350,6 @@ function catalogItem(
     name,
     description: null,
     grade: null,
-    provenance: "house",
     sourceUrl: null,
     archived: false,
     config: {},
@@ -369,7 +405,6 @@ function inventoryItem(
     kind,
     quantity,
     archived: false,
-    provenance: "house",
     ...rest,
   } as import("@/lib/api").CharacterInventoryItem
 }
@@ -406,7 +441,6 @@ function applyAssociation(
         : {}),
       ...(item?.grade ? { grade: item.grade } : {}),
       ...(item ? { definitionArchived: item.archived } : {}),
-      ...(item?.provenance ? { provenance: item.provenance } : {}),
     })
     return {
       ...current,
@@ -475,7 +509,6 @@ function applyInventory(
           kind: source?.kind === "consumables" ? "consumables" : "equipment",
           quantity: next,
           archived: source?.archived ?? false,
-          provenance: source?.provenance ?? "house",
           ...(typeof source?.config?.slot === "string" &&
           source.config.slot.length > 0
             ? { slot: source.config.slot }
@@ -529,10 +562,22 @@ function setupMock(options?: {
   creationRulesError?: unknown
   maxTranscendentSkills?: number
   advanceError?: unknown
+  professions?: import("@/lib/api").CatalogItem[]
+  events?: import("@/lib/api").ExportResponse["events"]
+  professionError?: unknown
+  skills?: import("@/lib/api").CatalogItem[]
+  upgradeError?: unknown
 }) {
   activeCharacter = options?.character ?? character
   advanceError = options?.advanceError ?? null
   advancePosts = []
+  professionCatalog = options?.professions ?? []
+  historyEvents = options?.events ?? []
+  professionPostError = options?.professionError ?? null
+  professionPosts = []
+  skillsCatalogForTest = options?.skills ?? []
+  upgradeErrorForTest = options?.upgradeError ?? null
+  upgradePostsForTest = []
   associationsError = options?.associationsError ?? null
   blessingsCatalog = options?.blessings ?? []
   bloodlinesCatalog = options?.bloodlines ?? []
@@ -569,6 +614,18 @@ function setupMock(options?: {
       return { character: activeCharacter }
     }
     if (url === "/api/characters/chr-1/portrait") return { portrait: null }
+    if (url === "/api/characters/chr-1/export") return { events: historyEvents }
+    if (url === "/api/catalog/professions")
+      return { kind: "catalog", items: professionCatalog }
+    if (url === "/api/characters/chr-1/profession" && method === "POST") {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      professionPosts.push(body)
+      if (professionPostError) throw professionPostError
+      return { character: activeCharacter }
+    }
     if (url === "/api/characters/chr-1/advance" && method === "POST") {
       const body = JSON.parse((init?.body as string) ?? "{}") as Record<
         string,
@@ -599,6 +656,36 @@ function setupMock(options?: {
     }
     if (url === "/api/catalog/consumables") {
       return { kind: "catalog", items: consumablesCatalog }
+    }
+    if (url === "/api/catalog/skills")
+      return { kind: "catalog", items: skillsCatalogForTest }
+    if (url === "/api/characters/chr-1/skills/upgrade" && method === "POST") {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      upgradePostsForTest.push(body)
+      if (upgradeErrorForTest) throw upgradeErrorForTest
+      activeCharacter = {
+        ...activeCharacter,
+        version: activeCharacter.version + 1,
+        associations: activeCharacter.associations.map((a) =>
+          a.kind === "skill"
+            ? {
+                ...a,
+                definitionId: String(body.definitionId),
+                name:
+                  skillsCatalogForTest.find((s) => s.id === body.definitionId)
+                    ?.name ?? a.name,
+                rarity: String(
+                  skillsCatalogForTest.find((s) => s.id === body.definitionId)
+                    ?.config.rarity ?? ""
+                ),
+              }
+            : a
+        ),
+      }
+      return { character: activeCharacter }
     }
     if (url === "/api/characters/chr-1/associations" && method === "POST") {
       if (associationsError) throw associationsError
@@ -879,6 +966,201 @@ describe("CharacterDetail ranked title claims", () => {
   })
 })
 
+describe("equipment eligibility and skill upgrades", () => {
+  const skill = (id: string, name: string, rarity: string, archived = false) =>
+    catalogItem({
+      id,
+      name,
+      kind: "skills",
+      archived,
+      config: { rarity, upgradeGroup: "ember" },
+      description: `${name} description`,
+    })
+  const sourceCharacter = (rarity?: string, archived = false) =>
+    ({
+      ...character,
+      associations: [
+        association({
+          id: "skill-link",
+          kind: "skill",
+          definitionId: "old-skill",
+          name: "Ember",
+          rarity,
+          upgradeGroup: rarity ? "ember" : undefined,
+          definitionArchived: archived,
+        }),
+      ],
+    }) as unknown as import("@/lib/api").CharacterDetail
+
+  it("loads skill catalog for owners, submits explicit higher-tier upgrade reason/version, and reloads", async () => {
+    setupMock({
+      character: sourceCharacter("Common"),
+      skills: [skill("target", "Ember II", "Rare")],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    await flush()
+    expect(
+      (apiFetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some(
+        ([url]) => url === "/api/catalog/skills"
+      )
+    ).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    fireEvent.click(screen.getByText(/Ember II - Rare/))
+    fireEvent.change(screen.getByLabelText("Reason"), {
+      target: { value: "Training" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Confirm upgrade" }))
+    await flush()
+    expect(upgradePostsForTest).toEqual([
+      { definitionId: "target", version: 3, reason: "Training" },
+    ])
+    expect(activeCharacter.associations[0]?.definitionId).toBe("target")
+    expect(
+      (apiFetch as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([url]) => url === "/api/characters/chr-1"
+      ).length
+    ).toBeGreaterThan(1)
+  })
+
+  it("blocks Unique, lower/equal, and missing source rarity; archived source metadata remains upgradeable", async () => {
+    setupMock({
+      character: sourceCharacter("Unique", true),
+      skills: [skill("target", "Higher", "Divine")],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText(/Unique rarity is incomparable/)).toBeTruthy()
+    cleanup()
+    setupMock({
+      character: sourceCharacter("Rare"),
+      skills: [
+        skill("lower", "Lower", "Common"),
+        skill("equal", "Same", "Rare"),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText(/No active higher-rarity variant/)).toBeTruthy()
+    cleanup()
+    setupMock({
+      character: sourceCharacter(undefined),
+      skills: [skill("target", "Higher", "Divine")],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText(/Source rarity metadata unavailable/)).toBeTruthy()
+    cleanup()
+    setupMock({
+      character: sourceCharacter("Common", true),
+      skills: [skill("target", "Higher", "Rare")],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    await flush()
+    expect(screen.getByRole("button", { name: "Upgrade skill" })).toBeTruthy()
+  })
+
+  it("surfaces rejected upgrade without claiming success and reloads latest character", async () => {
+    setupMock({
+      character: sourceCharacter("Common"),
+      skills: [skill("target", "Higher", "Rare")],
+      upgradeError: new Error("Version conflict"),
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    fireEvent.click(screen.getByText(/Higher - Rare/))
+    fireEvent.change(screen.getByLabelText("Reason"), {
+      target: { value: "Practice" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Confirm upgrade" }))
+    await flush()
+    expect(toast.error).toHaveBeenCalledWith("Version conflict")
+    expect(activeCharacter.associations[0]?.definitionId).toBe("old-skill")
+  })
+
+  it("shows inventory and linked equipment requirement badges and blocks equip but allows stock and unequip", async () => {
+    const inv = inventoryItem({
+      id: "inv",
+      definitionId: "blade",
+      name: "Blade",
+      kind: "equipment",
+      quantity: 1,
+      rarity: "Rare",
+      soulbound: true,
+      slot: "hand",
+      requirements: { minRaceLevel: 30, requiredRaceType: "monster" },
+      equipmentEligibility: { eligible: false, reason: "Requires level 30" },
+    })
+    const equipped = association({
+      id: "blade-link",
+      kind: "equipment",
+      definitionId: "blade",
+      name: "Blade",
+      rarity: "Rare",
+      soulbound: true,
+      slot: "hand",
+      requirements: { minRaceLevel: 30, requiredRaceType: "monster" },
+      equipmentEligibility: { eligible: false, reason: "Requires level 30" },
+    })
+    const stockOnly = inventoryItem({
+      id: "inv-helm",
+      definitionId: "helm",
+      name: "Helm",
+      kind: "equipment",
+      quantity: 1,
+      rarity: "Common",
+      requirements: { minRaceLevel: 40, requiredRaceType: "monster" },
+      equipmentEligibility: { eligible: false, reason: "Requires level 40" },
+    })
+    setupMock({
+      character: {
+        ...character,
+        inventory: [inv, stockOnly],
+        associations: [equipped],
+      },
+      equipmentCatalog: [
+        catalogItem({
+          id: "blade",
+          name: "Blade",
+          kind: "equipment",
+          config: { slot: "hand" },
+        }),
+        catalogItem({
+          id: "helm",
+          name: "Helm",
+          kind: "equipment",
+          config: { slot: "head" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Inventory" }))
+    await flush()
+    expect(screen.getAllByText("Soulbound").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("Requires level 30").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("Monstrous (monster)").length).toBeGreaterThan(0)
+    expect(
+      screen
+        .getAllByRole("button", { name: "Equip" })
+        .some((button) => (button as HTMLButtonElement).disabled)
+    ).toBe(true)
+    expect(screen.getByRole("button", { name: "Add stock" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Unequip" }))
+    await flush()
+    expect(
+      activeCharacter.associations.some((row) => row.kind === "equipment")
+    ).toBe(false)
+  })
+})
+
 describe("CharacterDetail race-only progression", () => {
   it("posts race advancement and displays failures", async () => {
     const monster = {
@@ -909,6 +1191,261 @@ describe("CharacterDetail race-only progression", () => {
     expect(screen.getByRole("alert").textContent).toContain(
       "Race advance unavailable"
     )
+  })
+
+  it("shows only race actions for a monster: one Advance race, no class/profession tabs, advance, or evolution", async () => {
+    const monster = {
+      ...character,
+      classId: null,
+      className: null,
+      state: {
+        ...character.state,
+        race: { ...character.state.race, mode: "independent", quarter: 2 },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: monster })
+    await renderDetail()
+
+    // Exactly one race advance action - no duplicate race actions.
+    expect(
+      screen.getAllByRole("button", { name: /Advance race \(L25 Q2\)/ })
+    ).toHaveLength(1)
+    expect(
+      screen.getByRole("button", { name: /Advance race \(L25 Q2\)/ })
+    ).toBeTruthy()
+    // Race grade evolution is a race action and stays available. The button
+    // carries an aria-label, so match the accessible name, not the visible text
+    // ("Evolve grade (to E)").
+    expect(
+      screen.getByRole("button", { name: /Evolve race grade to E/ })
+    ).toBeTruthy()
+    // No class/profession advance or evolution actions.
+    expect(screen.queryByRole("button", { name: /Advance class/ })).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /Advance profession/ })
+    ).toBeNull()
+    expect(screen.queryByRole("button", { name: /Evolve class/ })).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /Evolve profession/ })
+    ).toBeNull()
+
+    // Open the identity tab: no class/profession sub-tabs, and no
+    // class/profession track history panels.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Race / Class / Profession" })
+    )
+    await flush()
+    expect(screen.queryByRole("button", { name: "Class" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Profession" })).toBeNull()
+    expect(screen.queryByLabelText("class history")).toBeNull()
+    expect(screen.queryByLabelText("profession history")).toBeNull()
+    expect(screen.getByLabelText("race history")).toBeTruthy()
+  })
+})
+
+describe("CharacterDetail profession assignment and track history", () => {
+  it("offers only current-grade professions, including Integrated G, and posts CAS version", async () => {
+    const integrated = {
+      ...character,
+      origin: "integrated",
+      state: {
+        ...character.state,
+        race: { ...character.state.race, grade: "G" },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: integrated,
+      professions: [
+        catalogItem({
+          id: "g-pro",
+          name: "G profession",
+          kind: "professions",
+          grade: "G",
+          config: { grades: { G: {} } },
+        }),
+        catalogItem({
+          id: "e-pro",
+          name: "E profession",
+          kind: "professions",
+          grade: "E",
+          config: { grades: { E: {} } },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Race / Class / Profession" })
+    )
+    await flush()
+    expect(screen.getByText("G profession")).toBeTruthy()
+    expect(screen.queryByText("E profession")).toBeNull()
+    fireEvent.click(screen.getByText("G profession"))
+    fireEvent.click(screen.getByRole("button", { name: "Assign profession" }))
+    await flush()
+    expect(professionPosts).toEqual([{ professionId: "g-pro", version: 3 }])
+  })
+
+  it("shows CAS errors and separates track history by payload track", async () => {
+    const events = [
+      { kind: "create", payload: { initial: true }, createdAt: "one" },
+      {
+        kind: "advance",
+        payload: {
+          track: "class",
+          journal: { raceLevelBefore: 1, raceLevelAfter: 2 },
+        },
+        createdAt: "two",
+      },
+      {
+        kind: "profession_set",
+        payload: { professionId: "p1" },
+        createdAt: "three",
+      },
+      { kind: "advance", payload: { track: "profession" }, createdAt: "four" },
+    ]
+    setupMock({
+      professions: [
+        catalogItem({
+          id: "g-pro",
+          name: "G profession",
+          kind: "professions",
+          grade: "G",
+          config: { grades: { G: {} } },
+        }),
+      ],
+      events,
+      professionError: new Error("Version conflict"),
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Race / Class / Profession" })
+    )
+    await flush()
+    fireEvent.click(screen.getByText("G profession"))
+    fireEvent.click(screen.getByRole("button", { name: "Assign profession" }))
+    await flush()
+    expect(toast.error).toHaveBeenCalledWith("Version conflict")
+    const raceHistory = screen.getByLabelText("race history")
+    expect(raceHistory.textContent).toContain("Initial state")
+    expect(raceHistory.textContent).toContain('"track": "class"')
+    const professionHistory = screen.getByLabelText("profession history")
+    expect(professionHistory.textContent).toContain("profession_set")
+    expect(professionHistory.textContent).toContain('"track": "profession"')
+    expect(professionHistory.textContent).not.toContain('"track": "class"')
+  })
+
+  it("offers a profession only when BOTH the row grade and the config grade entry match the current race grade", async () => {
+    setupMock({
+      professions: [
+        catalogItem({
+          id: "valid",
+          name: "Valid profession",
+          kind: "professions",
+          grade: "G",
+          config: { grades: { G: {} } },
+        }),
+        catalogItem({
+          id: "grade-mismatch",
+          name: "Grade mismatch",
+          kind: "professions",
+          grade: "E",
+          config: { grades: { G: {} } },
+        }),
+        catalogItem({
+          id: "config-missing",
+          name: "Config missing",
+          kind: "professions",
+          grade: "G",
+          config: { grades: { E: {} } },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Race / Class / Profession" })
+    )
+    await flush()
+    // Only the entry whose row grade AND config agree with the current grade.
+    expect(screen.getByText("Valid profession")).toBeTruthy()
+    expect(screen.queryByText("Grade mismatch")).toBeNull()
+    expect(screen.queryByText("Config missing")).toBeNull()
+  })
+
+  it("classifies a grade-only evolve (no payload track) as race history only", async () => {
+    const events = [
+      { kind: "create", payload: { initial: true }, createdAt: "one" },
+      {
+        kind: "evolve",
+        payload: { journal: { raceLevelBefore: 5, raceLevelAfter: 6 } },
+        createdAt: "two",
+      },
+      {
+        kind: "advance",
+        payload: {
+          track: "class",
+          journal: { raceLevelBefore: 6, raceLevelAfter: 7 },
+        },
+        createdAt: "three",
+      },
+    ]
+    setupMock({ events })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Race / Class / Profession" })
+    )
+    await flush()
+    const raceHistory = screen.getByLabelText("race history")
+    expect(raceHistory.textContent).toContain("evolve")
+    const classHistory = screen.getByLabelText("class history")
+    expect(classHistory.textContent).not.toContain("evolve")
+    const professionHistory = screen.getByLabelText("profession history")
+    expect(professionHistory.textContent).not.toContain("evolve")
+  })
+
+  it("invalidates cached export events after a successful profession set when history is already loaded", async () => {
+    const initial = [
+      { kind: "create", payload: { initial: true }, createdAt: "one" },
+    ]
+    setupMock({
+      professions: [
+        catalogItem({
+          id: "g-pro",
+          name: "G profession",
+          kind: "professions",
+          grade: "G",
+          config: { grades: { G: {} } },
+        }),
+      ],
+      events: initial,
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Race / Class / Profession" })
+    )
+    await flush()
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const exportBefore = mock.mock.calls.filter(
+      ([url]) => url === "/api/characters/chr-1/export"
+    ).length
+    expect(exportBefore).toBe(1)
+    // The server has since recorded the assignment; the next export reflects it.
+    historyEvents = [
+      ...initial,
+      {
+        kind: "profession_set",
+        payload: { professionId: "g-pro" },
+        createdAt: "two",
+      },
+    ]
+    fireEvent.click(screen.getByText("G profession"))
+    fireEvent.click(screen.getByRole("button", { name: "Assign profession" }))
+    await flush()
+    const exportAfter = mock.mock.calls.filter(
+      ([url]) => url === "/api/characters/chr-1/export"
+    ).length
+    expect(exportAfter).toBeGreaterThan(exportBefore)
+    const professionHistory = screen.getByLabelText("profession history")
+    expect(professionHistory.textContent).toContain("profession_set")
   })
 })
 
@@ -1098,6 +1635,63 @@ describe("CharacterDetail power associations", () => {
     // The archived linked blessing stays visible but is honestly marked inert.
     expect(blessingSection.getByText("Old Blessing")).toBeTruthy()
     expect(blessingSection.getByText("Archived - inert")).toBeTruthy()
+  })
+
+  it("monster and classless characters can open Manage powers and add a blessing", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    const monster = {
+      ...character,
+      classId: null,
+      className: null,
+      state: {
+        ...character.state,
+        tracks: {},
+        race: {
+          ...character.state.race,
+          mode: "independent",
+          quarter: 2,
+        },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: monster,
+      blessings: [
+        catalogItem({ id: "bless-monster", name: "Monster Blessing" }),
+      ],
+    })
+
+    await renderDetail()
+    // The Manage powers button is NOT gated on a class: a monster/classless
+    // character can open the association sheet.
+    fireEvent.click(screen.getByText("Manage powers"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Blessings" }))
+    fireEvent.click(screen.getByText("Add"))
+    await flush()
+
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const addPost = mock.mock.calls.find(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(addPost).toBeTruthy()
+    const body = JSON.parse((addPost![1] as RequestInit).body as string) as {
+      kind: string
+      definitionId: string
+      operation: string
+      version: number
+    }
+    expect(body).toEqual({
+      kind: "blessing",
+      definitionId: "bless-monster",
+      operation: "add",
+      version: 3,
+    })
+
+    // The reload reflects the newly linked blessing on the powers tab.
+    const blessingSection = within(screen.getByLabelText("Blessing"))
+    expect(blessingSection.getByText("Monster Blessing")).toBeTruthy()
   })
 
   it("AssociationSheet blessing option surfaces the patronGodStableId", async () => {

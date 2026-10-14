@@ -31,7 +31,6 @@ const item: CharacterInventoryItemView = {
   quantity: 2,
   archived: false,
   slot: "head",
-  provenance: "house",
 }
 
 describe("inventory route", () => {

@@ -114,8 +114,8 @@ evolution_choice_required`).
   `primal-character/3` backup is still accepted and imports no stock, marking every
   equipment link as grandfathered. No sample characters are created.
 - **Admin-managed catalog**: a polymorphic catalog for all of the kinds above.
-  Admins can create and edit entries, set a `verified` / `inferred` / `house`
-  provenance, attach a source URL, and store per-kind `config`. With
+  Admins can create and edit entries, attach a source URL, and store per-kind
+  `config`. With
   `CATALOG_PUBLIC` unset, catalog reads require a session.
 - **Admin opt-in catalog import (reviewed manifest)**: an admin can apply a
   manually reviewed, version-controlled manifest
@@ -123,16 +123,15 @@ evolution_choice_required`).
   The `GET` preview is read-only; the `POST` apply inserts every missing row in one
   atomic `SERIALIZABLE` transaction and never overwrites an existing row (the
   entry is skipped instead). It is never run by `db:seed` or app startup. See
-  `docs/catalog/wiki-reviewed.md` for source provenance, exact per-entry URLs and
+  `docs/catalog/wiki-reviewed.md` for the source policy, exact per-entry URLs and
   the "no fabricated numeric bonus" policy.
 - **Admin bulk catalog upload (JSON / CSV)**: an admin can paste a JSON or CSV
   catalog file and preview it (`POST /api/admin/catalog-import/bulk/preview`),
   then apply it (`POST /api/admin/catalog-import/bulk/apply`). The preview is
   read-only; the apply inserts every missing row in one atomic `SERIALIZABLE`
-  transaction and never overwrites an existing row. `provenance` defaults to
-  `house` (only `house` / `inferred` are accepted - `verified` is rejected so an
-  unverified admin paste is not claimed as canon), `inferred` entries require an
-  https source, and would-create blessings revalidate their patron god against
+  transaction and never overwrites an existing row. `sourceUrl` is optional but
+  HTTPS when supplied (an unverified admin paste must not claim a `verified`
+  status), and would-create blessings revalidate their patron god against
   both the live catalog and gods created by the same upload (archived / missing
   patrons roll back the whole import). An optional content digest (SHA256 of the
   uploaded text) is a content-integrity check, not proof that a preview ran;

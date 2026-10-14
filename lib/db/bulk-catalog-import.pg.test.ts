@@ -69,7 +69,7 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
         description: "Description",
         provenance: "house",
         sourceUrl: `https://example.com/${s}`,
-        config: { effects: [] },
+        config: { effects: [], rarity: "Common" },
       },
     ])
   }
@@ -90,7 +90,6 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
       where: { id: result.createdIds[0] },
     })
     expect(persisted).not.toBeNull()
-    expect(persisted?.provenance).toBe("house")
     expect(persisted?.archived).toBe(false)
 
     const reapply = await applyBulkImport(
@@ -125,7 +124,6 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
         kind: "titles",
         stableId: s,
         name: "House Title",
-        provenance: "house",
         config: { houseStub: true },
       },
     })
@@ -156,7 +154,6 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
       where: { kind_stableId: { kind: "titles", stableId: s } },
     })
     expect(row?.name).toBe("House Title")
-    expect(row?.provenance).toBe("house")
   })
 
   it("creates gods first so a blessing can reference a god later in the upload", async () => {

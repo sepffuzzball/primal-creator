@@ -74,9 +74,9 @@ addition to the legacy `grade` / `grants` (which are preserved):
     `improvement` (or by including only `flat` / `percentBasisPoints`).
 
 Title bonuses are **not** silently auto-granted: only titles a user explicitly
-attaches produce effects. Effects synthesized from a title carry the catalog
-entry's `provenance` (`verified` / `inferred` / `house`) so nothing is presented
-as canon. A title with no numeric `flat` / `percentBasisPoints` contributes no
+attaches produce effects. Effects synthesized from a title carry the generic
+internal `provenance: "catalog"` value (the catalog provenance taxonomy no longer
+exists). A title with no numeric `flat` / `percentBasisPoints` contributes no
 effect (an unresolved placeholder), matching the wiki-uncertain note above.
 
 ## Ranked title improvement (sequential)

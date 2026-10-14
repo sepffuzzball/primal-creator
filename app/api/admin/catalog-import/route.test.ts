@@ -142,7 +142,6 @@ describe("api/admin/catalog-import (unit, mocked db)", () => {
       stableId: "legendary-prodigy",
       name: "Old Legendary Prodigy",
       config: { houseNote: true },
-      provenance: "house",
       sourceUrl: "https://house.example/old",
       archived: false,
     })
@@ -150,7 +149,6 @@ describe("api/admin/catalog-import (unit, mocked db)", () => {
       status: string
       existing?: {
         name: string
-        provenance: string
         sourceUrl: string | null
         archived: boolean
       }
@@ -174,7 +172,6 @@ describe("api/admin/catalog-import (unit, mocked db)", () => {
     expect(getSkipped.existing).toEqual({
       id: "house-title",
       name: "Old Legendary Prodigy",
-      provenance: "house",
       sourceUrl: "https://house.example/old",
       archived: false,
     })
@@ -199,14 +196,12 @@ describe("api/admin/catalog-import (unit, mocked db)", () => {
     expect(postSkipped.existing).toEqual({
       id: "house-title",
       name: "Old Legendary Prodigy",
-      provenance: "house",
       sourceUrl: "https://house.example/old",
       archived: false,
     })
     const row = [...dbMock.store.catalog.values()].find(
       (r) => r.id === "house-title"
     )!
-    expect(row.provenance).toBe("house")
     expect(row.name).toBe("Old Legendary Prodigy")
   })
 

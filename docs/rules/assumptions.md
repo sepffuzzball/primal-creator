@@ -70,7 +70,7 @@ duration.
   A **born** race counts levels 1..9 at the **F rate** when its natural grade is F
   (e.g. Human) because it enters the system at that grade; an **integrated** race
   counts levels 1..9 at the **G rate** (0 unless configured). The overlapping G/F
-  bands are resolved by provenance, so we do not invent a canonical G multiplier;
+  bands are resolved by origin, so we do not invent a canonical G multiplier;
   the F band applies only to a race whose `naturalGrade` is F, not universally.
 
 ## 3. Race-level rounding and missing track

@@ -108,8 +108,8 @@ a profession). See `docs/rules/leveling.md` for the four-quarter race advance an
 ## Seeded Human race (`db:seed`)
 
 `pnpm db:seed` seeds the Human race table (`races/human`) from
-`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Race`, labelled
-`provenance: inferred` (fan wiki, a secondary source). The G-grade line is now
+`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Race` (fan wiki, a
+secondary source). The G-grade line is now
 sourced as +1 all / +1 free, so G is no longer a house-zero placeholder. Because
 these values are fan-wiki-inferred rather than verified canon, the sourced grade
 list is recorded as `inferredGrades` (`["G","F","E","D","C","B"]`) and

@@ -82,7 +82,6 @@ The preview response is:
       "stableId": "one-step-mile",
       "name": "One Step Mile",
       "sourceUrl": "https://example.com/one-step-mile",
-      "provenance": "house",
       "status": "create"
     }
   ],
@@ -96,8 +95,8 @@ The preview response is:
 - `status` is `create` or `skip_existing`.
 - `existing` is present only when `status` is `skip_existing`, and carries the
   metadata of the ACTUAL existing catalog row (never the proposed upload values).
-  The proposed `name` / `sourceUrl` / `provenance` stay on the entry so the admin
-  can see what the upload WOULD have created.
+  The proposed `name` / `sourceUrl` stay on the entry so the admin can see what
+  the upload WOULD have created.
 - `createCount` / `skipCount` are actual counts.
 
 The apply response is the same shape plus `createdIds`, the ids of the catalog rows
@@ -107,19 +106,17 @@ text (recomputed from the upload), not a token issued by the server. Note that t
 database may have changed between preview and apply, so the counts reported by
 apply reflect the transaction-time state, not the preview.
 
-## Provenance policy
+## Source rules
 
-An upload is un-verified admin content. To avoid "trust laundering" (claiming an
-arbitrary admin paste is canon), `verified` is rejected outright:
+An upload is un-verified admin content. The old `verified` / `inferred` / `house`
+catalog provenance taxonomy has been removed, so a bulk upload no longer
+classifies entries by provenance. For backward compatibility the bulk importer
+still accepts a `provenance` key (JSON) / header (CSV) and ignores it - even a
+`verified` value - so an upload written against the old format keeps working. It
+is never persisted or re-echoed.
 
-- `provenance` defaults to `house`, and only `house` and `inferred` are accepted.
-- `house` entries may omit `sourceUrl`; when present it MUST be an `https:` URL
-  with a host.
-- `inferred` entries REQUIRE an `https:` `sourceUrl` that names a host (they cite
-  evidence, and broken evidence links must fail at import time).
-
-A bulk upload's provenance is deliberately not upgraded to `verified`, even though
-the wiki-reviewed manifest is labelled `inferred` for its own reasons.
+`sourceUrl` is optional, but when supplied it MUST be an `https:` URL with a host
+(a link to broken evidence must fail at import time).
 
 ## Patron-god rules (blessings)
 
@@ -143,8 +140,8 @@ archived patron fails the whole transaction and rolls back every insert.
 
 - Required: `kind`, `stableId`, `name`, `config` (a JSON object).
 - Optional: `description` (string or null), `grade` (one of G/F/E/D/C/B/A/S or
-  null), `provenance` (`house`/`inferred`, default `house`), `sourceUrl`
-  (https string or null).
+  null), `provenance` (accepted for backward compatibility and ignored),
+  `sourceUrl` (https string or null).
 
 The accepted keys on an entry are a CLOSED set - only `kind`, `stableId`,
 `name`, `description`, `grade`, `provenance`, `sourceUrl`, and `config`. Any
@@ -213,14 +210,18 @@ line, so a quoted field containing a newline does not corrupt the reported line.
 
 ```csv
 kind,stableId,name,config,description,grade,provenance,sourceUrl
-skills,one-step-mile,"One Step Mile","{""effects"":[]}",A descriptive skill,,inferred,https://the-primal-hunter.fandom.com/wiki/One_Step_Mile
+skills,one-step-mile,"One Step Mile","{""effects"":[],""rarity"":""Common""}",A descriptive skill,,inferred,https://the-primal-hunter.fandom.com/wiki/One_Step_Mile
 titles,legendary-prodigy,"Legendary Prodigy","{""flat"":{""strength"":10},""percentBasisPoints"":{""strength"":1000}}","A title",C,house,
 ```
+
+A new or config-changing `skill`/`equipment` config requires a `rarity`; an
+`equipment` config must also declare a canonical `slot` (see
+[docs/rules/equipment.md](../rules/equipment.md) for the slot name list).
 
 ## What is safe about it
 
 - **Never overwrites.** A row occupying a `(kind, stableId)` key is left untouched
-  (its config / provenance / slug are preserved); the import reports it as
+  (its config / slug are preserved); the import reports it as
   `skip_existing`.
 - **Never implicit.** The catalog is only mutated when an admin calls apply. It is
   never run by `db:seed` or app startup.
@@ -240,7 +241,7 @@ titles,legendary-prodigy,"Legendary Prodigy","{""flat"":{""strength"":10},""perc
 ## Relationship to the reviewed manifest
 
 The fixed, version-controlled `prisma/catalog/wiki-reviewed.ts` manifest remains a
-separate path (`GET` / `POST /api/admin/catalog-import`). It is unchanged: it is
-always `inferred`, always requires an https `sourceUrl`, and its six curated
-entries are not subject to the bulk provenance rules. A bulk upload is a distinct,
-ad-hoc way to add rows without editing code.
+separate path (`GET` / `POST /api/admin/catalog-import`). It is unchanged: it
+always requires an https `sourceUrl`, and its six curated entries are not subject
+to the bulk source rules. A bulk upload is a distinct, ad-hoc way to add rows
+without editing code.

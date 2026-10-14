@@ -36,7 +36,7 @@ The phases are ordered so that earlier phases set up values used by later phases
 The exact set may evolve, but the ordering principle (dependencies before
 dependents) must hold.
 
-1. **Identity & grade resolution** - Determine the starting grade from provenance
+1. **Identity & grade resolution** - Determine the starting grade from origin
    (newly integrated vs. born into system) and the resolved race/class/profession.
    A born participant starts at the selected race's `naturalGrade` (legacy
    fallback `F`); a newly integrated participant starts at `G`.
@@ -128,7 +128,7 @@ fixed level, for a race whose natural grade is F (e.g. Human):
 - level 150 -> D-grade.
 - level 300 -> C-grade.
 
-Implication: the G/F overlap (G 0-9 vs F 0-24) is resolved by **provenance**, not
+Implication: the G/F overlap (G 0-9 vs F 0-24) is resolved by **origin**, not
 by a formula. The engine must record whether the participant was newly integrated
 or born into the system and choose the appropriate band. That born band is NOT
 universal: a born participant starts at the selected race's `naturalGrade`

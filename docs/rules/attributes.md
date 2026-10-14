@@ -26,7 +26,7 @@ Example Human stat lines (fan-wiki **inferred**, not source-verified canon):
 - Human (C): +18 to all stats, +45 Free Points.
 - Human (B): +54 to all stats, +135 Free Points.
 
-The seeded Human row stores these with `inferred` provenance (see
+The seeded Human row stores these as configurable data (see
 `prisma/catalog/jake-seed.ts`): the fan wiki never publishes a formal attribute
 table, so the numbers are configurable data, not lore canon. The **G** row is
 inferred in particular - it models the born-into-system overlap grade and is not

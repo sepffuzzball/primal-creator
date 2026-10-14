@@ -47,12 +47,19 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { ATTRIBUTE_KEYS } from "@/lib/api"
+import {
+  EQUIPMENT_RARITIES,
+  EQUIPMENT_SLOTS,
+  EQUIPMENT_UNIQUE_RARITY,
+} from "@/lib/server/schemas"
 
-const PROVENANCE_OPTIONS = [
-  { value: "verified", label: "Verified" },
-  { value: "inferred", label: "Inferred" },
-  { value: "house", label: "House" },
-] as const
+const GRADES = ["G", "F", "E", "D", "C", "B", "A", "S"] as const
+const RARITIES = [...EQUIPMENT_RARITIES, EQUIPMENT_UNIQUE_RARITY] as const
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
 
 const BLESSING_TIERS = [
   "Baptism",
@@ -69,7 +76,6 @@ interface FormState {
   name: string
   description: string
   grade: string
-  provenance: string
   sourceUrl: string
   configText: string
 }
@@ -78,7 +84,6 @@ const EMPTY_FORM: FormState = {
   name: "",
   description: "",
   grade: "",
-  provenance: "house",
   sourceUrl: "",
   configText: "{}",
 }
@@ -90,13 +95,11 @@ interface ImportPreview {
     stableId: string
     name: string
     sourceUrl: string
-    provenance: string
     status: "create" | "skip_existing"
     existing?: {
       id: string
       name: string
       sourceUrl: string | null
-      provenance: string
       archived: boolean
     }
   }>
@@ -114,13 +117,11 @@ interface BulkPreview {
     stableId: string
     name: string
     sourceUrl: string
-    provenance: string
     status: "create" | "skip_existing"
     existing?: {
       id: string
       name: string
       sourceUrl: string | null
-      provenance: string
       archived: boolean
     }
   }>
@@ -129,11 +130,14 @@ interface BulkPreview {
 }
 
 function toForm(item: CatalogItem): FormState {
+  const config = isRecord(item.config) ? item.config : {}
   return {
     name: item.name,
     description: item.description ?? "",
-    grade: item.grade ?? "",
-    provenance: item.provenance,
+    grade:
+      item.kind === "races" && typeof config.naturalGrade === "string"
+        ? config.naturalGrade
+        : (item.grade ?? ""),
     sourceUrl: item.sourceUrl ?? "",
     configText: JSON.stringify(item.config ?? {}, null, 2),
   }
@@ -186,6 +190,31 @@ export function CatalogManager({ kind }: { kind: string }) {
       return { valid: false as const, config: null, legacy: false }
     }
   }, [form.configText, kind])
+  const structuredConfig = React.useMemo(() => {
+    try {
+      const parsed: unknown = JSON.parse(form.configText || "{}")
+      return isRecord(parsed) ? parsed : null
+    } catch {
+      return null
+    }
+  }, [form.configText])
+  const structuredKind = ["races", "classes", "professions"].includes(kind)
+  const hasStructuredEditor =
+    structuredKind || ["equipment", "skills"].includes(kind)
+  const setConfigValue = React.useCallback((key: string, value: unknown) => {
+    setForm((current) => {
+      try {
+        const parsed: unknown = JSON.parse(current.configText || "{}")
+        if (!isRecord(parsed)) return current
+        return {
+          ...current,
+          configText: JSON.stringify({ ...parsed, [key]: value }, null, 2),
+        }
+      } catch {
+        return current
+      }
+    })
+  }, [])
   const [submitting, setSubmitting] = React.useState(false)
   const [formError, setFormError] = React.useState<string | null>(null)
   const [showArchived, setShowArchived] = React.useState(false)
@@ -553,14 +582,195 @@ export function CatalogManager({ kind }: { kind: string }) {
       )
       return
     }
+    const legacyRaceWithoutNaturalGrade =
+      kind === "races" &&
+      editing != null &&
+      !form.grade &&
+      !(isRecord(config) && typeof config.naturalGrade === "string")
+    if (structuredKind && !legacyRaceWithoutNaturalGrade) {
+      if (
+        (!editing || form.grade) &&
+        form.grade &&
+        !GRADES.includes(form.grade as (typeof GRADES)[number])
+      ) {
+        setFormError("Choose a valid grade.")
+        return
+      }
+      if (kind === "races") {
+        if (
+          !editing &&
+          (!form.grade ||
+            !["enlightened", "monster"].includes(String(config.raceType)))
+        ) {
+          setFormError("Choose a race type before creating a race.")
+          return
+        }
+        const originalNatural =
+          isRecord(editing?.config) &&
+          typeof editing.config.naturalGrade === "string"
+            ? editing.config.naturalGrade
+            : editing?.grade
+        if (
+          !editing ||
+          (form.grade &&
+            (form.grade !== originalNatural ||
+              stableStringify(config) !==
+                stableStringify(editing.config ?? {})))
+        )
+          config.naturalGrade = form.grade
+        if (!editing) {
+          const definitions = isRecord(config.raceDefinitions)
+            ? config.raceDefinitions
+            : {}
+          if (!form.grade || !isRecord(definitions[form.grade])) {
+            setFormError(
+              "Add a row for the natural grade before creating this race."
+            )
+            return
+          }
+        } else if (form.grade && form.grade !== editing.grade) {
+          const definitions = isRecord(config.raceDefinitions)
+            ? config.raceDefinitions
+            : {}
+          if (!isRecord(definitions[form.grade])) {
+            setFormError(
+              "The selected natural grade has no matching race gains row."
+            )
+            return
+          }
+        }
+      }
+      const configuredGrades = isRecord(config.grades) ? config.grades : {}
+      if (
+        ["classes", "professions"].includes(kind) &&
+        !editing &&
+        !isRecord(configuredGrades[form.grade])
+      ) {
+        setFormError(
+          "Add a row for the initial grade before creating this entry."
+        )
+        return
+      }
+      if (
+        ["classes", "professions"].includes(kind) &&
+        editing &&
+        form.grade !== editing.grade &&
+        !isRecord(configuredGrades[form.grade])
+      ) {
+        setFormError(
+          "The selected initial grade has no matching gains row. Add it or restore the previous grade."
+        )
+        return
+      }
+      if (
+        ["classes", "professions"].includes(kind) &&
+        !editing &&
+        !config.grades
+      )
+        config.grades = {}
+      // Only validate the per-grade rows when the config is actually new or
+      // changed. A metadata-only legacy edit (or any edit whose config is
+      // semantically unchanged) skips row validation, so legacy sparse rows - a
+      // class row with `fixed: {}` and no attributes, for instance - remain
+      // PATCHable without re-validating a config the server will not re-stamp.
+      if (
+        !editing ||
+        stableStringify(config) !== stableStringify(editing.config ?? {})
+      ) {
+        const rowsKey = kind === "races" ? "raceDefinitions" : "grades"
+        const rows = isRecord(config[rowsKey]) ? config[rowsKey] : {}
+        for (const [grade, rawRow] of Object.entries(rows)) {
+          if (!isRecord(rawRow)) continue
+          const vectorKey = kind === "races" ? "perLevel" : "fixed"
+          const freeKey = kind === "races" ? "freePerLevel" : "free"
+          const rawVector = isRecord(rawRow[vectorKey]) ? rawRow[vectorKey] : {}
+          if (
+            Object.values(rawVector).some(
+              (value) => typeof value !== "number" || !Number.isFinite(value)
+            )
+          ) {
+            setFormError(`${grade}-grade attributes must be finite numbers.`)
+            return
+          }
+          const free = rawRow[freeKey]
+          if (
+            free !== undefined &&
+            (typeof free !== "number" || !Number.isInteger(free) || free < 0)
+          ) {
+            setFormError(
+              `${grade}-grade free points must be a nonnegative integer.`
+            )
+            return
+          }
+          if (kind === "classes" || kind === "professions") {
+            // The backend partialVectorSchema allows sparse vectors, so `fixed`
+            // need not carry every attribute. It must still be a record (the
+            // schema makes `fixed` required) when a row is authored/changed.
+            const fixed = isRecord(rawRow.fixed) ? rawRow.fixed : null
+            if (!fixed) {
+              setFormError(
+                `${grade}-grade rows require a numeric value for every attribute.`
+              )
+              return
+            }
+            if (
+              typeof rawRow.free !== "number" ||
+              !Number.isInteger(rawRow.free) ||
+              rawRow.free < 0
+            ) {
+              setFormError(
+                `${grade}-grade free points must be a nonnegative integer.`
+              )
+              return
+            }
+          }
+          if (
+            kind === "races" &&
+            (typeof rawRow.id !== "string" || !rawRow.id.trim())
+          ) {
+            setFormError(`${grade}-grade race gains require an id.`)
+            return
+          }
+        }
+      }
+    }
+    if (
+      kind === "equipment" &&
+      !editing &&
+      (!EQUIPMENT_SLOTS.includes(
+        String(config.slot) as (typeof EQUIPMENT_SLOTS)[number]
+      ) ||
+        !RARITIES.includes(String(config.rarity) as (typeof RARITIES)[number]))
+    ) {
+      setFormError(
+        "Choose a supported equipment slot and rarity before creating equipment."
+      )
+      return
+    }
+    if (
+      kind === "skills" &&
+      !editing &&
+      !RARITIES.includes(String(config.rarity) as (typeof RARITIES)[number])
+    ) {
+      setFormError("Choose a supported rarity before creating a skill.")
+      return
+    }
     setSubmitting(true)
     setFormError(null)
     try {
       const body = {
         name: form.name,
         ...(form.description.trim() ? { description: form.description } : {}),
-        ...(form.grade.trim() ? { grade: form.grade } : {}),
-        provenance: form.provenance,
+        ...(form.grade.trim() &&
+        (kind !== "races" ||
+          !editing ||
+          form.grade !==
+            (isRecord(editing.config) &&
+            typeof editing.config.naturalGrade === "string"
+              ? editing.config.naturalGrade
+              : editing.grade))
+          ? { grade: form.grade }
+          : {}),
         ...(form.sourceUrl.trim() ? { sourceUrl: form.sourceUrl } : {}),
         // On an EDIT whose parsed config is semantically unchanged from the
         // currently persisted one, omit `config` entirely so the PATCH does not
@@ -593,7 +803,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     } finally {
       setSubmitting(false)
     }
-  }, [editing, form, kind, load])
+  }, [editing, form, kind, load, structuredKind])
 
   const openSource = React.useCallback((url: string | null) => {
     if (url) window.open(url, "_blank", "noopener")
@@ -693,7 +903,6 @@ export function CatalogManager({ kind }: { kind: string }) {
               <TableRow>
                 <TableHead>Name</TableHead>
                 <TableHead>Grade</TableHead>
-                <TableHead>Provenance</TableHead>
                 <TableHead>Stable id</TableHead>
                 <TableHead>Source</TableHead>
                 {isAdmin ? (
@@ -723,9 +932,6 @@ export function CatalogManager({ kind }: { kind: string }) {
                       ) : null}
                     </TableCell>
                     <TableCell>{item.grade ?? "-"}</TableCell>
-                    <TableCell className="capitalize">
-                      {item.provenance}
-                    </TableCell>
                     <TableCell className="font-mono text-[0.6875rem]">
                       {item.stableId}
                     </TableCell>
@@ -777,7 +983,9 @@ export function CatalogManager({ kind }: { kind: string }) {
       )}
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden sm:max-w-lg">
+        <DialogContent
+          className={`max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden ${structuredKind ? "sm:max-w-6xl" : "sm:max-w-lg"}`}
+        >
           <DialogHeader>
             <DialogTitle>{editing ? "Edit entry" : "New entry"}</DialogTitle>
             <DialogDescription>
@@ -809,7 +1017,339 @@ export function CatalogManager({ kind }: { kind: string }) {
                   }
                 />
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              {structuredKind ? (
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="cat-grade">
+                    {kind === "races" ? "Natural grade" : "Initial grade"}
+                  </Label>
+                  <div
+                    id="cat-grade"
+                    role="radiogroup"
+                    aria-label={
+                      kind === "races" ? "Natural grade" : "Initial grade"
+                    }
+                    className="grid grid-cols-8 overflow-hidden rounded-md border"
+                    onKeyDown={(event) => {
+                      const current = GRADES.indexOf(
+                        form.grade as (typeof GRADES)[number]
+                      )
+                      const next =
+                        event.key === "ArrowRight" || event.key === "ArrowDown"
+                          ? (current + 1) % GRADES.length
+                          : event.key === "ArrowLeft" || event.key === "ArrowUp"
+                            ? (current - 1 + GRADES.length) % GRADES.length
+                            : event.key === "Home"
+                              ? 0
+                              : event.key === "End"
+                                ? GRADES.length - 1
+                                : -1
+                      if (next >= 0) {
+                        event.preventDefault()
+                        const buttons =
+                          event.currentTarget.querySelectorAll("button")
+                        ;(buttons[next] as HTMLButtonElement)?.focus()
+                        setForm((f) => ({ ...f, grade: GRADES[next] }))
+                      }
+                    }}
+                  >
+                    {GRADES.map((grade) => (
+                      <Button
+                        key={grade}
+                        type="button"
+                        size="sm"
+                        role="radio"
+                        disabled={!structuredConfig}
+                        variant={form.grade === grade ? "secondary" : "outline"}
+                        aria-checked={form.grade === grade}
+                        tabIndex={
+                          form.grade === grade ||
+                          (!form.grade && grade === GRADES[0])
+                            ? 0
+                            : -1
+                        }
+                        className="rounded-none border-0 border-r last:border-r-0 focus-visible:z-10"
+                        onClick={() => setForm((f) => ({ ...f, grade }))}
+                      >
+                        {grade}
+                      </Button>
+                    ))}
+                  </div>
+                  {kind === "races" ? (
+                    <div className="flex flex-col gap-2">
+                      <Label htmlFor="race-type">Race type</Label>
+                      <select
+                        id="race-type"
+                        className="h-9 rounded-md border bg-background px-3 text-sm"
+                        value={
+                          typeof structuredConfig?.raceType === "string"
+                            ? structuredConfig.raceType
+                            : ""
+                        }
+                        onChange={(e) =>
+                          setConfigValue("raceType", e.target.value)
+                        }
+                      >
+                        <option value="">Choose race type</option>
+                        <option value="enlightened">Enlightened</option>
+                        <option value="monster">Monstrous</option>
+                      </select>
+                    </div>
+                  ) : null}
+                  {(["races", "classes", "professions"] as string[]).includes(
+                    kind
+                  ) ? (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-xs text-muted-foreground">
+                        Per-level gains by grade. Blank rows are left unchanged;
+                        enter 0 explicitly to save zero. Integrated characters
+                        require a G-grade race row.
+                      </p>
+                      <div className="overflow-x-auto rounded-md border">
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Grade</TableHead>
+                              {ATTRIBUTE_KEYS.map((key) => (
+                                <TableHead key={key}>{key}</TableHead>
+                              ))}
+                              <TableHead>Free points</TableHead>
+                              <TableHead>Actions</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {GRADES.filter((grade) => {
+                              const natural =
+                                form.grade &&
+                                GRADES.indexOf(grade) >=
+                                  GRADES.indexOf(
+                                    form.grade as (typeof GRADES)[number]
+                                  )
+                              const configured =
+                                kind === "races"
+                                  ? isRecord(
+                                      structuredConfig?.raceDefinitions
+                                    ) &&
+                                    Object.hasOwn(
+                                      structuredConfig.raceDefinitions,
+                                      grade
+                                    )
+                                  : isRecord(structuredConfig?.grades) &&
+                                    Object.hasOwn(
+                                      structuredConfig.grades,
+                                      grade
+                                    )
+                              return natural || configured || grade === "G"
+                            }).map((grade) => {
+                              const track =
+                                kind === "races"
+                                  ? isRecord(
+                                      structuredConfig?.raceDefinitions
+                                    ) &&
+                                    isRecord(
+                                      structuredConfig.raceDefinitions[grade]
+                                    )
+                                    ? (structuredConfig.raceDefinitions[
+                                        grade
+                                      ] as Record<string, unknown>)
+                                    : {}
+                                  : isRecord(structuredConfig?.grades) &&
+                                      isRecord(structuredConfig.grades[grade])
+                                    ? (structuredConfig.grades[grade] as Record<
+                                        string,
+                                        unknown
+                                      >)
+                                    : {}
+                              const vectorKey =
+                                kind === "races" ? "perLevel" : "fixed"
+                              const vector = isRecord(track[vectorKey])
+                                ? (track[vectorKey] as Record<string, unknown>)
+                                : {}
+                              const updateTrack = (
+                                field: string,
+                                value: unknown
+                              ) => {
+                                const outerKey =
+                                  kind === "races"
+                                    ? "raceDefinitions"
+                                    : "grades"
+                                const outer = isRecord(
+                                  structuredConfig?.[outerKey]
+                                )
+                                  ? (structuredConfig[outerKey] as Record<
+                                      string,
+                                      unknown
+                                    >)
+                                  : {}
+                                const old = isRecord(outer[grade])
+                                  ? (outer[grade] as Record<string, unknown>)
+                                  : {}
+                                const slug =
+                                  form.name
+                                    .trim()
+                                    .toLowerCase()
+                                    .replace(/[^a-z0-9]+/g, "-")
+                                    .replace(/^-|-$/g, "") ||
+                                  editing?.stableId ||
+                                  "entry"
+                                const updated = {
+                                  ...old,
+                                  ...(kind === "races"
+                                    ? {
+                                        id:
+                                          old.id ??
+                                          `${slug}-${grade.toLowerCase()}`,
+                                        freePerLevel: old.freePerLevel ?? 0,
+                                        perLevel: old.perLevel ?? {},
+                                      }
+                                    : {
+                                        free: old.free ?? 0,
+                                        fixed: old.fixed ?? {},
+                                      }),
+                                  [field]: value,
+                                }
+                                setConfigValue(outerKey, {
+                                  ...outer,
+                                  [grade]: updated,
+                                })
+                              }
+                              return (
+                                <TableRow key={grade}>
+                                  <TableHead scope="row">{grade}</TableHead>
+                                  {ATTRIBUTE_KEYS.map((key) => (
+                                    <TableCell key={key}>
+                                      <Input
+                                        aria-label={`${grade} ${key}`}
+                                        type="number"
+                                        min="0"
+                                        step="1"
+                                        disabled={!structuredConfig}
+                                        inputMode="numeric"
+                                        className="w-16"
+                                        value={
+                                          vector[key] == null
+                                            ? ""
+                                            : String(vector[key])
+                                        }
+                                        onChange={(e) =>
+                                          updateTrack(vectorKey, {
+                                            ...vector,
+                                            [key]:
+                                              e.target.value === ""
+                                                ? undefined
+                                                : Number.isFinite(
+                                                      Number(e.target.value)
+                                                    )
+                                                  ? Number(e.target.value)
+                                                  : vector[key],
+                                          })
+                                        }
+                                      />
+                                    </TableCell>
+                                  ))}
+                                  <TableCell>
+                                    <Input
+                                      aria-label={`${grade} Free points`}
+                                      type="number"
+                                      min="0"
+                                      step="1"
+                                      disabled={!structuredConfig}
+                                      inputMode="numeric"
+                                      className="w-20"
+                                      value={
+                                        track[
+                                          kind === "races"
+                                            ? "freePerLevel"
+                                            : "free"
+                                        ] == null
+                                          ? ""
+                                          : String(
+                                              track[
+                                                kind === "races"
+                                                  ? "freePerLevel"
+                                                  : "free"
+                                              ]
+                                            )
+                                      }
+                                      onChange={(e) =>
+                                        updateTrack(
+                                          kind === "races"
+                                            ? "freePerLevel"
+                                            : "free",
+                                          e.target.value === ""
+                                            ? undefined
+                                            : Number.isFinite(
+                                                  Number(e.target.value)
+                                                )
+                                              ? Number(e.target.value)
+                                              : track[
+                                                  kind === "races"
+                                                    ? "freePerLevel"
+                                                    : "free"
+                                                ]
+                                        )
+                                      }
+                                    />
+                                  </TableCell>
+                                  <TableCell>
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="outline"
+                                      disabled={
+                                        !Object.hasOwn(
+                                          isRecord(
+                                            structuredConfig?.[
+                                              kind === "races"
+                                                ? "raceDefinitions"
+                                                : "grades"
+                                            ]
+                                          )
+                                            ? (structuredConfig[
+                                                kind === "races"
+                                                  ? "raceDefinitions"
+                                                  : "grades"
+                                              ] as object)
+                                            : {},
+                                          grade
+                                        )
+                                      }
+                                      onClick={() => {
+                                        if (
+                                          !window.confirm(
+                                            `Remove the ${grade}-grade gains row?`
+                                          )
+                                        )
+                                          return
+                                        const key =
+                                          kind === "races"
+                                            ? "raceDefinitions"
+                                            : "grades"
+                                        const rows = isRecord(
+                                          structuredConfig?.[key]
+                                        )
+                                          ? (structuredConfig[key] as Record<
+                                              string,
+                                              unknown
+                                            >)
+                                          : {}
+                                        const next = { ...rows }
+                                        delete next[grade]
+                                        setConfigValue(key, next)
+                                      }}
+                                    >
+                                      Remove
+                                    </Button>
+                                  </TableCell>
+                                </TableRow>
+                              )
+                            })}
+                          </TableBody>
+                        </Table>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : !["equipment", "skills"].includes(kind) ? (
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="cat-grade">Grade</Label>
                   <Input
@@ -820,30 +1360,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                     }
                   />
                 </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="cat-provenance">Provenance</Label>
-                  <Select
-                    value={form.provenance}
-                    onValueChange={(value) =>
-                      setForm((f) => ({
-                        ...f,
-                        provenance: value ?? f.provenance,
-                      }))
-                    }
-                  >
-                    <SelectTrigger id="cat-provenance" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {PROVENANCE_OPTIONS.map((opt) => (
-                        <SelectItem key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
+              ) : null}
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="cat-source">Source URL</Label>
                 <Input
@@ -918,15 +1435,181 @@ export function CatalogManager({ kind }: { kind: string }) {
                     ) : null}
                   </div>
                 ) : null}
-                <Label htmlFor="cat-config">Config (JSON)</Label>
-                <Textarea
-                  id="cat-config"
-                  className="max-h-[40vh] min-h-28 resize-y font-mono text-[0.6875rem]"
-                  value={form.configText}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, configText: e.target.value }))
-                  }
-                />
+                {kind === "equipment" || kind === "skills" ? (
+                  <div className="flex flex-col gap-2 rounded-md border p-3">
+                    <p className="text-sm font-medium">
+                      {kind === "equipment"
+                        ? "Equipment details"
+                        : "Skill rarity"}
+                    </p>
+                    {kind === "equipment" ? (
+                      <>
+                        <Label htmlFor="equip-slot">Slot</Label>
+                        <select
+                          id="equip-slot"
+                          disabled={!structuredConfig}
+                          className="h-9 rounded-md border bg-background px-3 text-sm"
+                          value={
+                            typeof structuredConfig?.slot === "string" &&
+                            EQUIPMENT_SLOTS.includes(
+                              structuredConfig.slot as (typeof EQUIPMENT_SLOTS)[number]
+                            )
+                              ? structuredConfig.slot
+                              : typeof structuredConfig?.slot === "string"
+                                ? structuredConfig.slot
+                                : ""
+                          }
+                          onChange={(e) =>
+                            setConfigValue("slot", e.target.value)
+                          }
+                        >
+                          <option value="">Select equipment slot</option>
+                          {typeof structuredConfig?.slot === "string" &&
+                          !EQUIPMENT_SLOTS.includes(
+                            structuredConfig.slot as (typeof EQUIPMENT_SLOTS)[number]
+                          ) ? (
+                            <option value={structuredConfig.slot}>
+                              {structuredConfig.slot} (legacy)
+                            </option>
+                          ) : null}
+                          {EQUIPMENT_SLOTS.map((slot) => (
+                            <option key={slot} value={slot}>
+                              {slot}
+                            </option>
+                          ))}
+                        </select>
+                      </>
+                    ) : null}
+                    <Label htmlFor="cat-rarity">Rarity</Label>
+                    <select
+                      id="cat-rarity"
+                      disabled={!structuredConfig}
+                      className="h-9 rounded-md border bg-background px-3 text-sm"
+                      value={
+                        typeof structuredConfig?.rarity === "string" &&
+                        RARITIES.includes(
+                          structuredConfig.rarity as (typeof RARITIES)[number]
+                        )
+                          ? structuredConfig.rarity
+                          : typeof structuredConfig?.rarity === "string"
+                            ? structuredConfig.rarity
+                            : ""
+                      }
+                      onChange={(e) => setConfigValue("rarity", e.target.value)}
+                    >
+                      <option value="">Select rarity</option>
+                      {typeof structuredConfig?.rarity === "string" &&
+                      !RARITIES.includes(
+                        structuredConfig.rarity as (typeof RARITIES)[number]
+                      ) ? (
+                        <option value={structuredConfig.rarity}>
+                          {structuredConfig.rarity} (legacy)
+                        </option>
+                      ) : null}
+                      {RARITIES.map((rarity) => (
+                        <option key={rarity} value={rarity}>
+                          {rarity}
+                        </option>
+                      ))}
+                    </select>
+                    {kind === "equipment" ? (
+                      <>
+                        <label className="flex items-center gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            disabled={!structuredConfig}
+                            checked={structuredConfig?.soulbound === true}
+                            onChange={(e) =>
+                              setConfigValue("soulbound", e.target.checked)
+                            }
+                          />
+                          Soulbound (metadata only)
+                        </label>
+                        <Label htmlFor="min-race-level">
+                          Minimum race level
+                        </Label>
+                        <Input
+                          id="min-race-level"
+                          type="number"
+                          min="0"
+                          disabled={!structuredConfig}
+                          value={
+                            typeof structuredConfig?.minRaceLevel === "number"
+                              ? structuredConfig.minRaceLevel
+                              : ""
+                          }
+                          onChange={(e) =>
+                            setConfigValue(
+                              "minRaceLevel",
+                              e.target.value === ""
+                                ? undefined
+                                : Number(e.target.value)
+                            )
+                          }
+                        />
+                        <Label htmlFor="race-requirement">
+                          Required race type
+                        </Label>
+                        <select
+                          id="race-requirement"
+                          disabled={!structuredConfig}
+                          className="h-9 rounded-md border bg-background px-3 text-sm"
+                          value={
+                            typeof structuredConfig?.requiredRaceType ===
+                            "string"
+                              ? structuredConfig.requiredRaceType
+                              : ""
+                          }
+                          onChange={(e) =>
+                            setConfigValue(
+                              "requiredRaceType",
+                              e.target.value || undefined
+                            )
+                          }
+                        >
+                          <option value="">Any</option>
+                          <option value="enlightened">
+                            Humanoid (enlightened)
+                          </option>
+                          <option value="monster">Monstrous (monster)</option>
+                        </select>
+                      </>
+                    ) : null}
+                    {(kind === "equipment" &&
+                      typeof structuredConfig?.slot === "string" &&
+                      !EQUIPMENT_SLOTS.includes(
+                        structuredConfig.slot as (typeof EQUIPMENT_SLOTS)[number]
+                      )) ||
+                    (typeof structuredConfig?.rarity === "string" &&
+                      !RARITIES.includes(
+                        structuredConfig.rarity as (typeof RARITIES)[number]
+                      )) ? (
+                      <p role="alert" className="text-xs text-destructive">
+                        Legacy value is not in the supported choices. Preserve
+                        or correct it in Advanced JSON before editing these
+                        metadata fields.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+                <details className="rounded-md border p-3">
+                  <summary className="cursor-pointer text-sm font-medium">
+                    Advanced JSON
+                  </summary>
+                  <p className="my-2 text-xs text-muted-foreground">
+                    Unrecognized configuration is preserved. Invalid JSON
+                    disables structured editing and saving.
+                  </p>
+                  <Label htmlFor="cat-config">Config (JSON)</Label>
+                  <Textarea
+                    id="cat-config"
+                    className="max-h-[40vh] min-h-28 resize-y font-mono text-[0.6875rem]"
+                    value={form.configText}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, configText: e.target.value }))
+                    }
+                  />
+                </details>
               </div>
               {formError ? (
                 <Alert variant="destructive">{formError}</Alert>
@@ -936,7 +1619,11 @@ export function CatalogManager({ kind }: { kind: string }) {
           <DialogFooter showCloseButton>
             <Button
               onClick={save}
-              disabled={submitting || form.name.trim().length === 0}
+              disabled={
+                submitting ||
+                form.name.trim().length === 0 ||
+                (hasStructuredEditor && !structuredConfig)
+              }
             >
               {submitting ? "Saving..." : "Save"}
             </Button>
@@ -995,18 +1682,11 @@ export function CatalogManager({ kind }: { kind: string }) {
                               ? "Create"
                               : "Skip existing"}
                           </Badge>
-                          {entry.provenance === "inferred" ? (
-                            <Badge variant="secondary">Inferred</Badge>
-                          ) : (
-                            <Badge variant="secondary">
-                              {entry.provenance}
-                            </Badge>
-                          )}
                         </span>
                         {entry.status === "skip_existing" && entry.existing ? (
                           <span className="flex flex-col gap-1 text-xs text-muted-foreground">
                             <span>
-                              {`Existing preserved: ${entry.existing.name} (${entry.existing.provenance})`}
+                              {`Existing preserved: ${entry.existing.name}`}
                               {entry.existing.archived ? " - Archived" : ""}
                             </span>
                             {entry.existing.sourceUrl ? (
@@ -1091,8 +1771,7 @@ export function CatalogManager({ kind }: { kind: string }) {
             </DialogHeader>
             <Alert>
               No existing entries are overwritten. Imports do not grant
-              characters access, and provenance is not independently verified.
-              Review sources and provenance before applying.
+              characters access. Review sources before applying.
             </Alert>
             <div className="flex flex-col gap-2">
               <Label htmlFor="bulk-catalog-file">
@@ -1137,7 +1816,6 @@ export function CatalogManager({ kind }: { kind: string }) {
                         <span className="font-mono text-xs">
                           {entry.stableId}
                         </span>
-                        <span>Provenance: {entry.provenance}</span>
                         {entry.sourceUrl ? (
                           <a
                             className="break-all text-primary underline"
@@ -1157,8 +1835,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                         </Badge>
                         {entry.status === "skip_existing" && entry.existing ? (
                           <span className="text-xs text-muted-foreground">
-                            Existing preserved: {entry.existing.name} (
-                            {entry.existing.provenance})
+                            Existing preserved: {entry.existing.name}
                             {entry.existing.archived ? " - Archived" : ""};{" "}
                             {entry.existing.sourceUrl ?? "No source URL"}
                           </span>

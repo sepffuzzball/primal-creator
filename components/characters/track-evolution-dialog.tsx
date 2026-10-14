@@ -242,8 +242,7 @@ export function TrackEvolutionDialog({
                     </span>
                   ) : null}
                   <span className="text-muted-foreground">
-                    Provenance: {option.provenance}
-                    {option.sourceUrl ? ` - ${option.sourceUrl}` : ""}
+                    {option.sourceUrl ? `Source: ${option.sourceUrl}` : null}
                   </span>
                   {option.blockers.length > 0 ? (
                     <ul className="list-disc pl-5 text-muted-foreground">

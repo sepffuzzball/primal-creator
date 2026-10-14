@@ -242,7 +242,6 @@ function makeItem(
     name: `Name ${id}`,
     description: null,
     grade: null,
-    provenance: "verified",
     sourceUrl: null,
     archived: false,
     config: {},

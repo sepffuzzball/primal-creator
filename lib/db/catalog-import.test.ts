@@ -28,9 +28,8 @@ function skillEntry(stableId: string, name = stableId): WikiReviewedEntry {
     stableId,
     name,
     description: `Description for ${name}`,
-    provenance: "inferred",
     sourceUrl: `https://example.com/${stableId}`,
-    config: { effects: [] },
+    config: { effects: [], rarity: "Common" },
   }
 }
 
@@ -49,7 +48,7 @@ describe("catalog import (unit, mocked db)", () => {
     expect(dbMock.store.catalog.size).toBe(0)
   })
 
-  it("apply creates all six curated entries with inferred provenance and archived=false", async () => {
+  it("apply creates all six curated entries with archived=false", async () => {
     const result = await applyWikiReviewedImport(WIKI_REVIEWED_ENTRIES)
     expect(result.source).toBe("wiki-reviewed")
     expect(result.createCount).toBe(6)
@@ -57,7 +56,6 @@ describe("catalog import (unit, mocked db)", () => {
     expect(result.createdIds).toHaveLength(6)
     expect(dbMock.store.catalog.size).toBe(6)
     for (const row of dbMock.store.catalog.values()) {
-      expect(row.provenance).toBe("inferred")
       expect(row.archived).toBe(false)
     }
     // Spot-check the kind-specific configs that must round-trip exactly.
@@ -94,6 +92,32 @@ describe("catalog import (unit, mocked db)", () => {
     })
   })
 
+  it("stores the exact reviewed rarity for both curated skills", async () => {
+    // The manifest records the (kind, stableId)-specific rarity reviewed against
+    // the wiki system description. One Step Mile is Ancient and Gaze of the Apex
+    // Hunter is Legendary - neither is the Common default, so this guards the
+    // curated values from a copy-paste regression.
+    const oneStepMile = WIKI_REVIEWED_ENTRIES.find(
+      (e) => e.stableId === "one-step-mile"
+    )!
+    expect(oneStepMile.config.rarity).toBe("Ancient")
+    const gaze = WIKI_REVIEWED_ENTRIES.find(
+      (e) => e.stableId === "gaze-of-the-apex-hunter"
+    )!
+    expect(gaze.config.rarity).toBe("Legendary")
+
+    // The values must survive the import round-trip into the stored config.
+    await applyWikiReviewedImport(WIKI_REVIEWED_ENTRIES)
+    const storedOneStepMile = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "one-step-mile"
+    )!
+    expect(storedOneStepMile.config).toMatchObject({ rarity: "Ancient" })
+    const storedGaze = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "gaze-of-the-apex-hunter"
+    )!
+    expect(storedGaze.config).toMatchObject({ rarity: "Legendary" })
+  })
+
   it("reapplying the identical manifest skips every existing row", async () => {
     await applyWikiReviewedImport(WIKI_REVIEWED_ENTRIES)
     const before = dbMock.store.catalog.size
@@ -102,12 +126,11 @@ describe("catalog import (unit, mocked db)", () => {
     expect(result.skipCount).toBe(6)
     expect(result.createdIds).toHaveLength(0)
     // Every skipped entry reports the ACTUAL existing row (the rows created by
-    // the first apply, all inferred), not the manifest's proposed values.
+    // the first apply), not the manifest's proposed values.
     const skipped = result.entries.filter((e) => e.status === "skip_existing")
     expect(skipped).toHaveLength(6)
     for (const entry of skipped) {
       expect(entry.existing).toBeDefined()
-      expect(entry.existing?.provenance).toBe("inferred")
       expect(entry.existing?.archived).toBe(false)
       expect(entry.existing?.id).toBeTruthy()
     }
@@ -121,7 +144,6 @@ describe("catalog import (unit, mocked db)", () => {
       stableId: "legendary-prodigy",
       name: "Old Legendary Prodigy",
       config: { houseNote: true, flat: { strength: 0 } },
-      provenance: "house",
       grade: "C",
       sourceUrl: "https://house.example/old",
       archived: true,
@@ -136,12 +158,10 @@ describe("catalog import (unit, mocked db)", () => {
     expect(skipped.sourceUrl).toBe(
       "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy"
     )
-    expect(skipped.provenance).toBe("inferred")
     expect(skipped.existing).toEqual({
       id: "house-title",
       name: "Old Legendary Prodigy",
       sourceUrl: "https://house.example/old",
-      provenance: "house",
       archived: true,
     })
     // Created entries never carry `existing`.
@@ -164,13 +184,11 @@ describe("catalog import (unit, mocked db)", () => {
       id: "house-title",
       name: "Old Legendary Prodigy",
       sourceUrl: "https://house.example/old",
-      provenance: "house",
       archived: true,
     })
     const row = [...dbMock.store.catalog.values()].find(
       (r) => r.id === "house-title"
     )!
-    expect(row.provenance).toBe("house")
     expect(row.grade).toBe("C")
     expect(row.name).toBe("Old Legendary Prodigy")
     expect(row.config).toEqual({ houseNote: true, flat: { strength: 0 } })
@@ -199,7 +217,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "legacy-bless",
         name: "Legacy",
         description: "A legacy blessing",
-        provenance: "inferred",
+
         sourceUrl: "https://example.com/x",
         config: { grade: "F", effect: {} },
       },
@@ -218,7 +236,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "legacy-race",
         name: "Legacy Race",
         description: "A legacy race with no raceType",
-        provenance: "inferred",
+
         sourceUrl: "https://example.com/legacy-race",
         config: {
           naturalGrade: "F",
@@ -242,7 +260,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "no-grade-race",
         name: "No Grade Race",
         description: "A race that omits naturalGrade",
-        provenance: "inferred",
+
         sourceUrl: "https://example.com/no-grade-race",
         config: {
           raceType: "enlightened",
@@ -266,7 +284,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "bad-title",
         name: "Bad",
         description: "A bad title",
-        provenance: "inferred",
+
         sourceUrl: "https://example.com/bad",
         config: { flat: { strength: -1 } },
       },
@@ -285,7 +303,6 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "x",
         name: "X",
         description: "d",
-        provenance: "inferred",
         sourceUrl: "https://example.com/x",
         config: {},
       },
@@ -293,24 +310,6 @@ describe("catalog import (unit, mocked db)", () => {
     await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
       status: 400,
       code: "invalid_kind",
-    })
-  })
-
-  it("rejects an entry whose provenance is not inferred", async () => {
-    const bad = [
-      {
-        kind: "titles",
-        stableId: "x",
-        name: "X",
-        description: "d",
-        provenance: "house",
-        sourceUrl: "https://example.com/x",
-        config: {},
-      },
-    ] as unknown as WikiReviewedEntry[]
-    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
-      status: 400,
-      code: "validation",
     })
   })
 
@@ -323,7 +322,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "http-title",
         name: "Http",
         description: "A title cited with an http source",
-        provenance: "inferred",
+
         sourceUrl: "http://example.com/http-title",
         config: {},
       },
@@ -333,7 +332,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "hostless-title",
         name: "Hostless",
         description: "A title cited with a hostless source",
-        provenance: "inferred",
+
         sourceUrl: "https://",
         config: {},
       },
@@ -359,7 +358,7 @@ describe("catalog import (unit, mocked db)", () => {
         stableId: "ghost-bless",
         name: "Ghost",
         description: "A blessing naming a missing god",
-        provenance: "inferred",
+
         sourceUrl: "https://example.com/ghost",
         config: {
           tier: "Minor",

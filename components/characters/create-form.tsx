@@ -1799,7 +1799,7 @@ export function CreateCharacterForm() {
                             ? " (Unavailable - re-select required)"
                             : null}
                           <QuestionnaireChoiceDescription>
-                            {[x.provenance, x.grade, x.description]
+                            {[x.grade, x.description]
                               .filter(Boolean)
                               .join(" - ")}
                           </QuestionnaireChoiceDescription>
@@ -1927,7 +1927,6 @@ export function CreateCharacterForm() {
                                 : null}
                               <small className="block text-muted-foreground">
                                 {[
-                                  x.provenance,
                                   x.grade,
                                   x.description,
                                   conflict
@@ -2026,7 +2025,7 @@ export function CreateCharacterForm() {
                               ? " (Unavailable - re-select required)"
                               : null}
                             <small className="block text-muted-foreground">
-                              {[x.provenance, x.grade, x.description]
+                              {[x.grade, x.description]
                                 .filter(Boolean)
                                 .join(" - ")}
                             </small>

@@ -90,7 +90,7 @@ The following are **requested default assumptions**, not canon. They run as
   source citation.
 - **G-grade and unknown grades: rate 0** by default (`consumable.rates.G` unset). A
   born-F race counts levels 1..9 at the F rate (3) rather than the G rate, because
-  the overlapping G/F bands are resolved by provenance, not by formula. Because an
+  the overlapping G/F bands are resolved by origin, not by formula. Because an
   unknown grade has rate 0, the cumulative permanent-consumable capacity is 0 for a
   character whose race levels fall only in unknown/unconfigured bands - so a
   **positive permanent gain is rejected against zero capacity** (rather than

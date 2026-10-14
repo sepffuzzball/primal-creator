@@ -16,11 +16,11 @@
  *     argument so tests can inject a fixture manifest while the production route
  *     stays fixed on `WIKI_REVIEWED_ENTRIES`.
  *   - Existing catalog rows are never overwritten: an entry whose (kind, stableId)
- *     already exists is skipped, leaving its config / provenance / slug untouched.
+ *     already exists is skipped, leaving its config / slug untouched.
  *     A skipped entry carries `existing` (read from the actual live row, never the
  *     manifest) so the admin can see exactly what was preserved; the manifest's
- *     proposed name/sourceUrl/provenance stay on the entry as the proposed values.
- *   - Created rows always set `archived: false` and `provenance: inferred`.
+ *     proposed name/sourceUrl stay on the entry as the proposed values.
+ *   - Created rows always set `archived: false`.
  *   - No scraping: this module never fetches a URL, it only reads a static array.
  *   - Every `sourceUrl` must be an `https:` URL that names a host. An `http:` or
  *     hostless value is rejected with a 400 even though `catalogCreateSchema`
@@ -46,8 +46,10 @@ import {
   catalogCreateSchema,
   catalogKindSchema,
   hasInvalidSkillTrack,
+  isIncompleteEquipmentConfig,
   isIncompleteRaceConfig,
   isIncompleteSkillConfig,
+  isIncompleteSkillRarity,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyConsumableConfig,
@@ -65,10 +67,9 @@ import type { Grade } from "@/lib/rules"
 export type CatalogKind = z.infer<typeof catalogKindSchema>
 
 /**
- * A single curated manifest entry. `provenance` is fixed to `"inferred"` because
- * the manifest is fan-wiki-derived (see docs/catalog/wiki-reviewed.md); `grade`
- * is optional and null when the entry has no grade band. `sourceUrl` must be an
- * https URL pointing at the exact evidence page.
+ * A single curated manifest entry. `grade` is optional and null when the entry
+ * has no grade band. `sourceUrl` must be an https URL pointing at the exact
+ * evidence page.
  */
 export interface WikiReviewedEntry {
   kind: CatalogKind
@@ -76,7 +77,6 @@ export interface WikiReviewedEntry {
   name: string
   description: string
   grade?: Grade | null
-  provenance: "inferred"
   sourceUrl: string
   config: Record<string, unknown>
 }
@@ -88,7 +88,6 @@ interface ValidatedEntry {
   name: string
   description: string
   grade: Grade | null
-  provenance: "inferred"
   sourceUrl: string
   config: Record<string, unknown>
 }
@@ -96,14 +95,12 @@ interface ValidatedEntry {
 /**
  * Metadata read from the ACTUAL existing catalog row that occupies a (kind,
  * stableId) key and is therefore preserved untouched. Copied verbatim from the
- * live row (never from the manifest); `provenance` reflects the real row
- * (`verified` | `inferred` | `house`), NOT the manifest's fixed `"inferred"`.
+ * live row (never from the manifest).
  */
 export interface CatalogImportExistingRow {
   id: string
   name: string
   sourceUrl: string | null
-  provenance: "verified" | "inferred" | "house"
   archived: boolean
 }
 
@@ -112,13 +109,12 @@ export interface CatalogImportEntryPreview {
   kind: CatalogKind
   stableId: string
   /**
-   * The PROPOSED wiki entry from the manifest. `name` / `sourceUrl` /
-   * `provenance:'inferred'` always describe what the manifest WOULD create; they
-   * are never overwritten by an existing row.
+   * The PROPOSED wiki entry from the manifest. `name` / `sourceUrl` always
+   * describe what the manifest WOULD create; they are never overwritten by an
+   * existing row.
    */
   name: string
   sourceUrl: string | null
-  provenance: "inferred"
   status: "create" | "skip_existing"
   /**
    * Present ONLY when `status` is `"skip_existing"`: metadata read directly
@@ -196,19 +192,12 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
   if (!catalogKindSchema.safeParse(entry.kind).success) {
     throw badRequest("invalid_kind", `Unknown catalog kind "${entry.kind}"`)
   }
-  if (entry.provenance !== "inferred") {
-    throw badRequest(
-      "validation",
-      `Manifest entry "${entry.stableId}" must use provenance "inferred" (got "${entry.provenance}")`
-    )
-  }
   assertHttpsSourceUrl(entry.sourceUrl, entry.stableId)
   const parsed = catalogCreateSchema.safeParse({
     stableId: entry.stableId,
     name: entry.name,
     description: entry.description,
     grade: entry.grade ?? null,
-    provenance: entry.provenance,
     sourceUrl: entry.sourceUrl,
     config: entry.config,
   })
@@ -236,7 +225,6 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     name: entry.name,
     description: entry.description,
     grade: entry.grade ?? null,
-    provenance: "inferred",
     sourceUrl: entry.sourceUrl,
     config,
   }
@@ -267,6 +255,13 @@ export function assertModernConfig(
     throw badRequest(
       "invalid_config",
       'Skill config has an invalid "track": expected "class" or "profession"'
+    )
+  }
+  // A NEW manifest skill must declare a valid rarity, same as a new skill POST.
+  if (kind === "skills" && isIncompleteSkillRarity(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Skill config requires a valid "rarity" (one of Inferior/Common/Uncommon/Rare/Epic/Ancient/Legendary/Mythical/Sacred/Divine/Unique)'
     )
   }
   if (kind === "races" && isIncompleteRaceConfig(config)) {
@@ -302,6 +297,14 @@ export function assertModernConfig(
       'Transcendent skill config is missing required "passiveEffects" field'
     )
   }
+  // A NEW equipment entry requires a valid slot AND a valid rarity; a legacy
+  // metadata-only config (no slot / no rarity) is never authoritative here.
+  if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring 1/Ring 2/Weapon, or a documented legacy alias) and a valid "rarity"'
+    )
+  }
 }
 
 // ------------------------------------------------------------------ //
@@ -321,7 +324,6 @@ interface ExistingCatalogRow {
   id: string
   name: string
   sourceUrl?: string | null
-  provenance?: string | null
   archived?: boolean
 }
 
@@ -330,8 +332,6 @@ function toExistingRow(row: ExistingCatalogRow): CatalogImportExistingRow {
     id: row.id,
     name: row.name,
     sourceUrl: row.sourceUrl ?? null,
-    provenance: (row.provenance ??
-      "house") as CatalogImportExistingRow["provenance"],
     archived: row.archived ?? false,
   }
 }
@@ -346,7 +346,6 @@ function toPreviewEntry(
     stableId: entry.stableId,
     name: entry.name,
     sourceUrl: entry.sourceUrl,
-    provenance: entry.provenance,
     status,
     ...(status === "skip_existing" && existingRow
       ? { existing: toExistingRow(existingRow) }
@@ -484,7 +483,6 @@ export async function applyWikiReviewedImport(
               name: entry.name,
               description: entry.description,
               grade: entry.grade,
-              provenance: entry.provenance,
               sourceUrl: entry.sourceUrl,
               archived: false,
               config: entry.config as Prisma.InputJsonValue,

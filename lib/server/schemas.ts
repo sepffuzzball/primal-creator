@@ -392,6 +392,19 @@ export const consumeSchema = z.object({
 })
 
 /**
+ * Set-once profession after creation. The client supplies the id of an active
+ * `professions` catalog entry (graded exactly at the character's current race
+ * grade and declaring a per-level config for that grade) plus the CAS `version`.
+ * The service rejects a monster / classless race, validates the catalog entry,
+ * and 409s an already-set profession with `profession_already_set`. No level
+ * awards are granted and the class/race tracks are never touched.
+ */
+export const professionSetSchema = z.object({
+  professionId: z.string().min(1),
+  version: z.number().int().nonnegative(),
+})
+
+/**
  * Manual inventory bookkeeping (add / remove owned equipment or consumable
  * quantity). `operation` is a literal add/remove, `quantity` is bounded 1..999999
  * (the same bound the migration's CHECK constraint enforces), `version` is the CAS
@@ -486,6 +499,18 @@ export const skillGrantSchema = z.object({
   reason: z.string().min(1),
 })
 
+/**
+ * An explicit skill-upgrade request. The owner or an admin upgrades the
+ * character's linked skill in an `upgradeGroup` to a strictly higher-ordered
+ * rarity variant. `reason` is a mandatory at-most-500-character note recorded
+ * into the `skill_upgrade` journal; `version` is the CAS token.
+ */
+export const skillUpgradeSchema = z.object({
+  definitionId: z.string().min(1),
+  version: z.number().int().nonnegative(),
+  reason: z.string().min(1).max(500),
+})
+
 // Discriminated union: a skill action is either a player/admin selection of a
 // pending offer option, or an admin-only manual grant.
 export const skillsPostSchema = z.discriminatedUnion("operation", [
@@ -516,7 +541,6 @@ const catalogBase = {
   name: z.string().min(1),
   description: z.string().nullable().optional(),
   grade: gradeSchema.nullable().optional(),
-  provenance: z.enum(["verified", "inferred", "house"]).optional(),
   sourceUrl: z.string().url().nullable().optional(),
   archived: z.boolean().optional(),
 }
@@ -619,10 +643,142 @@ export const trackConfigSchema = z
   })
   .passthrough()
 
+// ------------------------------------------------------------------ //
+// Equipment metadata (slot / rarity / soulbound / eligibility)
+// ------------------------------------------------------------------ //
+
+/** Ordered canonical equipment rarity tiers, ascending by commonness. */
+export const EQUIPMENT_RARITIES = [
+  "Inferior",
+  "Common",
+  "Uncommon",
+  "Rare",
+  "Epic",
+  "Ancient",
+  "Legendary",
+  "Mythical",
+  "Sacred",
+  "Divine",
+] as const
+
+/**
+ * The `Unique` rarity is "incomparable": it is NOT part of the ordered comparable
+ * ladder in `EQUIPMENT_RARITIES` (no tier is above or below it), so it is held
+ * separately rather than appended to that ladder.
+ */
+export const EQUIPMENT_UNIQUE_RARITY = "Unique" as const
+
+/** The full equipment rarity vocabulary incl. the incomparable `Unique`. */
+export const equipmentRaritySchema = z.enum([
+  ...EQUIPMENT_RARITIES,
+  EQUIPMENT_UNIQUE_RARITY,
+])
+
+/**
+ * The shared rarity vocabulary reused by every catalog kind that carries a
+ * rarity tier, aliased to `equipmentRaritySchema` so the accepted values and the
+ * incomparable `Unique` tier stay identical across equipment and skills.
+ */
+export const raritySchema = equipmentRaritySchema
+
+/**
+ * The 0-based order of a rarity within the comparable ladder
+ * (`EQUIPMENT_RARITIES`). The incomparable `Unique` tier and any missing /
+ * unrecognized value return undefined, so a caller can distinguish "not on the
+ * comparable ladder, nothing is strictly above or below it" from a real tier.
+ */
+export function rarityOrderIndex(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined
+  const index = EQUIPMENT_RARITIES.indexOf(
+    value as (typeof EQUIPMENT_RARITIES)[number]
+  )
+  return index >= 0 ? index : undefined
+}
+
+/** The canonical equipment slots. */
+export const EQUIPMENT_SLOTS = [
+  "Head",
+  "Chest",
+  "Back",
+  "Arms",
+  "Hands",
+  "Legs",
+  "Feet",
+  "Neck",
+  "Ring 1",
+  "Ring 2",
+  "Weapon",
+] as const
+
+export const equipmentSlotSchema = z.enum(EQUIPMENT_SLOTS)
+
+/**
+ * Documented legacy slot aliases -> canonical slot. These normalize ONLY for
+ * slot-collision / replacement / import-integrity comparisons; a catalog write
+ * stores the original config verbatim (no synonym coercion) unless the value is
+ * already canonical.
+ */
+const EQUIPMENT_SLOT_ALIASES: Record<string, string> = {
+  head: "Head",
+  chest: "Chest",
+  cloak: "Back",
+  bracers: "Arms",
+  gloves: "Hands",
+  boots: "Feet",
+  necklace: "Neck",
+  ring1: "Ring 1",
+  ring2: "Ring 2",
+}
+
+/**
+ * Normalize an equipment slot value to its canonical form purely for collision /
+ * replacement / import-integrity comparisons. Canonical values pass through
+ * (case-insensitively, so `feet` maps to `Feet`), documented legacy aliases map
+ * to their canonical slot, and any other value returns undefined (so an
+ * unrecognized / legacy slot never participates in a collision). The original
+ * `config.slot` is never rewritten by this function.
+ */
+export function normalizeEquipmentSlot(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const canonical = EQUIPMENT_SLOTS.find(
+    (s) => s.toLowerCase() === value.toLowerCase()
+  )
+  if (canonical) return canonical
+  return EQUIPMENT_SLOT_ALIASES[value.toLowerCase()]
+}
+
+/** Whether an equipment slot value is one of the canonical `EQUIPMENT_SLOTS`. */
+export function isCanonicalEquipmentSlot(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    (EQUIPMENT_SLOTS as readonly string[]).includes(value)
+  )
+}
+
+/**
+ * Detect an equipment config that is not a valid authoritative config for a NEW
+ * or CONFIG-CHANGING write. The modern-shape guard requires BOTH a slot that
+ * normalizes to a recognized canonical slot AND a valid `rarity`. A legacy
+ * config lacking either remains readable / metadata-PATCHable but is never
+ * authoritative for a new or config-changing write (mirroring race / skill /
+ * blessing hardening). `minRaceLevel` / `soulbound` / `requiredRaceType` are
+ * optional metadata validated by `equipmentConfigSchema` itself.
+ */
+export function isIncompleteEquipmentConfig(
+  config: Record<string, unknown>
+): boolean {
+  if (normalizeEquipmentSlot(config.slot) == null) return true
+  return !equipmentRaritySchema.safeParse(config.rarity).success
+}
+
 export const equipmentConfigSchema = z
   .object({
     slot: z.string().min(1).optional(),
     bonus: nonnegativePartialVectorSchema.optional(),
+    rarity: equipmentRaritySchema.optional(),
+    soulbound: z.boolean().optional(),
+    minRaceLevel: z.number().int().nonnegative().optional(),
+    requiredRaceType: z.enum(["enlightened", "monster"]).optional(),
   })
   .passthrough()
 
@@ -701,8 +857,22 @@ export const skillConfigSchema = z
     eligibleDefinitionStableIds: z.array(z.string()).optional(),
     effects: z.array(skillEffectSchema).optional(),
     upgradeGroup: z.string().optional(),
+    rarity: raritySchema.optional(),
   })
   .passthrough()
+
+/**
+ * Detect a `skills` config that does not declare a valid `rarity`. A NEW or
+ * CONFIG-CHANGED skill must declare a rarity (see `skillConfigSchema`); a legacy
+ * config without one stays readable and metadata-only-PATCHable (mirroring the
+ * equipment slot/rarity hardening), but is never authoritative for a new or
+ * config-changing write.
+ */
+export function isIncompleteSkillRarity(
+  config: Record<string, unknown>
+): boolean {
+  return !raritySchema.safeParse(config.rarity).success
+}
 
 /**
  * A skill config is "offer-incomplete" when it declares exactly one of

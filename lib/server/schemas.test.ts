@@ -5,16 +5,30 @@ import {
   bloodlineConfigSchema,
   characterCreateSchema,
   characterUpdateSchema,
+  EQUIPMENT_RARITIES,
+  EQUIPMENT_SLOTS,
+  EQUIPMENT_UNIQUE_RARITY,
+  equipmentConfigSchema,
+  equipmentRaritySchema,
   evolveSchema,
   godConfigSchema,
   hasInvalidNaturalGradeConfig,
   hasInvalidRaceTypeConfig,
   inventoryPostSchema,
+  isCanonicalEquipmentSlot,
+  isIncompleteEquipmentConfig,
   isIncompleteRaceConfig,
+  isIncompleteSkillRarity,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
+  normalizeEquipmentSlot,
+  professionSetSchema,
   raceConfigSchema,
+  rarityOrderIndex,
+  raritySchema,
+  skillConfigSchema,
+  skillUpgradeSchema,
   specialAbilitiesSchema,
   titleConfigSchema,
   titleImprovementSchema,
@@ -379,6 +393,43 @@ describe("inventoryPostSchema", () => {
   })
 })
 
+describe("professionSetSchema", () => {
+  it("parses a valid set-once profession payload", () => {
+    const parsed = professionSetSchema.safeParse({
+      professionId: "prof-f",
+      version: 0,
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toEqual({ professionId: "prof-f", version: 0 })
+    }
+  })
+
+  it("rejects an empty professionId", () => {
+    expect(
+      professionSetSchema.safeParse({ professionId: "", version: 0 }).success
+    ).toBe(false)
+  })
+
+  it("rejects a missing professionId", () => {
+    expect(professionSetSchema.safeParse({ version: 0 }).success).toBe(false)
+  })
+
+  it("rejects a negative version", () => {
+    expect(
+      professionSetSchema.safeParse({ professionId: "prof-f", version: -1 })
+        .success
+    ).toBe(false)
+  })
+
+  it("rejects a non-integer version", () => {
+    expect(
+      professionSetSchema.safeParse({ professionId: "prof-f", version: 1.5 })
+        .success
+    ).toBe(false)
+  })
+})
+
 describe("transcendent_skills catalog config", () => {
   it("parses a modern transcendent config and preserves its typed passive effects", () => {
     const parsed = transcendentSkillConfigSchema.safeParse({
@@ -685,6 +736,233 @@ describe("race advancement (raceType / quarter / track)", () => {
     ).toBe(false)
     expect(
       isIncompleteRaceConfig({ raceType: "monster", naturalGrade: "S" })
+    ).toBe(false)
+  })
+})
+
+describe("equipment metadata (rarity / slot / soulbound / requirements)", () => {
+  it("exports the ordered rarity ladder plus the incomparable Unique tier separately", () => {
+    expect(EQUIPMENT_RARITIES).toEqual([
+      "Inferior",
+      "Common",
+      "Uncommon",
+      "Rare",
+      "Epic",
+      "Ancient",
+      "Legendary",
+      "Mythical",
+      "Sacred",
+      "Divine",
+    ])
+    expect(EQUIPMENT_UNIQUE_RARITY).toBe("Unique")
+    // Unique is NOT part of the ordered comparable ladder.
+    expect(EQUIPMENT_RARITIES).not.toContain(EQUIPMENT_UNIQUE_RARITY)
+  })
+
+  it("accepts every rarity in the vocabulary (incl. Unique)", () => {
+    for (const rarity of [...EQUIPMENT_RARITIES, EQUIPMENT_UNIQUE_RARITY]) {
+      expect(equipmentRaritySchema.safeParse(rarity).success).toBe(true)
+    }
+    expect(equipmentRaritySchema.safeParse("Commoner").success).toBe(false)
+  })
+
+  it("equipmentConfigSchema reads a full modern config and preserves optional metadata", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      soulbound: true,
+      minRaceLevel: 45,
+      requiredRaceType: "enlightened",
+      bonus: { strength: 10 },
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({
+        slot: "Head",
+        rarity: "Ancient",
+        soulbound: true,
+        minRaceLevel: 45,
+        requiredRaceType: "enlightened",
+        bonus: { strength: 10 },
+      })
+    }
+  })
+
+  it("equipmentConfigSchema reads a legacy config (lowercase alias slot, no rarity)", () => {
+    const parsed = equipmentConfigSchema.safeParse({ slot: "head" })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data).toMatchObject({ slot: "head" })
+  })
+
+  it("equipmentConfigSchema rejects an invalid rarity / negative minRaceLevel", () => {
+    expect(
+      equipmentConfigSchema.safeParse({ slot: "Head", rarity: "Commoner" })
+        .success
+    ).toBe(false)
+    expect(
+      equipmentConfigSchema.safeParse({ slot: "Head", minRaceLevel: -1 })
+        .success
+    ).toBe(false)
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        requiredRaceType: "humanoid",
+      }).success
+    ).toBe(false)
+  })
+
+  it("EQUIPMENT_SLOTS lists exactly the canonical slots", () => {
+    expect(EQUIPMENT_SLOTS).toEqual([
+      "Head",
+      "Chest",
+      "Back",
+      "Arms",
+      "Hands",
+      "Legs",
+      "Feet",
+      "Neck",
+      "Ring 1",
+      "Ring 2",
+      "Weapon",
+    ])
+  })
+
+  it("normalizeEquipmentSlot maps canonical + legacy aliases and rejects unknown slots", () => {
+    expect(normalizeEquipmentSlot("Head")).toBe("Head")
+    expect(normalizeEquipmentSlot("head")).toBe("Head")
+    expect(normalizeEquipmentSlot("chest")).toBe("Chest")
+    expect(normalizeEquipmentSlot("cloak")).toBe("Back")
+    expect(normalizeEquipmentSlot("bracers")).toBe("Arms")
+    expect(normalizeEquipmentSlot("gloves")).toBe("Hands")
+    expect(normalizeEquipmentSlot("boots")).toBe("Feet")
+    expect(normalizeEquipmentSlot("necklace")).toBe("Neck")
+    expect(normalizeEquipmentSlot("ring1")).toBe("Ring 1")
+    expect(normalizeEquipmentSlot("ring2")).toBe("Ring 2")
+    // A lowercased canonical value maps to the canonical slot too.
+    expect(normalizeEquipmentSlot("feet")).toBe("Feet")
+    expect(normalizeEquipmentSlot("weapon")).toBe("Weapon")
+    expect(normalizeEquipmentSlot("ring 1")).toBe("Ring 1")
+    expect(normalizeEquipmentSlot("body")).toBeUndefined()
+    expect(normalizeEquipmentSlot(undefined)).toBeUndefined()
+  })
+
+  it("isCanonicalEquipmentSlot accepts only canonical values", () => {
+    expect(isCanonicalEquipmentSlot("Head")).toBe(true)
+    expect(isCanonicalEquipmentSlot("Weapon")).toBe(true)
+    expect(isCanonicalEquipmentSlot("head")).toBe(false)
+    expect(isCanonicalEquipmentSlot("body")).toBe(false)
+  })
+
+  it("isIncompleteEquipmentConfig requires a normalizable slot AND a valid rarity", () => {
+    expect(isIncompleteEquipmentConfig({})).toBe(true)
+    expect(isIncompleteEquipmentConfig({ slot: "Head" })).toBe(true)
+    expect(isIncompleteEquipmentConfig({ rarity: "Common" })).toBe(true)
+    expect(
+      isIncompleteEquipmentConfig({ slot: "body", rarity: "Common" })
+    ).toBe(true)
+    expect(
+      isIncompleteEquipmentConfig({ slot: "Head", rarity: "Common" })
+    ).toBe(false)
+    // A legacy alias slot is accepted IF it normalizes to a canonical slot.
+    expect(isIncompleteEquipmentConfig({ slot: "head", rarity: "Rare" })).toBe(
+      false
+    )
+    expect(
+      isIncompleteEquipmentConfig({ slot: "Head", rarity: "Commoner" })
+    ).toBe(true)
+  })
+})
+
+describe("skill rarity (shared vocabulary + monotonic ordering)", () => {
+  it("shares the equipment rarity vocabulary via raritySchema", () => {
+    for (const rarity of [...EQUIPMENT_RARITIES, EQUIPMENT_UNIQUE_RARITY]) {
+      expect(raritySchema.safeParse(rarity).success).toBe(true)
+    }
+    expect(raritySchema.safeParse("Commoner").success).toBe(false)
+    // raritySchema is the same enum as equipmentRaritySchema.
+    expect(raritySchema).toEqual(equipmentRaritySchema)
+  })
+
+  it("rarityOrderIndex returns the 0-based comparable ladder order only", () => {
+    expect(rarityOrderIndex("Inferior")).toBe(0)
+    expect(rarityOrderIndex("Common")).toBe(1)
+    expect(rarityOrderIndex("Uncommon")).toBe(2)
+    expect(rarityOrderIndex("Rare")).toBe(3)
+    expect(rarityOrderIndex("Divine")).toBe(9)
+    // Unique is incomparable: NOT on the ladder.
+    expect(rarityOrderIndex("Unique")).toBeUndefined()
+    expect(rarityOrderIndex(undefined)).toBeUndefined()
+    expect(rarityOrderIndex("Commoner")).toBeUndefined()
+    expect(rarityOrderIndex(42)).toBeUndefined()
+  })
+
+  it("skillConfigSchema reads a rarity and rejects an invalid one", () => {
+    expect(
+      skillConfigSchema.safeParse({
+        track: "class",
+        milestone: 4,
+        rarity: "Rare",
+        effects: [],
+      }).success
+    ).toBe(true)
+    expect(
+      skillConfigSchema.safeParse({
+        track: "class",
+        milestone: 4,
+        rarity: "Commoner",
+      }).success
+    ).toBe(false)
+    // A legacy config without rarity still parses (readable).
+    expect(
+      skillConfigSchema.safeParse({ track: "class", milestone: 4 }).success
+    ).toBe(true)
+  })
+
+  it("isIncompleteSkillRarity rejects a missing or invalid rarity", () => {
+    expect(isIncompleteSkillRarity({})).toBe(true)
+    expect(isIncompleteSkillRarity({ track: "class", milestone: 4 })).toBe(true)
+    expect(
+      isIncompleteSkillRarity({
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+      })
+    ).toBe(false)
+    expect(isIncompleteSkillRarity({ tag: "x", rarity: "Unique" })).toBe(false)
+    expect(isIncompleteSkillRarity({ rarity: "Commoner" })).toBe(true)
+  })
+
+  it("skillUpgradeSchema requires definitionId, version and a 1..500 reason", () => {
+    expect(
+      skillUpgradeSchema.safeParse({
+        definitionId: "sk-1",
+        version: 3,
+        reason: "because",
+      }).success
+    ).toBe(true)
+    expect(
+      skillUpgradeSchema.safeParse({ definitionId: "sk-1", version: 0 }).success
+    ).toBe(false)
+    expect(
+      skillUpgradeSchema.safeParse({
+        definitionId: "sk-1",
+        version: 0,
+        reason: "",
+      }).success
+    ).toBe(false)
+    expect(
+      skillUpgradeSchema.safeParse({
+        definitionId: "sk-1",
+        version: 0,
+        reason: "x".repeat(501),
+      }).success
+    ).toBe(false)
+    expect(
+      skillUpgradeSchema.safeParse({
+        definitionId: "",
+        version: 0,
+        reason: "x",
+      }).success
     ).toBe(false)
   })
 })

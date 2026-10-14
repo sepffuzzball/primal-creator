@@ -57,12 +57,57 @@ so the catalog must define a `<grade>`-grade per-level config
 otherwise. Profession evolution is then a catalog-driven per-track path choice
 with **no** grade-only legacy fallback (see `docs/rules/evolution.md`).
 
+## Setting a profession after creation (set-once)
+
+A character created without a profession (or that must be assigned later by an
+owner/admin) can gain one through `POST /api/characters/[id]/profession`. This
+is a **set-once** assignment: it links a `professions` catalog entry and opens a
+`profession` progression track on a character that has neither. It never
+re-assigns an existing profession.
+
+Guards:
+
+- Only an **enlightened** race with a **class track** may carry a profession. A
+  monster (independent race mode) or a legacy classless imported character is
+  rejected with 400 `profession_requires_class`. That mirrors the wizard rule: a
+  profession is a class-adjacent track and cannot exist without a class.
+- A character that already carries a `professionId` or a `profession` track is
+  rejected with 409 `profession_already_set` (set once).
+- The catalog entry must be an **active** (unarchived) `professions` definition;
+  anything else is rejected (404 `catalog_not_found`, 400 `wrong_kind`,
+  400 `catalog_archived`).
+
+Grade gate:
+
+- The profession is chosen EXACTLY at the character's **current race grade**
+  (`state.race.grade`), the same way a creation wizard profession is stamped.
+  The catalog entry's own `grade` must equal the current race grade (a mismatch
+  is 400 `profession_grade_mismatch`) AND it must declare a
+  `grades.<currentRaceGrade>` per-level config (missing is 400
+  `profession_grade_config_missing`), exactly the per-grade gate a create-time
+  profession goes through. No lower-grade fallback is used.
+
+Write:
+
+- The `profession` track is created at `{ level: 0, quarter: 0,
+grade: currentRaceGrade, definitionId: "<stableId>:<grade>" }`; the
+  `professionId` column, the engine state and the version are written together
+  under the character's CAS version (a stale version 409s `version_conflict` and
+  rolls back the state write + event).
+- No level awards are granted. The class/race tracks, historical awards,
+  allocations and every other ledger are left untouched, and the run uses
+  SERIALIZABLE isolation (a concurrent write that cannot serialize surfaces as a
+  retryable 409 `catalog_serialization_conflict`, never a raw 500).
+- One immutable `profession_set` progression event is appended carrying the
+  resolved stable id/name/grade and a before/after snapshot of the profession id
+  and track.
+
 ## Seeded profession definitions (`db:seed`)
 
 `pnpm db:seed` seeds Jake Thayne's five alchemist profession progression
 definitions (`prisma/catalog/jake-seed.ts`), sourced from
-`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Profession`, each labelled
-`provenance: inferred` with exactly one `grades.<grade>` entry:
+`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Profession`, each with
+exactly one `grades.<grade>` entry:
 
 | Grade | Name                                          | stableId                                          |
 | ----- | --------------------------------------------- | ------------------------------------------------- |

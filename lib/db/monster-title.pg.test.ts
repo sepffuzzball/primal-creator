@@ -131,7 +131,7 @@ describe.skipIf(!gate.run)(
           stableId: raceStableId,
           name: "Cave Crawler",
           grade: "E",
-          provenance: "house",
+
           config: {
             raceType: "monster",
             naturalGrade: "E",
@@ -155,7 +155,7 @@ describe.skipIf(!gate.run)(
           stableId: dp1StableId,
           name: "Dungeon Pioneer I",
           grade: "E",
-          provenance: "house",
+
           config: {
             grade: "E",
             flat: allEqual(3),
@@ -173,7 +173,7 @@ describe.skipIf(!gate.run)(
           stableId: dp2StableId,
           name: "Dungeon Pioneer II",
           grade: "E",
-          provenance: "house",
+
           config: {
             grade: "E",
             flat: allEqual(6),
@@ -192,7 +192,7 @@ describe.skipIf(!gate.run)(
           stableId: arch1StableId,
           name: "Dungeon Pioneer Arch I",
           grade: "E",
-          provenance: "house",
+
           config: {
             grade: "E",
             flat: allEqual(3),
@@ -214,7 +214,7 @@ describe.skipIf(!gate.run)(
           stableId: arch2StableId,
           name: "Dungeon Pioneer Arch II",
           grade: "E",
-          provenance: "house",
+
           config: {
             grade: "E",
             flat: allEqual(6),

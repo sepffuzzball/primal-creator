@@ -6,20 +6,21 @@ scraper and it is never applied automatically: an authenticated admin calls
 `POST /api/admin/catalog-import` to opt in, and no other code path mutates the
 catalog on behalf of this manifest.
 
-## Provenance policy
+## Source provenance
 
-Every entry in this manifest is labelled `inferred`. The source is the
-fan-maintained **The Primal Hunter Wiki (Fandom)** - a secondary source - so this
-manifest conservatively marks anything derived from it as `inferred` rather than
-asserting it as canon.
+Every entry in this manifest is reviewed against the fan-maintained **The Primal
+Hunter Wiki (Fandom)** - a secondary source - so the numbers it records are
+derived readings, never asserted as canon. The catalog previously carried a
+`verified` / `inferred` / `house` provenance taxonomy on each row; that taxonomy
+has been removed. A row's only source indicator is now its `sourceUrl` (the
+exact page it was reviewed against).
 
 That is a choice about this manifest's own entries; it makes no claim about the
 rest of the catalog. Rows from other sources (for example, a row created through
-the admin catalog UI, or the curated rows the seed writes) carry their own
-provenance, and that is independent of this manifest. Because the import never
-overwrites an existing row, a pre-existing row's provenance is never rewritten to
-`inferred` by the import itself: whatever provenance a row was seeded with is
-preserved.
+the admin catalog UI, or the curated rows the seed writes) are ordinary catalog
+rows with their own `sourceUrl`. Because the import never overwrites an existing
+row, a pre-existing row is never rewritten by the import itself: whatever
+metadata a row was seeded with is preserved.
 
 There is **no scraping** here. The Fandom wiki returns HTTP 403 to most direct
 page fetches, so the project never fetches a URL at import time. An admin edits
@@ -44,7 +45,7 @@ stableId)` already exists.
 
 There is no separate audit table and no immutable import event journal. Catalog
 rows carry their own metadata - the `createdAt` / `updatedAt` timestamps,
-`sourceUrl`, `provenance`, and `archived` flag - but these are ordinary, editable
+`sourceUrl`, and `archived` flag - but these are ordinary, editable
 row fields, not an append-only record of import events. The apply response
 identifies the created row ids, and the row timestamps indicate when a row was
 written, but there is no journal that logs the sequence of import operations.

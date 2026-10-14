@@ -90,7 +90,6 @@ function snapshotCatalog(store: TestStore): string {
         stableId: row.stableId,
         name: row.name,
         grade: row.grade,
-        provenance: row.provenance,
         sourceUrl: row.sourceUrl,
         archived: row.archived,
         config: row.config,
@@ -183,7 +182,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     expect(JAKE_CLASSES.map((c) => c.grade)).toEqual(["F", "E", "D", "C", "B"])
     for (const cls of JAKE_CLASSES) {
       expect(cls.kind).toBe("classes")
-      expect(cls.provenance).toBe("inferred")
       const grade = cls.grade as string
       const grades = cls.config.grades as Record<string, unknown>
       expect(Object.keys(grades)).toEqual([grade])
@@ -223,7 +221,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     expect(c.stableId).toBe("heretic-chosen-alchemist-of-the-malefic-viper-c")
     for (const p of JAKE_PROFESSIONS) {
       expect(p.kind).toBe("professions")
-      expect(p.provenance).toBe("inferred")
       const grade = p.grade as string
       expect(Object.keys(p.config.grades as Record<string, unknown>)).toEqual([
         grade,
@@ -238,7 +235,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     // Every god config stays { } - no fabricated pantheon/rank/numeric effect.
     for (const god of JAKE_GODS) {
       expect(god.kind).toBe("gods")
-      expect(god.provenance).toBe("inferred")
       expect(god.grade).toBeNull()
       expect(god.config).toEqual({})
     }
@@ -287,7 +283,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       const rank = i + 1
       const numeral = numerals[i]
       expect(entry.kind).toBe("titles")
-      expect(entry.provenance).toBe("inferred")
       expect(entry.stableId).toBe(`dungeon-pioneer-${numeral.toLowerCase()}`)
       expect(entry.name).toBe(`Dungeon Pioneer ${numeral}`)
       expect(entry.sourceUrl).toBe(`${FANDOM}Dungeon_Pioneer`)
@@ -324,7 +319,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     )
     expect(titles).toHaveLength(15)
     for (const row of titles) {
-      expect(row.provenance).toBe("inferred")
       expect(row.archived).toBe(false)
       expect(row.stableId).toMatch(/^dungeon-pioneer-/)
       const config = row.config as DungeonPioneerConfig
@@ -343,7 +337,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
 
   it("keeps the sourced Human race table and the legacy baselines intact", () => {
     expect(HUMAN_ENTRY.kind).toBe("races")
-    expect(HUMAN_ENTRY.provenance).toBe("inferred")
     expect(HUMAN_ENTRY.sourceUrl).toBe(`${FANDOM}Jake_Thayne/Race`)
     const config = HUMAN_ENTRY.config as Record<string, unknown>
     // Human is authoritative and enlightened: it always selects an exact
@@ -371,7 +364,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     // The 0.0.2 baseline the legacy guard compares against. Its verifiedGrades /
     // houseGrades are retained exactly so the seed can detect an untouched 0.0.2
     // row and only then update it.
-    expect(LEGACY_HUMAN_BASELINE.provenance).toBe("verified")
     expect(
       (LEGACY_HUMAN_BASELINE.config as unknown as HumanRaceConfig).houseGrades
     ).toEqual(["G"])
@@ -393,7 +385,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       perception: 0,
       willpower: 0,
     })
-    expect(LEGACY_ARCHER_BASELINE.provenance).toBe("house")
     expect(
       (LEGACY_ARCHER_BASELINE.config as unknown as TrackGradesConfig).grades.F
         .fixed
@@ -406,7 +397,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     // seed detects a current 0.0.3 row and promotes it to the sourced entry that
     // now carries raceType. It is never authoritative itself.
     expect(LEGACY_HUMAN_BASELINE_V3.name).toBe("Human")
-    expect(LEGACY_HUMAN_BASELINE_V3.provenance).toBe("inferred")
     expect(
       (LEGACY_HUMAN_BASELINE_V3.config as unknown as HumanRaceConfig).raceType
     ).toBeUndefined()
@@ -416,7 +406,7 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     ).toBe(5)
   })
 
-  it("uses provenance inferred and never emits an evolutions row", () => {
+  it("uses no provenance taxonomy and never emits an evolutions row", () => {
     const all = [
       HUMAN_ENTRY,
       ARCHER_ENTRY,
@@ -424,7 +414,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       ...JAKE_PROFESSIONS,
       ...JAKE_GODS,
     ]
-    expect(all.every((e) => e.provenance === "inferred")).toBe(true)
     expect(all.every((e) => e.kind !== "evolutions")).toBe(true)
     // Every source URL is an https URL naming a host.
     for (const e of all) {
@@ -448,7 +437,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     expect(kinds.includes("evolutions")).toBe(false)
     expect(store.characters.size).toBe(0)
     for (const row of store.catalog.values()) {
-      expect(row.provenance).toBe("inferred")
       expect(row.archived).toBe(false)
     }
   })
@@ -469,7 +457,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: LEGACY_HUMAN_BASELINE.name,
       description: LEGACY_HUMAN_BASELINE.description,
       grade: LEGACY_HUMAN_BASELINE.grade,
-      provenance: LEGACY_HUMAN_BASELINE.provenance,
       sourceUrl: LEGACY_HUMAN_BASELINE.sourceUrl,
       archived: LEGACY_HUMAN_BASELINE.archived,
       config: LEGACY_HUMAN_BASELINE.config,
@@ -481,7 +468,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: LEGACY_ARCHER_BASELINE.name,
       description: LEGACY_ARCHER_BASELINE.description,
       grade: LEGACY_ARCHER_BASELINE.grade,
-      provenance: LEGACY_ARCHER_BASELINE.provenance,
       sourceUrl: LEGACY_ARCHER_BASELINE.sourceUrl,
       archived: LEGACY_ARCHER_BASELINE.archived,
       config: LEGACY_ARCHER_BASELINE.config,
@@ -493,7 +479,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     // gains no raceType.
     const human = store.catalog.get("human-baseline")!
     expect(human.name).toBe(LEGACY_HUMAN_BASELINE.name)
-    expect(human.provenance).toBe("verified")
     expect(human.sourceUrl).toBe(LEGACY_HUMAN_BASELINE.sourceUrl)
     const humanConfig = human.config as unknown as HumanRaceConfig
     expect(humanConfig.raceType).toBeUndefined()
@@ -506,7 +491,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     // promoted to the sourced replacement.
     const archer = store.catalog.get("archer-baseline")!
     expect(archer.name).toBe(ARCHER_ENTRY.name)
-    expect(archer.provenance).toBe("inferred")
     expect(archer.sourceUrl).toBe(ARCHER_ENTRY.sourceUrl)
     const archerConfig = archer.config as unknown as TrackGradesConfig
     expect(archerConfig.grades.F.fixed).toEqual({
@@ -526,7 +510,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: LEGACY_HUMAN_BASELINE_V3.name,
       description: LEGACY_HUMAN_BASELINE_V3.description,
       grade: LEGACY_HUMAN_BASELINE_V3.grade,
-      provenance: LEGACY_HUMAN_BASELINE_V3.provenance,
       sourceUrl: LEGACY_HUMAN_BASELINE_V3.sourceUrl,
       archived: LEGACY_HUMAN_BASELINE_V3.archived,
       config: LEGACY_HUMAN_BASELINE_V3.config,
@@ -535,7 +518,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
 
     const human = store.catalog.get("human-003")!
     expect(human.name).toBe(HUMAN_ENTRY.name)
-    expect(human.provenance).toBe("inferred")
     expect(human.sourceUrl).toBe(HUMAN_ENTRY.sourceUrl)
     const humanConfig = human.config as unknown as HumanRaceConfig
     expect(humanConfig.raceType).toBe("enlightened")
@@ -553,7 +535,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: "Custom Human",
       description: "admin-edited",
       grade: "D",
-      provenance: "verified",
       sourceUrl: "https://example.com/custom-human",
       archived: false,
       config: { naturalGrade: "C", raceDefinitions: {}, houseGrades: [] },
@@ -565,7 +546,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: "Custom Archer",
       description: "admin-edited",
       grade: "F",
-      provenance: "house",
       sourceUrl: "https://example.com/custom-archer",
       archived: false,
       config: {
@@ -577,13 +557,11 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     const human = store.catalog.get("human-modified")!
     expect(human.name).toBe("Custom Human")
     expect(human.grade).toBe("D")
-    expect(human.provenance).toBe("verified")
     expect(human.sourceUrl).toBe("https://example.com/custom-human")
     expect((human.config as unknown as HumanRaceConfig).naturalGrade).toBe("C")
 
     const archer = store.catalog.get("archer-modified")!
     expect(archer.name).toBe("Custom Archer")
-    expect(archer.provenance).toBe("house")
     expect(
       (archer.config as unknown as TrackGradesConfig).grades.F.fixed
     ).toEqual({
@@ -600,7 +578,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: "Alchemist of the Malefic Viper",
       description: "description from the reviewed manifest",
       grade: "F",
-      provenance: "inferred",
       sourceUrl: `${FANDOM}Jake_Thayne/Profession`,
       archived: false,
       config: {
@@ -631,7 +608,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
       name: LEGACY_HUMAN_BASELINE_V3.name,
       description: LEGACY_HUMAN_BASELINE_V3.description,
       grade: LEGACY_HUMAN_BASELINE_V3.grade,
-      provenance: LEGACY_HUMAN_BASELINE_V3.provenance,
       sourceUrl: LEGACY_HUMAN_BASELINE_V3.sourceUrl,
       archived: LEGACY_HUMAN_BASELINE_V3.archived,
       config: LEGACY_HUMAN_BASELINE_V3.config,
@@ -647,7 +623,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
         row.name = "Custom Human"
         row.description = "admin-edited"
         row.grade = "D"
-        row.provenance = "verified"
         row.sourceUrl = "https://example.com/custom-human"
         row.config = { naturalGrade: "C", raceDefinitions: {}, houseGrades: [] }
       },
@@ -660,7 +635,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     const human = store.catalog.get("human-baseline-conflict")!
     expect(human.name).toBe("Custom Human")
     expect(human.grade).toBe("D")
-    expect(human.provenance).toBe("verified")
     expect(human.sourceUrl).toBe("https://example.com/custom-human")
     expect((human.config as unknown as HumanRaceConfig).naturalGrade).toBe("C")
 
@@ -689,7 +663,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
           name: "Custom Human",
           description: "admin-edited before the seed create",
           grade: "D",
-          provenance: "verified",
           sourceUrl: "https://example.com/custom-human",
           archived: false,
           config: { naturalGrade: "C", raceDefinitions: {}, houseGrades: [] },
@@ -702,7 +675,6 @@ describe("Jake Thayne catalog seed (unit, mocked db)", () => {
     // The concurrently inserted admin row survives untouched.
     const human = store.catalog.get("human-race-admin")!
     expect(human.name).toBe("Custom Human")
-    expect(human.provenance).toBe("verified")
     expect((human.config as unknown as HumanRaceConfig).naturalGrade).toBe("C")
 
     const logs = logSpy.mock.calls.map((c) => c[0] as string)

@@ -102,6 +102,24 @@ function metadataOrNull(value: string | null | undefined): string | null {
 
 // Race grade ladder, lowest to highest. Mirrors the server's grade order.
 const GRADE_ORDER = ["G", "F", "E", "D", "C", "B", "A", "S"] as const
+const SKILL_RARITY_ORDER = [
+  "Inferior",
+  "Common",
+  "Uncommon",
+  "Rare",
+  "Epic",
+  "Ancient",
+  "Legendary",
+  "Mythical",
+  "Sacred",
+  "Divine",
+] as const
+
+function rarityRank(rarity: string | undefined): number {
+  return rarity === "Unique"
+    ? -1
+    : SKILL_RARITY_ORDER.indexOf(rarity as (typeof SKILL_RARITY_ORDER)[number])
+}
 
 // House rule entry level required to evolve INTO each grade (source-verified).
 const GRADE_ENTRY_LEVEL: Record<Grade, number> = {
@@ -207,6 +225,53 @@ function formatVector(
   const entries = ATTRIBUTE_KEYS.filter((key) => (v[key] ?? 0) !== 0)
   if (entries.length === 0) return "0"
   return entries.map((key) => `${key}:${v[key] ?? 0}`).join(", ")
+}
+
+function payloadRecord(payload: unknown): Record<string, unknown> {
+  return payload && typeof payload === "object" && !Array.isArray(payload)
+    ? (payload as Record<string, unknown>)
+    : {}
+}
+
+function eventsForTrack(
+  events: ExportResponse["events"],
+  track: "race" | "class" | "profession"
+) {
+  return events.filter((event) => {
+    const payload = payloadRecord(event.payload)
+    if (event.kind === "create") return true
+    if (event.kind === "profession_set") return track === "profession"
+    if (event.kind === "advance" || event.kind === "evolve") {
+      const changedTrack = payload.track
+      if (changedTrack === track) return true
+      // A grade-only evolution carries no payload.track; it is inherently a race
+      // grade change and belongs only in race history. An explicit
+      // payload.track === "race" is handled by the changedTrack check above.
+      if (event.kind === "evolve" && changedTrack == null)
+        return track === "race"
+      const journal = payloadRecord(payload.journal)
+      return (
+        track === "race" &&
+        (changedTrack === "class" || changedTrack === "profession") &&
+        (journal.raceLevelBefore !== undefined ||
+          journal.raceLevelAfter !== undefined)
+      )
+    }
+    if (event.kind === "skill_select" || event.kind === "skill_grant")
+      return payload.track === track
+    return false
+  })
+}
+
+/**
+ * A profession is assignable only when its catalog row grade equals the
+ * character's current race grade AND its config declares a grade entry for that
+ * exact grade. Both facts must hold; a valid grade with no config entry, or a
+ * config entry with a mismatched grade, is not offered.
+ */
+function professionEligible(p: CatalogItem, currentGrade: Grade): boolean {
+  const grades = p.config?.grades as Record<string, unknown> | undefined
+  return p.grade === currentGrade && grades?.[currentGrade] != null
 }
 
 function slotFor(item: CatalogItem): string | undefined {
@@ -361,7 +426,6 @@ function AssociationSheet({
             id: a.definitionId,
             name: a.name,
             description: null,
-            provenance: a.provenance ?? "house",
             grade: a.grade ?? null,
             archived: a.definitionArchived,
             config: {},
@@ -388,6 +452,33 @@ function AssociationSheet({
                 : "No upgrade group"}{" "}
             - linked but archived, no longer contributing.
           </div>
+          {a.kind === "equipment" ? (
+            <div className="flex flex-wrap items-center gap-1 text-[0.6875rem] text-muted-foreground">
+              {a.rarity ? <Badge variant="outline">{a.rarity}</Badge> : null}
+              {a.soulbound ? <Badge variant="outline">Soulbound</Badge> : null}
+              {a.requirements?.minRaceLevel != null ? (
+                <Badge variant="outline">
+                  Min race level {a.requirements.minRaceLevel}
+                </Badge>
+              ) : null}
+              {a.requirements?.requiredRaceType ? (
+                <Badge variant="outline">
+                  {a.requirements.requiredRaceType === "enlightened"
+                    ? "Humanoid (enlightened)"
+                    : "Monstrous (monster)"}
+                </Badge>
+              ) : null}
+              {a.equipmentEligibility?.eligible === false ? (
+                <>
+                  <Badge variant="outline">Ineligible</Badge>
+                  <span>
+                    {a.equipmentEligibility.reason ??
+                      "Equipment bonus inactive."}
+                  </span>
+                </>
+              ) : null}
+            </div>
+          ) : null}
         </div>
         <Button
           variant="outline"
@@ -406,16 +497,97 @@ function AssociationSheet({
   function equipmentRow(item: CatalogItem) {
     const isLinked = linked.has(item.id)
     const status = equipmentStatusById.get(item.id)
+    const inventoryItem = character.inventory?.find(
+      (row) => row.definitionId === item.id
+    )
+    const association = linked.get(item.id)
+    const eligibility =
+      inventoryItem?.equipmentEligibility ?? association?.equipmentEligibility
     return (
       <div
         key={item.id}
         className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
       >
         <div className="min-w-0">
-          <div className="truncate font-medium">{item.name}</div>
-          <div className="text-[0.6875rem] text-muted-foreground">
-            Slot: {slotFor(item) ?? "unspecified"} - Bonus: {bonusFor(item)}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="truncate font-medium">{item.name}</span>
+            <Badge variant="outline">
+              {inventoryItem?.rarity ??
+                (typeof item.config.rarity === "string"
+                  ? item.config.rarity
+                  : "Unknown")}
+            </Badge>
+            {inventoryItem?.soulbound ? (
+              <Badge variant="outline">Soulbound</Badge>
+            ) : null}
           </div>
+          <div className="text-[0.6875rem] text-muted-foreground">
+            Rarity: {inventoryItem?.rarity ?? "Unknown"} - Slot:{" "}
+            {slotFor(item) ?? "unspecified"} - Bonus: {bonusFor(item)}
+          </div>
+          {association ? (
+            <div className="flex flex-wrap items-center gap-1 text-[0.6875rem] text-muted-foreground">
+              {association.rarity ? (
+                <Badge variant="outline">{association.rarity}</Badge>
+              ) : null}
+              {association.soulbound ? (
+                <Badge variant="outline">Soulbound</Badge>
+              ) : null}
+              {association.requirements?.minRaceLevel != null ? (
+                <Badge variant="outline">
+                  Min race level {association.requirements.minRaceLevel}
+                </Badge>
+              ) : null}
+              {association.requirements?.requiredRaceType ? (
+                <Badge variant="outline">
+                  {association.requirements.requiredRaceType === "enlightened"
+                    ? "Humanoid (enlightened)"
+                    : "Monstrous (monster)"}
+                </Badge>
+              ) : null}
+              {eligibility?.eligible === false ? (
+                <>
+                  <Badge variant="outline">Ineligible</Badge>
+                  <span>
+                    {eligibility.reason ?? "Equipment bonus inactive."}
+                  </span>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="text-[0.6875rem] text-muted-foreground">
+            {inventoryItem?.requirements?.minRaceLevel != null
+              ? `Minimum race level ${inventoryItem.requirements.minRaceLevel}`
+              : "No minimum race level"}
+            {inventoryItem?.requirements?.requiredRaceType
+              ? ` - ${inventoryItem.requirements.requiredRaceType === "enlightened" ? "Humanoid (enlightened)" : "Monstrous (monster)"}`
+              : ""}
+          </div>
+          <div className="flex flex-wrap gap-1 text-[0.6875rem] text-muted-foreground">
+            {inventoryItem?.soulbound ? (
+              <Badge variant="outline">Soulbound</Badge>
+            ) : null}
+            {inventoryItem?.requirements?.minRaceLevel != null ? (
+              <Badge variant="outline">
+                Min race level {inventoryItem.requirements.minRaceLevel}
+              </Badge>
+            ) : null}
+            {inventoryItem?.requirements?.requiredRaceType ? (
+              <Badge variant="outline">
+                {inventoryItem.requirements.requiredRaceType === "enlightened"
+                  ? "Humanoid (enlightened)"
+                  : "Monstrous (monster)"}
+              </Badge>
+            ) : null}
+            {eligibility?.eligible === false ? (
+              <Badge variant="outline">Ineligible</Badge>
+            ) : null}
+          </div>
+          {eligibility?.eligible === false ? (
+            <p className="text-[0.6875rem] text-muted-foreground">
+              {eligibility.reason ?? "Requirements not met; bonus inactive."}
+            </p>
+          ) : null}
           {status ? (
             <div className="mt-1 text-[0.6875rem] text-muted-foreground">
               <span className="tabular-nums">
@@ -436,7 +608,12 @@ function AssociationSheet({
           <Button
             variant="outline"
             size="sm"
-            disabled={busy}
+            disabled={busy || eligibility?.eligible === false}
+            title={
+              eligibility?.eligible === false
+                ? (eligibility.reason ?? "Equipment requirements not met")
+                : undefined
+            }
             onClick={() => onRemove("equipment", item.id)}
           >
             Remove
@@ -591,9 +768,6 @@ function AssociationSheet({
             {permanent
               ? null
               : ` - Duration: ${consumableDurationFor(item) ?? "?"} quarter(s)`}
-          </div>
-          <div className="text-[0.6875rem] text-muted-foreground">
-            Provenance: {item.provenance}
           </div>
           {permanent &&
           character.permanentConsumableCap &&
@@ -810,7 +984,6 @@ function AssociationSheet({
                       id: a.definitionId,
                       name: a.name,
                       description: null,
-                      provenance: a.provenance ?? "house",
                       grade: a.grade ?? null,
                       archived: true,
                       config: {},
@@ -856,15 +1029,21 @@ function AssociationSheet({
                                 </Badge>
                               ) : null}
                             </div>
-                            <div className="text-[0.6875rem] text-muted-foreground">
-                              Provenance: {item.provenance}
-                              {typeof tier === "string"
-                                ? ` - Tier: ${tier}`
-                                : ""}
-                              {typeof patron === "string"
-                                ? ` - Patron: ${patron}`
-                                : ""}
-                            </div>
+                            {typeof tier === "string" ||
+                            typeof patron === "string" ? (
+                              <div className="text-[0.6875rem] text-muted-foreground">
+                                {typeof tier === "string"
+                                  ? `Tier: ${tier}`
+                                  : ""}
+                                {typeof tier === "string" &&
+                                typeof patron === "string"
+                                  ? " - "
+                                  : ""}
+                                {typeof patron === "string"
+                                  ? `Patron: ${patron}`
+                                  : ""}
+                              </div>
+                            ) : null}
                             {item.description ? (
                               <p className="text-xs text-muted-foreground">
                                 {item.description}
@@ -953,25 +1132,18 @@ function AssociationSheet({
                             <Badge variant="outline">Archived</Badge>
                           ) : null}
                         </div>
-                        <p className="text-[0.6875rem] text-muted-foreground">
-                          Provenance: {item.provenance}
-                          {item.sourceUrl ? (
-                            <>
-                              {" "}
-                              -{" "}
-                              <a
-                                className="underline"
-                                href={item.sourceUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                Source
-                              </a>
-                            </>
-                          ) : (
-                            ""
-                          )}
-                        </p>
+                        {item.sourceUrl ? (
+                          <p className="text-[0.6875rem] text-muted-foreground">
+                            <a
+                              className="underline"
+                              href={item.sourceUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Source
+                            </a>
+                          </p>
+                        ) : null}
                         {item.description ? (
                           <p className="text-xs text-muted-foreground">
                             {item.description}
@@ -1155,6 +1327,10 @@ export function CharacterDetail({
     React.useState<CatalogItem | null>(null)
   const [skillsCatalog, setSkillsCatalog] = React.useState<CatalogItem[]>([])
   const [skillBusy, setSkillBusy] = React.useState(false)
+  const [upgradeSource, setUpgradeSource] =
+    React.useState<CharacterAssociationView | null>(null)
+  const [upgradeTargetId, setUpgradeTargetId] = React.useState("")
+  const [upgradeReason, setUpgradeReason] = React.useState("")
   const [selectConfirm, setSelectConfirm] = React.useState<{
     offerId: string
     definitionId: string
@@ -1174,6 +1350,11 @@ export function CharacterDetail({
   const [inventoryQuantity, setInventoryQuantity] = React.useState("")
   const [inventorySourceNote, setInventorySourceNote] = React.useState("")
   const [inventoryBusy, setInventoryBusy] = React.useState(false)
+  const [professionOptions, setProfessionOptions] = React.useState<
+    CatalogItem[]
+  >([])
+  const [professionChoice, setProfessionChoice] = React.useState("")
+  const [professionBusy, setProfessionBusy] = React.useState(false)
   const [inventoryError, setInventoryError] = React.useState<string | null>(
     null
   )
@@ -1205,6 +1386,24 @@ export function CharacterDetail({
       setLoading(false)
     }
   }, [id])
+
+  // Invalidate and reload cached export events after a mutation that refreshes
+  // the character only when the history/track data is already on screen or
+  // cached. The cache stays lazy: with no history loaded and no track tab open,
+  // we leave it untouched and the lazy-load effect fetches it on demand.
+  const refreshEvents = React.useCallback(async () => {
+    if (!id) return
+    const trackContext = activeTab === "history" || activeTab === "identity"
+    if (!events && !trackContext) return
+    try {
+      const res = await apiFetch<ExportResponse>(`/api/characters/${id}/export`)
+      setEvents(res.events)
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to refresh history."
+      )
+    }
+  }, [id, events, activeTab])
 
   const submitInventory = async (
     operation: "add" | "remove",
@@ -1381,7 +1580,11 @@ export function CharacterDetail({
 
   // Load the immutable journal when the History tab is first opened.
   React.useEffect(() => {
-    if (activeTab === "history" && !events && id) {
+    if (
+      (activeTab === "history" || activeTab === "identity") &&
+      !events &&
+      id
+    ) {
       apiFetch<ExportResponse>(`/api/characters/${id}/export`)
         .then((res) => setEvents(res.events))
         .catch((err) =>
@@ -1391,6 +1594,17 @@ export function CharacterDetail({
         )
     }
   }, [activeTab, events, id])
+
+  React.useEffect(() => {
+    if (activeTab !== "identity" || professionOptions.length) return
+    apiFetch<CatalogListResponse>("/api/catalog/professions")
+      .then((res) => setProfessionOptions(res.items))
+      .catch((err) =>
+        toast.error(
+          err instanceof Error ? err.message : "Could not load professions."
+        )
+      )
+  }, [activeTab, professionOptions.length])
 
   const advance = React.useCallback(
     async (track: "class" | "profession" | "race") => {
@@ -1407,13 +1621,14 @@ export function CharacterDetail({
         setJournal(res.journal)
         setJournalOpen(true)
         await reload()
+        void refreshEvents()
       } catch (err) {
         setError(err instanceof Error ? err.message : "Advance failed.")
       } finally {
         setBusy(false)
       }
     },
-    [character, reload]
+    [character, reload, refreshEvents]
   )
 
   const allocate = React.useCallback(
@@ -1514,12 +1729,20 @@ export function CharacterDetail({
       setEvolveOpen(false)
       toast.success(`Evolved race grade to ${res.journal.to}.`)
       await reload()
+      void refreshEvents()
     } catch (err) {
       setEvolveError(err instanceof Error ? err.message : "Evolution failed.")
     } finally {
       setEvolveBusy(false)
     }
-  }, [character, evolutionOptionMode, selectedOptionId, evolveReason, reload])
+  }, [
+    character,
+    evolutionOptionMode,
+    selectedOptionId,
+    evolveReason,
+    reload,
+    refreshEvents,
+  ])
 
   const archive = React.useCallback(async () => {
     if (!character) return
@@ -1805,6 +2028,7 @@ export function CharacterDetail({
         setSelectConfirm(null)
         toast.success("Skill selected.")
         await reload()
+        void refreshEvents()
       } catch (err) {
         toast.error(
           err instanceof Error ? err.message : "Skill selection failed."
@@ -1813,7 +2037,7 @@ export function CharacterDetail({
         setSkillBusy(false)
       }
     },
-    [character, reload]
+    [character, reload, refreshEvents]
   )
 
   const grantSkill = React.useCallback(async () => {
@@ -1834,17 +2058,57 @@ export function CharacterDetail({
       setGrantReason("")
       toast.success("Skill granted.")
       await reload()
+      void refreshEvents()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Skill grant failed.")
     } finally {
       setSkillBusy(false)
     }
-  }, [character, grantSkillId, grantReason, reload])
+  }, [character, grantSkillId, grantReason, reload, refreshEvents])
 
-  // Load the skills catalog when the Skills tab is opened by an admin (needed for
-  // the manual grant). It is only required for admins; owners just select options.
+  const upgradeSkill = React.useCallback(async () => {
+    if (
+      !character ||
+      !upgradeSource ||
+      !upgradeTargetId ||
+      !upgradeReason.trim() ||
+      upgradeReason.length > 500
+    )
+      return
+    setSkillBusy(true)
+    try {
+      await apiFetch<SkillResponse>(
+        `/api/characters/${character.id}/skills/upgrade`,
+        {
+          ...jsonInit("POST", {
+            definitionId: upgradeTargetId,
+            version: character.version,
+            reason: upgradeReason.trim(),
+          }),
+        }
+      )
+      setUpgradeSource(null)
+      toast.success("Skill upgraded.")
+      await reload()
+      await refreshEvents()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Skill upgrade failed.")
+      await reload()
+    } finally {
+      setSkillBusy(false)
+    }
+  }, [
+    character,
+    upgradeSource,
+    upgradeTargetId,
+    upgradeReason,
+    reload,
+    refreshEvents,
+  ])
+
+  // Load active skill variants for owner upgrades and admin grants.
   React.useEffect(() => {
-    if (activeTab !== "skills" || !isAdmin || skillsCatalog.length > 0) return
+    if (activeTab !== "skills" || skillsCatalog.length > 0) return
     let active = true
     apiFetch<CatalogListResponse>(`/api/catalog/skills`)
       .then((res) => {
@@ -1858,7 +2122,7 @@ export function CharacterDetail({
     return () => {
       active = false
     }
-  }, [activeTab, isAdmin, skillsCatalog.length])
+  }, [activeTab, skillsCatalog.length])
 
   if (loading && !character) {
     return (
@@ -1911,6 +2175,39 @@ export function CharacterDetail({
       : selectedOption?.eligible === true &&
         (!selectedOption.manualReview ||
           (isAdmin && evolveReason.trim().length > 0))
+
+  const trackHistory = (track: "race" | "class" | "profession") => {
+    const matching = events ? eventsForTrack(events, track) : null
+    return (
+      <div className="mt-4 flex flex-col gap-2" aria-label={`${track} history`}>
+        <h3 className="text-sm font-medium">
+          {track[0].toUpperCase() + track.slice(1)} history
+        </h3>
+        {matching === null ? (
+          <p className="text-xs text-muted-foreground">Loading history...</p>
+        ) : matching.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No events yet</p>
+        ) : (
+          matching.map((event, i) => (
+            <div
+              key={`${event.createdAt}-${i}`}
+              className="rounded-lg border bg-input/20 p-2 text-xs/relaxed"
+            >
+              <div className="flex justify-between">
+                <Badge variant="outline">
+                  {event.kind === "create" ? "Initial state" : event.kind}
+                </Badge>
+                <span className="text-muted-foreground">{event.createdAt}</span>
+              </div>
+              <pre className="whitespace-pre-wrap text-muted-foreground">
+                {JSON.stringify(event.payload, null, 2)}
+              </pre>
+            </div>
+          ))
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -2036,105 +2333,150 @@ export function CharacterDetail({
       {error ? <Alert variant="destructive">{error}</Alert> : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        {character.classId == null || state.race.mode === "independent" ? (
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1"
-            onClick={() => advance("race")}
-            disabled={busy}
-          >
-            <ArrowUpIcon />
-            Advance race (L{state.race.level} Q{state.race.quarter})
-          </Button>
+        {state.race.mode === "independent" ? (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => advance("race")}
+              disabled={busy}
+            >
+              <ArrowUpIcon /> Advance race (L{state.race.level} Q
+              {state.race.quarter})
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={() => {
+                setEvolveError(null)
+                setSelectedOptionId("")
+                setEvolutionOptionMode("option")
+                setEvolveReason("")
+                setEvolveOpen(true)
+                void loadEvolutionOptions()
+              }}
+              disabled={busy || evolveBusy || !evolveTarget}
+              title={
+                evolveTarget
+                  ? `Evolve race grade to ${evolveTarget}`
+                  : "No higher race grade reached at this level yet"
+              }
+              aria-label={
+                evolveTarget
+                  ? `Evolve race grade to ${evolveTarget}`
+                  : "Evolve race grade"
+              }
+            >
+              <SparklesIcon />
+              Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
+            </Button>
+          </>
         ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1"
-            onClick={() => advance("class")}
-            disabled={busy || !classTrack}
-          >
-            <ArrowUpIcon />
-            Advance class
-            {classTrack ? ` (L${classTrack.level} Q${classTrack.quarter})` : ""}
-          </Button>
+          <>
+            {character.classId == null || state.race.mode === "independent" ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={() => advance("race")}
+                disabled={busy}
+              >
+                <ArrowUpIcon />
+                Advance race (L{state.race.level} Q{state.race.quarter})
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={() => advance("class")}
+                disabled={busy || !classTrack}
+              >
+                <ArrowUpIcon />
+                Advance class
+                {classTrack
+                  ? ` (L${classTrack.level} Q${classTrack.quarter})`
+                  : ""}
+              </Button>
+            )}
+            {character.classId != null && professionTrack ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={() => advance("profession")}
+                disabled={busy}
+              >
+                <ArrowUpIcon />
+                Advance profession (L{professionTrack.level} Q
+                {professionTrack.quarter})
+              </Button>
+            ) : null}
+            {character.classId != null && classTrack ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={() => setTrackEvolveTrack("class")}
+                disabled={busy}
+                title={
+                  classTrack.grade
+                    ? `Evolve class grade from ${classTrack.grade}`
+                    : "Class has no explicit grade yet (legacy state)"
+                }
+              >
+                <SparklesIcon />
+                Evolve class{classTrack.grade ? ` (${classTrack.grade})` : ""}
+              </Button>
+            ) : null}
+            {character.classId != null && professionTrack ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={() => setTrackEvolveTrack("profession")}
+                disabled={busy}
+                title={
+                  professionTrack.grade
+                    ? `Evolve profession grade from ${professionTrack.grade}`
+                    : "Profession has no explicit grade yet (legacy state)"
+                }
+              >
+                <SparklesIcon />
+                Evolve profession
+                {professionTrack.grade ? ` (${professionTrack.grade})` : ""}
+              </Button>
+            ) : null}
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={() => {
+                setEvolveError(null)
+                setSelectedOptionId("")
+                setEvolutionOptionMode("option")
+                setEvolveReason("")
+                setEvolveOpen(true)
+                void loadEvolutionOptions()
+              }}
+              disabled={busy || evolveBusy || !evolveTarget}
+              title={
+                evolveTarget
+                  ? `Evolve race grade to ${evolveTarget}`
+                  : "No higher race grade reached at this level yet"
+              }
+              aria-label={
+                evolveTarget
+                  ? `Evolve race grade to ${evolveTarget}`
+                  : "Evolve race grade"
+              }
+            >
+              <SparklesIcon />
+              Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
+            </Button>
+          </>
         )}
-        {character.classId != null && professionTrack ? (
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1"
-            onClick={() => advance("profession")}
-            disabled={busy}
-          >
-            <ArrowUpIcon />
-            Advance profession (L{professionTrack.level} Q
-            {professionTrack.quarter})
-          </Button>
-        ) : null}
-        {character.classId != null && classTrack ? (
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1"
-            onClick={() => setTrackEvolveTrack("class")}
-            disabled={busy}
-            title={
-              classTrack.grade
-                ? `Evolve class grade from ${classTrack.grade}`
-                : "Class has no explicit grade yet (legacy state)"
-            }
-          >
-            <SparklesIcon />
-            Evolve class{classTrack.grade ? ` (${classTrack.grade})` : ""}
-          </Button>
-        ) : null}
-        {character.classId != null && professionTrack ? (
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1"
-            onClick={() => setTrackEvolveTrack("profession")}
-            disabled={busy}
-            title={
-              professionTrack.grade
-                ? `Evolve profession grade from ${professionTrack.grade}`
-                : "Profession has no explicit grade yet (legacy state)"
-            }
-          >
-            <SparklesIcon />
-            Evolve profession
-            {professionTrack.grade ? ` (${professionTrack.grade})` : ""}
-          </Button>
-        ) : null}
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1"
-          onClick={() => {
-            setEvolveError(null)
-            setSelectedOptionId("")
-            setEvolutionOptionMode("option")
-            setEvolveReason("")
-            setEvolveOpen(true)
-            void loadEvolutionOptions()
-          }}
-          disabled={busy || evolveBusy || !evolveTarget}
-          title={
-            evolveTarget
-              ? `Evolve race grade to ${evolveTarget}`
-              : "No higher race grade reached at this level yet"
-          }
-          aria-label={
-            evolveTarget
-              ? `Evolve race grade to ${evolveTarget}`
-              : "Evolve race grade"
-          }
-        >
-          <SparklesIcon />
-          Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
-        </Button>
       </div>
 
       <Tabs
@@ -2219,10 +2561,37 @@ export function CharacterDetail({
                                     ) : null}
                                   </div>
                                   <p className="text-xs text-muted-foreground">
-                                    {item.slot ? `Slot: ${item.slot} - ` : ""}
-                                    Provenance: {item.provenance}
-                                    {equipped ? " - Equipped" : ""}
+                                    {item.rarity
+                                      ? `Rarity: ${item.rarity} - `
+                                      : ""}
+                                    {item.slot ? `Slot: ${item.slot}` : ""}
+                                    {item.slot && equipped ? " - " : ""}
+                                    {equipped ? "Equipped" : ""}
                                   </p>
+                                  {item.soulbound ? (
+                                    <Badge variant="outline">Soulbound</Badge>
+                                  ) : null}
+                                  {item.requirements?.minRaceLevel != null ? (
+                                    <Badge variant="outline">
+                                      Min race level{" "}
+                                      {item.requirements.minRaceLevel}
+                                    </Badge>
+                                  ) : null}
+                                  {item.requirements?.requiredRaceType ? (
+                                    <Badge variant="outline">
+                                      {item.requirements.requiredRaceType ===
+                                      "enlightened"
+                                        ? "Humanoid (enlightened)"
+                                        : "Monstrous (monster)"}
+                                    </Badge>
+                                  ) : null}
+                                  {item.equipmentEligibility?.eligible ===
+                                  false ? (
+                                    <p className="text-xs text-muted-foreground">
+                                      {item.equipmentEligibility.reason ??
+                                        "Ineligible; equipment bonus inactive."}
+                                    </p>
+                                  ) : null}
                                 </div>
                                 <div className="flex flex-wrap gap-2">
                                   {item.kind === "equipment" ? (
@@ -2247,7 +2616,17 @@ export function CharacterDetail({
                                         disabled={
                                           assocBusy ||
                                           item.archived ||
-                                          item.quantity < 1
+                                          item.quantity < 1 ||
+                                          item.equipmentEligibility
+                                            ?.eligible === false
+                                        }
+                                        title={
+                                          item.equipmentEligibility
+                                            ?.eligible === false
+                                            ? (item.equipmentEligibility
+                                                .reason ??
+                                              "Equipment requirements not met")
+                                            : undefined
                                         }
                                         onClick={() =>
                                           void addAssociation(
@@ -2624,9 +3003,8 @@ export function CharacterDetail({
                                 ) : null}
                               </div>
                               <p className="text-[0.6875rem] text-muted-foreground">
-                                Provenance: {a.provenance ?? "unspecified"}
                                 {a.definitionArchived
-                                  ? " - linked but not effective"
+                                  ? "linked but not effective"
                                   : ""}
                               </p>
                             </div>
@@ -2677,9 +3055,8 @@ export function CharacterDetail({
                                 ) : null}
                               </div>
                               <p className="text-[0.6875rem] text-muted-foreground">
-                                Provenance: {a.provenance ?? "unspecified"}
                                 {a.definitionArchived
-                                  ? " - linked but not effective"
+                                  ? "linked but not effective"
                                   : ""}
                               </p>
                             </div>
@@ -2798,35 +3175,234 @@ export function CharacterDetail({
         </TabsContent>
 
         <TabsContent value="identity" className="pt-3">
-          <Card>
-            <CardContent>
-              <div className="flex flex-col gap-1">
-                <MetaRow label="Race">
-                  {character.raceName ?? "Not set"}
-                </MetaRow>
-                <MetaRow label="Class">
-                  {character.className ?? "Not set"}
-                </MetaRow>
-                <MetaRow label="Profession">
-                  {character.professionName ?? "None"}
-                </MetaRow>
-                <MetaRow label="Race grade">
-                  {state.race.grade} (mode {state.race.mode})
-                </MetaRow>
-                <MetaRow label="Race level">{state.race.level}</MetaRow>
-                <MetaRow label="Class level">
-                  {classTrack
-                    ? `${classTrack.level} (quarter ${classTrack.quarter})`
-                    : "None"}
-                </MetaRow>
-                <MetaRow label="Profession level">
-                  {professionTrack
-                    ? `${professionTrack.level} (quarter ${professionTrack.quarter})`
-                    : "None"}
-                </MetaRow>
-              </div>
-            </CardContent>
-          </Card>
+          <Tabs defaultValue="race">
+            <TabsList variant="line">
+              <TabsTrigger value="race">Race</TabsTrigger>
+              {state.race.mode !== "independent" ? (
+                <>
+                  <TabsTrigger
+                    value="class"
+                    disabled={!classTrack}
+                    title={
+                      !classTrack
+                        ? "No class track exists for this character."
+                        : undefined
+                    }
+                  >
+                    Class
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="profession"
+                    disabled={state.race.mode === "independent"}
+                    title={
+                      state.race.mode === "independent"
+                        ? "Monsters cannot have professions."
+                        : undefined
+                    }
+                  >
+                    Profession
+                  </TabsTrigger>
+                </>
+              ) : null}
+            </TabsList>
+            <TabsContent value="race" className="pt-3">
+              <Card>
+                <CardContent>
+                  <div className="flex flex-col gap-1">
+                    <MetaRow label="Race">
+                      {character.raceName ?? "Not set"}
+                    </MetaRow>
+                    {state.race.mode !== "independent" ? (
+                      <MetaRow label="Class">
+                        {character.className ?? "Not set"}
+                      </MetaRow>
+                    ) : null}
+                    {state.race.mode !== "independent" ? (
+                      <MetaRow label="Profession">
+                        {character.professionName ?? "None"}
+                      </MetaRow>
+                    ) : null}
+                    <MetaRow label="Race grade">
+                      {state.race.grade} (mode {state.race.mode})
+                    </MetaRow>
+                    <MetaRow label="Race level">{state.race.level}</MetaRow>
+                    {state.race.mode !== "independent" ? (
+                      <MetaRow label="Class level">
+                        {classTrack
+                          ? `${classTrack.level} (quarter ${classTrack.quarter})`
+                          : "None"}
+                      </MetaRow>
+                    ) : null}
+                    {state.race.mode !== "independent" ? (
+                      <MetaRow label="Profession level">
+                        {professionTrack
+                          ? `${professionTrack.level} (quarter ${professionTrack.quarter})`
+                          : "None"}
+                      </MetaRow>
+                    ) : null}
+                  </div>
+                </CardContent>
+              </Card>
+              {trackHistory("race")}
+            </TabsContent>
+            {state.race.mode !== "independent" ? (
+              <TabsContent value="class" className="pt-3">
+                <Card>
+                  <CardContent>
+                    <div className="flex flex-col gap-1">
+                      <MetaRow label="Class">
+                        {character.className ?? "Not set"}
+                      </MetaRow>
+                      <MetaRow label="Grade">
+                        {classTrack?.grade ?? "-"}
+                      </MetaRow>
+                      <MetaRow label="Level">
+                        {classTrack?.level ?? "-"}
+                      </MetaRow>
+                      <MetaRow label="Quarter">
+                        {classTrack?.quarter ?? "-"}
+                      </MetaRow>
+                    </div>
+                    {character.classId != null && classTrack ? (
+                      <Button
+                        className="mt-3"
+                        variant="outline"
+                        onClick={() => void advance("class")}
+                        disabled={busy}
+                      >
+                        Advance class
+                      </Button>
+                    ) : null}
+                    {classTrack && classTrack.grade ? (
+                      <Button
+                        className="mt-2"
+                        variant="outline"
+                        onClick={() => setTrackEvolveTrack("class")}
+                        disabled={busy}
+                      >
+                        Evolve class
+                      </Button>
+                    ) : null}
+                    {trackHistory("class")}
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            ) : null}
+            {state.race.mode !== "independent" ? (
+              <TabsContent value="profession" className="pt-3">
+                <Card>
+                  <CardContent>
+                    <div className="flex flex-col gap-3">
+                      <div className="flex flex-col gap-1">
+                        <MetaRow label="Profession">
+                          {character.professionName ?? "None"}
+                        </MetaRow>
+                        <MetaRow label="Grade">
+                          {professionTrack?.grade ?? "-"}
+                        </MetaRow>
+                        <MetaRow label="Level">
+                          {professionTrack?.level ?? "-"}
+                        </MetaRow>
+                        <MetaRow label="Quarter">
+                          {professionTrack?.quarter ?? "-"}
+                        </MetaRow>
+                      </div>
+                      {!professionTrack ? (
+                        <>
+                          <p className="text-sm text-muted-foreground">
+                            Choose an eligible profession at your current race
+                            grade.
+                          </p>
+                          <Select
+                            value={professionChoice}
+                            onValueChange={(value) =>
+                              setProfessionChoice(value ?? "")
+                            }
+                          >
+                            <SelectTrigger aria-label="Profession">
+                              <SelectValue placeholder="Select profession" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectGroup>
+                                {professionOptions
+                                  .filter((p) =>
+                                    professionEligible(p, state.race.grade)
+                                  )
+                                  .map((p) => (
+                                    <SelectItem key={p.id} value={p.id}>
+                                      {p.name}
+                                    </SelectItem>
+                                  ))}
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                          {professionOptions.filter((p) =>
+                            professionEligible(p, state.race.grade)
+                          ).length === 0 ? (
+                            <p className="text-sm text-muted-foreground">
+                              No professions are configured for current race
+                              grade {state.race.grade}, including Integrated G.
+                            </p>
+                          ) : (
+                            <Button
+                              disabled={!professionChoice || professionBusy}
+                              onClick={async () => {
+                                setProfessionBusy(true)
+                                try {
+                                  await apiFetch(
+                                    `/api/characters/${character.id}/profession`,
+                                    {
+                                      ...jsonInit("POST", {
+                                        professionId: professionChoice,
+                                        version: character.version,
+                                      }),
+                                    }
+                                  )
+                                  await reload()
+                                  void refreshEvents()
+                                  setProfessionChoice("")
+                                } catch (err) {
+                                  toast.error(
+                                    err instanceof Error
+                                      ? err.message
+                                      : "Could not assign profession."
+                                  )
+                                  await reload()
+                                } finally {
+                                  setProfessionBusy(false)
+                                }
+                              }}
+                            >
+                              Assign profession
+                            </Button>
+                          )}
+                        </>
+                      ) : null}
+                      {character.classId != null && professionTrack ? (
+                        <Button
+                          variant="outline"
+                          onClick={() => void advance("profession")}
+                          disabled={busy}
+                        >
+                          Advance profession
+                        </Button>
+                      ) : null}
+                      {professionTrack?.grade ? (
+                        <Button
+                          variant="outline"
+                          onClick={() => setTrackEvolveTrack("profession")}
+                          disabled={busy}
+                        >
+                          Evolve profession
+                        </Button>
+                      ) : null}
+                      {trackHistory("profession")}
+                    </div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            ) : null}
+          </Tabs>
         </TabsContent>
 
         <TabsContent value="skills" className="pt-3">
@@ -2906,12 +3482,12 @@ export function CharacterDetail({
                                         </Badge>
                                       ) : null}
                                     </div>
-                                    <div className="text-[0.6875rem] text-muted-foreground">
-                                      Provenance: {opt.provenance ?? "house"}
-                                      {opt.archived
-                                        ? " - unavailable until re-enabled in the catalog"
-                                        : ""}
-                                    </div>
+                                    {opt.archived ? (
+                                      <div className="text-[0.6875rem] text-muted-foreground">
+                                        unavailable until re-enabled in the
+                                        catalog
+                                      </div>
+                                    ) : null}
                                   </div>
                                   {opt.archived ? null : (
                                     <Button
@@ -2964,30 +3540,158 @@ export function CharacterDetail({
                   </p>
                 ) : (
                   <div className="flex flex-col gap-2">
-                    {skillAssociations.map((a) => (
-                      <div
-                        key={a.id}
-                        className="rounded-lg border bg-input/20 p-2"
-                      >
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="font-medium">{a.name}</span>
-                          {a.definitionArchived ? (
-                            <Badge variant="outline">Archived</Badge>
+                    {skillAssociations.map((a) => {
+                      const sourceRank = rarityRank(a.rarity)
+                      const group = a.upgradeGroup
+                      const targets = skillsCatalog.filter((item) => {
+                        const rarity =
+                          typeof item.config.rarity === "string"
+                            ? item.config.rarity
+                            : undefined
+                        return (
+                          !item.archived &&
+                          Boolean(group) &&
+                          item.config.upgradeGroup === group &&
+                          sourceRank >= 0 &&
+                          rarityRank(rarity) > sourceRank
+                        )
+                      })
+                      const blocked = !a.rarity
+                        ? "Source rarity metadata unavailable"
+                        : !group
+                          ? "Upgrade group metadata unavailable"
+                          : a.rarity === "Unique"
+                            ? "Unique rarity is incomparable"
+                            : targets.length === 0
+                              ? "No active higher-rarity variant in this upgrade group"
+                              : null
+                      return (
+                        <div
+                          key={a.id}
+                          className="rounded-lg border bg-input/20 p-2"
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-medium">{a.name}</span>
+                            {a.definitionArchived ? (
+                              <Badge variant="outline">Archived</Badge>
+                            ) : null}
+                            {a.grade ? (
+                              <Badge variant="outline">{a.grade}</Badge>
+                            ) : null}
+                            {a.rarity ? (
+                              <Badge variant="outline">{a.rarity}</Badge>
+                            ) : null}
+                          </div>
+                          {a.upgradeGroup ? (
+                            <div className="text-[0.6875rem] text-muted-foreground">
+                              Upgrade group: {a.upgradeGroup}
+                            </div>
                           ) : null}
-                          {a.grade ? (
-                            <Badge variant="outline">{a.grade}</Badge>
-                          ) : null}
+                          {blocked ? (
+                            <p className="text-[0.6875rem] text-muted-foreground">
+                              {blocked}
+                            </p>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={skillBusy}
+                              onClick={() => {
+                                setUpgradeSource(a)
+                                setUpgradeTargetId("")
+                                setUpgradeReason("")
+                              }}
+                            >
+                              Upgrade skill
+                            </Button>
+                          )}
                         </div>
-                        <div className="text-[0.6875rem] text-muted-foreground">
-                          Provenance: {a.provenance ?? "house"}
-                          {a.upgradeGroup
-                            ? ` - Upgrade group: ${a.upgradeGroup}`
-                            : ""}
-                        </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 )}
+
+                {upgradeSource
+                  ? (() => {
+                      const targets = skillsCatalog.filter((item) => {
+                        const rarity =
+                          typeof item.config.rarity === "string"
+                            ? item.config.rarity
+                            : undefined
+                        return (
+                          !item.archived &&
+                          item.config.upgradeGroup ===
+                            upgradeSource.upgradeGroup &&
+                          rarityRank(upgradeSource.rarity) >= 0 &&
+                          rarityRank(rarity) > rarityRank(upgradeSource.rarity)
+                        )
+                      })
+                      return (
+                        <div className="flex flex-col gap-2 rounded-lg border p-3">
+                          <h4 className="font-medium">
+                            Upgrade {upgradeSource.name}
+                          </h4>
+                          <p className="text-xs text-muted-foreground">
+                            Current: {upgradeSource.rarity ?? "Unknown"}
+                          </p>
+                          <Select
+                            value={upgradeTargetId}
+                            onValueChange={(value) =>
+                              setUpgradeTargetId(value ?? "")
+                            }
+                          >
+                            <SelectTrigger aria-label="Upgrade target">
+                              <SelectValue placeholder="Select higher-rarity variant" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectGroup>
+                                {targets.map((target) => (
+                                  <SelectItem key={target.id} value={target.id}>
+                                    {target.name} -{" "}
+                                    {String(target.config.rarity)}
+                                    {target.description
+                                      ? ` - ${target.description}`
+                                      : ""}
+                                  </SelectItem>
+                                ))}
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                          <Label htmlFor="skill-upgrade-reason">Reason</Label>
+                          <Input
+                            id="skill-upgrade-reason"
+                            maxLength={500}
+                            value={upgradeReason}
+                            onChange={(event) =>
+                              setUpgradeReason(event.target.value)
+                            }
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            {upgradeReason.length}/500 characters
+                          </p>
+                          <div className="flex gap-2">
+                            <Button
+                              variant="outline"
+                              onClick={() => setUpgradeSource(null)}
+                            >
+                              Cancel
+                            </Button>
+                            <Button
+                              disabled={
+                                skillBusy ||
+                                !upgradeTargetId ||
+                                !upgradeReason.trim() ||
+                                upgradeReason.length > 500
+                              }
+                              onClick={() => void upgradeSkill()}
+                            >
+                              Confirm upgrade
+                            </Button>
+                          </div>
+                        </div>
+                      )
+                    })()
+                  : null}
 
                 {isAdmin ? (
                   <>
@@ -3444,10 +4148,11 @@ export function CharacterDetail({
                         {option.description}
                       </span>
                     ) : null}
-                    <span className="text-muted-foreground">
-                      Provenance: {option.provenance}
-                      {option.sourceUrl ? ` - ${option.sourceUrl}` : ""}
-                    </span>
+                    {option.sourceUrl ? (
+                      <span className="text-muted-foreground">
+                        Source: {option.sourceUrl}
+                      </span>
+                    ) : null}
                     {option.blockers.length > 0 ? (
                       <ul className="list-disc pl-5 text-muted-foreground">
                         {option.blockers.map((blocker, i) => (
@@ -3553,7 +4258,10 @@ export function CharacterDetail({
           character={character}
           isAdmin={isAdmin}
           onClose={() => setTrackEvolveTrack(null)}
-          onEvolved={() => void reload()}
+          onEvolved={() => {
+            void reload()
+            void refreshEvents()
+          }}
         />
       ) : null}
 
@@ -3563,7 +4271,10 @@ export function CharacterDetail({
           character={character}
           isAdmin={isAdmin}
           onClose={() => setTrackEvolveTrack(null)}
-          onEvolved={() => void reload()}
+          onEvolved={() => {
+            void reload()
+            void refreshEvents()
+          }}
         />
       ) : null}
 

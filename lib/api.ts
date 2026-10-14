@@ -158,7 +158,6 @@ export interface CatalogItem {
   name: string
   description: string | null
   grade: string | null
-  provenance: "verified" | "inferred" | "house"
   sourceUrl: string | null
   archived: boolean
   config: Record<string, unknown>
@@ -330,12 +329,25 @@ export interface CharacterAssociationView {
   upgradeGroup?: string
   /** Catalog grade of the linked definition (skills use this for tiers). */
   grade?: string
-  /** Provenance label of the linked definition. */
-  provenance?: string
   /** Ranked title progression metadata, when the linked title declares it. */
   improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
+  /** Rarity tier, present on equipment and skill links that declare one. */
+  rarity?: string
+  /** Whether an equipment link is soulbound (metadata only; no transfer mechanic). */
+  soulbound?: boolean
+  /** Level / race-type requirements an equipment link declares, when any. */
+  requirements?: {
+    minRaceLevel?: number
+    requiredRaceType?: "enlightened" | "monster"
+  }
+  /**
+   * Live eligibility of an equipment link against the character's current race
+   * level / race type. An ineligible item stays linked (and shown) but its
+   * equipment bonus is not synthesized until the character qualifies.
+   */
+  equipmentEligibility?: { eligible: boolean; reason?: string }
 }
 
 export interface SkillOfferOptionView {
@@ -345,8 +357,6 @@ export interface SkillOfferOptionView {
   archived: boolean
   /** Catalog tier grade of the offered definition, when set. */
   grade?: string
-  /** Provenance label of the offered definition. */
-  provenance?: string
 }
 
 export interface SkillOfferView {
@@ -374,8 +384,21 @@ export interface CharacterInventoryItem {
   archived: boolean
   /** Equipment slot, when the linked definition declares one. */
   slot?: string
-  /** Provenance label of the linked definition. */
-  provenance: string
+  /** Equipment rarity tier, present only on equipment definitions. */
+  rarity?: string
+  /** Whether an equipment definition is soulbound (metadata only; no transfer mechanic). */
+  soulbound?: boolean
+  /** Level / race-type requirements an equipment definition declares, when any. */
+  requirements?: {
+    minRaceLevel?: number
+    requiredRaceType?: "enlightened" | "monster"
+  }
+  /**
+   * Live eligibility of an equipment definition against the character's current
+   * race level / race type. Metadata for future UI; it does not gate inventory
+   * stock ownership (which may always be acquired).
+   */
+  equipmentEligibility?: { eligible: boolean; reason?: string }
 }
 
 /** GET /api/characters/[id]/inventory - owned inventory plus the CAS version. */
@@ -581,7 +604,6 @@ export interface EvolutionOptionView {
   toTrackName: string
   /** The track this evolution path targets. */
   track: "race" | "class" | "profession"
-  provenance: string
   sourceUrl: string | null
   /** Whether all mechanical (hard) requirements are met. */
   eligible: boolean
@@ -614,6 +636,16 @@ export interface ConsumeResponse {
   character: CharacterDetail
   status: StatusResult
   event: { kind: string; payload: unknown }
+}
+
+/** POST /api/characters/[id]/profession - set a set-once profession (after creation). */
+export interface ProfessionSetRequest {
+  professionId: string
+  version: number
+}
+
+export interface ProfessionSetResponse {
+  character: CharacterDetail
 }
 
 export interface AssociationRequest {
@@ -649,6 +681,22 @@ export interface SkillResponse {
   character: CharacterDetail
 }
 
+/**
+ * An explicit skill-upgrade request from the owner or an admin. Upgrades the
+ * character's linked skill in an `upgradeGroup` to a strictly higher-ordered
+ * rarity variant; `reason` is mandatory and recorded into the `skill_upgrade`
+ * journal.
+ */
+export type SkillUpgradeRequest = {
+  definitionId: string
+  version: number
+  reason: string
+}
+
+export interface SkillUpgradeResponse {
+  character: CharacterDetail
+}
+
 export interface ProgressionEvent {
   kind: string
   payload: unknown
@@ -661,7 +709,6 @@ export interface ExportDefinitionSnapshot {
   name: string
   kind: string
   config: Record<string, unknown>
-  provenance: string
   archived: boolean
   stableId: string
   updatedAt: string

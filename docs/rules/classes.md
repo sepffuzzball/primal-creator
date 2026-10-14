@@ -69,9 +69,9 @@ carries no class at all (see `docs/rules/races.md`).
 
 `pnpm db:seed` seeds the curated Jake Thayne class progression
 (`prisma/catalog/jake-seed.ts`), sourced from
-`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Class`. Every row is
-labelled `provenance: inferred` (secondary fan-wiki source) and carries exactly
-one `grades.<grade>` entry for its own grade:
+`https://the-primal-hunter.fandom.com/wiki/Jake_Thayne/Class`. Every row
+(secondary fan-wiki source) carries exactly one `grades.<grade>` entry for its own
+grade:
 
 | Grade | Name | stableId |
 | ----- | ---- | -------- |

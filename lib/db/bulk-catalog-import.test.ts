@@ -38,7 +38,7 @@ function skill(
     description: `Description of ${stableId}`,
     provenance: "house",
     sourceUrl: "https://example.com/" + stableId,
-    config: { effects: [] },
+    config: { effects: [], rarity: "Common" },
     ...extra,
   }
 }
@@ -143,7 +143,6 @@ describe("bulk JSON parsing and validation", () => {
     expect(entries[0].row).toBe(1)
     expect(entries[1].row).toBe(2)
     expect(entries[0].kind).toBe("skills")
-    expect(entries[0].provenance).toBe("house")
     expect(entries[0].sourceUrl).toBe("https://example.com/a")
   })
 
@@ -165,14 +164,6 @@ describe("bulk JSON parsing and validation", () => {
     ).toThrowError(expect.objectContaining({ status: 400, code: "validation" }))
   })
 
-  it("defaults provenance to house when omitted", () => {
-    const [entry] = parseBulkEntries(
-      "json",
-      jsonContent([{ ...skill("skills", "a"), provenance: undefined }])
-    )
-    expect(entry.provenance).toBe("house")
-  })
-
   it("rejects an unknown catalog kind", () => {
     const bad = { ...skill("skills", "a"), kind: "spells" }
     expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
@@ -180,28 +171,9 @@ describe("bulk JSON parsing and validation", () => {
     )
   })
 
-  it("rejects provenance verified to avoid trust laundering", () => {
-    const bad = { ...skill("skills", "a"), provenance: "verified" }
-    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
-      expect.objectContaining({ status: 400, code: "validation" })
-    )
-  })
-
-  it("requires an https sourceUrl for an inferred entry", () => {
+  it("rejects a non-https sourceUrl", () => {
     const bad = {
       ...skill("skills", "a"),
-      provenance: "inferred",
-      sourceUrl: null,
-    }
-    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
-      expect.objectContaining({ status: 400, code: "validation" })
-    )
-  })
-
-  it("rejects a house entry with a non-https sourceUrl", () => {
-    const bad = {
-      ...skill("skills", "a"),
-      provenance: "house",
       sourceUrl: "http://example.com/a",
     }
     expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
@@ -307,8 +279,18 @@ describe("bulk CSV parsing and validation", () => {
   it("parses RFC4180 content with BOM and CRLF, keeping physical row numbers", () => {
     const content = csvContent(
       [
-        { kind: "skills", stableId: "a", name: "A", config: '{"effects":[]}' },
-        { kind: "skills", stableId: "b", name: "B", config: '{"effects":[]}' },
+        {
+          kind: "skills",
+          stableId: "a",
+          name: "A",
+          config: '{"effects":[],"rarity":"Common"}',
+        },
+        {
+          kind: "skills",
+          stableId: "b",
+          name: "B",
+          config: '{"effects":[],"rarity":"Common"}',
+        },
       ],
       { bom: true, crlf: true }
     )
@@ -317,8 +299,7 @@ describe("bulk CSV parsing and validation", () => {
     // Header is line 1, first data row is line 2.
     expect(entries[0].row).toBe(2)
     expect(entries[1].row).toBe(3)
-    expect(entries[0].provenance).toBe("house")
-    expect(entries[0].config).toEqual({ effects: [] })
+    expect(entries[0].config).toEqual({ effects: [], rarity: "Common" })
   })
 
   it("handles a quoted config with an embedded comma and newline", () => {
@@ -337,7 +318,7 @@ describe("bulk CSV parsing and validation", () => {
   it("treats a doubled quote inside a quoted field as a literal quote", () => {
     // name = 'He said "hi"'
     const content =
-      'kind,stableId,name,config\r\nskills,s,"He said ""hi""","{""effects"":[]}"\r\n'
+      'kind,stableId,name,config\r\nskills,s,"He said ""hi""","{""effects"":[],""rarity"":""Common""}"\r\n'
     const [entry] = parseBulkEntries("csv", content)
     expect(entry.name).toBe('He said "hi"')
   })
@@ -439,7 +420,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
     expect(dbMock.store.catalog.size).toBe(0)
   })
 
-  it("apply creates missing rows with house provenance and an unarchived flag", async () => {
+  it("apply creates missing rows with an unarchived flag", async () => {
     const entries = parseBulkEntries(
       "json",
       jsonContent([skill("skills", "a")])
@@ -450,9 +431,8 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
     expect(result.createdIds).toHaveLength(1)
     expect(dbMock.store.catalog.size).toBe(1)
     const row = [...dbMock.store.catalog.values()][0]
-    expect(row.provenance).toBe("house")
     expect(row.archived).toBe(false)
-    expect(row.config).toEqual({ effects: [] })
+    expect(row.config).toEqual({ effects: [], rarity: "Common" })
   })
 
   it("skips an existing row and reports its actual metadata without overwriting it", async () => {
@@ -462,7 +442,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       stableId: "a",
       name: "Old Name",
       config: { houseNote: true, effects: [] },
-      provenance: "house",
+
       sourceUrl: "https://house.example/old",
       archived: true,
     })
@@ -480,7 +460,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       id: "existing-1",
       name: "Old Name",
       sourceUrl: "https://house.example/old",
-      provenance: "house",
+
       archived: true,
     })
 
@@ -548,7 +528,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       stableId: "odin",
       name: "Odin",
       config: {},
-      provenance: "house",
+
       archived: true,
     })
     const entries = parseBulkEntries(
@@ -573,7 +553,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       stableId: "odin",
       name: "Odin",
       config: {},
-      provenance: "house",
+
       archived: false,
     })
     const entries = parseBulkEntries(
@@ -596,7 +576,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       stableId: "bless-one",
       name: "Existing Blessing",
       config: { tier: "Minor", effects: [], patronGodStableId: "no-such-god" },
-      provenance: "house",
+
       archived: false,
     })
     const entries = parseBulkEntries(

@@ -64,14 +64,18 @@ import {
   hasInvalidSkillTrack,
   isIncompleteRaceConfig,
   isIncompleteSkillConfig,
+  isIncompleteSkillRarity,
   isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyConsumableConfig,
+  isIncompleteEquipmentConfig,
   isLegacyTranscendentSkillConfig,
   isValidEvolutionConfig,
   isValidRaceEvolutionConfig,
   isValidTrackEvolutionConfig,
+  normalizeEquipmentSlot,
   parseCatalogConfig,
+  rarityOrderIndex,
   titleImprovementSchema,
   type TitleImprovement,
 } from "@/lib/server/schemas"
@@ -115,12 +119,25 @@ export interface CharacterAssociationView {
   upgradeGroup?: string
   /** Catalog grade of the linked definition (skills use this for tiers). */
   grade?: string
-  /** Provenance label of the linked definition. */
-  provenance?: string
   /** Ranked title progression metadata, when the linked title declares it. */
   improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
+  /** Rarity tier, present on equipment and skill links that declare one. */
+  rarity?: string
+  /** Whether an equipment link is soulbound (metadata only; no transfer mechanic). */
+  soulbound?: boolean
+  /** Level / race-type requirements an equipment link declares, when any. */
+  requirements?: {
+    minRaceLevel?: number
+    requiredRaceType?: "enlightened" | "monster"
+  }
+  /**
+   * Live eligibility of an equipment link against the character's current race
+   * level / race type. An ineligible item stays linked (and shown) but its
+   * equipment bonus is not synthesized until the character qualifies.
+   */
+  equipmentEligibility?: { eligible: boolean; reason?: string }
 }
 
 /**
@@ -140,8 +157,21 @@ export interface CharacterInventoryItemView {
   archived: boolean
   /** Equipment slot, when the linked definition declares one. */
   slot?: string
-  /** Provenance label of the linked definition. */
-  provenance: string
+  /** Equipment rarity tier, present only on equipment definitions. */
+  rarity?: string
+  /** Whether an equipment definition is soulbound (metadata only). */
+  soulbound?: boolean
+  /** Level / race-type requirements an equipment definition declares, when any. */
+  requirements?: {
+    minRaceLevel?: number
+    requiredRaceType?: "enlightened" | "monster"
+  }
+  /**
+   * Live eligibility of an equipment definition against the character's current
+   * race level / race type. Metadata for future UI; it does not gate inventory
+   * stock ownership (which may always be acquired).
+   */
+  equipmentEligibility?: { eligible: boolean; reason?: string }
 }
 
 export interface SkillOfferOptionView {
@@ -151,8 +181,6 @@ export interface SkillOfferOptionView {
   archived: boolean
   /** Catalog tier grade of the offered definition, when set. */
   grade?: string
-  /** Provenance label of the offered definition. */
-  provenance?: string
 }
 
 export interface SkillOfferView {
@@ -247,7 +275,6 @@ export interface CatalogItem {
   name: string
   description: string | null
   grade: string | null
-  provenance: "verified" | "inferred" | "house"
   sourceUrl: string | null
   archived: boolean
   config: Record<string, unknown>
@@ -438,7 +465,7 @@ export function resolveTrackDefinition(
  * - Tracks (class/profession) start at level 0 (a configurable start could be
  *   injected by overriding the level, but 0 is the safe default).
  * - Race level is 0. Integrated origin -> grade G; born -> grade F. Grade is the
- *   provenance-driven starting grade, not derived from level.
+ *   origin-driven starting grade, not derived from level.
  * - No awards are granted at creation; every award is a server-side snapshot from
  *   the catalog. Base attributes are zero (no fabricated starting stats).
  *
@@ -477,7 +504,7 @@ export function createInitialState(
   // new class/profession is immediately gated by the grade it must operate at.
   const trackStartGrade: Grade = naturalGrade ?? "F"
 
-  // The race's own starting grade is provenance-driven: an integrated character
+  // The race's own starting grade is origin-driven: an integrated character
   // always enters at G; a born character enters at the race's natural grade (F
   // fallback) - never derived from level.
   const raceStartGrade: Grade =
@@ -620,11 +647,13 @@ type DeclarativeEffect = {
  * the prefix used to give every effect a unique id - for a skill/blessing it is
  * the definition id, and for a bloodline's grade-scaled effects it is
  * `def.id:grade-<grade>` so a base effect and a grade effect never share an id.
- * `provenance` and `source` always come from the catalog row.
+ * `source` comes from the catalog row; the synthesized effect's `provenance` is
+ * the generic internal `"catalog"` string (the catalog provenance taxonomy no
+ * longer exists).
  */
 function appendDeclarativeEffects(
   activeEffects: CharacterState["activeEffects"],
-  def: { id: string; name: string; provenance: string },
+  def: { id: string; name: string },
   effects: DeclarativeEffect[],
   idBase: string
 ): void {
@@ -634,7 +663,7 @@ function appendDeclarativeEffects(
     const base = {
       id: `${idBase}:eff-${i}`,
       source: def.name,
-      provenance: def.provenance,
+      provenance: "catalog",
       condition: eff.condition,
       group,
       stacking: eff.stacking ?? (group ? "replace" : "stack"),
@@ -656,6 +685,67 @@ function appendDeclarativeEffects(
 }
 
 /**
+ * The character's authoritative race type for equipment ELIGIBILITY ONLY. An
+ * explicit catalog `raceType` is always authoritative. For a LEGACY race config
+ * with no `raceType`, resolve from the character's race mode instead:
+ * `independent` (a monster) => `monster`, anything else (`derived`) =>
+ * `enlightened`. This eligibility-only resolution changes no other race-category
+ * semantics - it does not affect how the race itself is classified anywhere else.
+ */
+function characterRaceType(
+  character: { race?: { config?: unknown } | null },
+  state: CharacterState
+): RaceType {
+  if (!character.race) {
+    return state.race.mode === "independent" ? "monster" : "enlightened"
+  }
+  const raceConfig = parseCatalogConfig("races", character.race.config ?? {})
+  const raceType = raceConfig.raceType as RaceType | undefined
+  if (raceType) return raceType
+  // Legacy race config with no explicit raceType: fall back to the character's
+  // race mode for eligibility only (independent => monster, derived =>
+  // enlightened).
+  return state.race.mode === "independent" ? "monster" : "enlightened"
+}
+
+/**
+ * Whether a character currently meets an equipment config's level / race-type
+ * eligibility requirements. `enlightened` maps to humanoid races and `monster`
+ * to monstrous races. `minRaceLevel` is checked against the character's RACE
+ * level (never the total/class level); a missing `requiredRaceType` imposes no
+ * type restriction. Returns a human-readable reason when ineligible. This gates
+ * only the live equipment bonus: a linked-but-ineligible item stays linked and
+ * is still shown, just synthesized without its bonus.
+ */
+function equipmentEligibilityFor(
+  config: Record<string, unknown>,
+  state: CharacterState,
+  character: { race?: { config?: unknown } | null }
+): { eligible: boolean; reason?: string } {
+  const minRaceLevel = config.minRaceLevel
+  const raceLevel = state.race.level
+  if (typeof minRaceLevel === "number" && raceLevel < minRaceLevel) {
+    return {
+      eligible: false,
+      reason: `Requires race level ${minRaceLevel} or higher (currently ${raceLevel})`,
+    }
+  }
+  const requiredRaceType = config.requiredRaceType
+  if (requiredRaceType === "enlightened" || requiredRaceType === "monster") {
+    const characterType = characterRaceType(character, state)
+    if (characterType !== requiredRaceType) {
+      const label = (t: RaceType) =>
+        t === "monster" ? "monstrous" : "humanoid"
+      return {
+        eligible: false,
+        reason: `Requires a ${label(requiredRaceType)} race (currently ${label(characterType)})`,
+      }
+    }
+  }
+  return { eligible: true }
+}
+
+/**
  * Build a read-time "live" CharacterState by merging the immutable stored state
  * with equipment and effects synthesized from the character's currently linked,
  * unarchived catalog definitions. The stored `state` is never mutated, so
@@ -674,12 +764,22 @@ function liveState(character: CharacterWithCatalog): CharacterState {
     if (def.kind === "equipment") {
       const slot = config.slot as string | undefined
       if (!slot) continue
+      // A linked item whose level / race-type requirement is currently unmet is
+      // still shown (the link, stock and journal stay intact) but its bonus is
+      // not synthesized until the character qualifies.
+      const eligible = equipmentEligibilityFor(
+        config,
+        state,
+        character
+      ).eligible
       equipment.push({
         id: def.id,
         name: def.name,
         slot,
         source: def.name,
-        bonus: makeVector((config.bonus ?? {}) as PartialVector),
+        bonus: eligible
+          ? makeVector((config.bonus ?? {}) as PartialVector)
+          : {},
       })
     } else if (def.kind === "titles") {
       const flat = config.flat as PartialVector | undefined
@@ -687,7 +787,7 @@ function liveState(character: CharacterWithCatalog): CharacterState {
         activeEffects.push({
           id: `${def.id}:flat`,
           source: def.name,
-          provenance: def.provenance,
+          provenance: "catalog",
           phase: "flat",
           amount: makeVector(flat),
           stacking: "stack",
@@ -698,7 +798,7 @@ function liveState(character: CharacterWithCatalog): CharacterState {
         activeEffects.push({
           id: `${def.id}:percent`,
           source: def.name,
-          provenance: def.provenance,
+          provenance: "catalog",
           phase: "percent",
           basisPoints: makeVector(pct),
           stacking: "stack",
@@ -855,8 +955,69 @@ function associationViewKind(
   return associationViewKinds[kind]
 }
 
+/**
+ * The subset of a character row needed to compute equipment eligibility metadata.
+ */
+type EquipmentViewContext = {
+  state: unknown
+  race?: { config?: unknown } | null
+}
+
+/**
+ * Extract public equipment metadata - rarity / soulbound / declared requirements /
+ * live eligibility - from an equipment config against the owning character's
+ * current race level and race type. Callers invoke this only for equipment
+ * definitions; the returned object always carries a live `equipmentEligibility`
+ * (an ineligible definition stays shown but its bonus is not synthesized until
+ * the character qualifies). A legacy config lacking rarity/requirements simply
+ * yields absent fields.
+ */
+function equipmentViewMetadata(
+  config: Record<string, unknown>,
+  context: EquipmentViewContext
+): {
+  rarity?: string
+  soulbound?: boolean
+  requirements?: {
+    minRaceLevel?: number
+    requiredRaceType?: "enlightened" | "monster"
+  }
+  equipmentEligibility: { eligible: boolean; reason?: string }
+} {
+  const state = deserializeState(context.state)
+  const metadata: {
+    rarity?: string
+    soulbound?: boolean
+    requirements?: {
+      minRaceLevel?: number
+      requiredRaceType?: "enlightened" | "monster"
+    }
+    equipmentEligibility: { eligible: boolean; reason?: string }
+  } = { equipmentEligibility: equipmentEligibilityFor(config, state, context) }
+  if (config.rarity != null) metadata.rarity = config.rarity as string
+  if (config.soulbound != null) metadata.soulbound = config.soulbound as boolean
+  const requirements: {
+    minRaceLevel?: number
+    requiredRaceType?: "enlightened" | "monster"
+  } = {}
+  if (typeof config.minRaceLevel === "number") {
+    requirements.minRaceLevel = config.minRaceLevel as number
+  }
+  if (
+    config.requiredRaceType === "enlightened" ||
+    config.requiredRaceType === "monster"
+  ) {
+    requirements.requiredRaceType = config.requiredRaceType
+  }
+  if (Object.keys(requirements).length > 0) {
+    metadata.requirements = requirements
+  }
+  return metadata
+}
+
 function associationView(
-  link: CharacterWithCatalog["associations"][number]
+  link: CharacterWithCatalog["associations"][number],
+  character: EquipmentViewContext
 ): CharacterAssociationView {
   const config = parseCatalogConfig(
     link.definition.kind,
@@ -873,6 +1034,11 @@ function associationView(
   if (kind === "equipment") {
     const slot = config.slot as string | undefined
     if (slot) view.slot = slot
+    const metadata = equipmentViewMetadata(config, character)
+    if (metadata.rarity != null) view.rarity = metadata.rarity
+    if (metadata.soulbound != null) view.soulbound = metadata.soulbound
+    if (metadata.requirements) view.requirements = metadata.requirements
+    view.equipmentEligibility = metadata.equipmentEligibility
   }
   if (
     kind === "title" ||
@@ -895,7 +1061,10 @@ function associationView(
   }
   if (kind === "skill" || kind === "transcendent") {
     if (link.definition.grade) view.grade = link.definition.grade
-    view.provenance = link.definition.provenance
+  }
+  if (kind === "skill") {
+    const rarity = config.rarity as string | undefined
+    if (rarity) view.rarity = rarity
   }
   return view
 }
@@ -914,9 +1083,6 @@ function skillOfferView(
       nameSnapshot: o.nameSnapshot,
       archived: o.definition?.archived ?? false,
       ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
-      ...(o.definition?.provenance
-        ? { provenance: o.definition.provenance }
-        : {}),
     })),
     selectedDefinitionId: offer.selectedDefinitionId,
   }
@@ -944,7 +1110,8 @@ function isTranscendentFor(character: CharacterWithCatalog): boolean {
  * archived items they may not be able to newly add but still own).
  */
 function inventoryView(
-  item: CharacterWithCatalog["inventory"][number]
+  item: CharacterWithCatalog["inventory"][number],
+  character: EquipmentViewContext
 ): CharacterInventoryItemView {
   const def = item.definition
   const config = parseCatalogConfig(def.kind, def.config ?? {})
@@ -955,11 +1122,15 @@ function inventoryView(
     kind: def.kind === "consumables" ? "consumables" : "equipment",
     quantity: item.quantity,
     archived: def.archived,
-    provenance: def.provenance,
   }
   if (def.kind === "equipment") {
     const slot = config.slot as string | undefined
     if (slot) view.slot = slot
+    const metadata = equipmentViewMetadata(config, character)
+    if (metadata.rarity != null) view.rarity = metadata.rarity
+    if (metadata.soulbound != null) view.soulbound = metadata.soulbound
+    if (metadata.requirements) view.requirements = metadata.requirements
+    view.equipmentEligibility = metadata.equipmentEligibility
   }
   return view
 }
@@ -995,8 +1166,10 @@ function toDetail(
     isTranscendent: isTranscendentFor(character),
     createdAt: character.createdAt.toISOString(),
     updatedAt: character.updatedAt.toISOString(),
-    associations: character.associations.map(associationView),
-    inventory: character.inventory.map(inventoryView),
+    associations: character.associations.map((l) =>
+      associationView(l, character)
+    ),
+    inventory: character.inventory.map((i) => inventoryView(i, character)),
     skillOffers: character.skillOffers.map(skillOfferView),
     status: withStatus ? statusFor(character, config) : undefined,
     permanentConsumableCap: consumableInfo.cap,
@@ -1069,13 +1242,12 @@ function specialAbilitySnapshot(def: {
   id: string
   name: string
   stableId: string
-  provenance: string
 }): Record<string, unknown> {
   return {
     id: def.id,
     name: def.name,
     stableId: def.stableId,
-    provenance: def.provenance,
+    provenance: "catalog",
   }
 }
 
@@ -1138,7 +1310,6 @@ async function resolveSpecialAbilities(
     id: string
     name: string
     stableId: string
-    provenance: string
     config: Record<string, unknown>
   }> => {
     const def = await tx.catalogDefinition.findUnique({ where: { id } })
@@ -1165,7 +1336,6 @@ async function resolveSpecialAbilities(
       id: def.id,
       name: def.name,
       stableId: def.stableId,
-      provenance: def.provenance,
       config: (def.config ?? {}) as Record<string, unknown>,
     }
   }
@@ -1395,7 +1565,7 @@ export async function createCharacter(
       // The class/profession tracks are stamped with the grade they must operate at:
       // the race's natural grade, or the legacy F fallback.
       const trackStartGrade: Grade = naturalGrade ?? "F"
-      // The race's own starting grade is provenance-driven: integrated always G;
+      // The race's own starting grade is origin-driven: integrated always G;
       // born enters at the race's natural grade (F fallback).
       const raceStartGrade: Grade =
         input.origin === "integrated" ? "G" : (naturalGrade ?? "F")
@@ -1531,7 +1701,7 @@ export async function createCharacter(
             raceId: race.id,
             classId: cls?.id ?? null,
             professionId: profession?.id ?? null,
-            // Selection snapshots + provenance, present only when the caller supplied
+            // Selection snapshots, present only when the caller supplied
             // a non-empty special-ability selection.
             ...(special.journal ? { specialAbilities: special.journal } : {}),
             ...(suppliedMetadataFields.length
@@ -2003,6 +2173,92 @@ function skillUpgradeGroup(def: {
 }
 
 /**
+ * Resolve the skill config's ordered rarity from a definition, or undefined.
+ */
+function skillRarityOf(def: {
+  kind: string
+  config?: unknown
+}): string | undefined {
+  const rarity = parseCatalogConfig(def.kind, def.config ?? {}).rarity
+  return typeof rarity === "string" && rarity.length > 0 ? rarity : undefined
+}
+
+/**
+ * Collect every SKILL-kind link on the character that shares `upgradeGroup`,
+ * WITHOUT deleting anything. The newly acquired definition is excluded, and only
+ * SKILL-kind links are considered. This is the exact set
+ * `removeSameUpgradeGroupSkills` would remove - used to enforce the
+ * monotonic-rarity guard BEFORE any write.
+ */
+function sameUpgradeGroupSkillLinks(
+  associations: CharacterWithCatalog["associations"],
+  definitionId: string,
+  upgradeGroup: string
+): Array<{
+  definitionId: string
+  name: string
+  rarity: string | undefined
+}> {
+  const links: Array<{
+    definitionId: string
+    name: string
+    rarity: string | undefined
+  }> = []
+  for (const link of associations) {
+    if (link.kind !== "SKILL") continue
+    if (link.definitionId === definitionId) continue
+    if (skillUpgradeGroup(link.definition) !== upgradeGroup) continue
+    links.push({
+      definitionId: link.definitionId,
+      name: link.definition.name,
+      rarity: skillRarityOf(link.definition),
+    })
+  }
+  return links
+}
+
+/**
+ * Enforce the monotonic rarity rule for a select/grant that replaces one or more
+ * linked skills in the same upgrade group: the incoming skill must carry a
+ * strictly higher ordered rarity than EVERY removed link. Rejects with 400
+ * `skill_rarity_not_higher` when the target rarity is missing/incomparable
+ * (e.g. `Unique`), when any removed link's rarity is missing/incomparable, or
+ * when any removed link is not strictly lower. Skills with no group (or with no
+ * removable same-group links) never reach this check.
+ */
+function assertSkillRarityMonotonic(
+  target: { definitionId: string; name: string; rarity: string | undefined },
+  removedLinks: Array<{
+    definitionId: string
+    name: string
+    rarity: string | undefined
+  }>
+): void {
+  const targetIndex = rarityOrderIndex(target.rarity)
+  if (targetIndex == null) {
+    throw badRequest(
+      "skill_rarity_not_higher",
+      `Skill "${target.name}" must carry an ordered rarity (missing or incomparable "Unique") to replace a linked skill in its upgrade group`
+    )
+  }
+  for (const link of removedLinks) {
+    const linkIndex = rarityOrderIndex(link.rarity)
+    if (linkIndex == null) {
+      throw badRequest(
+        "skill_rarity_not_higher",
+        `Skill "${target.name}" cannot replace "${link.name}": "${link.name}" has an incomparable/missing rarity ("${link.rarity ?? "(none)"}")`
+      )
+    }
+    if (linkIndex >= targetIndex) {
+      throw badRequest(
+        "skill_rarity_not_higher",
+        `Skill "${target.name}" (rarity "${target.rarity}") is not strictly higher than "${link.name}" (rarity "${link.rarity}")`
+      )
+    }
+  }
+}
+
+/**
  * Delete every skill link on the character that shares `upgradeGroup` (never
  * stack superseded tiers). The newly acquired definition is excluded, and only
  * SKILL-kind links are considered.
@@ -2116,6 +2372,23 @@ export async function skillCharacter(
         defConfig.upgradeGroup.length > 0
           ? defConfig.upgradeGroup
           : undefined
+      const defRarity =
+        typeof defConfig.rarity === "string" && defConfig.rarity.length > 0
+          ? defConfig.rarity
+          : undefined
+      const removedLinks =
+        upgradeGroup != null
+          ? sameUpgradeGroupSkillLinks(row.associations, def.id, upgradeGroup)
+          : []
+      // Monotonic-rarity guard: only enforced when the action would actually
+      // remove a linked skill in the same upgrade group. Reject (400) BEFORE any
+      // write so a lower/equal/incomparable replacement never lands.
+      if (removedLinks.length > 0) {
+        assertSkillRarityMonotonic(
+          { definitionId: def.id, name: def.name, rarity: defRarity },
+          removedLinks
+        )
+      }
       const removed =
         upgradeGroup != null
           ? await removeSameUpgradeGroupSkills(
@@ -2166,7 +2439,7 @@ export async function skillCharacter(
               name: def.name,
               stableId: def.stableId,
               grade: def.grade,
-              provenance: def.provenance,
+              provenance: "catalog",
               upgradeGroup: upgradeGroup ?? null,
             },
             selectedAt: new Date().toISOString(),
@@ -2225,6 +2498,23 @@ export async function skillCharacter(
       defConfig.upgradeGroup.length > 0
         ? defConfig.upgradeGroup
         : undefined
+    const defRarity =
+      typeof defConfig.rarity === "string" && defConfig.rarity.length > 0
+        ? defConfig.rarity
+        : undefined
+    const removedLinks =
+      upgradeGroup != null
+        ? sameUpgradeGroupSkillLinks(row.associations, def.id, upgradeGroup)
+        : []
+    // Monotonic-rarity guard: only enforced when the action would actually
+    // remove a linked skill in the same upgrade group. Reject (400) BEFORE any
+    // write so a lower/equal/incomparable replacement never lands.
+    if (removedLinks.length > 0) {
+      assertSkillRarityMonotonic(
+        { definitionId: def.id, name: def.name, rarity: defRarity },
+        removedLinks
+      )
+    }
     const removed =
       upgradeGroup != null
         ? await removeSameUpgradeGroupSkills(
@@ -2269,7 +2559,7 @@ export async function skillCharacter(
             name: def.name,
             stableId: def.stableId,
             grade: def.grade,
-            provenance: def.provenance,
+            provenance: "catalog",
             upgradeGroup: upgradeGroup ?? null,
           },
           grantedAt: new Date().toISOString(),
@@ -2284,6 +2574,212 @@ export async function skillCharacter(
     }))!
     return { character: detailFor(updated, houseRules) }
   })
+}
+
+type SkillUpgradeInput = {
+  definitionId: string
+  version: number
+  reason: string
+}
+
+/**
+ * Upgrade a character's linked skill to a strictly higher-ordered rarity variant
+ * of the same `upgradeGroup`.
+ *
+ * The owner or an admin supplies the id of an ACTIVE (unarchived) `skills` entry
+ * that carries BOTH a valid `rarity` and a nonempty `upgradeGroup`, plus a
+ * mandatory reason. The character must currently hold EXACTLY ONE other linked
+ * skill in that same upgrade group with a strictly LOWER ordered rarity; that
+ * existing link is replaced (never stacked). Rejections are all 400
+ * `skill_rarity_not_higher`:
+ *   - the target name is not an active skills entry, lacks a rarity / group, or
+ *     is itself already linked,
+ *   - the target rarity is missing or incomparable (`Unique`),
+ *   - the character holds zero same-group links (nothing to upgrade) or more
+ *     than one (ambiguous), or
+ *   - the (single) same-group link's rarity is missing/incomparable or not
+ *     strictly lower.
+ *
+ * The replacement runs under SERIALIZABLE isolation with the same CAS version
+ * increment as select/grant; there is no XP cost. The removed source link may be
+ * an ARCHIVED catalog entry - its config is still read to determine its rarity /
+ * group so an archived source can be upgraded away from. The immutable
+ * `skill_upgrade` event snapshots the from/to stable ids, names, rarities,
+ * descriptions, the reason, and the removed-link record.
+ */
+export async function upgradeSkill(
+  id: string,
+  input: SkillUpgradeInput,
+  user: SessionUser
+): Promise<{ character: CharacterDetail }> {
+  return prisma
+    .$transaction(
+      async (tx) => {
+        const row = await assertOwner(tx, id, user)
+        const houseRules = await loadHouseRules(tx)
+
+        const def = await tx.catalogDefinition.findUnique({
+          where: { id: input.definitionId },
+        })
+        if (!def) {
+          throw notFound("catalog_not_found", "Catalog entry not found")
+        }
+        if (def.kind !== "skills") {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind (expected "skills")`
+          )
+        }
+        if (def.archived) {
+          throw badRequest(
+            "catalog_archived",
+            `Skill "${def.name}" is archived; re-enable it in the catalog to upgrade to it`
+          )
+        }
+        const defConfig = parseCatalogConfig("skills", def.config ?? {})
+        const targetGroup = upgradeGroupForConfig(defConfig)
+        if (targetGroup == null) {
+          throw badRequest(
+            "skill_rarity_not_higher",
+            `Skill "${def.name}" has no "upgradeGroup", so it cannot upgrade a linked skill`
+          )
+        }
+        const targetRarity = skillRarityOf({
+          kind: "skills",
+          config: def.config ?? {},
+        })
+        if (targetRarity == null) {
+          throw badRequest(
+            "skill_rarity_not_higher",
+            `Skill "${def.name}" has no ordered "rarity" (missing or incomparable "Unique"), so it cannot upgrade a linked skill`
+          )
+        }
+        if (
+          row.associations.some(
+            (a) => a.definitionId === def.id && a.kind === "SKILL"
+          )
+        ) {
+          throw badRequest(
+            "duplicate",
+            `Skill "${def.name}" is already acquired`
+          )
+        }
+
+        // The same-group source links (excluding the target). Exactly one is
+        // required; an archived source is allowed and its config still read.
+        const sources = row.associations.filter(
+          (a) =>
+            a.kind === "SKILL" &&
+            a.definitionId !== def.id &&
+            skillUpgradeGroup(a.definition) === targetGroup
+        )
+        if (sources.length === 0) {
+          throw badRequest(
+            "skill_rarity_not_higher",
+            `Skill "${def.name}" cannot upgrade: no linked skill in upgrade group "${targetGroup}" to replace`
+          )
+        }
+        if (sources.length > 1) {
+          throw badRequest(
+            "skill_rarity_not_higher",
+            `Skill "${def.name}" cannot upgrade: more than one linked skill in upgrade group "${targetGroup}" (ambiguous)`
+          )
+        }
+        const source = sources[0]
+        const sourceDef = source.definition
+        const sourceRarity = skillRarityOf(sourceDef)
+        // Strictly higher ordered rarity than the single source link.
+        assertSkillRarityMonotonic(
+          {
+            definitionId: def.id,
+            name: def.name,
+            rarity: targetRarity,
+          },
+          [
+            {
+              definitionId: source.definitionId,
+              name: sourceDef.name,
+              rarity: sourceRarity,
+            },
+          ]
+        )
+
+        const removed = await removeSameUpgradeGroupSkills(
+          tx,
+          id,
+          row.associations,
+          def.id,
+          targetGroup
+        )
+        await tx.characterAssociation.create({
+          data: {
+            characterId: id,
+            definitionId: def.id,
+            kind: "SKILL" as never,
+          },
+        })
+
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: input.version },
+          data: { version: { increment: 1 } },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${input.version}, got a newer version`
+          )
+        }
+
+        await tx.progressionEvent.create({
+          data: {
+            characterId: id,
+            kind: "skill_upgrade",
+            payload: {
+              operation: "upgrade",
+              definitionId: def.id,
+              reason: input.reason,
+              from: {
+                definitionId: sourceDef.id,
+                stableId: sourceDef.stableId,
+                name: sourceDef.name,
+                rarity: sourceRarity ?? null,
+                description: sourceDef.description,
+              },
+              to: {
+                definitionId: def.id,
+                stableId: def.stableId,
+                name: def.name,
+                rarity: targetRarity,
+                description: def.description,
+              },
+              upgradeGroup: targetGroup,
+              removed,
+              upgradedAt: new Date().toISOString(),
+            } as unknown as Prisma.InputJsonValue,
+          },
+        })
+
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return { character: detailFor(updated, houseRules) }
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      // A concurrent character write that cannot serialize surfaces as P2034;
+      // map it to a retryable 409 rather than a raw 500. The SERIALIZABLE
+      // transaction has already rolled back, so no stray event, replaced link or
+      // CAS version bump is left behind.
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "serialization_conflict",
+          "Concurrent character write conflict; retry the skill upgrade"
+        )
+      }
+      throw err
+    })
 }
 
 export async function allocateCharacter(
@@ -2357,7 +2853,6 @@ export interface EvolutionOptionView {
   toTrackName: string
   /** The track this evolution path targets. */
   track: "race" | "class" | "profession"
-  provenance: string
   sourceUrl: string | null
   eligible: boolean
   blockers: string[]
@@ -2378,7 +2873,6 @@ interface RaceEvolutionPath {
   id: string
   name: string
   description: string | null
-  provenance: string
   sourceUrl: string | null
   fromRaceStableId: string
   toRaceStableId: string
@@ -2394,7 +2888,6 @@ function parseRaceEvolutionPath(row: {
   id: string
   name: string
   description: string | null
-  provenance: string
   sourceUrl: string | null
   config: unknown
 }): RaceEvolutionPath | null {
@@ -2404,7 +2897,6 @@ function parseRaceEvolutionPath(row: {
     id: row.id,
     name: row.name,
     description: row.description,
-    provenance: row.provenance,
     sourceUrl: row.sourceUrl,
     fromRaceStableId: config.fromRaceStableId as string,
     toRaceStableId: config.toRaceStableId as string,
@@ -2436,7 +2928,6 @@ interface TrackEvolutionPath {
   id: string
   name: string
   description: string | null
-  provenance: string
   sourceUrl: string | null
   track: "class" | "profession"
   fromDefinitionStableId: string
@@ -2453,7 +2944,6 @@ function parseTrackEvolutionPath(row: {
   id: string
   name: string
   description: string | null
-  provenance: string
   sourceUrl: string | null
   config: unknown
 }): TrackEvolutionPath | null {
@@ -2464,7 +2954,6 @@ function parseTrackEvolutionPath(row: {
     id: row.id,
     name: row.name,
     description: row.description,
-    provenance: row.provenance,
     sourceUrl: row.sourceUrl,
     track,
     fromDefinitionStableId: config.fromDefinitionStableId as string,
@@ -2869,7 +3358,6 @@ export async function getEvolutionOptions(
       toGrade: path.toGrade,
       toTrackName: destRace.name,
       track: "race",
-      provenance: path.provenance,
       sourceUrl: path.sourceUrl,
       eligible: allBlockers.length === 0,
       blockers: allBlockers,
@@ -2946,7 +3434,6 @@ async function getTrackEvolutionOptions(
       toGrade: path.toGrade,
       toTrackName: destDefinition.name,
       track,
-      provenance: path.provenance,
       sourceUrl: path.sourceUrl,
       eligible: allBlockers.length === 0,
       blockers: allBlockers,
@@ -3551,7 +4038,7 @@ export async function consumeCharacter(
         const state = deserializeState(row.state)
         const rulesConfig = configFor(row, houseRules.config)
 
-        // The engine never guesses provenance from the grade: origin is always
+        // The engine never guesses the origin from the grade: origin is always
         // reconstructed from the authoritative Character.origin column before any
         // apply, and the mutation persists it so the ledger state becomes
         // self-describing. This both fixes legacy states that predate origin
@@ -3604,7 +4091,7 @@ export async function consumeCharacter(
           stableId: definition.stableId,
           kind: definition.kind,
           config: (definition.config ?? {}) as Record<string, unknown>,
-          provenance: definition.provenance,
+          provenance: "catalog",
           grade: definition.grade,
           archived: definition.archived,
         }
@@ -3761,14 +4248,17 @@ export async function getCharacterInventory(
 ): Promise<{ inventory: CharacterInventoryItemView[]; version: number }> {
   const row = await prisma.character.findUnique({
     where: { id },
-    include: { inventory: { include: { definition: true } } },
+    include: {
+      inventory: { include: { definition: true } },
+      race: true,
+    },
   })
   if (!row) throw notFound("character_not_found", "Character not found")
   if (!user.isAdmin && row.ownerId !== user.id) {
     throw forbidden("forbidden", "You do not own this character")
   }
   return {
-    inventory: row.inventory.map(inventoryView),
+    inventory: row.inventory.map((i) => inventoryView(i, row)),
     version: row.version,
   }
 }
@@ -3956,7 +4446,7 @@ export async function adjustCharacterInventory(
                 kind: definition.kind,
                 stableId: definition.stableId,
                 grade: definition.grade,
-                provenance: definition.provenance,
+
                 archived: definition.archived,
               },
               quantity: body.quantity,
@@ -3975,7 +4465,7 @@ export async function adjustCharacterInventory(
         }))!
         return {
           character: detailFor(updated, houseRules),
-          inventory: updated.inventory.map(inventoryView),
+          inventory: updated.inventory.map((i) => inventoryView(i, updated)),
           version: updated.version,
         }
       },
@@ -3994,13 +4484,13 @@ export async function adjustCharacterInventory(
     })
 }
 
-/** Decode the equipment slot from a catalog definition's parsed config. */
+/** Decode the equipment slot from a catalog definition's parsed config (normalized). */
 function definitionSlot(def: {
   kind: string
   config?: unknown
 }): string | undefined {
   const slot = parseCatalogConfig(def.kind, def.config ?? {}).slot
-  return typeof slot === "string" && slot.length > 0 ? slot : undefined
+  return normalizeEquipmentSlot(slot)
 }
 
 /** Decode the title upgrade group from a catalog definition's parsed config. */
@@ -4261,6 +4751,23 @@ export async function associateCharacter(
             definition.config ?? {}
           )
 
+          // Equipping is gated by the item's level / race-type requirements. An
+          // add whose requirement is currently unmet is rejected (400
+          // `equipment_requirements_unmet`) BEFORE any link is removed or created;
+          // acquiring inventory stock is still allowed (only the equip link is
+          // gated). The requirement is checked against the character's RACE level
+          // and race type, never the total/class level.
+          if (body.kind === "equipment") {
+            const raceState = deserializeState(row.state)
+            const eligibility = equipmentEligibilityFor(config, raceState, row)
+            if (!eligibility.eligible) {
+              throw badRequest(
+                "equipment_requirements_unmet",
+                `${definition.name}: ${eligibility.reason}`
+              )
+            }
+          }
+
           // A ranked title (its config carries `improvement`) is added through a
           // strict sequential rank gate. This runs before any link is removed, so a
           // rejected add writes nothing: the grade gate uses the character's race
@@ -4327,9 +4834,11 @@ export async function associateCharacter(
 
           // Equipment add replaces whatever currently occupies the SAME slot.
           // Remove every such link atomically - never leave a second effective
-          // item in a slot.
+          // item in a slot. Slot matching is done on the NORMALIZED canonical
+          // slot so a legacy alias (`head`, `cloak`, ...) collides with its
+          // canonical counterpart (`Head`, `Back`, ...).
           if (body.kind === "equipment") {
-            const slot = config.slot as string | undefined
+            const slot = normalizeEquipmentSlot(config.slot)
             if (slot) {
               const sameSlotLinks = existing.filter(
                 (l) =>
@@ -4507,7 +5016,7 @@ export async function associateCharacter(
                 kind: definition.kind,
                 stableId: definition.stableId,
                 grade: definition.grade,
-                provenance: definition.provenance,
+
                 ...(body.kind === "equipment"
                   ? {
                       slot: (config.slot as string | undefined) ?? null,
@@ -4597,6 +5106,176 @@ export async function associateCharacter(
     })
 }
 
+/**
+ * Set a set-once profession on an existing character, at its CURRENT race grade.
+ *
+ * This is the post-creation path that links a `professions` catalog entry to a
+ * character whose creation did not pick one (or that must be assigned later by an
+ * owner/admin). The profession is chosen EXACTLY at the character's current race
+ * grade: the catalog entry's own `grade` must equal `state.race.grade` AND it must
+ * declare a `grades[state.race.grade]` per-level config (the same per-grade gate a
+ * create-time profession goes through). No level awards are granted and the
+ * class/race tracks are never touched - only the `profession` track is added and
+ * the `professionId` column/version are written under the transaction.
+ *
+ * Validations, in order:
+ *   - Only an enlightened (non-monster) race with a class track may set a
+ *     profession. A monster (independent race mode) or a legacy classless imported
+ *     character is rejected with 400 `profession_requires_class`.
+ *   - A character that already has a `professionId` or a `profession` track is
+ *     rejected with 409 `profession_already_set` (set once).
+ *   - The catalog entry must be an active (unarchived) `professions` definition.
+ *   - The entry must be graded exactly at the character's current race grade
+ *     (`profession_grade_mismatch` vs `profession_grade_config_missing`).
+ *
+ * The write CASes the character version (a stale version 409s `version_conflict`
+ * and rolls back the state write + event) and runs under SERIALIZABLE isolation;
+ * a concurrent write that fails to serialize is mapped to a retryable 409 rather
+ * than a raw 500.
+ */
+export async function setCharacterProfession(
+  id: string,
+  body: { professionId: string; version: number },
+  user: SessionUser
+): Promise<{ character: CharacterDetail }> {
+  return prisma
+    .$transaction(
+      async (tx) => {
+        const row = await assertOwner(tx, id, user)
+        const houseRules = await loadHouseRules(tx)
+        const state = deserializeState(row.state)
+
+        // A profession is a class-adjacent track: only an enlightened race that
+        // advances through a class track may carry one. A monster (independent
+        // race mode) and a legacy classless imported character both lack a class
+        // track, so neither can gain a profession.
+        if (state.race.mode === "independent" || !state.tracks["class"]) {
+          throw badRequest(
+            "profession_requires_class",
+            "A profession can only be set on an enlightened race with a class track; this character has none"
+          )
+        }
+
+        // Set once: a character that already carries a professionId or profession
+        // track cannot be re-set to another profession.
+        if (row.professionId != null || state.tracks["profession"]) {
+          throw conflict(
+            "profession_already_set",
+            "Character already has a profession"
+          )
+        }
+
+        const definition = await tx.catalogDefinition.findUnique({
+          where: { id: body.professionId },
+        })
+        if (!definition) {
+          throw notFound("catalog_not_found", "Profession not found")
+        }
+        if (definition.kind !== "professions") {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind (expected "professions")`
+          )
+        }
+        if (definition.archived) {
+          throw badRequest(
+            "catalog_archived",
+            "Profession is archived and cannot be set"
+          )
+        }
+
+        const currentRaceGrade = state.race.grade
+        // The profession must be selected AT the character's current race grade:
+        // the catalog entry's own grade must match, and it must define a per-level
+        // config for that grade (otherwise the profession track could never
+        // advance).
+        if (definition.grade !== currentRaceGrade) {
+          throw badRequest(
+            "profession_grade_mismatch",
+            `Profession "${definition.name}" is grade ${definition.grade ?? "(unset)"}; character is race grade ${currentRaceGrade}`
+          )
+        }
+        if (!trackHasGradeConfig(definition, currentRaceGrade)) {
+          throw badRequest(
+            "profession_grade_config_missing",
+            `Profession "${definition.name}" defines no ${currentRaceGrade}-grade per-level config; add a "grades.${currentRaceGrade}" entry to set it`
+          )
+        }
+
+        const professionTrack = {
+          level: 0,
+          quarter: 0,
+          grade: currentRaceGrade,
+          definitionId: `${definition.stableId}:${currentRaceGrade}`,
+        }
+        const nextState: CharacterState = {
+          ...state,
+          tracks: { ...state.tracks, profession: professionTrack },
+        }
+        const serialized = serializeState(nextState)
+
+        // CAS: only the profession column, the engine state and the version change;
+        // the class/race tracks and every ledger are left untouched.
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: body.version },
+          data: {
+            professionId: definition.id,
+            state: serialized as Prisma.InputJsonValue,
+            version: { increment: 1 },
+          },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${body.version}, got a newer version`
+          )
+        }
+
+        await tx.progressionEvent.create({
+          data: {
+            characterId: id,
+            kind: "profession_set",
+            payload: {
+              professionId: definition.id,
+              profession: {
+                id: definition.id,
+                name: definition.name,
+                stableId: definition.stableId,
+                grade: definition.grade,
+              },
+              before: {
+                professionId: row.professionId,
+                track: state.tracks["profession"] ?? null,
+              },
+              after: {
+                professionId: definition.id,
+                track: professionTrack,
+              },
+            } as Prisma.InputJsonValue,
+          },
+        })
+
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return { character: detailFor(updated, houseRules) }
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      // A concurrent profession set (or any concurrent character write) that cannot
+      // serialize surfaces as P2034; map it to a 409 rather than a raw 500.
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "catalog_serialization_conflict",
+          "Concurrent character write conflict; retry the change"
+        )
+      }
+      throw err
+    })
+}
+
 export async function exportCharacter(
   id: string,
   user: SessionUser
@@ -4628,7 +5307,6 @@ export async function exportCharacter(
       name: a.definition.name,
       kind: a.definition.kind,
       config: (a.definition.config ?? {}) as Record<string, unknown>,
-      provenance: a.definition.provenance,
       archived: a.definition.archived,
       stableId: a.definition.stableId,
       updatedAt: a.definition.updatedAt.toISOString(),
@@ -4735,7 +5413,6 @@ type CatalogLookupRow = {
   name: string
   config: unknown
   archived: boolean
-  provenance: string
 }
 
 async function findCatalogByStableId(
@@ -5899,7 +6576,6 @@ function catalogItem(row: {
   name: string
   description: string | null
   grade: string | null
-  provenance: "verified" | "inferred" | "house"
   sourceUrl: string | null
   archived: boolean
   config: unknown
@@ -5913,7 +6589,6 @@ function catalogItem(row: {
     name: row.name,
     description: row.description,
     grade: row.grade,
-    provenance: row.provenance,
     sourceUrl: row.sourceUrl,
     archived: row.archived,
     config: (row.config ?? {}) as Record<string, unknown>,
@@ -5955,7 +6630,6 @@ export async function createCatalogItem(
     name: string
     description?: string | null
     grade?: string | null
-    provenance?: "verified" | "inferred" | "house"
     sourceUrl?: string | null
     archived?: boolean
     config?: Record<string, unknown>
@@ -5980,6 +6654,15 @@ export async function createCatalogItem(
     throw badRequest(
       "invalid_config",
       'Skill config has an invalid "track": expected "class" or "profession"'
+    )
+  }
+  // A NEW skill must declare a valid rarity (the same ordered vocabulary as
+  // equipment). A legacy config without one is acceptable only for existing
+  // entries, never here.
+  if (kind === "skills" && isIncompleteSkillRarity(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Skill config requires a valid "rarity" (one of Inferior/Common/Uncommon/Rare/Epic/Ancient/Legendary/Mythical/Sacred/Divine/Unique)'
     )
   }
   // A NEW race must carry a recognized raceType ("enlightened" or "monster") AND
@@ -6027,6 +6710,15 @@ export async function createCatalogItem(
       'Transcendent skill config is missing required "passiveEffects" field'
     )
   }
+  // A NEW equipment entry requires a valid slot AND a valid rarity; a legacy
+  // metadata-only config (no slot / no rarity) is acceptable only for existing
+  // entries, never here.
+  if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring 1/Ring 2/Weapon, or a documented legacy alias) and a valid "rarity"'
+    )
+  }
   let stableId = input.stableId
   if (!stableId) {
     stableId =
@@ -6060,7 +6752,6 @@ export async function createCatalogItem(
           name: input.name,
           description: input.description ?? null,
           grade: input.grade ?? null,
-          provenance: input.provenance ?? "house",
           sourceUrl: input.sourceUrl ?? null,
           archived: input.archived ?? false,
           config: config as Prisma.InputJsonValue,
@@ -6093,7 +6784,7 @@ export async function createCatalogItem(
  * authority for its character's rank progression, so changing its identity would
  * invalidate the sequence; the owner's current association must stay intact.
  *
- * Allowed on a linked title: metadata (name/description/grade/provenance) edits
+ * Allowed on a linked title: metadata (name/description/grade) edits
  * and bonus recalculations (flat / percent), as long as the improvement identity
  * is not being added, changed or removed. Rejected with 409
  * `title_improvement_conflict` (no write) for a linked title whose improvement
@@ -6135,6 +6826,51 @@ async function assertTitleImprovementStable(
   throw conflict(
     "title_improvement_conflict",
     "This ranked title is assigned to a character; its improvement series/rank/grade cannot be added, changed or removed"
+  )
+}
+
+/**
+ * Reject a catalog update that would change a LINKED skill's rarity or
+ * upgradeGroup. A linked skill's rarity/group is the mechanical fact its
+ * character link relies on for monotonic upgrade ordering and same-group
+ * replacement, so changing it would silently invalidate the recorded
+ * `skill_upgrade` history / snapshots. Metadata (name/description/grade) edits
+ * and config edits that keep rarity/group stable (effects/track/milestone) are
+ * allowed; prior snapshots are never silently adjusted. Rejected with 409
+ * `skill_rarity_conflict` (no write) for a linked skill whose rarity/group is
+ * added, changed or removed. An unlinked catalog row may be edited freely. This
+ * runs AFTER `assertNoLinkCollision`, so a genuine group collision still
+ * reports `link_collision` first.
+ */
+async function assertSkillAssociationStable(
+  tx: DbClient,
+  definitionId: string,
+  existingConfig: Record<string, unknown>,
+  finalConfig: Record<string, unknown>
+): Promise<void> {
+  const existingParsed = parseCatalogConfig("skills", existingConfig)
+  const existingRarity =
+    typeof existingParsed.rarity === "string" &&
+    existingParsed.rarity.length > 0
+      ? existingParsed.rarity
+      : undefined
+  const finalParsed = parseCatalogConfig("skills", finalConfig)
+  const finalRarity =
+    typeof finalParsed.rarity === "string" && finalParsed.rarity.length > 0
+      ? finalParsed.rarity
+      : undefined
+  const existingGroup = upgradeGroupForConfig(existingConfig)
+  const finalGroup = upgradeGroupForConfig(finalConfig)
+  // Rarity AND group both stable - an ordinary metadata / effects edit, nothing
+  // to protect.
+  if (existingRarity === finalRarity && existingGroup === finalGroup) return
+  const links = await tx.characterAssociation.findMany({
+    where: { definitionId },
+  })
+  if (links.length === 0) return
+  throw conflict(
+    "skill_rarity_conflict",
+    "This skill is assigned to a character; its rarity or upgrade group cannot be added, changed or removed while it is linked"
   )
 }
 
@@ -6245,8 +6981,7 @@ async function assertNoLinkCollision(
 }
 
 function slotForConfig(config: Record<string, unknown>): string | undefined {
-  const slot = config.slot
-  return typeof slot === "string" && slot.length > 0 ? slot : undefined
+  return normalizeEquipmentSlot(config.slot)
 }
 
 function upgradeGroupForConfig(
@@ -6264,7 +6999,6 @@ export async function updateCatalogItem(
     name?: string
     description?: string | null
     grade?: string | null
-    provenance?: "verified" | "inferred" | "house"
     sourceUrl?: string | null
     archived?: boolean
     config?: Record<string, unknown>
@@ -6284,7 +7018,8 @@ export async function updateCatalogItem(
     kind === "races" ||
     kind === "blessings" ||
     kind === "bloodlines" ||
-    kind === "titles"
+    kind === "titles" ||
+    kind === "skills"
       ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       : undefined
   try {
@@ -6317,6 +7052,15 @@ export async function updateCatalogItem(
           throw badRequest(
             "invalid_config",
             'Skill config has an invalid "track": expected "class" or "profession"'
+          )
+        }
+        // A config-changing skill PATCH, like a new skill POST, must declare a
+        // valid rarity. A legacy config that never carried one is editable only
+        // via a metadata-only PATCH (no `config` in the payload).
+        if (kind === "skills" && isIncompleteSkillRarity(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Skill config requires a valid "rarity" (one of Inferior/Common/Uncommon/Rare/Epic/Ancient/Legendary/Mythical/Sacred/Divine/Unique)'
           )
         }
         if (kind === "races" && isIncompleteRaceConfig(config)) {
@@ -6402,6 +7146,15 @@ export async function updateCatalogItem(
             'Transcendent skill config is missing required "passiveEffects" field'
           )
         }
+        // A config-changing equipment PATCH, like a new POST, requires the modern
+        // full shape: a valid slot AND a valid rarity. Legacy configs remain
+        // editable for metadata-only PATCHes (no `config` in the payload).
+        if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
+          throw badRequest(
+            "invalid_config",
+            'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring 1/Ring 2/Weapon, or a documented legacy alias) and a valid "rarity"'
+          )
+        }
       }
       const finalConfig =
         config ?? parseCatalogConfig(kind, existing.config ?? {})
@@ -6467,6 +7220,14 @@ export async function updateCatalogItem(
           finalConfig
         )
       }
+      if (kind === "skills") {
+        await assertSkillAssociationStable(
+          tx,
+          id,
+          parseCatalogConfig("skills", existing.config ?? {}),
+          finalConfig
+        )
+      }
       const row = await tx.catalogDefinition.update({
         where: { id },
         data: {
@@ -6476,7 +7237,6 @@ export async function updateCatalogItem(
             ? { description: patch.description }
             : {}),
           ...(patch.grade != null ? { grade: patch.grade } : {}),
-          ...(patch.provenance != null ? { provenance: patch.provenance } : {}),
           ...(patch.sourceUrl != null ? { sourceUrl: patch.sourceUrl } : {}),
           ...(patch.archived != null ? { archived: patch.archived } : {}),
           ...(config != null

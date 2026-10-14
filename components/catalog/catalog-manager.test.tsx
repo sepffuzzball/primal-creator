@@ -35,7 +35,22 @@ vi.mock("@/lib/api", () => {
     headers: body !== undefined ? { "Content-Type": "application/json" } : {},
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
-  return { ApiError, jsonInit, apiFetch: vi.fn() }
+  return {
+    ApiError,
+    jsonInit,
+    apiFetch: vi.fn(),
+    ATTRIBUTE_KEYS: [
+      "strength",
+      "agility",
+      "endurance",
+      "vitality",
+      "toughness",
+      "wisdom",
+      "intelligence",
+      "perception",
+      "willpower",
+    ],
+  }
 })
 
 vi.mock("@/components/ui/button", () => ({
@@ -569,6 +584,336 @@ describe("CatalogManager config omission on edit", () => {
   })
 })
 
+describe("structured catalog editors", () => {
+  afterEach(() => cleanup())
+
+  function useCreateMock(kind: string) {
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { item: { ...item, kind } }
+      return { kind, items: [] }
+    })
+    return mock
+  }
+
+  it("exposes grade choices as an accessible single-select group", async () => {
+    useCreateMock("races")
+    render(<CatalogManager kind="races" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    const group = screen.getByRole("radiogroup", { name: "Natural grade" })
+    const gradeA = screen.getByRole("radio", { name: "A" })
+    fireEvent.click(gradeA)
+    expect(
+      screen.getByRole("radio", { name: "A" }).getAttribute("aria-checked")
+    ).toBe("true")
+    fireEvent.click(screen.getByRole("radio", { name: "B" }))
+    expect(
+      screen.getByRole("radio", { name: "B" }).getAttribute("aria-checked")
+    ).toBe("true")
+    expect(group.querySelectorAll('[aria-checked="true"]')).toHaveLength(1)
+  })
+
+  it("creates a race with a deterministic A-grade row and preserves explicit zero", async () => {
+    const mock = useCreateMock("races")
+    render(<CatalogManager kind="races" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Ashkin" },
+    })
+    fireEvent.click(screen.getByRole("radio", { name: "A" }))
+    fireEvent.change(screen.getByLabelText("Race type"), {
+      target: { value: "monster" },
+    })
+    fireEvent.change(screen.getByLabelText("A strength"), {
+      target: { value: "0" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(request).toBeTruthy()
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body.grade).toBe("A")
+    expect(body.config.naturalGrade).toBe("A")
+    expect(body.config.raceDefinitions.A).toMatchObject({
+      id: "ashkin-a",
+      perLevel: { strength: 0 },
+      freePerLevel: 0,
+    })
+  })
+
+  it("offers every schema rarity and does not require grade for equipment", async () => {
+    const mock = useCreateMock("equipment")
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Helm" },
+    })
+    fireEvent.change(screen.getByLabelText("Slot"), {
+      target: { value: "Head" },
+    })
+    fireEvent.change(screen.getByLabelText("Rarity"), {
+      target: { value: "Ancient" },
+    })
+    expect(screen.getByRole("option", { name: "Sacred" })).toBeTruthy()
+    expect(screen.queryByRole("option", { name: "Mythic" })).toBeNull()
+    fireEvent.change(screen.getByLabelText("Minimum race level"), {
+      target: { value: "0" },
+    })
+    fireEvent.click(screen.getByLabelText(/Soulbound/))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body).not.toHaveProperty("grade")
+    expect(body.config).toMatchObject({
+      slot: "Head",
+      rarity: "Ancient",
+      soulbound: true,
+      minRaceLevel: 0,
+    })
+  })
+
+  it("creates a class track row with all fixed stats and preserves explicit zero", async () => {
+    const mock = useCreateMock("classes")
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Vanguard" },
+    })
+    fireEvent.click(screen.getByRole("radio", { name: "F" }))
+    for (const key of [
+      "strength",
+      "agility",
+      "endurance",
+      "vitality",
+      "toughness",
+      "wisdom",
+      "intelligence",
+      "perception",
+      "willpower",
+    ]) {
+      fireEvent.change(screen.getByLabelText(`F ${key}`), {
+        target: { value: "0" },
+      })
+    }
+    fireEvent.change(screen.getByLabelText("F Free points"), {
+      target: { value: "0" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body.grade).toBe("F")
+    expect(body.config.grades.F).toMatchObject({
+      fixed: { strength: 0, willpower: 0 },
+      free: 0,
+    })
+  })
+
+  it("keeps malformed JSON text intact and disables structured controls/save", async () => {
+    useCreateMock("equipment")
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+      target: { value: "{broken" },
+    })
+    expect(
+      (screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement).value
+    ).toBe("{broken")
+    expect(screen.getByLabelText("Slot")).toHaveProperty("disabled", true)
+    expect(screen.getByRole("button", { name: "Save" })).toHaveProperty(
+      "disabled",
+      true
+    )
+  })
+})
+
+describe("structured catalog editor legacy and sparse rows", () => {
+  afterEach(() => cleanup())
+
+  function useEditMock(kind: string, fixture: Record<string, unknown>) {
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") return { item: fixture }
+      return { kind, items: [fixture] }
+    })
+    return mock
+  }
+
+  function useCreateMock(kind: string) {
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { item: { ...item, kind } }
+      return { kind, items: [] }
+    })
+    return mock
+  }
+
+  function patchCallsFor(mock: ReturnType<typeof vi.fn>, kind: string) {
+    return mock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).startsWith(`/api/catalog/${kind}/`) &&
+        (init as RequestInit | undefined)?.method === "PATCH"
+    )
+  }
+
+  it("patches naturalGrade from the grade field when editing a legacy race lacking config.naturalGrade", async () => {
+    const legacyRace = {
+      ...item,
+      kind: "races",
+      id: "race-legacy",
+      stableId: "race-legacy",
+      name: "Legacy Race",
+      grade: "F",
+      config: {
+        raceType: "enlightened",
+        raceDefinitions: {
+          F: {
+            id: "legacy-race:F",
+            perLevel: { strength: 1 },
+            freePerLevel: 2,
+          },
+        },
+      },
+    }
+    const mock = useEditMock("races", legacyRace)
+    render(<CatalogManager kind="races" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    fireEvent.change(screen.getByLabelText("Race type"), {
+      target: { value: "monster" },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const calls = patchCallsFor(mock, "races")
+    expect(calls).toHaveLength(1)
+    const body = JSON.parse(
+      (calls[0][1] as RequestInit).body as string
+    ) as Record<string, unknown>
+    expect((body.config as Record<string, unknown>).naturalGrade).toBe("F")
+    expect((body.config as Record<string, unknown>).raceType).toBe("monster")
+  })
+
+  it("permits a metadata-only edit of a legacy class with a sparse fixed row and omits config", async () => {
+    const legacyClass = {
+      ...item,
+      kind: "classes",
+      id: "class-legacy",
+      stableId: "class-legacy",
+      name: "Legacy Class",
+      grade: "F",
+      config: { grades: { F: { fixed: {}, free: 0 } } },
+    }
+    const mock = useEditMock("classes", legacyClass)
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "Updated description" },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const calls = patchCallsFor(mock, "classes")
+    expect(calls).toHaveLength(1)
+    const body = JSON.parse(
+      (calls[0][1] as RequestInit).body as string
+    ) as Record<string, unknown>
+    expect(body).not.toHaveProperty("config")
+    expect(body.description).toBe("Updated description")
+  })
+
+  it("creates a race entering only free points, serializing a sparse perLevel vector", async () => {
+    const mock = useCreateMock("races")
+    render(<CatalogManager kind="races" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Ashkin" },
+    })
+    fireEvent.click(screen.getByRole("radio", { name: "A" }))
+    fireEvent.change(screen.getByLabelText("Race type"), {
+      target: { value: "monster" },
+    })
+    fireEvent.change(screen.getByLabelText("A Free points"), {
+      target: { value: "3" },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(request).toBeTruthy()
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body.config.raceDefinitions.A).toEqual({
+      id: "ashkin-a",
+      freePerLevel: 3,
+      perLevel: {},
+    })
+  })
+
+  it("serializes a class row with only free points as a valid sparse fixed vector and no extra rows", async () => {
+    const mock = useCreateMock("classes")
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Vanguard" },
+    })
+    fireEvent.click(screen.getByRole("radio", { name: "F" }))
+    fireEvent.change(screen.getByLabelText("F Free points"), {
+      target: { value: "2" },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(request).toBeTruthy()
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body.config.grades).toEqual({ F: { fixed: {}, free: 2 } })
+  })
+
+  it("rejects a negative free-point value and prevents the create from being sent", async () => {
+    const mock = useCreateMock("races")
+    render(<CatalogManager kind="races" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Ashkin" },
+    })
+    fireEvent.click(screen.getByRole("radio", { name: "A" }))
+    fireEvent.change(screen.getByLabelText("Race type"), {
+      target: { value: "monster" },
+    })
+    fireEvent.change(screen.getByLabelText("A Free points"), {
+      target: { value: "-1" },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    expect(
+      screen.getByText(/free points must be a nonnegative integer/)
+    ).toBeTruthy()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+      )
+    ).toBe(false)
+  })
+})
+
 describe("CatalogManager import preview staleness", () => {
   afterEach(() => {
     mockIsAdmin = true
@@ -796,20 +1141,17 @@ describe("CatalogManager import preview existing metadata", () => {
       archived: true,
     })
     await openImportPreview()
-    // The proposed manifest source is still shown (name, wiki URL, Inferred).
+    // The proposed manifest source is still shown (name, wiki URL).
     expect(screen.getByText("Legendary Prodigy")).toBeTruthy()
     expect(
       screen.getByText(
         "https://the-primal-hunter.fandom.com/wiki/Legendary_Prodigy"
       )
     ).toBeTruthy()
-    expect(screen.getByText("Inferred")).toBeTruthy()
-    // The preserved existing house row is shown with its ACTUAL provenance and
-    // URL, never labelled Inferred.
+    // The preserved existing house row is shown with its ACTUAL source URL, never
+    // the proposed manifest one.
     expect(
-      screen.getByText(
-        /Existing preserved: Old House Title \(house\) - Archived/
-      )
+      screen.getByText(/Existing preserved: Old House Title - Archived/)
     ).toBeTruthy()
     expect(screen.getByText("https://house.example/old")).toBeTruthy()
     // The row is clearly marked as a skip, not a create.
@@ -826,9 +1168,7 @@ describe("CatalogManager import preview existing metadata", () => {
       archived: false,
     })
     await openImportPreview()
-    expect(
-      screen.getByText("Existing preserved: Old House Title (house)")
-    ).toBeTruthy()
+    expect(screen.getByText("Existing preserved: Old House Title")).toBeTruthy()
     expect(screen.getByText("No source URL")).toBeTruthy()
     expect(
       screen.queryByText(
@@ -926,7 +1266,7 @@ describe("CatalogManager bulk imports", () => {
     expect(confirm).toHaveBeenCalled()
     expect(screen.getByText("Created 1; skipped 1.")).toBeTruthy()
     expect(
-      screen.getByText(/Existing preserved: Existing One \(house\) - Archived/)
+      screen.getByText(/Existing preserved: Existing One - Archived/)
     ).toBeTruthy()
   })
 

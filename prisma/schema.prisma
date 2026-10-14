@@ -38,12 +38,6 @@ enum CatalogKind {
   transcendent_skills
 }
 
-enum Provenance {
-  verified
-  inferred
-  house
-}
-
 enum AssociationKind {
   TITLE
   EQUIPMENT
@@ -201,8 +195,9 @@ model ProgressionEvent {
 // A single table holds every kind of catalog entry keyed by `kind` + `stableId`.
 // `config` carries kind-specific validated JSON (per-kind Zod schema on the
 // server). `grade` is the grade band the entry belongs to (G/F/E/D/C/B/A/S);
-// arbitrary entries may leave it null. `provenance` distinguishes verified wiki
-// facts from inferred/house placeholders so nothing is presented as canon.
+// arbitrary entries may leave it null. `sourceUrl` cites the evidence page where
+// the entry was sourced. No provenance taxonomy is stored: catalog entries are
+// not labelled verified/inferred/house.
 
 model CatalogDefinition {
   id          String      @id @default(cuid())
@@ -211,7 +206,6 @@ model CatalogDefinition {
   name        String
   description String?
   grade       String?
-  provenance  Provenance  @default(house)
   sourceUrl   String?
   archived    Boolean     @default(false)
   config      Json        @default("{}")

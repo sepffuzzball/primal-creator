@@ -82,13 +82,55 @@ the inventory quantity is the recorded number owned.
   the journal records only the prior/new quantity and the user-supplied note.
 
 The `config` for an `equipment` catalog entry carries the existing fields (which
-are preserved):
+are preserved) plus the new authoritative metadata:
 
 - `slot: string` - the equipment slot (e.g. Head, weapon slot). Equipping an item
   replaces whatever currently occupies the same slot; the journal records the old
-  and new items.
+  and new items. This is preserved verbatim on write (no synonym coercion).
 - `bonus?: PartialVector` - nonnegative-integer attribute bonuses. With `slot`
   absent, an entry contributes nothing.
+- `rarity?: string` - one of the canonical rarity tiers
+  (`Inferior`/`Common`/`Uncommon`/`Rare`/`Epic`/`Ancient`/`Legendary`/`Mythical`/
+  `Sacred`/`Divine`, or the incomparable `Unique`). Required for a NEW or
+  config-changing write; legacy entries lacking it remain readable and
+  metadata-PATCHable.
+- `soulbound?: boolean` - bound-to-character flag (metadata only; exposed in
+  inventory/detail views).
+- `minRaceLevel?: number` - nonnegative integer minimum RACE level required to be
+  eligible (metadata only).
+- `requiredRaceType?: "enlightened" | "monster"` - the required race type; a
+  missing value imposes no type restriction.
+
+Slot normalization is comparison-only. `normalizeEquipmentSlot` maps documented
+legacy aliases (`head`/`chest`/`cloak`/`bracers`/`gloves`/`boots`/`necklace`/
+`ring1`/`ring2`) and case-insensitive canonical values to a canonical slot purely
+for slot-collision / replacement / import-integrity comparisons and for the
+modern-shape completeness guard. The original `config.slot` is never rewritten.
+
+## Eligibility & live bonus gating
+
+An equipment config with a `requiredRaceType` maps `enlightened` to humanoid
+races and `monster` to monstrous races (a character's authoritative type is read
+from its race catalog config; an absent `raceType` defaults to `enlightened`).
+`minRaceLevel` is checked against the character's RACE level, never the
+total/class level.
+
+A linked item whose requirement is currently unmet is still linked and shown - the
+link, inventory stock and journal are untouched - but its bonus is NOT
+synthesized into the live status until the character qualifies. An ineligible
+item therefore adds no bonus (represented as an empty bonus) while it stays
+equipped and visible. On ADD, an unmet requirement is rejected with a 400
+(`equipment_requirements_unmet`); the stock-owned add that consumes inventory is
+allowed only when the eligibility check passes (no partial mutation on denial).
+
+Import of a trusted backup does NOT reject an old equipped link merely because the
+requirement is unmet; the live eligibility is recomputed at read time and
+historical snapshots are left untouched.
+
+The inventory and detail views expose minimal equipment metadata (rarity /
+soulbound / declared requirements) and a live `equipmentEligibility`
+(`{ eligible, reason? }`) so a client can show why a linked item contributes no
+bonus yet.
 
 Equipment bonuses are synthesized live from the **current, unarchived** catalog
 config at read time and never written into `Character.state`, so editing an item's

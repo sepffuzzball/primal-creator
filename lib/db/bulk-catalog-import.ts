@@ -24,14 +24,11 @@
  *
  * Policy (distinct from the wiki-reviewed import):
  *   - Existing catalog rows are NEVER overwritten. An entry whose (kind, stableId)
- *     already exists is skipped, leaving its config / provenance / slug untouched.
+ *     already exists is skipped, leaving its config / slug untouched.
  *     A skipped entry carries `existing` (read from the actual live row, never the
  *     upload) so the admin sees exactly what was preserved.
- *   - `provenance` defaults to `house`. Only `house` and `inferred` are accepted -
- *     `verified` is rejected, because a bulk upload is un-verified admin content
- *     and claiming it as canon would be trust laundering.
- *   - `inferred` entries REQUIRE an https sourceUrl (they cite evidence). `house`
- *     entries may omit it, but when present it must also be https.
+ *   - `sourceUrl` is optional but, when supplied, must be an https URL that names
+ *     a host (an `http:` or hostless value is rejected).
  *   - No automatic granting to characters: the importer only creates catalog rows;
  *     it never touches character associations.
  *
@@ -45,9 +42,9 @@
  *
  * Validation uses `catalogCreateSchema` + `parseCatalogConfig` +
  * `assertModernConfig` (the same modern-shape guards the service layer applies on
- * a create), plus the explicit length bounds and the provenance rules above. It
- * does NOT reuse the wiki-reviewed fixed-inferred validator, and it never copies
- * an untrusted `config` into the DB unvalidated.
+ * a create), plus the explicit length bounds and the https sourceUrl rule above.
+ * It does NOT reuse the wiki-reviewed fixed-inferred validator, and it never
+ * copies an untrusted `config` into the DB unvalidated.
  */
 
 import { createHash } from "node:crypto"
@@ -95,13 +92,12 @@ const MAX_SOURCE_URL = 2048
 // ------------------------------------------------------------------ //
 
 export type BulkFormat = "json" | "csv"
-export type BulkProvenance = "house" | "inferred"
 
 /**
- * A fully validated, canonical bulk entry. `grade`/`provenance` are normalized
- * (`Grade | null` and `"house" | "inferred"`), `config` is the parsed per-kind
- * config, and `row` is the 1-based physical row/line (JSON array index + 1, or
- * the CSV physical starting line) used to report errors back to the admin.
+ * A fully validated, canonical bulk entry. `grade` is normalized
+ * (`Grade | null`), `config` is the parsed per-kind config, and `row` is the
+ * 1-based physical row/line (JSON array index + 1, or the CSV physical starting
+ * line) used to report errors back to the admin.
  */
 export interface BulkCatalogEntry {
   row: number
@@ -110,7 +106,6 @@ export interface BulkCatalogEntry {
   name: string
   description: string | null
   grade: Grade | null
-  provenance: BulkProvenance
   sourceUrl: string | null
   config: Record<string, unknown>
 }
@@ -120,7 +115,6 @@ export interface BulkImportExistingRow {
   id: string
   name: string
   sourceUrl: string | null
-  provenance: "verified" | "inferred" | "house"
   archived: boolean
 }
 
@@ -130,13 +124,12 @@ export interface BulkImportEntryPreview {
   kind: CatalogKind
   stableId: string
   /**
-   * The PROPOSED upload values. `name` / `sourceUrl` / `provenance` always
-   * describe what the upload WOULD create; they are never overwritten by an
-   * existing row (see `existing` for what was actually preserved).
+   * The PROPOSED upload values. `name` / `sourceUrl` always describe what the
+   * upload WOULD create; they are never overwritten by an existing row (see
+   * `existing` for what was actually preserved).
    */
   name: string
   sourceUrl: string | null
-  provenance: BulkProvenance
   status: "create" | "skip_existing"
   /**
    * Present ONLY when `status` is `"skip_existing"`: metadata read directly from
@@ -174,7 +167,6 @@ interface RawBulkEntry {
   name: unknown
   description: unknown
   grade: unknown
-  provenance: unknown
   sourceUrl: unknown
   config: unknown
 }
@@ -324,23 +316,6 @@ function optionalGrade(value: unknown, row: number): Grade | null {
   )
 }
 
-function optionalProvenance(value: unknown, row: number): BulkProvenance {
-  if (value === undefined || value === null) return "house"
-  if (typeof value !== "string") {
-    throw badRequest(
-      "validation",
-      `Bulk row ${row}: "provenance" must be a string`
-    )
-  }
-  const s = value.trim()
-  if (s === "") return "house"
-  if (s === "house" || s === "inferred") return s
-  throw badRequest(
-    "validation",
-    `Bulk row ${row}: provenance must be "house" or "inferred" (got "${s}")`
-  )
-}
-
 function assertHttpsSource(source: string, row: number): void {
   let url: URL | null = null
   try {
@@ -406,7 +381,6 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     )
   }
   const grade = optionalGrade(raw.grade, row)
-  const provenance = optionalProvenance(raw.provenance, row)
   const sourceUrl = optionalNullableString(raw.sourceUrl, row, "sourceUrl")
   if (sourceUrl != null && sourceUrl.length > MAX_SOURCE_URL) {
     throw badRequest(
@@ -415,12 +389,6 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     )
   }
   if (sourceUrl != null) assertHttpsSource(sourceUrl, row)
-  if (provenance === "inferred" && sourceUrl == null) {
-    throw badRequest(
-      "validation",
-      `Bulk row ${row}: inferred entries require an https sourceUrl`
-    )
-  }
   const config = requireRecord(raw.config, row)
 
   const parsedCreate = catalogCreateSchema.safeParse({
@@ -428,7 +396,6 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     name,
     description,
     grade: grade ?? null,
-    provenance,
     sourceUrl: sourceUrl ?? null,
     config,
   })
@@ -470,7 +437,6 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     name,
     description,
     grade,
-    provenance,
     sourceUrl: sourceUrl ?? null,
     config: parsedConfig,
   }
@@ -571,7 +537,6 @@ function parseJsonContent(content: string): RawBulkEntry[] {
       name: obj.name,
       description: obj.description,
       grade: obj.grade,
-      provenance: obj.provenance,
       sourceUrl: obj.sourceUrl,
       config: obj.config,
     }
@@ -809,7 +774,6 @@ function parseCsvContent(content: string): RawBulkEntry[] {
       name: get("name"),
       description: get("description"),
       grade: get("grade"),
-      provenance: get("provenance"),
       sourceUrl: get("sourceUrl"),
       config,
     })
@@ -825,7 +789,6 @@ interface ExistingCatalogRowSource {
   id: string
   name: string
   sourceUrl?: string | null
-  provenance?: string | null
   archived?: boolean
 }
 
@@ -834,8 +797,6 @@ function toExistingRow(row: ExistingCatalogRowSource): BulkImportExistingRow {
     id: row.id,
     name: row.name,
     sourceUrl: row.sourceUrl ?? null,
-    provenance: (row.provenance ??
-      "house") as BulkImportExistingRow["provenance"],
     archived: row.archived ?? false,
   }
 }
@@ -968,7 +929,6 @@ export async function previewBulkImport(
       stableId: entry.stableId,
       name: entry.name,
       sourceUrl: entry.sourceUrl,
-      provenance: entry.provenance,
       status: exists ? "skip_existing" : "create",
       ...(exists && existingRow
         ? { existing: toExistingRow(existingRow) }
@@ -1036,7 +996,6 @@ export async function applyBulkImport(
               name: entry.name,
               description: entry.description,
               grade: entry.grade,
-              provenance: entry.provenance,
               sourceUrl: entry.sourceUrl,
               archived: false,
               config: entry.config as Prisma.InputJsonValue,
@@ -1059,7 +1018,6 @@ export async function applyBulkImport(
               stableId: entry.stableId,
               name: entry.name,
               sourceUrl: entry.sourceUrl,
-              provenance: entry.provenance,
               status: "create",
             })
           } else {
@@ -1071,7 +1029,6 @@ export async function applyBulkImport(
               stableId: entry.stableId,
               name: entry.name,
               sourceUrl: entry.sourceUrl,
-              provenance: entry.provenance,
               status: "skip_existing",
               existing: toExistingRow(existing),
             })
