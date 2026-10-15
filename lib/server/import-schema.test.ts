@@ -50,9 +50,7 @@ const identity = {
 
 function baseDoc(
   schema:
-    | typeof IMPORT_SCHEMA_V3
-    | typeof IMPORT_SCHEMA_V6
-    | typeof IMPORT_SCHEMA_V7,
+    typeof IMPORT_SCHEMA_V3 | typeof IMPORT_SCHEMA_V6 | typeof IMPORT_SCHEMA_V7,
   skillOffers: unknown[]
 ): Record<string, unknown> {
   const doc: Record<string, unknown> = {

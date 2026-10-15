@@ -45,12 +45,7 @@ export interface TestAssociationRow {
   characterId: string
   definitionId: string
   kind:
-    | "TITLE"
-    | "EQUIPMENT"
-    | "SKILL"
-    | "BLESSING"
-    | "BLOODLINE"
-    | "TRANSCENDENT"
+    "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
   // True only for equipment links that predate the inventory-ownership model.
   // New associations default to false.
   legacyUnowned: boolean
