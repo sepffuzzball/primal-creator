@@ -87,6 +87,10 @@ export interface TestSkillOfferRow {
   track: string
   level: number
   choiceGroup: string
+  /** Sequential offer generation for the same base key (0 = initial offer). */
+  generation: number
+  /** Cancellation timestamp; null while the offer is still active/selectable. */
+  canceledAt: Date | null
   selectedDefinitionId: string | null
   selectedDefinition?: TestCatalogRow | null
   offeredAt: Date
@@ -280,17 +284,25 @@ export interface TestPrismaInstance {
         where:
           | { id: string }
           | {
-              characterId_track_level_choiceGroup: {
+              characterId_track_level_choiceGroup_generation: {
                 characterId: string
                 track: string
                 level: number
                 choiceGroup: string
+                generation: number
               }
             }
         include?: unknown
       }) => Promise<TestSkillOfferRow | null>
       findMany: (args: {
-        where?: { characterId?: string }
+        where?: {
+          characterId?: string
+          track?: string
+          level?: number
+          choiceGroup?: string
+          generation?: number
+          canceledAt?: Date | null
+        }
         include?: unknown
       }) => Promise<TestSkillOfferRow[]>
       update: (args: {
@@ -483,17 +495,25 @@ interface Transaction {
       where:
         | { id: string }
         | {
-            characterId_track_level_choiceGroup: {
+            characterId_track_level_choiceGroup_generation: {
               characterId: string
               track: string
               level: number
               choiceGroup: string
+              generation: number
             }
           }
       include?: unknown
     }) => Promise<TestSkillOfferRow | null>
     findMany: (args: {
-      where?: { characterId?: string }
+      where?: {
+        characterId?: string
+        track?: string
+        level?: number
+        choiceGroup?: string
+        generation?: number
+        canceledAt?: Date | null
+      }
       include?: unknown
     }) => Promise<TestSkillOfferRow[]>
     update: (args: {
@@ -612,21 +632,23 @@ export function createTestPrisma(): TestPrismaInstance {
 
   function findOfferByKey(where: {
     id?: string
-    characterId_track_level_choiceGroup?: {
+    characterId_track_level_choiceGroup_generation?: {
       characterId: string
       track: string
       level: number
       choiceGroup: string
+      generation: number
     }
   }): TestSkillOfferRow | undefined {
-    const key = where.characterId_track_level_choiceGroup
+    const key = where.characterId_track_level_choiceGroup_generation
     if (key) {
       return skillOffers.find(
         (o) =>
           o.characterId === key.characterId &&
           o.track === key.track &&
           o.level === key.level &&
-          o.choiceGroup === key.choiceGroup
+          o.choiceGroup === key.choiceGroup &&
+          o.generation === key.generation
       )
     }
     return skillOffers.find((o) => o.id === where.id)
@@ -1148,6 +1170,8 @@ export function createTestPrisma(): TestPrismaInstance {
           track: data.track as string,
           level: data.level as number,
           choiceGroup: data.choiceGroup as string,
+          generation: (data.generation as number | undefined) ?? 0,
+          canceledAt: (data.canceledAt as Date | null | undefined) ?? null,
           selectedDefinitionId:
             (data.selectedDefinitionId as string | null) ?? null,
           offeredAt: (data.offeredAt as Date | undefined) ?? now,
@@ -1181,6 +1205,23 @@ export function createTestPrisma(): TestPrismaInstance {
         let results = skillOffers
         if (where?.characterId != null)
           results = results.filter((o) => o.characterId === where.characterId)
+        if (where?.track != null)
+          results = results.filter((o) => o.track === where.track)
+        if (where?.level != null)
+          results = results.filter((o) => o.level === where.level)
+        if (where?.choiceGroup != null)
+          results = results.filter((o) => o.choiceGroup === where.choiceGroup)
+        if (where?.generation != null)
+          results = results.filter((o) => o.generation === where.generation)
+        if (where?.canceledAt != null) {
+          if (where.canceledAt instanceof Date) {
+            results = results.filter(
+              (o) => o.canceledAt?.getTime() === where.canceledAt!.getTime()
+            )
+          } else {
+            results = results.filter((o) => o.canceledAt == null)
+          }
+        }
         return results.map((o) => attachOffer(o))
       },
       update: async ({ where, data }) => {
@@ -1191,6 +1232,9 @@ export function createTestPrisma(): TestPrismaInstance {
         }
         if (data.selectedAt != null) {
           offer.selectedAt = data.selectedAt as Date
+        }
+        if (data.canceledAt !== undefined) {
+          offer.canceledAt = data.canceledAt as Date | null
         }
         return attachOffer(offer)
       },

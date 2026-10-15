@@ -130,14 +130,49 @@ workflow supplies `latest`/`main`/tag refs, not necessarily literal `latest`.
 
 ### 4.1 Non-root user and volumes
 
-The app runs as `nextjs` (`uid 1001`) and expects to write uploads under
-`/app/data/uploads`.
+The app runs as the non-root `nextjs` user (`uid 1100`, primary group `nodejs`
+`gid 1100`) and expects to write uploads under `/app/data/uploads`. The image
+never starts as root and never blanket-chmods/chowns the upload mount at boot:
+the app user is assumed to already have write access to wherever uploads live,
+because any mount attached over `/app/data` or `/app/data/uploads` **masks the
+image-layer ownership** that `chown -R nextjs:nodejs /app` created. The
+filesystem the process actually sees is the attached volume, not the image's
+directory tree, so the owner of that volume is the effective owner and the
+image's `nextjs` ownership is invisible behind it. This is why binding a
+production PVC over `/app/data` and then seeing `EACCES` on
+`/app/data/uploads` is an ownership mismatch on the mount, not something the
+image can repair.
 
-- **Named volume** (`uploads`): Docker initialises it from the image tree on
-  first use, copying the `nextjs` ownership, so it is writable by the app user.
-- **Bind mount**: if you bind a host directory over `/app/data/uploads`, ensure
-  it is owned by `uid 1001` (or writable by it), e.g.
-  `sudo chown -R 1001:1001 /srv/.../uploads`.
+- **Named volume** (`uploads`, from `compose.yaml`): Docker initialises it from
+  the image tree on first use, copying the `nextjs` ownership into the volume,
+  so a fresh named volume is writable by the app user with no manual step. (If
+  the stack is run under Kubernetes, that is not this named volume - see the
+  PVC bullet.)
+
+- **Bind mount / PVC**: if you bind a host directory or a Kubernetes PVC over
+  `/app/data` (or `/app/data/uploads`), the mount's own owner and mode govern
+  access and the image's ownership is hidden behind it. The mount must be
+  writable by `uid 1100` (or by the `nodejs` group, `gid 1100`) - a mode-`775`
+  directory owned by `1100:1100` is exactly the expected shape. The image will
+  not fix a mismatched mount, so set the ownership on the host/cluster, e.g. on
+  a host bind:
+  `sudo chown -R 1100:1100 /srv/.../uploads`.
+
+- **Legacy `1001` volume**: if the bound path was previously used with the
+  earlier image whose `nextjs` user was `uid 1001` (or where the volume or its
+  PVC was provisioned as `1001:1001`), the files on it are owned by `1001:1001`
+  and the current `uid 1100` process gets `EACCES` when it tries to create or
+  write `/app/data/uploads`. Fix ownership once:
+  `sudo chown -R 1100:1100 /srv/.../uploads` (or, for a PVC, re-provision the
+  backing store as `1100:1100`). This is a one-time migration; after it, no
+  further ownership changes are needed, because the image does not touch the
+  mount.
+
+- **`UPLOAD_DIR`**: the app resolves the private directory from `UPLOAD_DIR`
+  first, then `/app/data/uploads` in production, then `<cwd>/data/uploads`
+  outside production. The override is unchanged and still works - if you set
+  `UPLOAD_DIR`, whatever path it points to must already be writable by
+  `uid 1100`, because nothing in the image creates or chowns it.
 
 ### 4.2 Reversing the proxy
 

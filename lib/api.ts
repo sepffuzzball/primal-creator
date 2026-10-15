@@ -318,6 +318,18 @@ export interface CharacterListItem {
   archived: boolean
   /** True when the character was created from a user-supplied trusted-backup import. */
   imported: boolean
+  /** The character's authoritative race grade, read from stored state (never derived from level). */
+  raceGrade: Grade
+  /** The character's current race level, read from stored state. */
+  raceLevel: number
+  /**
+   * The configured level band for the character's race grade per the current
+   * house-rules grade table (inclusive min/max). `null` when that grade has no
+   * configured band. Exposed even when the level falls outside the band (a born
+   * high-grade character at level 0), since the starting grade is provenance
+   * driven, not level driven.
+   */
+  raceGradeBand: { min: number; max: number } | null
   status?: StatusResult
   /**
    * The version of the server-wide house-rules config this list item was derived
@@ -386,6 +398,14 @@ export interface SkillOfferView {
   track: string
   level: number
   choiceGroup: string
+  /** Sequential offer generation for this base key (0 = initial offer). */
+  generation: number
+  /**
+   * When the offer was canceled (append-only). Null while the offer is still
+   * active and selectable. The UI marks a canceled offer non-selectable; it stays
+   * visible as historical record.
+   */
+  canceledAt: string | null
   options: SkillOfferOptionView[]
   selectedDefinitionId: string | null
 }
@@ -594,9 +614,47 @@ export interface JournalDelta {
   skillOffers?: Array<{ id: string; choiceGroup: string }>
   /** Ids of the generated skill offers (sugar for the above). */
   skillOfferIds?: string[]
+  /** True on a level-up reversal (`operation: "undo"`) journal. */
+  undone?: boolean
+  /** Ids of the skill offers canceled by an undo (append-only `canceledAt` stamp). */
+  canceledOfferIds?: string[]
+  /** Id of the immutable `advance` event that this undo reversed. */
+  originalEventId?: string
+  /** The character CAS version committed after this (undo) event. */
+  characterVersionAfter?: number
 }
 
 export interface AdvanceResponse {
+  character: CharacterDetail
+  journal: JournalDelta
+}
+
+/**
+ * Request body for POST /api/characters/[id]/experience. Discriminated on
+ * `operation`: a `set` settles the authoritative EXP percentage of a track
+ * (`percent` 0..100, where 100 requests a level-up), while a `levelUp` is an
+ * instant level-up from any percentage and carries no `percent`.
+ */
+export type ExperienceRequest =
+  | {
+      operation: "set"
+      track: "race" | "class" | "profession"
+      percent: number
+      version: number
+    }
+  | {
+      operation: "levelUp"
+      track: "race" | "class" | "profession"
+      version: number
+    }
+  | {
+      operation: "undo"
+      track: "race" | "class" | "profession"
+      version: number
+    }
+
+/** Response body for POST /api/characters/[id]/experience. Mirrors AdvanceResponse. */
+export interface ExperienceResponse {
   character: CharacterDetail
   journal: JournalDelta
 }
@@ -831,13 +889,17 @@ export interface SkillOfferExport {
   track: string
   level: number
   choiceGroup: string
+  /** Sequential offer generation for this base key (0 = initial offer). */
+  generation: number
+  /** Cancellation timestamp (ISO), null while the offer is still active. */
+  canceledAt: string | null
   offeredAt: string
   selectedStableId: string | null
   options: SkillOfferOptionExport[]
 }
 
 export interface ExportResponse {
-  /** "primal-character/5" - the current trusted-backup schema. */
+  /** "primal-character/6" - the current trusted-backup schema. */
   schema: string
   rulesetVersion: string
   identity: CharacterIdentityExport

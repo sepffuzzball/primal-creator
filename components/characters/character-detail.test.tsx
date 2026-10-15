@@ -80,6 +80,114 @@ vi.mock("@/components/ui/button", () => ({
   buttonVariants: () => "mock-button",
 }))
 
+vi.mock("@/components/ui/progress", () => ({
+  Progress: ({
+    children,
+    value,
+    "aria-label": ariaLabel,
+  }: {
+    children?: React.ReactNode
+    value?: number | null
+    "aria-label"?: string
+  }) => (
+    <div
+      role="progressbar"
+      aria-label={ariaLabel}
+      aria-valuenow={value ?? undefined}
+    >
+      {children}
+    </div>
+  ),
+  ProgressTrack: ({ children }: React.ComponentProps<"div">) => (
+    <div>{children}</div>
+  ),
+  ProgressIndicator: () => null,
+  ProgressLabel: ({ children }: React.ComponentProps<"span">) => (
+    <span>{children}</span>
+  ),
+  ProgressValue: () => null,
+}))
+
+vi.mock("@/components/ui/slider", () => ({
+  Slider: ({
+    children,
+    value,
+    onValueChange,
+    onValueCommitted,
+    disabled,
+    ...props
+  }: React.ComponentProps<"div"> & {
+    value: number[]
+    onValueChange: (value: number[]) => void
+    onValueCommitted: (value: number[]) => void
+    disabled?: boolean
+  }) => (
+    <div {...props}>
+      {React.cloneElement(
+        React.Children.only(children) as React.ReactElement<
+          Record<string, unknown>
+        >,
+        {
+          value,
+          onValueChange,
+          onValueCommitted,
+          disabled,
+        }
+      )}
+    </div>
+  ),
+  SliderControl: ({
+    children,
+    ...props
+  }: React.ComponentProps<"div"> & {
+    value: number[]
+    onValueChange: (value: number[]) => void
+    onValueCommitted: (value: number[]) => void
+    disabled?: boolean
+  }) => (
+    <div {...props}>
+      {React.Children.map(children, (child) =>
+        React.isValidElement(child) ? React.cloneElement(child, props) : child
+      )}
+    </div>
+  ),
+  SliderTrack: ({
+    children,
+    ...props
+  }: React.ComponentProps<"div"> & {
+    value: number[]
+    onValueChange: (value: number[]) => void
+    onValueCommitted: (value: number[]) => void
+    disabled?: boolean
+  }) => <div {...props}>{children}</div>,
+  SliderIndicator: () => null,
+  SliderThumb: ({
+    value,
+    onValueChange,
+    onValueCommitted,
+    disabled,
+  }: {
+    value: number[]
+    onValueChange: (value: number[]) => void
+    onValueCommitted: (value: number[]) => void
+    disabled?: boolean
+  }) => (
+    <input
+      aria-label="Experience slider"
+      type="range"
+      min={0}
+      max={100}
+      value={value[0]}
+      disabled={disabled}
+      onChange={(event) => onValueChange([Number(event.currentTarget.value)])}
+      onMouseUp={(event) =>
+        onValueCommitted([Number(event.currentTarget.value)])
+      }
+      onKeyUp={(event) => onValueCommitted([Number(event.currentTarget.value)])}
+    />
+  ),
+}))
+
 vi.mock("@/components/ui/alert", () => ({
   Alert: ({ children }: React.ComponentProps<"div">) => (
     <div role="alert">{children}</div>
@@ -328,6 +436,9 @@ let maxTranscendentSkills = 3
 let activeCharacter: import("@/lib/api").CharacterDetail = character
 let advanceError: unknown = null
 let advancePosts: Array<Record<string, unknown>> = []
+let experiencePosts: Array<Record<string, unknown>> = []
+let experienceError: unknown = null
+let experienceJournal: Record<string, unknown> = { leveledUp: false, notes: [] }
 let professionCatalog: import("@/lib/api").CatalogItem[] = []
 let historyEvents: import("@/lib/api").ExportResponse["events"] = []
 let professionPostError: unknown = null
@@ -563,6 +674,8 @@ function setupMock(options?: {
   creationRulesError?: unknown
   maxTranscendentSkills?: number
   advanceError?: unknown
+  experienceError?: unknown
+  experienceJournal?: Record<string, unknown>
   professions?: import("@/lib/api").CatalogItem[]
   events?: import("@/lib/api").ExportResponse["events"]
   professionError?: unknown
@@ -572,6 +685,12 @@ function setupMock(options?: {
   activeCharacter = options?.character ?? character
   advanceError = options?.advanceError ?? null
   advancePosts = []
+  experiencePosts = []
+  experienceError = options?.experienceError ?? null
+  experienceJournal = options?.experienceJournal ?? {
+    leveledUp: false,
+    notes: [],
+  }
   professionCatalog = options?.professions ?? []
   historyEvents = options?.events ?? []
   professionPostError = options?.professionError ?? null
@@ -635,6 +754,45 @@ function setupMock(options?: {
       advancePosts.push(body)
       if (advanceError) throw advanceError
       return { journal: {} }
+    }
+    if (url === "/api/characters/chr-1/experience" && method === "POST") {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      experiencePosts.push(body)
+      if (experienceError) throw experienceError
+      if (body.operation === "set") {
+        const percent = Number(body.percent)
+        if (body.track === "race")
+          activeCharacter = {
+            ...activeCharacter,
+            state: {
+              ...activeCharacter.state,
+              race: {
+                ...activeCharacter.state.race,
+                experiencePercent: percent === 100 ? 0 : percent,
+              },
+            },
+          } as typeof activeCharacter
+        if (body.track === "class" || body.track === "profession") {
+          const track = body.track
+          activeCharacter = {
+            ...activeCharacter,
+            state: {
+              ...activeCharacter.state,
+              tracks: {
+                ...activeCharacter.state.tracks,
+                [track]: {
+                  ...activeCharacter.state.tracks[track],
+                  experiencePercent: percent,
+                },
+              },
+            },
+          } as typeof activeCharacter
+        }
+      }
+      return { character: activeCharacter, journal: experienceJournal }
     }
     if (url === "/api/characters/chr-1/evolutions") {
       if (evolutionsError) throw evolutionsError
@@ -765,6 +923,95 @@ afterEach(() => {
 })
 
 // --- Tests ---------------------------------------------------------------- //
+
+describe("CharacterDetail overview summary", () => {
+  it("shows all nine server-calculated attributes and available track levels", async () => {
+    setupMock({
+      character: {
+        ...character,
+        nickname: "Longshot",
+        status: {
+          attributes: {
+            strength: 11,
+            agility: 22,
+            endurance: 33,
+            vitality: 44,
+            toughness: 55,
+            wisdom: 66,
+            intelligence: 77,
+            perception: 88,
+            willpower: 99,
+          },
+          traces: [],
+          availablePoints: 0,
+          totalFreePoints: 0,
+          allocatedPoints: 0,
+          resources: [],
+          equipment: {
+            requested: {},
+            applied: {},
+            suppressed: {},
+            items: [],
+            capUsage: [],
+          },
+          consumables: {
+            requested: {},
+            applied: {},
+            suppressed: {},
+            capUsage: [],
+          },
+          capUsage: [],
+        },
+      } as unknown as import("@/lib/api").CharacterDetail,
+    })
+    await renderDetail()
+
+    expect(screen.getByRole("heading", { name: "Longshot" })).toBeTruthy()
+    for (const [label, value] of [
+      ["Strength", "11"],
+      ["Agility", "22"],
+      ["Endurance", "33"],
+      ["Vitality", "44"],
+      ["Toughness", "55"],
+      ["Wisdom", "66"],
+      ["Intelligence", "77"],
+      ["Perception", "88"],
+      ["Willpower", "99"],
+    ]) {
+      expect(screen.getByLabelText(`${label} ${value}`)).toBeTruthy()
+    }
+    expect(screen.getByLabelText("Race level 25")).toBeTruthy()
+    expect(screen.getByLabelText("Class level 20")).toBeTruthy()
+    expect(screen.getByText("Grade G")).toBeTruthy()
+  })
+
+  it("keeps race progression for monsters and gives a meaningful unavailable-stats state", async () => {
+    const monster = {
+      ...character,
+      nickname: "Mossback",
+      classId: null,
+      className: null,
+      status: undefined,
+      state: {
+        ...character.state,
+        tracks: { class: null, profession: null },
+        race: { ...character.state.race, mode: "independent" },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: monster })
+    await renderDetail()
+
+    expect(screen.getByRole("heading", { name: "Mossback" })).toBeTruthy()
+    expect(
+      screen.getByText(
+        "Current calculated attributes are unavailable right now."
+      )
+    ).toBeTruthy()
+    expect(screen.getByLabelText("Race level 25")).toBeTruthy()
+    expect(screen.queryByLabelText(/Class level/)).toBeNull()
+    expect(screen.queryByLabelText(/Profession level/)).toBeNull()
+  })
+})
 
 describe("CharacterDetail ranked title claims", () => {
   const rankedTitle = (
@@ -1163,7 +1410,7 @@ describe("equipment eligibility and skill upgrades", () => {
 })
 
 describe("CharacterDetail race-only progression", () => {
-  it("posts race advancement and displays failures", async () => {
+  it("commits percentage experience without a journal popup and reports API failures", async () => {
     const monster = {
       ...character,
       classId: null,
@@ -1175,26 +1422,38 @@ describe("CharacterDetail race-only progression", () => {
     } as unknown as import("@/lib/api").CharacterDetail
     setupMock({
       character: monster,
-      advanceError: new Error("Race advance unavailable"),
     })
     await renderDetail()
-
     expect(
-      screen.getByRole("button", { name: /Advance race \(L25 Q2\)/ })
-    ).toBeTruthy()
-    expect(screen.queryByRole("button", { name: /Advance class/ })).toBeNull()
-    expect(
-      screen.queryByRole("button", { name: /Advance profession/ })
-    ).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: /Advance race/ }))
+      screen
+        .getByRole("progressbar", { name: /Race experience/ })
+        .getAttribute("aria-valuenow")
+    ).toBe("50")
+    const slider = screen.getByLabelText("Experience slider")
+    fireEvent.change(slider, { target: { value: "35" } })
+    expect(experiencePosts).toHaveLength(0)
+    fireEvent.mouseUp(slider, { target: { value: "35" } })
     await flush()
-    expect(advancePosts).toEqual([{ track: "race", version: 3 }])
-    expect(screen.getByRole("alert").textContent).toContain(
-      "Race advance unavailable"
-    )
+    expect(experiencePosts).toEqual([
+      { operation: "set", track: "race", percent: 35, version: 3 },
+    ])
+    expect(screen.queryByText("Level-up")).toBeNull()
+
+    setupMock({
+      character: monster,
+      experienceError: new Error("Undo is not safe"),
+    })
+    cleanup()
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Decrease race level" }))
+    await flush()
+    expect(experiencePosts).toEqual([
+      { operation: "undo", track: "race", version: 3 },
+    ])
+    expect(screen.getByRole("alert").textContent).toContain("Undo is not safe")
   })
 
-  it("shows only race actions for a monster: one Advance race, no class/profession tabs, advance, or evolution", async () => {
+  it("shows editable monster Race experience and no old quarter actions", async () => {
     const monster = {
       ...character,
       classId: null,
@@ -1207,13 +1466,10 @@ describe("CharacterDetail race-only progression", () => {
     setupMock({ character: monster })
     await renderDetail()
 
-    // Exactly one race advance action - no duplicate race actions.
+    expect(screen.getByLabelText("Experience slider")).toBeTruthy()
     expect(
-      screen.getAllByRole("button", { name: /Advance race \(L25 Q2\)/ })
-    ).toHaveLength(1)
-    expect(
-      screen.getByRole("button", { name: /Advance race \(L25 Q2\)/ })
-    ).toBeTruthy()
+      screen.queryByText(/Advance race|Advance class|Advance profession/)
+    ).toBeNull()
     // Race grade evolution is a race action and stays available. The button
     // carries an aria-label, so match the accessible name, not the visible text
     // ("Evolve grade (to E)").
@@ -1221,10 +1477,6 @@ describe("CharacterDetail race-only progression", () => {
       screen.getByRole("button", { name: /Evolve race grade to E/ })
     ).toBeTruthy()
     // No class/profession advance or evolution actions.
-    expect(screen.queryByRole("button", { name: /Advance class/ })).toBeNull()
-    expect(
-      screen.queryByRole("button", { name: /Advance profession/ })
-    ).toBeNull()
     expect(screen.queryByRole("button", { name: /Evolve class/ })).toBeNull()
     expect(
       screen.queryByRole("button", { name: /Evolve profession/ })
@@ -1239,6 +1491,208 @@ describe("CharacterDetail race-only progression", () => {
     expect(screen.queryByLabelText("class history")).toBeNull()
     expect(screen.queryByLabelText("profession history")).toBeNull()
     expect(screen.getByLabelText("race history")).toBeTruthy()
+  })
+
+  it("allows undoing a level-one monster race and skips unchanged slider commits", async () => {
+    const monster = {
+      ...character,
+      classId: null,
+      className: null,
+      state: {
+        ...character.state,
+        race: {
+          ...character.state.race,
+          mode: "independent",
+          level: 1,
+          quarter: 2,
+        },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: monster })
+    await renderDetail()
+
+    const decrease = screen.getByRole("button", {
+      name: "Decrease race level",
+    }) as HTMLButtonElement
+    expect(decrease.disabled).toBe(false)
+    fireEvent.click(decrease)
+    await flush()
+    expect(experiencePosts).toEqual([
+      { operation: "undo", track: "race", version: 3 },
+    ])
+
+    // A slider commit equal to the authoritative value (including the legacy
+    // quarter fallback) does not issue a write or surface an error.
+    const slider = screen.getByLabelText("Experience slider")
+    fireEvent.change(slider, { target: { value: "50" } })
+    fireEvent.mouseUp(slider, { target: { value: "50" } })
+    await flush()
+    expect(experiencePosts).toHaveLength(1)
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("opens the journal exactly for a true level-up at 100 percent", async () => {
+    const monster = {
+      ...character,
+      classId: null,
+      state: {
+        ...character.state,
+        race: { ...character.state.race, mode: "independent", quarter: 3 },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: monster,
+      experienceJournal: { leveledUp: true, notes: ["Level increased"] },
+    })
+    await renderDetail()
+    expect(screen.getAllByText("75%").length).toBeGreaterThan(0)
+    const slider = screen.getByLabelText("Experience slider")
+    fireEvent.change(slider, { target: { value: "100" } })
+    fireEvent.mouseUp(slider, { target: { value: "100" } })
+    await flush()
+    expect(experiencePosts).toEqual([
+      { operation: "set", track: "race", percent: 100, version: 3 },
+    ])
+    expect(
+      screen
+        .getByRole("progressbar", { name: /Race experience/ })
+        .getAttribute("aria-valuenow")
+    ).toBe("0")
+    expect(screen.getByText("Level-up")).toBeTruthy()
+    expect(screen.getByText("Level increased")).toBeTruthy()
+  })
+
+  it("sends explicit level-up and undo operations", async () => {
+    const monster = {
+      ...character,
+      classId: null,
+      state: {
+        ...character.state,
+        race: { ...character.state.race, mode: "independent" },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: monster })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Increase race level" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Decrease race level" }))
+    await flush()
+    expect(experiencePosts).toEqual([
+      { operation: "levelUp", track: "race", version: 3 },
+      { operation: "undo", track: "race", version: 3 },
+    ])
+    expect(screen.queryByText("Level-up")).toBeNull()
+  })
+
+  it("shows derived Race average read-only alongside independently editable tracks", async () => {
+    const enlightened = {
+      ...character,
+      professionName: "Maker",
+      state: {
+        ...character.state,
+        tracks: {
+          class: {
+            level: 20,
+            quarter: 1,
+            experiencePercent: 30,
+            definitionId: "c",
+          },
+          profession: {
+            level: 4,
+            quarter: 3,
+            experiencePercent: 70,
+            definitionId: "p",
+          },
+        },
+        race: { ...character.state.race, mode: "derived" },
+      },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: enlightened })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
+    expect(screen.getAllByText("50%").length).toBeGreaterThan(0)
+    const derivedRace = screen.getByRole("progressbar", {
+      name: /Race experience/,
+    })
+    expect(
+      derivedRace.closest(".rounded-lg")?.querySelector('input[type="range"]')
+    ).toBeNull()
+    fireEvent.click(screen.getByRole("tab", { name: "Class" }))
+    expect(
+      screen.getAllByLabelText("Experience slider").length
+    ).toBeGreaterThan(0)
+    expect(screen.queryByText("Quarter")).toBeNull()
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
+    expect(
+      screen.getAllByLabelText("Experience slider").length
+    ).toBeGreaterThan(0)
+    expect(screen.queryByText("Quarter")).toBeNull()
+  })
+
+  it("retains canceled skill offers as history without selectable choices", async () => {
+    const canceled = {
+      ...character,
+      skillOffers: [
+        {
+          id: "offer-1",
+          track: "class",
+          level: 10,
+          choiceGroup: "core",
+          generation: 0,
+          canceledAt: "2026-01-01",
+          selectedDefinitionId: null,
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Quick Shot",
+              archived: false,
+            },
+          ],
+        },
+      ],
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: canceled })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    expect(screen.getByText("Canceled")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
+    expect(screen.getByText("Quick Shot")).toBeTruthy()
+  })
+
+  it("includes experience set and undo events only in their track history, including derived Race changes", async () => {
+    const events = [
+      { kind: "experience_set", createdAt: "now", payload: { track: "class" } },
+      {
+        kind: "level_undo",
+        createdAt: "later",
+        payload: {
+          track: "profession",
+          journal: { raceLevelBefore: 5, raceLevelAfter: 4 },
+        },
+      },
+    ]
+    setupMock({
+      events: events as import("@/lib/api").ExportResponse["events"],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
+    await flush()
+    expect(screen.getByLabelText("race history").textContent).toContain(
+      "level_undo"
+    )
+    expect(screen.getByLabelText("race history").textContent).not.toContain(
+      "experience_set"
+    )
+    fireEvent.click(screen.getByRole("tab", { name: "Class" }))
+    await flush()
+    expect(screen.getByLabelText("class history").textContent).toContain(
+      "experience_set"
+    )
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
+    await flush()
+    expect(screen.getByLabelText("profession history").textContent).toContain(
+      "level_undo"
+    )
   })
 })
 

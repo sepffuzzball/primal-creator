@@ -1,8 +1,8 @@
 /**
- * Zod schema for the trusted-backup character import document (v3, v4 and v5).
+ * Zod schema for the trusted-backup character import document (v3, v4, v5 and v6).
  *
- * The v5 document is the output of `exportCharacter` (schema
- * `primal-character/5`) plus `skillOffers`. It is a *trusted backup*, NOT
+ * The v6 document is the output of `exportCharacter` (schema
+ * `primal-character/6`) plus `skillOffers`. It is a *trusted backup*, NOT
  * authoritative server-verified state: the `state` is validated against the
  * engine `characterStateSchema`, but `liveState` and `status` are advisory and
  * are recomputed server-side on import. Catalog references (identity race/class/
@@ -10,8 +10,16 @@
  * skill-offer option) are resolved by `kind` + `stableId` to EXISTING catalog
  * definitions - no catalog content is ever auto-created, and a
  * missing/mismatched/archived required definition is rejected with an actionable
- * error. Every v5 equipment association carries the ring `equipmentPosition` so a
- * Ring-slot character round-trips its two physical ring positions.
+ * error. Every v5/v6 equipment association carries the ring `equipmentPosition` so
+ * a Ring-slot character round-trips its two physical ring positions.
+ *
+ * A v6 backup additionally carries the append-only skill-offer cancellation model:
+ * every exported skill offer includes a REQUIRED non-negative `generation` and a
+ * REQUIRED-but-nullable `canceledAt` timestamp. A canceled offer is never dropped,
+ * so a restore preserves the full historical offer identity; the importer
+ * re-validates the offer invariants (unique per track/level/choiceGroup/generation,
+ * at most one active offer per base key, no selected+canceled row) before any
+ * write. A legacy v3/v4/v5 backup omits both fields; they default to 0/null.
  *
  * The v4 document (schema `primal-character/4`) adds the `inventory` array and the
  * `legacyUnowned` equipment marker and is still accepted on import; it carries no
@@ -41,8 +49,9 @@ import { characterStateSchema } from "@/lib/server/schemas"
 export const IMPORT_SCHEMA_V3 = "primal-character/3" as const
 export const IMPORT_SCHEMA_V4 = "primal-character/4" as const
 export const IMPORT_SCHEMA_V5 = "primal-character/5" as const
+export const IMPORT_SCHEMA_V6 = "primal-character/6" as const
 /** The current trusted-backup schema (what `exportCharacter` emits). */
-export const IMPORT_SCHEMA = IMPORT_SCHEMA_V5
+export const IMPORT_SCHEMA = IMPORT_SCHEMA_V6
 
 export const IMPORT_RULESET_VERSION = "house-2026-10-12-v1" as const
 
@@ -185,16 +194,62 @@ const skillOfferOptionSchema = z.object({
   configSnapshot: z.record(z.string(), z.unknown()).optional(),
 })
 
-/** A skill offer exported from the source character. */
+/**
+ * A legacy (v3/v4/v5) skill-offer timestamp value. It may be an ISO string or a
+ * Unix ms epoch number, but when supplied it MUST represent a real, finite Date -
+ * it is never silently restamped to "now". A malformed value (`"not-a-date"`, `""`)
+ * is rejected rather than defaulted, so a canceled offer's cancellation time (or a
+ * selection time) survives a backup unchanged.
+ */
+const importDateValueSchema = z
+  .union([z.string(), z.number()])
+  .refine((value) => !Number.isNaN(new Date(value).getTime()), {
+    message: "Expected a valid ISO timestamp",
+  })
+
+/** A skill offer exported from the source character (legacy v3/v4/v5 shape). */
 const skillOfferSchema = z.object({
   track: z.enum(["class", "profession"]),
   level: z.number().int().nonnegative(),
   choiceGroup: z.string().min(1),
+  // Offer generation. Present only in a v6 backup; a legacy v3/v4/v5 backup omits
+  // it and the importer defaults it to 0 (the initial offer generation). A
+  // re-offer after a cancellation increments it, so historical generations coexist.
+  generation: z.number().int().nonnegative().optional(),
+  // Cancellation timestamp. Present only in a v6 backup; a legacy v3/v4/v5 backup
+  // omits it and the importer defaults it to null (still active). Null = active.
+  // When a legacy backup DOES supply it, it must be a valid timestamp (never a
+  // silent "now" restamp), so an invalid value is rejected instead.
+  canceledAt: importDateValueSchema.nullable().optional(),
   offeredAt: z.union([z.string(), z.number()]).optional(),
   selectedStableId: z.string().min(1).nullable().optional(),
   // Historical selection timestamp, preserved verbatim on import so an answer
   // keeps its original time rather than being restamped. Optional/nullable for
   // backward compatibility with backups that only carried `selectedStableId`.
+  selectedAt: z.union([z.string(), z.number()]).optional().nullable(),
+  options: z.array(skillOfferOptionSchema).max(MAX_IMPORT_ASSOCIATIONS),
+})
+
+/**
+ * The v6 skill-offer shape. Unlike the legacy v3/v4/v5 shape, `generation` is
+ * REQUIRED (a non-negative integer) and `canceledAt` is REQUIRED but nullable (an
+ * ISO timestamp or null), because a v6 backup is expected to carry the full
+ * append-only offer identity and cancellation state. The option snapshots are
+ * preserved verbatim - a re-offered generation never rewinds or rewrites a
+ * historical offer's snapshots.
+ */
+const skillOfferSchemaV6 = z.object({
+  track: z.enum(["class", "profession"]),
+  level: z.number().int().nonnegative(),
+  choiceGroup: z.string().min(1),
+  generation: z.number().int().nonnegative(),
+  // REQUIRED but nullable. A v6 backup must report a real ISO-8601 datetime WITH a
+  // timezone (Z or an explicit offset), or null for an active offer. An invalid or
+  // timezone-less value is rejected rather than restamped to "now", so a canceled
+  // offer's cancellation instant survives a backup round-trip exactly.
+  canceledAt: z.iso.datetime({ offset: true }).nullable(),
+  offeredAt: z.union([z.string(), z.number()]).optional(),
+  selectedStableId: z.string().min(1).nullable().optional(),
   selectedAt: z.union([z.string(), z.number()]).optional().nullable(),
   options: z.array(skillOfferOptionSchema).max(MAX_IMPORT_ASSOCIATIONS),
 })
@@ -258,7 +313,26 @@ const v5DocumentSchema = z.object({
 })
 
 /**
- * The full trusted-backup document: the current v5 shape, or a legacy v4/v3
+ * The current v6 trusted-backup document. It is everything v5 carries (v5
+ * association slots with the ring position, inventory, and skill offers) plus the
+ * append-only skill-offer cancellation model: every exported skill offer carries a
+ * REQUIRED non-negative `generation` and a REQUIRED-but-nullable `canceledAt`
+ * timestamp. A canceled offer stays in the backup (never dropped) so a restore
+ * preserves the full historical offer identity and cancellation state; the importer
+ * enforces the offer invariants (unique per track/level/choiceGroup/generation, at
+ * most one active offer per base key, no selected+canceled row) before any write.
+ */
+const v6DocumentSchema = z.object({
+  schema: z.literal(IMPORT_SCHEMA_V6),
+  ...documentBase,
+  associations: z.array(v5AssociationSchema).max(MAX_IMPORT_ASSOCIATIONS),
+  inventory: z.array(inventoryRefSchema).max(MAX_IMPORT_INVENTORY),
+  // Override the lenient legacy skill-offer schema with the strict v6 shape.
+  skillOffers: z.array(skillOfferSchemaV6).max(MAX_IMPORT_SKILL_OFFERS),
+})
+
+/**
+ * The full trusted-backup document: the current v6 shape, or a legacy v5/v4/v3
  * shape. `state` is the only authoritative field used to build the new character;
  * `liveState` / `status` are advisory and are validated loosely (they are ignored
  * on import, status is recomputed). The arrays are bounded so a pathological
@@ -268,9 +342,10 @@ export const characterImportDocumentSchema = z.discriminatedUnion("schema", [
   v3DocumentSchema,
   v4DocumentSchema,
   v5DocumentSchema,
+  v6DocumentSchema,
 ])
 
-/** The validated import document type (v3 or v4). */
+/** The validated import document type (v3, v4, v5 or v6). */
 export type CharacterImportDocument = z.infer<
   typeof characterImportDocumentSchema
 >

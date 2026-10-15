@@ -160,6 +160,56 @@ entries that remain readable/editable as metadata-only):
   higher-rarity variant with no prior same-group link; only a genuine same-group
   collision is rejected (`import_link_collision`), as before.
 
+## Offer cancellation (append-only) and re-offer
+
+A pending skill offer is **append-only**: it is never deleted or rewritten. It may
+be **canceled**, which stamps `canceledAt` on the row while leaving the historical
+snapshot (offered options, selection) intact. A canceled offer stays visible to the
+character as a historical record but is no longer selectable - answering it is a
+409 `offer_canceled`. This is the prerequisite for EXP undo: undoing a level that
+awarded an offer cancels the then-pending offer rather than deleting it, so the
+history of what was offered (and when) is preserved.
+
+- A **level-up undo** (`operation: "undo"`, see `docs/rules/leveling.md`) cancels
+  each pending offer the level-up created: it stomps `canceledAt` on the offer ids
+  recorded in the level-up journal (`skillOfferIds`), leaving the row and its option
+  snapshots untouched. If the undo's journal does not carry offer ids (a legacy
+  event), it cancels the active pending offers for the same `(track, level)` only
+  when they are the sole active set; a **selected** offer (or an already-canceled
+  one) blocks the undo with 409 `level_undo_blocked`.
+- A canceled offer is never deleted; re-earning the level re-offers as described
+  below.
+
+- Each offer carries an `offerId`-independent `generation` (non-negative integer,
+  default 0) that counts successive offers for the same
+  `(characterId, track, level, choiceGroup)` base key. The initial offer is
+  generation 0.
+- **Re-offer on a re-earned level:** when a character re-earns a level, the
+  service first checks for an existing **active** (`canceledAt` null) offer for
+  that base key. If one exists, it is preserved and no new offer is created. If
+  none exists (the prior offer was canceled), a new offer is created as the next
+  generation (`max existing generation + 1`), with fresh option snapshots from the
+  current unarchived `skills` catalog. The canceled offer and its snapshots are
+  never modified - only superseded.
+- At most **one active** offer may exist per base key at any time; multiple
+  generations may coexist as historical (canceled) records.
+
+## Backup import (v6)
+
+A v6 backup (`primal-character/6`) carries the full append-only offer state:
+every exported skill offer requires a non-negative `generation` and a
+nullable `canceledAt`. A legacy v3/v4/v5 backup omits both; they default to
+`0`/`null`. A v6 backup is never "rewound": the importer preserves every offered
+option snapshot verbatim and restores canceled offers as canceled (so a restore
+does not re-activate a canceled offer or restamp its cancellation time). The
+importer rejects:
+
+- a **duplicate** `(track, level, choiceGroup, generation)` key
+  (`import_duplicate_offer`),
+- more than **one active** offer for the same base key (`import_offer_conflict`),
+  and
+- a row that is both **selected and canceled** (`import_selected_canceled`).
+
 ## Engine note
 
 Skill rarity is used as a qualitative scale. The engine should treat the rarity

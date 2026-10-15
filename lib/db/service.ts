@@ -30,10 +30,13 @@ import {
   deriveRaceLevel,
   evolveGrade,
   evolveTrackGrade,
+  experiencePercentFor,
   gradeOrderIndex,
+  levelUpFromExperience,
   makeVector,
   nextGrade,
   permanentConsumableCap,
+  setExperiencePercent,
   totalFreePoints,
   zeroVector,
   type AttributeVector,
@@ -82,8 +85,10 @@ import {
 } from "@/lib/server/schemas"
 import {
   IMPORT_RULESET_VERSION,
+  IMPORT_SCHEMA_V3,
   IMPORT_SCHEMA_V4,
   IMPORT_SCHEMA_V5,
+  IMPORT_SCHEMA_V6,
   MAX_IMPORT_INVENTORY,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
@@ -205,6 +210,14 @@ export interface SkillOfferView {
   track: string
   level: number
   choiceGroup: string
+  /** Sequential offer generation for this base key (0 = initial offer). */
+  generation: number
+  /**
+   * When the offer was canceled (append-only). Null while the offer is still
+   * active and selectable. The UI marks a canceled offer non-selectable; it stays
+   * visible as historical record.
+   */
+  canceledAt: string | null
   options: SkillOfferOptionView[]
   selectedDefinitionId: string | null
 }
@@ -300,6 +313,18 @@ export interface CharacterListItem {
   archived: boolean
   /** True when the character was created from a user-supplied trusted-backup import. */
   imported: boolean
+  /** The character's authoritative race grade, read from stored state (never derived from level). */
+  raceGrade: Grade
+  /** The character's current race level, read from stored state. */
+  raceLevel: number
+  /**
+   * The configured level band for the character's race grade per the current
+   * house-rules grade table (inclusive min/max). `null` when that grade has no
+   * configured band. Exposed even when the level falls outside the band (a born
+   * high-grade character at level 0), since the starting grade is provenance
+   * driven, not level driven.
+   */
+  raceGradeBand: { min: number; max: number } | null
   status?: StatusResult
   /**
    * The version of the server-wide house-rules config this list item was derived
@@ -1194,6 +1219,8 @@ function skillOfferView(
     track: offer.track,
     level: offer.level,
     choiceGroup: offer.choiceGroup,
+    generation: offer.generation,
+    canceledAt: offer.canceledAt ? offer.canceledAt.toISOString() : null,
     options: offer.options.map((o) => ({
       definitionId: o.definitionId,
       nameSnapshot: o.nameSnapshot,
@@ -1314,12 +1341,21 @@ function toDetail(
   }
 }
 
-function toListItem(
+export function toListItem(
   character: CharacterWithCatalog,
   withStatus: boolean,
   config: RulesConfig,
-  rulesetVersion?: number
+  rulesetVersion: number | undefined,
+  state: CharacterState
 ): CharacterListItem {
+  // The race grade is the authoritative stored grade, never re-derived from the
+  // level (the G/F band overlap and born-high-grade provenance make `gradeForLevel`
+  // wrong for exactly the characters a dashboard card must trust). The configured
+  // band for that grade is read from the current house-rules grade table; a grade
+  // with no configured band reads back as null. The band is exposed even when the
+  // level falls outside it (a born high-grade character at level 0) - the starting
+  // grade is provenance driven, not level driven.
+  const raceBand = bandForGrade(state.race.grade, config.gradeTable)
   return {
     id: character.id,
     name: character.name,
@@ -1330,6 +1366,9 @@ function toListItem(
     updatedAt: character.updatedAt.toISOString(),
     archived: character.archived,
     imported: character.imported,
+    raceGrade: state.race.grade,
+    raceLevel: state.race.level,
+    raceGradeBand: raceBand ? { min: raceBand.min, max: raceBand.max } : null,
     status: withStatus ? statusFor(character, config) : undefined,
     ...(rulesetVersion != null ? { rulesetVersion } : {}),
   }
@@ -1357,8 +1396,9 @@ function listItemFor(
   houseRules: HouseRulesRow,
   withStatus: boolean
 ): CharacterListItem {
-  const config = buildRulesConfig(character.race, houseRules.config)
-  return toListItem(character, withStatus, config, houseRules.version)
+  const config = configFor(character, houseRules.config)
+  const state = deserializeState(character.state)
+  return toListItem(character, withStatus, config, houseRules.version, state)
 }
 
 // ------------------------------------------------------------------ //
@@ -2131,30 +2171,32 @@ async function createSkillOffersForAdvance(
 
   const created: Array<{ id: string; choiceGroup: string }> = []
   for (const [choiceGroup, entries] of byGroup) {
-    // Enforce the unique identity (characterId, track, level, choiceGroup) by
-    // checking for a pre-existing offer BEFORE creating, inside this live
-    // transaction. A pre-existing offer (e.g. a prior advance) is left untouched
-    // and never duplicated, so a re-advance produces no duplicate. If a concurrent
-    // request inserts the same identity between this check and the create, the
-    // resulting unique violation is NOT swallowed here - it propagates and aborts
-    // the entire transaction (no silent skip, no half-applied advance).
-    const existing = await tx.skillOffer.findUnique({
-      where: {
-        characterId_track_level_choiceGroup: {
-          characterId,
-          track,
-          level: newLevel,
-          choiceGroup,
-        },
-      },
+    // Enforce the active-offer invariant by checking for a pre-existing ACTIVE
+    // (canceledAt null) offer BEFORE creating, inside this live transaction. A
+    // pre-existing active offer (e.g. a prior advance) is left untouched and never
+    // duplicated, so a re-advance produces no duplicate. A canceled offer does NOT
+    // block a re-offer: the new offer is created as the next generation (max
+    // existing generation + 1), superseding the canceled one WITHOUT deleting it
+    // or rewriting its snapshots (append-only). If a concurrent request inserts
+    // the same generation between this check and the create, the resulting unique
+    // violation is NOT swallowed here - it propagates and aborts the entire
+    // transaction (no silent skip, no half-applied advance).
+    const existingOffers = await tx.skillOffer.findMany({
+      where: { characterId, track, level: newLevel, choiceGroup },
     })
-    if (existing) continue
+    if (existingOffers.some((o) => o.canceledAt == null)) continue
+    const maxGeneration = existingOffers.reduce(
+      (m, o) => Math.max(m, o.generation),
+      -1
+    )
+    const generation = maxGeneration === -1 ? 0 : maxGeneration + 1
     const offer = await tx.skillOffer.create({
       data: {
         characterId,
         track,
         level: newLevel,
         choiceGroup,
+        generation,
         options: {
           create: entries.map((e) => ({
             definitionId: e.def.id,
@@ -2270,9 +2312,20 @@ export async function advanceCharacter(
     }
 
     const advanceJournal: Record<string, unknown> = { ...result.journal }
-    if (skillOffers.length > 0) {
-      advanceJournal.skillOffers = skillOffers
+    // The version AFTER this advance committed, so a consumer can deterministically
+    // undo the event (find the prior version token). Legacy events that predate this
+    // field remain readable/undoable by falling back to the event's preceding
+    // version when this is absent.
+    advanceJournal.characterVersionAfter = body.version + 1
+    // Every level-up advance event records `skillOfferIds` (an empty array when
+    // zero offers were generated) so the undo code can distinguish "explicitly no
+    // offers to cancel" from a legacy event that never recorded the field. The
+    // `skillOffers` payload is optional and omitted when there are none.
+    if (result.journal.leveledUp) {
       advanceJournal.skillOfferIds = skillOffers.map((o) => o.id)
+      if (skillOffers.length > 0) {
+        advanceJournal.skillOffers = skillOffers
+      }
     }
 
     await tx.progressionEvent.create({
@@ -2295,6 +2348,803 @@ export async function advanceCharacter(
       journal: advanceJournal,
     }
   })
+}
+
+// ------------------------------------------------------------------ //
+// Level-up undo (safe compensating reversal)
+// ------------------------------------------------------------------ //
+
+/**
+ * Whether an `update` progression-event payload recorded a `currentResources`
+ * resource mutation. The `updateCharacter` journal carries `currentResources`
+ * only when the request actually supplied resources; an absent/undefined value
+ * means the update was metadata-only (name / description / archive). Conservative:
+ * any present value - even an empty object or null - is treated as a mutation,
+ * since it cannot prove a metadata-only edit.
+ */
+function updatePayloadMutatesResources(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return true
+  return (
+    (payload as { currentResources?: unknown }).currentResources !== undefined
+  )
+}
+
+/**
+ * Events that do NOT supersede a level-up for undo purposes. These are purely
+ * cosmetic / metadata-only (creation, archive toggle, and backup-import markers).
+ * An `update` is cosmetic ONLY when its payload records no `currentResources`
+ * change - a metadata-only profile edit (name / description / archive) is safe,
+ * but a resource mutation must block the undo. Every other event kind (advance,
+ * experience_set, allocate, evolve, consume,
+ * skill_select/skill_grant/skill_upgrade, associate, inventory_adjust,
+ * profession_set, level_undo) blocks the undo.
+ */
+function isCosmeticUndoEvent(e: { kind: string; payload: unknown }): boolean {
+  if (e.kind === "update") {
+    return !updatePayloadMutatesResources(e.payload)
+  }
+  return (
+    e.kind === "create" ||
+    e.kind === "archive" ||
+    e.kind === "import" ||
+    e.kind === "import_history"
+  )
+}
+
+/** Deterministic event order: by `createdAt` (asc), then `id` (asc). */
+function byCreatedAtThenId(
+  a: { createdAt: Date; id: string },
+  b: { createdAt: Date; id: string }
+): number {
+  const t = a.createdAt.getTime() - b.createdAt.getTime()
+  if (t !== 0) return t
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+
+/** Whether two attribute vectors are numerically identical across every attribute. */
+function vectorsEqual(a: AttributeVector, b: AttributeVector): boolean {
+  for (const attr of ATTRIBUTES) {
+    if ((a[attr] ?? 0) !== (b[attr] ?? 0)) return false
+  }
+  return true
+}
+
+/**
+ * The UndoHistory payload shape recovered from an immutable `advance` level-up
+ * event. Only the fields the undo needs are typed; unknown fields are ignored.
+ */
+type UndoAdvanceJournal = {
+  track?: string
+  levelBefore?: number
+  levelAfter?: number
+  quarterBefore?: number
+  percentBefore?: number
+  raceLevelBefore?: number
+  raceLevelAfter?: number
+  award?: { definitionId?: string; fixed?: AttributeVector; free?: number }
+  raceGain?: {
+    grade?: string
+    levelsGained?: number
+    fixed?: AttributeVector
+    free?: number
+  } | null
+  skillOfferIds?: string[]
+}
+
+/**
+ * Perform the safe compensating reversal of the most recent live level-up
+ * (`operation: "undo"`). It runs inside the same SERIALIZABLE transaction as the
+ * other experience operations. See `experienceCharacter` + docs/rules/leveling.md.
+ *
+ * The original `advance` event is never rewritten or deleted: only the current
+ * state is compensated back to the journal's "before" values, the corresponding
+ * award suffix is removed from `historicalLevelAwards`, and generated milestone
+ * skill offers are canceled (append-only `canceledAt` stamp, never deleted). Any
+ * condition that makes the reversal unsafe rejects with 409 `level_undo_blocked`
+ * and writes nothing.
+ */
+async function undoExperience(
+  tx: DbClient,
+  characterId: string,
+  state: CharacterState,
+  config: RulesConfig,
+  body: {
+    operation: "undo"
+    track: "race" | "class" | "profession"
+    version: number
+  },
+  houseRules: HouseRulesRow
+): Promise<{ character: CharacterDetail; journal: unknown }> {
+  const isMonster = state.race.mode === "independent"
+  const isRaceTrack = body.track === "race"
+
+  // Race-mode track validity, mirroring /advance and the set/levelUp path.
+  if (isRaceTrack) {
+    if (!isMonster) {
+      throw badRequest(
+        "invalid_track",
+        `Race experience is only for an independent (monster) race; character race mode is "${state.race.mode}"`
+      )
+    }
+  } else if (isMonster) {
+    throw badRequest(
+      "invalid_track",
+      `A monster (independent) race has no "${body.track}" track`
+    )
+  }
+
+  const trackState = isRaceTrack ? state.race : state.tracks[body.track]
+  if (!trackState) {
+    throw badRequest("invalid_track", `Character has no "${body.track}" track`)
+  }
+  // A level-up can only be undone when there is a level to undo.
+  const currentLevel = isRaceTrack ? state.race.level : trackState.level
+  if (currentLevel <= 0) {
+    throw conflict(
+      "level_undo_blocked",
+      `No level to undo: "${body.track}" is at level ${currentLevel}`
+    )
+  }
+
+  // Load the immutable journal and order it deterministically (createdAt, then id).
+  const events = (
+    await tx.progressionEvent.findMany({
+      where: { characterId },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    })
+  ).sort(byCreatedAtThenId)
+  // Imported history is never authoritative for undo: exclude it entirely.
+  const relevant = events.filter((e) => e.kind !== "import_history")
+
+  // Locate the most recent LIVE advance-with-leveledUp event.
+  let target: (typeof relevant)[number] | undefined
+  for (let i = relevant.length - 1; i >= 0; i--) {
+    const e = relevant[i]
+    if (e.kind !== "advance") continue
+    const payload = e.payload as { journal?: { leveledUp?: boolean } }
+    if (payload?.journal?.leveledUp === true) {
+      target = e
+      break
+    }
+  }
+  if (!target) {
+    throw conflict(
+      "level_undo_blocked",
+      `No level-up event found to undo on "${body.track}"`
+    )
+  }
+
+  const targetPayload = target.payload as {
+    track?: string
+    journal?: Record<string, unknown>
+  }
+  const j = (targetPayload.journal ?? {}) as UndoAdvanceJournal
+
+  // The selected track must be the one that actually leveled up.
+  if (targetPayload.track && targetPayload.track !== body.track) {
+    throw conflict(
+      "level_undo_blocked",
+      `The latest level-up was on "${targetPayload.track}", not "${body.track}"`
+    )
+  }
+
+  // A later non-cosmetic event (or a same-timestamp ambiguous progression event)
+  // supersedes the level-up: reject rather than guess.
+  const targetTime = target.createdAt.getTime()
+  for (const e of relevant) {
+    if (e.id === target.id) continue
+    if (isCosmeticUndoEvent(e)) continue
+    const sameTime = e.createdAt.getTime() === targetTime
+    const after = sameTime
+      ? e.id > target.id
+      : e.createdAt.getTime() > targetTime
+    if (after) {
+      throw conflict(
+        "level_undo_blocked",
+        `Cannot undo: a later "${e.kind}" event supersedes the level-up`
+      )
+    }
+    if (sameTime) {
+      throw conflict(
+        "level_undo_blocked",
+        `Cannot undo: ambiguous progression events share the level-up timestamp (${e.kind})`
+      )
+    }
+  }
+
+  const levelBefore = j.levelBefore
+  const levelAfter = j.levelAfter
+  const quarterBefore = j.quarterBefore ?? 0
+  const raceLevelBefore = j.raceLevelBefore
+  const raceLevelAfter = j.raceLevelAfter
+  if (
+    levelBefore == null ||
+    levelAfter == null ||
+    raceLevelBefore == null ||
+    raceLevelAfter == null
+  ) {
+    throw conflict(
+      "level_undo_blocked",
+      "Level-up event journal is missing level / race-level before or after"
+    )
+  }
+  const award = j.award
+  if (!award || !award.definitionId || !award.fixed || award.free == null) {
+    throw conflict(
+      "level_undo_blocked",
+      "Level-up event journal is missing the award snapshot"
+    )
+  }
+  const raceGain = j.raceGain
+
+  // Validate the CURRENT state against the level-up's "after" snapshot.
+  if (trackState.level !== levelAfter) {
+    throw conflict(
+      "level_undo_blocked",
+      `Track "${body.track}" is at level ${trackState.level}, expected ${levelAfter} (the level-up was already undone or superseded)`
+    )
+  }
+  const currentQuarter = isRaceTrack
+    ? (state.race.quarter ?? 0)
+    : trackState.quarter
+  const currentPercent = isRaceTrack
+    ? state.race.experiencePercent
+    : (trackState as { experiencePercent?: number }).experiencePercent
+  if (currentQuarter !== 0) {
+    throw conflict(
+      "level_undo_blocked",
+      `Track "${body.track}" has advanced to quarter ${currentQuarter}; cannot undo from the level-up boundary`
+    )
+  }
+  if (currentPercent != null && currentPercent !== 0) {
+    throw conflict(
+      "level_undo_blocked",
+      `Track "${body.track}" is at ${currentPercent}% within its level; cannot undo from the level-up boundary`
+    )
+  }
+  if (state.race.level !== raceLevelAfter) {
+    throw conflict(
+      "level_undo_blocked",
+      `Race level is ${state.race.level}, expected ${raceLevelAfter}`
+    )
+  }
+
+  // Track grade/definition must be unchanged since the award (a later evolution is
+  // already caught by the event scan, but a manual drift is rejected here).
+  if (!isRaceTrack) {
+    const currentDef = (trackState as { definitionId: string }).definitionId
+    if (award.definitionId && currentDef !== award.definitionId) {
+      throw conflict(
+        "level_undo_blocked",
+        `Track "${body.track}" definition changed since the award (${currentDef} vs ${award.definitionId})`
+      )
+    }
+  } else {
+    const raceDefId = state.race.definitionId
+    if (raceDefId && award.definitionId && raceDefId !== award.definitionId) {
+      throw conflict(
+        "level_undo_blocked",
+        `Race definition changed since the award (${raceDefId} vs ${award.definitionId})`
+      )
+    }
+  }
+
+  // Validate the exact historicalLevelAwards suffix that the level-up appended.
+  const trackAwards = state.historicalLevelAwards.filter(
+    (a) => a.track === body.track && a.level === levelAfter
+  )
+  if (trackAwards.length !== 1) {
+    throw conflict(
+      "level_undo_blocked",
+      `Expected exactly one "${body.track}" award at level ${levelAfter}, found ${trackAwards.length}`
+    )
+  }
+  const trackAward = trackAwards[0]
+  if (
+    trackAward.definitionId !== award.definitionId ||
+    !vectorsEqual(trackAward.fixed, award.fixed) ||
+    trackAward.free !== award.free
+  ) {
+    throw conflict(
+      "level_undo_blocked",
+      `The "${body.track}" award at level ${levelAfter} does not match the level-up snapshot`
+    )
+  }
+
+  if (isRaceTrack) {
+    // Independent monster race: the award IS a race award. It also must agree with
+    // the raceGain journal when present.
+    if (raceGain) {
+      if (
+        !vectorsEqual(raceGain.fixed ?? trackAward.fixed, trackAward.fixed) ||
+        (raceGain.free ?? trackAward.free) !== trackAward.free
+      ) {
+        throw conflict(
+          "level_undo_blocked",
+          `Race award at level ${levelAfter} does not match the raceGain snapshot`
+        )
+      }
+    }
+  } else if (raceGain) {
+    // A derived (enlightened) race also gained a race level from this level-up: there
+    // must be a matching race award at raceLevelAfter.
+    const raceAwards = state.historicalLevelAwards.filter(
+      (a) => a.track === "race" && a.level === raceLevelAfter
+    )
+    if (raceAwards.length !== 1) {
+      throw conflict(
+        "level_undo_blocked",
+        `Expected exactly one race award at level ${raceLevelAfter}, found ${raceAwards.length}`
+      )
+    }
+    const raceAward = raceAwards[0]
+    if (
+      !raceGain.fixed ||
+      !vectorsEqual(raceAward.fixed, raceGain.fixed) ||
+      (raceAward.free ?? 0) !== (raceGain.free ?? 0)
+    ) {
+      throw conflict(
+        "level_undo_blocked",
+        `Race award at level ${raceLevelAfter} does not match the raceGain snapshot`
+      )
+    }
+  } else if (raceLevelAfter !== raceLevelBefore) {
+    // No raceGain recorded but the race level changed: mismatch.
+    throw conflict(
+      "level_undo_blocked",
+      `Race level changed (${raceLevelBefore} -> ${raceLevelAfter}) but no raceGain was recorded`
+    )
+  }
+
+  // Restore the track (and race) to the journal's "before" values.
+  const percentBefore =
+    j.percentBefore != null && j.percentBefore >= 0 && j.percentBefore <= 99
+      ? j.percentBefore
+      : quarterBefore * 25
+  const restoredQuarter = Math.floor(percentBefore / 25)
+
+  const restoredTracks = { ...state.tracks }
+  const restoredRace = { ...state.race }
+  if (isRaceTrack) {
+    restoredRace.level = levelBefore
+    restoredRace.quarter = restoredQuarter
+    restoredRace.experiencePercent = percentBefore
+  } else {
+    restoredTracks[body.track] = {
+      ...state.tracks[body.track]!,
+      level: levelBefore,
+      quarter: restoredQuarter,
+      experiencePercent: percentBefore,
+    }
+    if (raceGain) {
+      // A derived race level that advanced with the level-up is restored to its
+      // prior value. We verify against the current derivation strategy below.
+      restoredRace.level = raceLevelBefore
+    }
+  }
+
+  // Remove only the current-state award suffix: the immutable advance event stays.
+  const restoredAwards = state.historicalLevelAwards.filter((a) => {
+    if (a.track === body.track && a.level === levelAfter) return false
+    if (raceGain && a.track === "race" && a.level === raceLevelAfter)
+      return false
+    return true
+  })
+
+  const restored: CharacterState = {
+    ...state,
+    tracks: restoredTracks,
+    race: restoredRace,
+    historicalLevelAwards: restoredAwards,
+  }
+
+  // Derived-race sanity check against the current configured derive strategy.
+  if (!isRaceTrack && !isMonster) {
+    const derived = deriveRaceLevel(restored, config)
+    if (derived !== raceLevelBefore) {
+      throw conflict(
+        "level_undo_blocked",
+        `Derived race level after undo would be ${derived}, expected ${raceLevelBefore}`
+      )
+    }
+  }
+
+  // The restored free pool must still cover every allocated point.
+  const freeAfter = totalFreePoints(restored)
+  const allocated = allocatedPoints(state)
+  if (freeAfter < allocated) {
+    throw conflict(
+      "level_undo_blocked",
+      `Undo would leave the character ${allocated - freeAfter} free points in deficit (${allocated} allocated, ${freeAfter} remaining)`
+    )
+  }
+
+  // Cancel generated milestone skill offers (append-only; never delete).
+  //
+  // An explicit `skillOfferIds` list (even an empty one) is authoritative: cancel
+  // exactly those ids and nothing else, so a `[]` recorded by a level-up that
+  // generated zero offers never cancels a pre-existing unrelated pending offer at
+  // the same track/level. Only when the field is ABSENT do we fall back to the
+  // legacy behavior of cancelling all active offers for the track/level.
+  const canceledOfferIds: string[] = []
+  if (j.skillOfferIds !== undefined) {
+    for (const offerId of j.skillOfferIds) {
+      const offer = await tx.skillOffer.findUnique({ where: { id: offerId } })
+      if (!offer) {
+        throw conflict(
+          "level_undo_blocked",
+          `Skill offer ${offerId} referenced by the level-up no longer exists`
+        )
+      }
+      if (
+        offer.characterId !== characterId ||
+        offer.track !== body.track ||
+        offer.level !== levelAfter
+      ) {
+        throw conflict(
+          "level_undo_blocked",
+          `Skill offer ${offerId} does not belong to this level-up`
+        )
+      }
+      if (offer.canceledAt != null) {
+        throw conflict(
+          "level_undo_blocked",
+          `Skill offer ${offerId} is already canceled`
+        )
+      }
+      if (offer.selectedDefinitionId != null) {
+        throw conflict(
+          "level_undo_blocked",
+          `Skill offer ${offerId} was selected; undo cannot remove the selected skill`
+        )
+      }
+      await tx.skillOffer.update({
+        where: { id: offerId },
+        data: { canceledAt: new Date() },
+      })
+      canceledOfferIds.push(offerId)
+    }
+  } else {
+    // Legacy event without offer ids: find active offers for the same track/level.
+    // A selected offer blocks; pending ones are associated with this single last
+    // level-up only when they are the sole active set (one per group).
+    const activeOffers = await tx.skillOffer.findMany({
+      where: {
+        characterId,
+        track: body.track,
+        level: levelAfter,
+        canceledAt: null,
+      },
+    })
+    if (activeOffers.some((o) => o.selectedDefinitionId != null)) {
+      throw conflict(
+        "level_undo_blocked",
+        `A skill offer at level ${levelAfter} was selected; undo cannot remove the selected skill`
+      )
+    }
+    for (const offer of activeOffers) {
+      await tx.skillOffer.update({
+        where: { id: offer.id },
+        data: { canceledAt: new Date() },
+      })
+      canceledOfferIds.push(offer.id)
+    }
+  }
+
+  // Compare-and-swap against the client's expected version.
+  const updatedMany = await tx.character.updateMany({
+    where: { id: characterId, version: body.version },
+    data: {
+      state: serializeState(restored) as Prisma.InputJsonValue,
+      version: { increment: 1 },
+    },
+  })
+  if (updatedMany.count !== 1) {
+    throw conflict(
+      "version_conflict",
+      `Version mismatch: expected ${body.version}, got a newer version`
+    )
+  }
+
+  const undoJournal: Record<string, unknown> = {
+    track: body.track,
+    levelBefore: levelAfter,
+    levelAfter: levelBefore,
+    quarterBefore: 0,
+    quarterAfter: restoredQuarter,
+    percentBefore: 0,
+    percentAfter: percentBefore,
+    raceLevelBefore: raceLevelAfter,
+    raceLevelAfter: raceLevelBefore,
+    leveledUp: false,
+    undone: true,
+    award,
+    raceGain: raceGain ?? null,
+    canceledOfferIds,
+    characterVersionAfter: body.version + 1,
+  }
+
+  await tx.progressionEvent.create({
+    data: {
+      characterId,
+      kind: "level_undo",
+      payload: {
+        operation: "undo",
+        track: body.track,
+        originalEventId: target.id,
+        journal: undoJournal,
+      } as unknown as Prisma.InputJsonValue,
+    },
+  })
+
+  const updated = (await tx.character.findUnique({
+    where: { id: characterId },
+    include: characterInclude,
+  }))!
+  return {
+    character: toDetail(updated, true, config, houseRules.version),
+    journal: { ...undoJournal, originalEventId: target.id },
+  }
+}
+
+/**
+ * POST /api/characters/[id]/experience.
+ *
+ * Settle the authoritative EXP percent of a track (class / profession / race) or
+ * perform an instant level-up, leveraging the pure engine functions
+ * `setExperiencePercent` / `levelUpFromExperience`. The authoritative race-mode
+ * validation mirrors `/advance`: a race track is legal only for an independent
+ * (monster) race; a class/profession track is legal only for an enlightened race.
+ *
+ * - `set` with `percent < 100` records an `experience_set` event (journal with
+ *   percentBefore/After, turnsAdvanced) and never touches skill offers.
+ * - `set` with `percent === 100`, or a `levelUp`, performs an actual level-up and
+ *   records an `advance` event whose journal carries `characterVersionAfter`, the
+ *   snapshotted award/raceGain, and the generated milestone skill offers (created
+ *   exactly once inside this transaction).
+ * - A no-op `set` (target === current) is rejected 400 `experience_unchanged`
+ *   without bumping the version or writing an event.
+ * - A closed grade gate thrown by the pure engine aborts atomically (state, turn,
+ *   offers, and event all roll back) and surfaces as 400 `grade_blocked`.
+ *
+ * The whole mutation runs under SERIALIZABLE isolation; a P2034 serialization
+ * conflict is surfaced as a 409 rather than a raw 500.
+ */
+export async function experienceCharacter(
+  id: string,
+  body:
+    | {
+        operation: "set"
+        track: "race" | "class" | "profession"
+        percent: number
+        version: number
+      }
+    | {
+        operation: "levelUp"
+        track: "race" | "class" | "profession"
+        version: number
+      }
+    | {
+        operation: "undo"
+        track: "race" | "class" | "profession"
+        version: number
+      },
+  user: SessionUser
+): Promise<{ character: CharacterDetail; journal: unknown }> {
+  const serializable = {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  } as const
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const row = await assertOwner(tx, id, user)
+      const houseRules = await loadHouseRules(tx)
+      const state = deserializeState(row.state)
+      const config = configFor(row, houseRules.config)
+
+      const isMonster = state.race.mode === "independent"
+      const isRaceTrack = body.track === "race"
+
+      // `undo` short-circuits the pure engine: it compensates the latest actual
+      // level-up directly (see `undoExperience`), so no definition resolution,
+      // engine call, or skill-offer generation is needed here.
+      if (body.operation === "undo") {
+        return await undoExperience(tx, id, state, config, body, houseRules)
+      }
+
+      // Resolve the authoritative current definition and validate race mode before
+      // calling the engine, mirroring /advance.
+      let definition: TrackDefinition | RaceDefinition
+      let definitionId: string
+      if (isRaceTrack) {
+        if (!isMonster) {
+          throw badRequest(
+            "invalid_track",
+            `Race experience is only for an independent (monster) race; character race mode is "${state.race.mode}"`
+          )
+        }
+        const raceDef = config.raceDefinitions?.[state.race.grade]
+        if (!raceDef) {
+          throw badRequest(
+            "no_definition",
+            `No race definition for grade ${state.race.grade}`
+          )
+        }
+        definition = raceDef
+        definitionId = raceDef.id
+      } else {
+        if (isMonster) {
+          throw badRequest(
+            "invalid_track",
+            `A monster (independent) race has no "${body.track}" track`
+          )
+        }
+        const trackRow = body.track === "class" ? row.class : row.profession
+        const trackDef = resolveTrackDefinition(trackRow, state, body.track)
+        if (!trackDef) {
+          throw badRequest(
+            "no_definition",
+            `No supported track definition for ${body.track}`
+          )
+        }
+        definition = trackDef
+        definitionId = trackDef.id
+      }
+
+      // A no-op set must reject 400 instead of bumping version / writing an event.
+      if (body.operation === "set") {
+        const current = experiencePercentFor(state, body.track)
+        if (body.percent === current) {
+          throw badRequest(
+            "experience_unchanged",
+            `Experience is already ${current}% on "${body.track}"`
+          )
+        }
+      }
+
+      // Run the pure engine. A closed grade gate throws before any write, so a
+      // partial state/turn/offer/event never escapes the transaction.
+      let result: AdvanceResult
+      try {
+        if (body.operation === "set") {
+          result = isRaceTrack
+            ? setExperiencePercent(
+                state,
+                "race",
+                body.percent,
+                definition as RaceDefinition,
+                config
+              )
+            : setExperiencePercent(
+                state,
+                body.track,
+                body.percent,
+                definition as TrackDefinition,
+                config
+              )
+        } else {
+          result = isRaceTrack
+            ? levelUpFromExperience(
+                state,
+                "race",
+                definition as RaceDefinition,
+                config
+              )
+            : levelUpFromExperience(
+                state,
+                body.track,
+                definition as TrackDefinition,
+                config
+              )
+        }
+      } catch (err) {
+        // Grade-ceiling gates from the pure engine. A graded class/profession
+        // track may not push PAST the next grade's entry level (`without
+        // completed track evolution`), and a derived/independent race may not
+        // push past its own (`without completed evolution`). Both are the
+        // caller's 400, never a 500, and the explicit substring match never
+        // masks an unrelated engine failure. Throwing here aborts the whole
+        // transaction, so no state / version / event / offer write escapes.
+        const message = err instanceof Error ? err.message : ""
+        if (
+          message.includes("without completed evolution") ||
+          message.includes("without completed track evolution")
+        ) {
+          throw badRequest("grade_blocked", message)
+        }
+        throw err
+      }
+
+      const serialized = serializeState(result.state)
+      // Compare-and-swap against the client's expected version. If any concurrent
+      // mutation bumped the version, `updateMany` matches 0 rows and we 409 (the
+      // event insert below is never reached, so it is rolled back with the txn).
+      const updatedMany = await tx.character.updateMany({
+        where: { id, version: body.version },
+        data: {
+          state: serialized as Prisma.InputJsonValue,
+          version: { increment: 1 },
+        },
+      })
+      if (updatedMany.count !== 1) {
+        throw conflict(
+          "version_conflict",
+          `Version mismatch: expected ${body.version}, got a newer version`
+        )
+      }
+
+      const leveledUp = result.journal.leveledUp === true
+
+      // Skill offers are generated only on an actual level-up of a class /
+      // profession track, exactly once inside this transaction (a race level-up
+      // and a percent-only set produce none).
+      let skillOffers: Array<{ id: string; choiceGroup: string }> = []
+      if (leveledUp && body.track !== "race") {
+        const newLevel = result.journal.levelAfter
+        const raceGrade = result.state.race.grade
+        const trackGrade = result.state.tracks[body.track]?.grade ?? raceGrade
+        const trackStableId =
+          body.track === "class"
+            ? row.class?.stableId
+            : row.profession?.stableId
+        skillOffers = await createSkillOffersForAdvance(
+          tx,
+          id,
+          body.track,
+          newLevel,
+          trackGrade,
+          trackStableId ?? undefined
+        )
+      }
+
+      const journal: Record<string, unknown> = { ...result.journal }
+      if (leveledUp) {
+        // The version AFTER this level-up committed, so a consumer can
+        // deterministically undo the event by finding the prior version token.
+        journal.characterVersionAfter = body.version + 1
+        // Every level-up advance event records `skillOfferIds` (an empty array
+        // when zero offers were generated) so the undo code can distinguish
+        // "explicitly no offers to cancel" from a legacy event that never
+        // recorded the field. The `skillOffers` payload is optional and omitted
+        // when there are none.
+        journal.skillOfferIds = skillOffers.map((o) => o.id)
+        if (skillOffers.length > 0) {
+          journal.skillOffers = skillOffers
+        }
+      }
+
+      const eventKind = leveledUp ? "advance" : "experience_set"
+      await tx.progressionEvent.create({
+        data: {
+          characterId: id,
+          kind: eventKind,
+          payload: {
+            operation: body.operation,
+            track: body.track,
+            ...(body.operation === "set" ? { percent: body.percent } : {}),
+            ...(leveledUp ? { definitionId } : {}),
+            journal,
+          } as unknown as Prisma.InputJsonValue,
+        },
+      })
+
+      const updated = (await tx.character.findUnique({
+        where: { id },
+        include: characterInclude,
+      }))!
+      return {
+        character: toDetail(updated, true, config, houseRules.version),
+        journal,
+      }
+    }, serializable)
+  } catch (err) {
+    if (isSerializationFailure(err)) {
+      throw conflict(
+        "serialization_conflict",
+        "Concurrent character change detected; retry the experience request"
+      )
+    }
+    throw err
+  }
 }
 
 /**
@@ -2470,6 +3320,12 @@ export async function skillCharacter(
       })
       if (!offer || offer.characterId !== id) {
         throw notFound("offer_not_found", "Skill offer not found")
+      }
+      // A canceled offer is no longer selectable: it stays visible as a historical
+      // record, but answering it is a 409 `offer_canceled` (the offer was voided,
+      // e.g. by an EXP undo that canceled the offer pending a re-offer).
+      if (offer.canceledAt != null) {
+        throw conflict("offer_canceled", "This skill offer has been canceled")
       }
       // Repeat selection / already-answered offer.
       if (offer.selectedDefinitionId != null) {
@@ -5549,7 +6405,10 @@ export async function exportCharacter(
   }
   // Export skill offers with STABLE catalog identifiers so a re-import on another
   // server instance can resolve each option/selection against its own catalog.
-  // `offeredAt` is emitted as an ISO string; the importer parses it back to a Date.
+  // `offeredAt`, `selectedAt` and `canceledAt` are emitted as ISO strings; the
+  // importer parses them back to Dates. `generation` and `canceledAt` are part of
+  // the v6 schema, re-exported verbatim so a canceled offer's identity and
+  // cancellation timestamp survive a backup round-trip unchanged (append-only).
   const skillOffers = row.skillOffers.map((offer) => {
     const selectedOption = offer.options.find(
       (o) => o.definitionId === offer.selectedDefinitionId
@@ -5558,6 +6417,8 @@ export async function exportCharacter(
       track: offer.track,
       level: offer.level,
       choiceGroup: offer.choiceGroup,
+      generation: offer.generation,
+      canceledAt: offer.canceledAt ? offer.canceledAt.toISOString() : null,
       offeredAt: offer.offeredAt.toISOString(),
       selectedStableId: selectedOption?.definition?.stableId ?? null,
       selectedAt: offer.selectedAt ? offer.selectedAt.toISOString() : null,
@@ -5569,7 +6430,7 @@ export async function exportCharacter(
     }
   })
   return {
-    schema: IMPORT_SCHEMA_V5,
+    schema: IMPORT_SCHEMA_V6,
     rulesetVersion: IMPORT_RULESET_VERSION,
     identity,
     character: listItemFor(row, houseRules, true),
@@ -5785,7 +6646,12 @@ async function resolveInventoryRefs(
   db: DbClient,
   inventory: Extract<
     CharacterImportDocument,
-    { schema: typeof IMPORT_SCHEMA_V4 | typeof IMPORT_SCHEMA_V5 }
+    {
+      schema:
+        | typeof IMPORT_SCHEMA_V4
+        | typeof IMPORT_SCHEMA_V5
+        | typeof IMPORT_SCHEMA_V6
+    }
   >["inventory"]
 ): Promise<ResolvedInventoryItem[]> {
   const seen = new Set<string>()
@@ -6132,6 +6998,8 @@ type ResolvedOffer = {
   track: string
   level: number
   choiceGroup: string
+  generation: number
+  canceledAt: Date | null
   offeredAt: Date
   selectedDefinitionId: string | null
   selectedAt: Date | null
@@ -6144,21 +7012,67 @@ function parseOfferDate(value: string | number | null | undefined): Date {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed
 }
 
+/**
+ * Parse a skill-offer `canceledAt` timestamp STRICTLY: a supplied value must
+ * represent a real, finite Date or the import is rejected with 400
+ * `invalid_import` - it is never silently restamped to "now" (the same hard
+ * rejection the document schema enforces for a direct service caller that bypasses
+ * the route's Zod check).
+ */
+function parseCanceledAtStrict(value: string | number): Date {
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    throw badRequest(
+      "invalid_import",
+      `Skill offer canceledAt "${String(value)}" is not a valid timestamp`
+    )
+  }
+  return parsed
+}
+
 async function resolveSkillOfferRefs(
   db: DbClient,
   offers: CharacterImportDocument["skillOffers"]
 ): Promise<ResolvedOffer[]> {
   const seen = new Set<string>()
+  const activeByBaseKey = new Map<string, string>()
   const result: ResolvedOffer[] = []
   for (const o of offers) {
-    const key = `${o.track}:${o.level}:${o.choiceGroup}`
+    // v3/v4/v5 documents omit generation/canceledAt; they default to 0/null. A v6
+    // document carries them explicitly and they are validated at the schema layer.
+    const generation = o.generation ?? 0
+    const baseKey = `${o.track}:${o.level}:${o.choiceGroup}`
+    const key = `${baseKey}:${generation}`
     if (seen.has(key)) {
       throw badRequest(
         "import_duplicate_offer",
-        `Duplicate skill offer for ${o.track} level ${o.level} choice group "${o.choiceGroup}"`
+        `Duplicate skill offer for ${o.track} level ${o.level} choice group "${o.choiceGroup}" generation ${generation}`
       )
     }
     seen.add(key)
+
+    // A selected + canceled offer is contradictory: a canceled (voided) offer is
+    // never answered, so it must not carry a selection.
+    if (o.selectedStableId != null && o.canceledAt != null) {
+      throw badRequest(
+        "import_selected_canceled",
+        `Offer for ${o.track} level ${o.level} choice group "${o.choiceGroup}" generation ${generation} is both selected and canceled`
+      )
+    }
+
+    // At most one ACTIVE (canceledAt null) offer per base key. Multiple
+    // generations may coexist as historical records (a canceled offer superseded
+    // by a new generation), but only one may be answerable.
+    if (o.canceledAt == null) {
+      const existing = activeByBaseKey.get(baseKey)
+      if (existing != null) {
+        throw badRequest(
+          "import_offer_conflict",
+          `Multiple active skill offers for ${o.track} level ${o.level} choice group "${o.choiceGroup}" (generations ${existing} and ${generation})`
+        )
+      }
+      activeByBaseKey.set(baseKey, String(generation))
+    }
 
     const options: ResolvedOfferOption[] = []
     const optionStableIds = new Set<string>()
@@ -6207,6 +7121,13 @@ async function resolveSkillOfferRefs(
       track: o.track,
       level: o.level,
       choiceGroup: o.choiceGroup,
+      generation,
+      // canceledAt is parsed strictly (reject -> 400 invalid_import, never "now"),
+      // so a canceled offer's cancellation instant is preserved exactly. The
+      // legacy offeredAt/selectedAt keep the historical fallback (a missing value
+      // restamps to now) for backward compatibility.
+      canceledAt:
+        o.canceledAt != null ? parseCanceledAtStrict(o.canceledAt) : null,
       offeredAt: parseOfferDate(o.offeredAt),
       selectedDefinitionId,
       selectedAt: selectedDefinitionId ? parseOfferDate(o.selectedAt) : null,
@@ -6617,7 +7538,9 @@ export async function importCharacter(
       // the association resolver consults to enforce the ownership invariant on
       // non-grandfathered equipment links.
       const hasInventory =
-        input.schema === IMPORT_SCHEMA_V4 || input.schema === IMPORT_SCHEMA_V5
+        input.schema === IMPORT_SCHEMA_V4 ||
+        input.schema === IMPORT_SCHEMA_V5 ||
+        input.schema === IMPORT_SCHEMA_V6
       let resolvedInventory: ResolvedInventoryItem[] = []
       let ownedStockByDefId = new Map<string, number>()
       if (hasInventory) {
@@ -6636,9 +7559,11 @@ export async function importCharacter(
           maxTranscendentSkills: houseRules.config.maxTranscendentSkills,
           raceGrade: state.race.grade,
           // Only a legacy v3/v4 document may recover a ring position from its own
-          // definition.config.slot snapshot; a v5 document carries the position
+          // definition.config.slot snapshot; a v5/v6 document carries the position
           // explicitly and never trusts the snapshot.
-          allowConfigSnapshotPosition: input.schema !== IMPORT_SCHEMA_V5,
+          allowConfigSnapshotPosition:
+            input.schema === IMPORT_SCHEMA_V3 ||
+            input.schema === IMPORT_SCHEMA_V4,
         }
       )
       assertAssocCollisions(
@@ -6715,6 +7640,8 @@ export async function importCharacter(
             track: o.track,
             level: o.level,
             choiceGroup: o.choiceGroup,
+            generation: o.generation,
+            canceledAt: o.canceledAt,
             offeredAt: o.offeredAt,
             selectedDefinitionId: o.selectedDefinitionId,
             selectedAt: o.selectedAt,

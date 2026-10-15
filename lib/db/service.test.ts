@@ -15,6 +15,7 @@ import {
   createInitialState,
   deserializeState,
   evolveCharacter,
+  experienceCharacter,
   exportCharacter,
   getCatalogItem,
   getCharacter,
@@ -22,11 +23,13 @@ import {
   getEvolutionOptions,
   importCharacter,
   listCatalog,
+  listCharacters,
   raceGradeBandBlockers,
   resolveTrackDefinition,
   serializeState,
   setCharacterProfession,
   skillCharacter,
+  toListItem,
   updateCatalogItem,
   updateCharacter,
   upgradeSkill,
@@ -35,6 +38,7 @@ import {
   IMPORT_SCHEMA_V3,
   IMPORT_SCHEMA_V4,
   IMPORT_SCHEMA_V5,
+  IMPORT_SCHEMA_V6,
   IMPORT_RULESET_VERSION,
   characterImportDocumentSchema,
   type CharacterImportDocument,
@@ -5368,7 +5372,7 @@ describe("exportCharacter (associations / live state)", () => {
       user
     )
     const portable = await exportCharacter("chr-1", user)
-    expect(portable.schema).toBe("primal-character/5")
+    expect(portable.schema).toBe("primal-character/6")
     expect(portable.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(portable.identity).toMatchObject({
       name: "Test",
@@ -5535,6 +5539,8 @@ describe("exportCharacter (associations / live state)", () => {
       track: "class",
       level: 1,
       choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
       selectedDefinitionId: null,
       offeredAt: new Date(),
       selectedAt: null,
@@ -6945,6 +6951,39 @@ describe("importCharacter (trusted backup v3)", () => {
     } as ImportV4Document
   }
 
+  type ImportV6Document = Extract<
+    CharacterImportDocument,
+    { schema: typeof IMPORT_SCHEMA_V6 }
+  >
+
+  type V6DocPartial = Partial<ImportV6Document> & { state?: CharacterState }
+
+  function v6Doc(partial: V6DocPartial = {}): ImportV6Document {
+    const { state: rawState, ...rest } = partial
+    return {
+      schema: IMPORT_SCHEMA_V6,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(
+        rawState ?? createInitialState("integrated", null, null)
+      ) as CharacterImportDocument["state"],
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+      ...rest,
+    } as ImportV6Document
+  }
+
   it("imports a valid v3 backup as a new imported character owned by the importer", async () => {
     seedRaceClass()
     addImportCatalog(
@@ -7893,6 +7932,8 @@ describe("importCharacter (trusted backup v3)", () => {
       track: "class",
       level: 1,
       choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
       selectedDefinitionId: null,
       offeredAt: new Date("2026-01-01T00:00:00.000Z"),
       selectedAt: null,
@@ -7923,6 +7964,8 @@ describe("importCharacter (trusted backup v3)", () => {
       track: "class",
       level: 2,
       choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
       selectedDefinitionId: null,
       offeredAt: new Date("2026-01-02T00:00:00.000Z"),
       selectedAt: null,
@@ -7956,6 +7999,93 @@ describe("importCharacter (trusted backup v3)", () => {
     const imported = await importCharacter(doc, user)
     const levelOne = imported.skillOffers.find((o) => o.level === 1)
     expect(levelOne?.selectedDefinitionId).toBe("skill-1")
+  })
+
+  // A supplied skill-offer `canceledAt` must be a real timestamp. An invalid value
+  // is rejected with 400 invalid_import BEFORE any write - it is never silently
+  // restamped to "now", so a canceled offer's cancellation instant is preserved.
+  it.each(["not-a-date", ""])(
+    "rejects a v6 backup with an invalid skill-offer canceledAt %j (no write)",
+    async (bad) => {
+      seedRaceClass()
+      const doc = v6Doc({
+        skillOffers: [
+          {
+            track: "class",
+            level: 1,
+            choiceGroup: "standard",
+            generation: 0,
+            canceledAt: bad,
+            options: [],
+          },
+        ],
+      })
+      await expect(importCharacter(doc, user)).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_import",
+      })
+      expect(dbMock.store.characters.size).toBe(0)
+      expect(dbMock.store.skillOffers).toHaveLength(0)
+    }
+  )
+
+  it("rejects a legacy v3 backup with an invalid skill-offer canceledAt (no write)", async () => {
+    seedRaceClass()
+    const doc = importDoc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          canceledAt: "not-a-date",
+          options: [],
+        },
+      ],
+    })
+    await expect(importCharacter(doc, user)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+  })
+
+  it("preserves a canceled offer's exact ISO canceledAt through v6 import and re-export", async () => {
+    seedRaceClass()
+    addImportCatalog("skills", "skill-1", {}, { name: "Skill One" })
+    const canceledAt = new Date("2026-03-03T12:00:00.000Z")
+    const doc = v6Doc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          generation: 1,
+          canceledAt: canceledAt.toISOString(),
+          offeredAt: "2026-03-03T00:00:00.000Z",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      ],
+    })
+    const imported = await importCharacter(doc, user)
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.characterId === imported.id
+    )
+    expect(stored?.canceledAt?.getTime()).toBe(canceledAt.getTime())
+    // Re-export reproduces the exact original ISO instant (never a "now" restamp).
+    const reexported = (await exportCharacter(
+      imported.id,
+      user
+    )) as unknown as CharacterImportDocument
+    expect(
+      (reexported.skillOffers[0] as { canceledAt: string | null }).canceledAt
+    ).toBe(canceledAt.toISOString())
   })
 
   it("rejects a state missing the required class track", async () => {
@@ -8644,7 +8774,7 @@ describe("importCharacter (trusted backup v3)", () => {
         "chr-r",
         user
       )) as CharacterImportDocument
-      expect(portable.schema).toBe("primal-character/5")
+      expect(portable.schema).toBe("primal-character/6")
       const inv = (portable as { inventory: Array<{ quantity: number }> })
         .inventory
       expect(inv).toHaveLength(2)
@@ -8964,7 +9094,7 @@ describe("importCharacter (trusted backup v3)", () => {
       "chr-nr",
       user
     )) as CharacterImportDocument
-    expect(portable.schema).toBe("primal-character/5")
+    expect(portable.schema).toBe("primal-character/6")
 
     // A real wire round-trip. JSON.stringify drops undefined values, which is what
     // used to delete equipmentPosition from a non-ring link and make the strict v5
@@ -10082,6 +10212,8 @@ describe("skill offers (milestone choice model)", () => {
       track?: string
       level?: number
       choiceGroup?: string
+      generation?: number
+      canceledAt?: Date | null
       options: Array<{
         definitionId: string
         nameSnapshot?: string
@@ -10097,6 +10229,8 @@ describe("skill offers (milestone choice model)", () => {
       track: opts.track ?? "class",
       level: opts.level ?? 4,
       choiceGroup: opts.choiceGroup ?? "standard",
+      generation: opts.generation ?? 0,
+      canceledAt: opts.canceledAt ?? null,
       selectedDefinitionId: opts.selectedDefinitionId ?? null,
       offeredAt: new Date(),
       selectedAt: opts.selectedDefinitionId ? new Date() : null,
@@ -10587,6 +10721,70 @@ describe("skill offers (milestone choice model)", () => {
       user
     )
     expect(res.character.skillOffers).toHaveLength(0)
+  })
+
+  it("rejects selecting a canceled offer (409 offer_canceled)", async () => {
+    seedCharacterForSkill(0, 0)
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    // An offer that was voided (e.g. by an EXP undo) is no longer selectable.
+    seedOffer("off-canceled", {
+      options: [{ definitionId: "sk-1" }],
+      canceledAt: new Date(),
+    })
+    await expect(
+      skillCharacter(
+        "chr-1",
+        {
+          operation: "select",
+          offerId: "off-canceled",
+          definitionId: "sk-1",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "offer_canceled" })
+    // The rejection wrote nothing.
+    expect(dbMock.store.associations).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("re-offers at the next generation after a cancellation, preserving the canceled record", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(3, 3)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [{ phase: "flat", amount: { strength: 1 } }],
+    })
+    // A prior offer sharing the base key was canceled. It must not block a
+    // re-offer, and it must never be deleted or rewritten (append-only).
+    seedOffer("off-canceled", {
+      level: 4,
+      canceledAt: new Date(),
+      generation: 0,
+      options: [{ definitionId: "sk-1" }],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    // Both the preserved canceled record and the new generation exist.
+    expect(dbMock.store.skillOffers).toHaveLength(2)
+    const canceled = dbMock.store.skillOffers.find(
+      (o) => o.id === "off-canceled"
+    )!
+    expect(canceled.canceledAt).toBeInstanceOf(Date)
+    expect(canceled.generation).toBe(0)
+    // The re-offer is created at the next generation and is actable.
+    const reoffer = res.character.skillOffers.find(
+      (o) => o.id !== "off-canceled"
+    )!
+    expect(reoffer.generation).toBe(1)
+    expect(reoffer.canceledAt).toBeNull()
+    const stored = dbMock.store.skillOffers.find((o) => o.id === reoffer.id)!
+    expect(stored.generation).toBe(1)
+    expect(stored.canceledAt).toBeNull()
   })
 })
 
@@ -11215,6 +11413,8 @@ describe("skill rarity monotonic guard (select/grant)", () => {
       track: "class",
       level: 4,
       choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
       selectedDefinitionId: null,
       offeredAt: new Date(),
       selectedAt: null,
@@ -13520,5 +13720,1442 @@ describe("character detail grade-description exposure (owner-authorized detail)"
     const detail = await getCharacter("chr-1", user)
     const skill = detail.associations.find((a) => a.definitionId === "sk-3")!
     expect(skill.gradeDescription).toBe("Beam-F prose")
+  })
+})
+
+describe("character list-item race grade / level / configured band", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedListCharacter(
+    raceGrade: Grade,
+    raceLevel: number,
+    overrides: Record<string, unknown> = {}
+  ): void {
+    const state = createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks: {},
+      race: { level: raceLevel, grade: raceGrade, mode: "derived" },
+    })
+    dbMock.store.addCharacter({
+      id: "chr-list",
+      ownerId: user.id,
+      name: "List Grade",
+      state: serializeState(state),
+      ...overrides,
+    })
+  }
+
+  function charFixture(
+    state: CharacterState
+  ): Parameters<typeof toListItem>[0] {
+    return {
+      id: "chr-fixture",
+      ownerId: user.id,
+      name: "Fixture",
+      description: null,
+      nickname: null,
+      pronouns: null,
+      ageDescription: null,
+      appearance: null,
+      biography: null,
+      notes: null,
+      origin: "integrated",
+      raceId: null,
+      classId: null,
+      professionId: null,
+      state: serializeState(state),
+      version: 0,
+      archived: false,
+      imported: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      race: null,
+      class: null,
+      profession: null,
+      associations: [],
+      inventory: [],
+      skillOffers: [],
+    } as Parameters<typeof toListItem>[0]
+  }
+
+  it("uses the stored race grade for the G/F overlap, never gradeForLevel", async () => {
+    // A G-origin integrated race whose stored grade is G but whose level (12) would
+    // make `gradeForLevel` derive F (F entry level is 10). The authoritative grade
+    // and its configured band must come from the stored state, not the level.
+    seedListCharacter("G", 12)
+    const items = await listCharacters(user)
+    expect(items).toHaveLength(1)
+    expect(items[0].raceGrade).toBe("G")
+    expect(items[0].raceLevel).toBe(12)
+    expect(items[0].raceGradeBand).toEqual({ min: 0, max: 9 })
+  })
+
+  it("exposes a born high-grade race at level 0 as-is, outside its band", async () => {
+    seedListCharacter("B", 0)
+    const items = await listCharacters(user)
+    expect(items).toHaveLength(1)
+    expect(items[0].raceGrade).toBe("B")
+    expect(items[0].raceLevel).toBe(0)
+    // B band is 350..499; a level-0 born B sits outside it, but the band is
+    // exposed as-is (the starting grade is provenance driven, not level driven).
+    expect(items[0].raceGradeBand).toEqual({ min: 350, max: 499 })
+  })
+
+  it("returns identical grade fields for archived / withStatus / noStatus reads", async () => {
+    seedListCharacter("E", 30, { archived: true })
+    const noStatus = await listCharacters(user, { includeArchived: true })
+    expect(noStatus).toHaveLength(1)
+    expect(noStatus[0].raceGrade).toBe("E")
+    expect(noStatus[0].raceLevel).toBe(30)
+    expect(noStatus[0].raceGradeBand).toEqual({ min: 25, max: 99 })
+
+    const withStatus = await listCharacters(user, {
+      withStatus: true,
+      includeArchived: true,
+    })
+    expect(withStatus).toHaveLength(1)
+    expect(withStatus[0].raceGrade).toBe("E")
+    expect(withStatus[0].raceLevel).toBe(30)
+    expect(withStatus[0].raceGradeBand).toEqual({ min: 25, max: 99 })
+  })
+
+  it("maps a custom configured grade-table band for the grade", () => {
+    const config = defaultRulesConfig()
+    config.gradeTable = [
+      { grade: "G", min: 0, max: 9, entryLevel: 0 },
+      { grade: "F", min: 0, max: 24, entryLevel: 10 },
+      { grade: "B", min: 300, max: 449, entryLevel: 300 },
+    ]
+    const state = createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks: {},
+      race: { level: 0, grade: "B", mode: "derived" },
+    })
+    const item = toListItem(charFixture(state), false, config, 7, state)
+    expect(item.raceGrade).toBe("B")
+    expect(item.raceLevel).toBe(0)
+    expect(item.raceGradeBand).toEqual({ min: 300, max: 449 })
+  })
+
+  it("reads a null grade band when the grade has no configured band", () => {
+    const config = defaultRulesConfig()
+    config.gradeTable = [
+      { grade: "G", min: 0, max: 9, entryLevel: 0 },
+      { grade: "F", min: 0, max: 24, entryLevel: 10 },
+    ]
+    const state = createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks: {},
+      race: { level: 0, grade: "B", mode: "derived" },
+    })
+    const item = toListItem(charFixture(state), false, config, 7, state)
+    expect(item.raceGrade).toBe("B")
+    expect(item.raceLevel).toBe(0)
+    expect(item.raceGradeBand).toBeNull()
+  })
+})
+
+describe("experienceCharacter (authoritative EXP percent)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedClassCatalog() {
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      grade: "F",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  function seedHumanRace() {
+    dbMock.store.addCatalog({
+      id: "race-e",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedMonsterRace() {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedSkill(id: string, config: Record<string, unknown>) {
+    dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: `Skill ${id}`,
+      config,
+    })
+  }
+
+  // A derived (enlightened) human class state, legacy by default (no explicit
+  // experiencePercent unless provided). The race level is kept consistent with the
+  // class level under the floorHalfAvg derivation (class + profession, halved), so
+  // the level-up undo's derived-race sanity check passes.
+  function classState(
+    level: number,
+    quarter: number,
+    percent: number | undefined,
+    grade: Grade = "F",
+    turn = 0
+  ): unknown {
+    const state = createInitialState("integrated", null, null)
+    state.tracks.class = {
+      level,
+      quarter,
+      definitionId: "archer:F",
+      grade,
+      ...(percent != null ? { experiencePercent: percent } : {}),
+    }
+    state.race.level = Math.floor(level / 2)
+    state.turn = turn
+    return serializeState(state)
+  }
+
+  function monsterState(
+    level: number,
+    quarter: number,
+    percent: number | undefined
+  ): unknown {
+    const state = createInitialState("born", null, null)
+    state.race = {
+      level,
+      quarter,
+      grade: "F",
+      mode: "independent",
+      origin: "born",
+      ...(percent != null ? { experiencePercent: percent } : {}),
+    }
+    state.tracks = {}
+    return serializeState(state)
+  }
+
+  function seedCharacter(
+    state: unknown,
+    overrides: Partial<Record<string, unknown>> = {}
+  ): unknown {
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      classId: "cls-1",
+      state,
+      version: 0,
+      ...(overrides as Record<string, unknown>),
+    })
+  }
+
+  function experienceEvents(): Array<{ kind: string }> {
+    return dbMock.store.events.filter((e) => e.kind !== "create")
+  }
+
+  function seedOffer(
+    id: string,
+    opts: {
+      track?: string
+      level?: number
+      choiceGroup?: string
+      canceledAt?: Date | null
+      selectedDefinitionId?: string | null
+      options: Array<{ definitionId: string }>
+    }
+  ): void {
+    dbMock.store.skillOffers.push({
+      id,
+      characterId: "chr-1",
+      track: opts.track ?? "class",
+      level: opts.level ?? 4,
+      choiceGroup: opts.choiceGroup ?? "standard",
+      generation: 0,
+      canceledAt: opts.canceledAt ?? null,
+      selectedDefinitionId: opts.selectedDefinitionId ?? null,
+      offeredAt: new Date(),
+      selectedAt: opts.selectedDefinitionId ? new Date() : null,
+    })
+    for (const o of opts.options) {
+      dbMock.store.skillOfferOptions.push({
+        id: `opt-${id}-${o.definitionId}`,
+        offerId: id,
+        definitionId: o.definitionId,
+        nameSnapshot: `Skill ${o.definitionId}`,
+        configSnapshot: {},
+      })
+    }
+  }
+
+  it("advances the turn when a forward set crosses a quarter boundary (24->25)", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    const created = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-e",
+        classId: "cls-1",
+      },
+      user
+    )
+    // Settle 24% first (same quarter, no turn change).
+    const a = await experienceCharacter(
+      created.id,
+      { operation: "set", track: "class", percent: 24, version: 0 },
+      user
+    )
+    const aState = a.character.state as CharacterState
+    expect(aState.tracks.class.experiencePercent).toBe(24)
+    expect(aState.tracks.class.quarter).toBe(0)
+    expect(aState.turn).toBe(0)
+    expect((a.journal as { turnsAdvanced: number }).turnsAdvanced).toBe(0)
+
+    // Cross the 24->25 quarter boundary: exactly one advance, one turn.
+    const b = await experienceCharacter(
+      created.id,
+      {
+        operation: "set",
+        track: "class",
+        percent: 25,
+        version: a.character.version,
+      },
+      user
+    )
+    const bState = b.character.state as CharacterState
+    expect(bState.tracks.class.experiencePercent).toBe(25)
+    expect(bState.tracks.class.quarter).toBe(1)
+    expect(bState.turn).toBe(1)
+    expect((b.journal as { turnsAdvanced: number }).turnsAdvanced).toBe(1)
+
+    const events = experienceEvents()
+    expect(events).toHaveLength(2)
+    expect(events[0].kind).toBe("experience_set")
+    expect(events[1].kind).toBe("experience_set")
+  })
+
+  it("levels up on a 75->100 set, snapshots the award and generates offers once", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
+    })
+    const res = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const journal = res.journal as {
+      leveledUp: boolean
+      levelAfter: number
+      award?: unknown
+      characterVersionAfter?: number
+    }
+    expect(journal.leveledUp).toBe(true)
+    expect(journal.levelAfter).toBe(4)
+    expect(journal.award).toBeDefined()
+    expect(journal.characterVersionAfter).toBe(1)
+    expect(res.character.version).toBe(1)
+    // Exactly one offer, at the new level.
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    expect(dbMock.store.skillOffers[0].level).toBe(4)
+    expect(experienceEvents()).toHaveLength(1)
+    expect(dbMock.store.events[0].kind).toBe("advance")
+  })
+
+  it("crosses three turns when leveling from 40", async () => {
+    seedClassCatalog()
+    seedCharacter(classState(0, 1, 40))
+    const res = await experienceCharacter(
+      "chr-1",
+      { operation: "levelUp", track: "class", version: 0 },
+      user
+    )
+    const journal = res.journal as {
+      turnsAdvanced: number
+      leveledUp: boolean
+      levelAfter: number
+    }
+    expect(journal.turnsAdvanced).toBe(3)
+    expect(journal.leveledUp).toBe(true)
+    expect(journal.levelAfter).toBe(1)
+    expect(experienceEvents()).toHaveLength(1)
+    expect(dbMock.store.events[0].kind).toBe("advance")
+  })
+
+  it("does not rewind the turn on a backward set", async () => {
+    seedClassCatalog()
+    seedCharacter(classState(2, 3, 75, "F", 3))
+    const res = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 25, version: 0 },
+      user
+    )
+    const state = res.character.state as CharacterState
+    expect(state.turn).toBe(3)
+    expect(state.tracks.class.experiencePercent).toBe(25)
+    expect(state.tracks.class.quarter).toBe(1)
+    // The level and its snapshotted awards are never revoked.
+    expect(state.tracks.class.level).toBe(2)
+    expect((res.journal as { turnsAdvanced: number }).turnsAdvanced).toBe(0)
+    expect(experienceEvents()).toHaveLength(1)
+    expect(dbMock.store.events[0].kind).toBe("experience_set")
+  })
+
+  it("settles an independent (monster) race on the race track", async () => {
+    seedMonsterRace()
+    seedCharacter(monsterState(0, 0, undefined), {
+      classId: null,
+      raceId: "race-m",
+    })
+    const res = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "race", percent: 50, version: 0 },
+      user
+    )
+    const state = res.character.state as CharacterState
+    expect(state.race.experiencePercent).toBe(50)
+    expect(state.race.quarter).toBe(2)
+    expect(state.turn).toBe(2)
+    expect((res.journal as { turnsAdvanced: number }).turnsAdvanced).toBe(2)
+    expect(experienceEvents()).toHaveLength(1)
+    expect(dbMock.store.events[0].kind).toBe("experience_set")
+  })
+
+  it("rejects class/profession tracks on a monster (race-only)", async () => {
+    seedMonsterRace()
+    seedCharacter(monsterState(0, 0, undefined), {
+      classId: null,
+      raceId: "race-m",
+    })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "set", track: "class", percent: 25, version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_track" })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "levelUp", track: "profession", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_track" })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects the race track on a derived (enlightened) race", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(0, 0, 0), { raceId: "race-e" })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "set", track: "race", percent: 25, version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_track" })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a no-op set with experience_unchanged and no event/version bump", async () => {
+    seedClassCatalog()
+    seedCharacter(classState(0, 1, 25))
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "set", track: "class", percent: 25, version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "experience_unchanged" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a stale version with 409 and writes no event (CAS)", async () => {
+    seedClassCatalog()
+    seedCharacter(classState(0, 0, 0))
+    const results = await Promise.allSettled([
+      experienceCharacter(
+        "chr-1",
+        { operation: "set", track: "class", percent: 25, version: 0 },
+        user
+      ),
+      experienceCharacter(
+        "chr-1",
+        { operation: "set", track: "class", percent: 50, version: 0 },
+        user
+      ),
+    ])
+    const fulfilled = results.filter((r) => r.status === "fulfilled")
+    const rejected = results.filter((r) => r.status === "rejected")
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    const reason = (rejected[0] as PromiseRejectedResult).reason as {
+      status?: number
+      code?: string
+    }
+    expect(reason).toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("maps a serialization failure (P2034) on experience to 409 serialization_conflict and rolls back", async () => {
+    seedClassCatalog()
+    seedCharacter(classState(0, 0, 0))
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        experienceCharacter(
+          "chr-1",
+          { operation: "set", track: "class", percent: 25, version: 0 },
+          user
+        )
+      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rolls back state/turn/offers/event on a closed grade gate (400 grade_blocked)", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 22,
+      effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
+    })
+    const state = createInitialState("integrated", null, null)
+    state.tracks.class = {
+      level: 21,
+      quarter: 3,
+      definitionId: "archer:F",
+      grade: "F",
+      experiencePercent: 75,
+    }
+    state.race.level = 10
+    state.turn = 3
+    seedCharacter(serializeState(state), { raceId: "race-e" })
+
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "set", track: "class", percent: 100, version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "grade_blocked" })
+
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+    const st = deserializeState(fresh.state) as CharacterState
+    expect(st.turn).toBe(3)
+    expect(st.tracks.class.level).toBe(21)
+    expect(st.tracks.class.quarter).toBe(3)
+  })
+
+  it("maps the class track grade gate to 400 grade_blocked (not a 500) and writes nothing", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    // Class grade F levels 25 -> 26 on the 75 -> 100 set. F's next grade is E
+    // (entryLevel 25), so 26 pushes PAST the threshold: the independent
+    // class/profession TRACK gate (not the race gate) must reject as 400
+    // grade_blocked, never leak as a 500.
+    const state = createInitialState("integrated", null, null)
+    state.tracks.class = {
+      level: 25,
+      quarter: 3,
+      definitionId: "archer:F",
+      grade: "F",
+      experiencePercent: 75,
+    }
+    state.race.level = 10
+    state.turn = 3
+    seedCharacter(serializeState(state), { raceId: "race-e" })
+
+    const err = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    ).catch((e) => e)
+    expect(err).toMatchObject({ status: 400, code: "grade_blocked" })
+    expect((err as Error).message).toContain(
+      "without completed track evolution"
+    )
+
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+    const st = deserializeState(fresh.state) as CharacterState
+    expect(st.turn).toBe(3)
+    expect(st.tracks.class.level).toBe(25)
+    expect(st.tracks.class.quarter).toBe(3)
+  })
+
+  it("maps the profession track grade gate to 400 grade_blocked (not a 500) and writes nothing", async () => {
+    seedHumanRace()
+    dbMock.store.addCatalog({
+      id: "prof-1",
+      kind: "professions",
+      stableId: "alchemist",
+      name: "Alchemist",
+      config: { grades: { F: { fixed: { intelligence: 1 }, free: 1 } } },
+    })
+    // Profession grade F levels 25 -> 26 on the 75 -> 100 set. F's next grade is
+    // E (entryLevel 25), so 26 pushes PAST the threshold: the independent
+    // profession TRACK gate must reject as 400 grade_blocked.
+    const state = createInitialState("integrated", null, null)
+    state.tracks.profession = {
+      level: 25,
+      quarter: 3,
+      definitionId: "alchemist:F",
+      grade: "F",
+      experiencePercent: 75,
+    }
+    state.race.level = 10
+    state.turn = 3
+    seedCharacter(serializeState(state), {
+      raceId: "race-e",
+      classId: null,
+      professionId: "prof-1",
+    })
+
+    const err = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "profession", percent: 100, version: 0 },
+      user
+    ).catch((e) => e)
+    expect(err).toMatchObject({ status: 400, code: "grade_blocked" })
+    expect((err as Error).message).toContain(
+      "without completed track evolution"
+    )
+
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+    const st = deserializeState(fresh.state) as CharacterState
+    expect(st.turn).toBe(3)
+    expect(st.tracks.profession.level).toBe(25)
+    expect(st.tracks.profession.quarter).toBe(3)
+  })
+
+  it("legacy /advance synchronizes experiencePercent to quarter*25 and records characterVersionAfter", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    const created = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-e",
+        classId: "cls-1",
+      },
+      user
+    )
+    const before = created.state as CharacterState
+    // The legacy class track carries no explicit experiencePercent.
+    expect(before.tracks.class.experiencePercent).toBeUndefined()
+
+    const res = await advanceCharacter(
+      created.id,
+      { track: "class", version: 0 },
+      user
+    )
+    const state = res.character.state as CharacterState
+    expect(state.tracks.class.quarter).toBe(1)
+    // The engine synchronizes the authoritative percent to the quarter boundary.
+    expect(state.tracks.class.experiencePercent).toBe(25)
+    expect(state.tracks.class.experiencePercent).toBe(
+      state.tracks.class.quarter * 25
+    )
+
+    // The advance event payload carries the post-commit version for deterministic
+    // undo. (events[0] is the create event; events[1] is the advance.)
+    const advancePayload = dbMock.store.events[1].payload as {
+      journal: { characterVersionAfter?: number }
+    }
+    expect(advancePayload.journal.characterVersionAfter).toBe(1)
+  })
+
+  // ------------------------------------------------------------------ //
+  // Level-up undo (operation: "undo")
+  // ------------------------------------------------------------------ //
+
+  it("undoes the most recent class level-up (75->100) and restores the prior EXP", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const leveledState = leveled.character.state as CharacterState
+    expect(leveledState.tracks.class.level).toBe(4)
+    expect(leveledState.tracks.class.quarter).toBe(0)
+    expect(leveledState.tracks.class.experiencePercent).toBe(0)
+
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(state.tracks.class.level).toBe(3)
+    expect(state.tracks.class.quarter).toBe(3)
+    expect(state.tracks.class.experiencePercent).toBe(75)
+    // The derived race level is restored, not left elevated.
+    expect(state.race.level).toBe(1)
+    // The turn was advanced by the level-up and is never rewound by the undo.
+    expect(state.turn).toBe(leveledState.turn)
+    const journal = undone.journal as {
+      leveledUp: boolean
+      undone: boolean
+      levelAfter: number
+      percentAfter: number
+      raceLevelAfter: number
+    }
+    expect(journal.leveledUp).toBe(false)
+    expect(journal.undone).toBe(true)
+    expect(journal.levelAfter).toBe(3)
+    expect(journal.percentAfter).toBe(75)
+    expect(journal.raceLevelAfter).toBe(1)
+  })
+
+  it("undoes the most recent race level-up on a monster and restores the prior quarter/percent", async () => {
+    seedMonsterRace()
+    seedCharacter(monsterState(0, 3, undefined), {
+      classId: null,
+      raceId: "race-m",
+    })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "levelUp", track: "race", version: 0 },
+      user
+    )
+    const leveledState = leveled.character.state as CharacterState
+    expect(leveledState.race.level).toBe(1)
+
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "race", version: leveled.character.version },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(state.race.level).toBe(0)
+    expect(state.race.quarter).toBe(3)
+    expect(state.race.experiencePercent).toBe(75)
+    expect(state.turn).toBe(leveledState.turn)
+    const journal = undone.journal as { undone: boolean; levelAfter: number }
+    expect(journal.undone).toBe(true)
+    expect(journal.levelAfter).toBe(0)
+  })
+
+  it("restores the prior EXP (40%) when undoing a level-up that was submitted from 40", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(0, 1, 40), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "levelUp", track: "class", version: 0 },
+      user
+    )
+    expect((leveled.character.state as CharacterState).tracks.class.level).toBe(
+      1
+    )
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(state.tracks.class.level).toBe(0)
+    expect(state.tracks.class.quarter).toBe(1)
+    expect(state.tracks.class.experiencePercent).toBe(40)
+  })
+
+  it("restores prior EXP from quarterBefore*25 (75) for a legacy /advance with no percentBefore", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(0, 3, undefined), { raceId: "race-e" })
+    const advanced = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    const advancedState = advanced.character.state as CharacterState
+    expect(advancedState.tracks.class.level).toBe(1)
+    expect(advancedState.tracks.class.experiencePercent).toBe(0)
+    const undone = await experienceCharacter(
+      "chr-1",
+      {
+        operation: "undo",
+        track: "class",
+        version: advanced.character.version,
+      },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(state.tracks.class.level).toBe(0)
+    expect(state.tracks.class.quarter).toBe(3)
+    expect(state.tracks.class.experiencePercent).toBe(75)
+  })
+
+  it("removes the derived race award (and the class award) when undoing a level-up with a race gain", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const after = leveled.character.state as CharacterState
+    expect(
+      after.historicalLevelAwards.some(
+        (a) => a.track === "class" && a.level === 4
+      )
+    ).toBe(true)
+    expect(
+      after.historicalLevelAwards.some(
+        (a) => a.track === "race" && a.level === 2
+      )
+    ).toBe(true)
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(
+      state.historicalLevelAwards.some(
+        (a) => a.track === "class" && a.level === 4
+      )
+    ).toBe(false)
+    expect(
+      state.historicalLevelAwards.some(
+        (a) => a.track === "race" && a.level === 2
+      )
+    ).toBe(false)
+  })
+
+  it("blocks undo (level_undo_blocked) when the generated skill offer was selected", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
+    })
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    // Simulate an answered offer (direct store mutation keeps the version/event
+    // history untouched so the selected-offer guard is what rejects).
+    dbMock.store.skillOffers[0].selectedDefinitionId = "sk-1"
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "class",
+          version: leveled.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("blocks undo (level_undo_blocked) when the awarded free points were already spent", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    // Spend all the free points awarded by this level-up (1 class + 1 race) so the
+    // undo would leave the character in a free-point deficit.
+    const row = dbMock.store.characters.get("chr-1")!
+    const st = deserializeState(row.state) as CharacterState
+    st.allocations = [
+      {
+        id: "alloc-1",
+        source: "test",
+        at: 0,
+        points: makeVector({ strength: 2 }),
+      },
+    ]
+    row.state = serializeState(st)
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "class",
+          version: leveled.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("blocks undo (level_undo_blocked) after the track definition changed (an evolution)", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    // Simulate a track evolution that changed the definition id without recording a
+    // superseding event: the definition-drift guard must reject.
+    const row = dbMock.store.characters.get("chr-1")!
+    const st = deserializeState(row.state) as CharacterState
+    st.tracks.class.definitionId = "archer:E"
+    row.state = serializeState(st)
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "class",
+          version: leveled.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("blocks undo (level_undo_blocked) after an in-level percent edit moved off the boundary", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    // Move off the level-up boundary (quarter 0 / 0%) without recording an event.
+    const row = dbMock.store.characters.get("chr-1")!
+    const st = deserializeState(row.state) as CharacterState
+    st.tracks.class.quarter = 1
+    st.tracks.class.experiencePercent = 25
+    row.state = serializeState(st)
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "class",
+          version: leveled.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("blocks undo (level_undo_blocked) when a later non-cosmetic event supersedes the level-up", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    dbMock.store.events.push({
+      id: "evt-set-later",
+      characterId: "chr-1",
+      kind: "experience_set",
+      payload: { percent: 50 },
+      createdAt: new Date(Date.now() + 1000),
+    })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "class",
+          version: leveled.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("cancels pending skill offers on undo and re-offers them as the next generation on re-level-up", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
+    })
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const a = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    expect(dbMock.store.skillOffers[0].generation).toBe(0)
+
+    const b = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: a.character.version },
+      user
+    )
+    expect(dbMock.store.skillOffers[0].canceledAt).not.toBeNull()
+    expect(
+      (b.journal as { canceledOfferIds: string[] }).canceledOfferIds
+    ).toContain(dbMock.store.skillOffers[0].id)
+
+    const c = await experienceCharacter(
+      "chr-1",
+      {
+        operation: "set",
+        track: "class",
+        percent: 100,
+        version: b.character.version,
+      },
+      user
+    )
+    void c
+    expect(dbMock.store.skillOffers).toHaveLength(2)
+    const gens = dbMock.store.skillOffers
+      .map((o) => o.generation)
+      .sort((x, y) => x - y)
+    expect(gens).toEqual([0, 1])
+    expect(dbMock.store.skillOffers[1].canceledAt).toBeNull()
+  })
+
+  it("rejects a stale-version undo with 409 version_conflict and writes no level_undo event", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const beforeEvents = dbMock.store.events.length
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "undo", track: "class", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.events).toHaveLength(beforeEvents)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(
+      leveled.character.version
+    )
+  })
+
+  it("maps a serialization failure (P2034) on an undo to 409 serialization_conflict and rolls back", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        experienceCharacter(
+          "chr-1",
+          {
+            operation: "undo",
+            track: "class",
+            version: leveled.character.version,
+          },
+          user
+        )
+      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(
+      leveled.character.version
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("does not treat a later import_history event as authoritative (it neither supersedes nor blocks undo)", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(0, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    dbMock.store.events.push({
+      id: "evt-import-later",
+      characterId: "chr-1",
+      kind: "import_history",
+      payload: { journal: { leveledUp: true, levelAfter: 99 } },
+      createdAt: new Date(Date.now() + 1000),
+    })
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(state.tracks.class.level).toBe(0)
+    expect(state.tracks.class.quarter).toBe(3)
+    expect(state.tracks.class.experiencePercent).toBe(75)
+  })
+
+  it("rejects an undo when only import_history (no live advance) exists", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(1, 0, 0), { raceId: "race-e" })
+    dbMock.store.events.push({
+      id: "evt-import-only",
+      characterId: "chr-1",
+      kind: "import_history",
+      payload: { journal: { leveledUp: true, levelBefore: 0, levelAfter: 1 } },
+      createdAt: new Date(),
+    })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "undo", track: "class", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("blocks undo (level_undo_blocked) when a progression event shares the level-up timestamp", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(1, 0, 0), { raceId: "race-e" })
+    const t = new Date()
+    dbMock.store.events.push({
+      id: "evt-adv",
+      characterId: "chr-1",
+      kind: "advance",
+      payload: {
+        track: "class",
+        journal: {
+          leveledUp: true,
+          levelBefore: 0,
+          levelAfter: 1,
+          quarterBefore: 0,
+          quarterAfter: 0,
+          raceLevelBefore: 0,
+          raceLevelAfter: 0,
+          award: { definitionId: "archer:F", fixed: { agility: 2 }, free: 1 },
+        },
+      },
+      createdAt: t,
+    })
+    dbMock.store.events.push({
+      id: "evt-z",
+      characterId: "chr-1",
+      kind: "experience_set",
+      payload: {},
+      createdAt: t,
+    })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "undo", track: "class", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("leaves the immutable advance event intact and appends a level_undo event", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const advanceId = dbMock.store.events[0].id
+    expect(dbMock.store.events[0].kind).toBe("advance")
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    void undone
+    // The original advance event is untouched.
+    expect(dbMock.store.events.some((e) => e.kind === "advance")).toBe(true)
+    expect(dbMock.store.events).toHaveLength(2)
+    const undoEvt = dbMock.store.events[1]
+    expect(undoEvt.kind).toBe("level_undo")
+    expect(
+      (undoEvt.payload as { originalEventId: string }).originalEventId
+    ).toBe(advanceId)
+    expect(
+      (undoEvt.payload as { journal: { undone: boolean } }).journal.undone
+    ).toBe(true)
+  })
+
+  it("records skillOfferIds as an empty list on a level-up that generates no offers", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    // No skills seeded: the level-up at level 4 generates zero offers.
+    const res = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const journal = res.journal as {
+      skillOfferIds?: string[]
+      leveledUp: boolean
+    }
+    expect(journal.leveledUp).toBe(true)
+    expect(journal.skillOfferIds).toEqual([])
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+  })
+
+  it("leaves a pre-existing unrelated pending offer unchanged on undo when the level-up recorded no offers", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    // No skills seeded, so the level-up generates zero offers and records [].
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    // A pre-existing IMPORTED pending offer at the same track/level, unrelated to
+    // any freshly generated offer, must never be canceled by the undo.
+    seedOffer("off-pre", {
+      level: 4,
+      options: [{ definitionId: "sk-1" }],
+    })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    expect(
+      (leveled.journal as { skillOfferIds: string[] }).skillOfferIds
+    ).toEqual([])
+    await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    // The unrelated pre-existing offer is untouched and still pending.
+    const pre = dbMock.store.skillOffers.find((o) => o.id === "off-pre")!
+    expect(pre.canceledAt).toBeNull()
+  })
+
+  it("cancels an own unselected offer on undo for a legacy no-list level-up event", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    seedOffer("off-own", {
+      level: 4,
+      options: [{ definitionId: "sk-1" }],
+    })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    // Simulate a legacy event that predates skillOfferIds (the field is absent).
+    const advanceEvt = dbMock.store.events.find((e) => e.kind === "advance")!
+    const advanceJournal = (
+      advanceEvt.payload as { journal: Record<string, unknown> }
+    ).journal
+    delete advanceJournal.skillOfferIds
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    void undone
+    // The legacy fallback cancels the own active offer for the track/level.
+    const own = dbMock.store.skillOffers.find((o) => o.id === "off-own")!
+    expect(own.canceledAt).not.toBeNull()
+  })
+
+  it("cancels exactly the recorded skillOfferIds on undo without touching an unrelated offer", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
+    })
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    // An unrelated pending offer in a different choice group at the same level is
+    // NOT one of the offers generated by this level-up, so it must stay.
+    seedOffer("off-other", {
+      level: 4,
+      choiceGroup: "unrelated",
+      options: [{ definitionId: "sk-other" }],
+    })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    const ids = (leveled.journal as { skillOfferIds: string[] }).skillOfferIds
+    expect(ids).toHaveLength(1)
+    const generatedId = ids[0]
+    expect(generatedId).not.toBe("off-other")
+    await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: leveled.character.version },
+      user
+    )
+    // The generated offer (recorded in skillOfferIds) is canceled...
+    const generated = dbMock.store.skillOffers.find(
+      (o) => o.id === generatedId
+    )!
+    expect(generated.canceledAt).not.toBeNull()
+    // ...but the unrelated offer is left pending.
+    const other = dbMock.store.skillOffers.find((o) => o.id === "off-other")!
+    expect(other.canceledAt).toBeNull()
+  })
+
+  it("blocks undo (level_undo_blocked) when a later updateCharacter mutated currentResources", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    // A later profile update that ALSO patches currentResources writes an update
+    // event carrying the resource mutation. That is NOT cosmetic for undo: the
+    // level-up may not be safely reversed while a resource edit has been applied.
+    const updated = await updateCharacter(
+      "chr-1",
+      { currentResources: { mana: 50 }, version: leveled.character.version },
+      user
+    )
+    expect(updated.version).toBe(leveled.character.version + 1)
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        { operation: "undo", track: "class", version: updated.version },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+    // The undo wrote nothing: the level-up state and the merged resources persist.
+    const row = dbMock.store.characters.get("chr-1")!
+    expect(row.version).toBe(updated.version)
+    const st = deserializeState(row.state) as CharacterState
+    expect(st.tracks.class.level).toBe(4)
+    expect(st.currentResources).toEqual({ mana: 50 })
+  })
+
+  it("allows undo after a metadata-only (name) updateCharacter", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    // A name-only update records no `currentResources`, so it is provably
+    // metadata-only and must NOT block the undo.
+    const renamed = await updateCharacter(
+      "chr-1",
+      { name: "Renamed", version: leveled.character.version },
+      user
+    )
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: renamed.version },
+      user
+    )
+    const state = undone.character.state as CharacterState
+    expect(state.tracks.class.level).toBe(3)
+    expect(state.tracks.class.quarter).toBe(3)
+    expect(state.tracks.class.experiencePercent).toBe(75)
+    // The metadata rename is preserved by the undo (it never rewinds the name).
+    expect(undone.character.name).toBe("Renamed")
+  })
+
+  it("blocks undo (level_undo_blocked) for an ambiguous update that cannot prove metadata-only", async () => {
+    seedHumanRace()
+    seedClassCatalog()
+    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    const leveled = await experienceCharacter(
+      "chr-1",
+      { operation: "set", track: "class", percent: 100, version: 0 },
+      user
+    )
+    // A legacy/ambiguous update event whose payload carries `currentResources`
+    // present-but-null cannot prove metadata-only, so the undo must reject rather
+    // than guess that resources were untouched.
+    dbMock.store.events.push({
+      id: "evt-update-ambiguous",
+      characterId: "chr-1",
+      kind: "update",
+      payload: { name: "Renamed", currentResources: null },
+      createdAt: new Date(Date.now() + 1000),
+    })
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "class",
+          version: leveled.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
   })
 })

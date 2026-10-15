@@ -100,7 +100,7 @@ evolution_choice_required`).
   consumables, caps, ...), so numbers are transparent rather than opaque.
 - **Immutable history & trusted-backup export/import**: every progression event is
   written to an append-only journal, and a character (state + live status + skill
-  offers + journal) can be exported as a `primal-character/5` JSON backup keyed by
+  offers + journal) can be exported as a `primal-character/6` JSON backup keyed by
   stable catalog identifiers. A backup can be re-imported (`POST
 /api/characters/import`) as a NEW character owned by the current user; it is a
   trusted-but-unverified backup, so it is marked `imported` in the UI and its
@@ -108,13 +108,17 @@ evolution_choice_required`).
   treated as server-verified. The live status is recomputed from the current
   catalog, catalog references are resolved by `kind` + `stableId` (no catalog
   content is auto-created), and any required definition that is missing, archived,
-  or the wrong kind rejects the whole import. The v5 backup also carries owned
+  or the wrong kind rejects the whole import. The current v6 backup carries owned
   inventory quantities and a `legacyUnowned` marker on equipment associations
-  (grandfathered links may round-trip with zero stock), and a per-link ring
+  (grandfathered links may round-trip with zero stock), a per-link ring
   `equipmentPosition` so a character's two `Ring`-slot rings round-trip their
-  physical positions; the legacy `primal-character/4` and `primal-character/3`
-  backups are still accepted (v4 imports stock, v3 imports none and marks every
-  equipment link grandfathered). No sample characters are created.
+  physical positions, and the append-only skill-offer generation and cancellation
+  state (every exported offer records a `generation` and a nullable `canceledAt`).
+  The v5 backup carried the inventory, `legacyUnowned` marker and ring positions
+  but no such offer-generation/cancellation state; the legacy
+  `primal-character/3` through `primal-character/5` backups are still accepted (v5
+  imports without offer generations, v4 imports stock, and v3 imports none and
+  marks every equipment link grandfathered). No sample characters are created.
 - **Admin-managed catalog**: a polymorphic catalog for all of the kinds above.
   Admins can create and edit entries, attach a source URL, and store per-kind
   `config`. With

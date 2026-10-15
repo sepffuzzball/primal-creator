@@ -111,26 +111,61 @@ export const integerPartialVectorSchema = z.object({
 // Engine CharacterState (mirrors lib/rules/types.ts)
 // ------------------------------------------------------------------ //
 
-const trackStateSchema = z.object({
-  level: z.number().int().nonnegative(),
-  quarter: z.number().int().min(0).max(3),
-  definitionId: z.string(),
-  // Optional explicit class/profession grade state; absent on legacy states. The
-  // engine never infers a grade for a missing field.
-  grade: gradeSchema.optional(),
-})
+const trackStateSchema = z
+  .object({
+    level: z.number().int().nonnegative(),
+    quarter: z.number().int().min(0).max(3),
+    definitionId: z.string(),
+    // Optional explicit class/profession grade state; absent on legacy states. The
+    // engine never infers a grade for a missing field.
+    grade: gradeSchema.optional(),
+    // Authoritative EXP percentage within the current level (0..99). Optional:
+    // legacy states predating explicit EXP tracking omit it. When present the track
+    // is "explicit" and `quarter` must equal floor(experiencePercent / 25).
+    experiencePercent: z.number().int().min(0).max(99).optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.experiencePercent == null) return
+    const expected = Math.floor(data.experiencePercent / 25)
+    if (data.quarter !== expected) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `experiencePercent ${data.experiencePercent} requires quarter ${expected} (got ${data.quarter})`,
+        path: ["quarter"],
+      })
+    }
+  })
 
-const raceStateSchema = z.object({
-  level: z.number().int().nonnegative(),
-  grade: gradeSchema,
-  mode: z.enum(["derived", "independent"]),
-  definitionId: z.string().optional(),
-  // Quarter index within the current race level, present on monsters
-  // (independent race mode) advancing on a four-quarter cadence. Optional so
-  // legacy states that predate race-quarter tracking still deserialize.
-  quarter: z.number().int().min(0).max(3).optional(),
-  origin: z.enum(["integrated", "born"]).optional(),
-})
+const raceStateSchema = z
+  .object({
+    level: z.number().int().nonnegative(),
+    grade: gradeSchema,
+    mode: z.enum(["derived", "independent"]),
+    definitionId: z.string().optional(),
+    // Quarter index within the current race level, present on monsters
+    // (independent race mode) advancing on a four-quarter cadence. Optional so
+    // legacy states that predate race-quarter tracking still deserialize; when
+    // absent the engine treats it as 0.
+    quarter: z.number().int().min(0).max(3).optional(),
+    // Authoritative race-level EXP percentage within the current race level
+    // (0..99), present on independent (monster) races only. Optional: legacy
+    // states and derived (enlightened) races omit it. When present, `quarter`
+    // (defaulting to 0 when absent) must equal floor(experiencePercent / 25).
+    experiencePercent: z.number().int().min(0).max(99).optional(),
+    origin: z.enum(["integrated", "born"]).optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.experiencePercent == null) return
+    const quarter = data.quarter ?? 0
+    const expected = Math.floor(data.experiencePercent / 25)
+    if (quarter !== expected) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `experiencePercent ${data.experiencePercent} requires quarter ${expected} (got ${quarter})`,
+        path: ["quarter"],
+      })
+    }
+  })
 
 const levelAwardSchema = z.object({
   track: z.string(),
@@ -385,6 +420,63 @@ export const advanceSchema = z.object({
   track: z.enum(["class", "profession", "race"]),
   version: z.number().int().nonnegative(),
 })
+
+/**
+ * The authoritative EXP-percent set / instant level-up payload for
+ * `POST /api/characters/[id]/experience`. Discriminated on `operation`:
+ *
+ *   - `operation: "set"` carries a `percent` integer 0..100 and settles the
+ *     authoritative experience percentage of the selected track. A target below
+ *     100 settles the percentage within the current level; a target of 100 is a
+ *     level-up (an instant `levelUp` equivalent).
+ *   - `operation: "levelUp"` carries no `percent` and is exactly
+ *     `setExperiencePercent(..., 100)`: an instant level-up from any percentage.
+ *
+ * Both variants require the CAS `version`. `track` accepts the same three
+ * vocabularies as `/advance`, and the same race-mode validation applies (a race
+ * track is legal only for an independent monster race; a class/profession track is
+ * legal only for an enlightened race).
+ */
+export const experienceSetSchema = z
+  .object({
+    operation: z.literal("set"),
+    track: z.enum(["class", "profession", "race"]),
+    percent: z.number().int().min(0).max(100),
+    version: z.number().int().nonnegative(),
+  })
+  .strict()
+
+export const experienceLevelUpSchema = z
+  .object({
+    operation: z.literal("levelUp"),
+    track: z.enum(["class", "profession", "race"]),
+    version: z.number().int().nonnegative(),
+  })
+  .strict()
+
+/**
+ * The safe-compensating reversal of the latest actual level-up. The client asks
+ * to undo the most recent `advance` level-up on the selected track, carrying only
+ * the CAS `version` - no `percent` (the restored EXP percentage comes entirely from
+ * the immutable journal of the original level-up event, which this operation never
+ * rewrites). The service rejects with 409 `level_undo_blocked` (and writes nothing)
+ * when no safe live level-up exists, when a later non-cosmetic event has superseded
+ * it, or when the current state no longer matches the original level-up's
+ * "after" snapshot. See docs/rules/leveling.md.
+ */
+export const experienceUndoSchema = z
+  .object({
+    operation: z.literal("undo"),
+    track: z.enum(["class", "profession", "race"]),
+    version: z.number().int().nonnegative(),
+  })
+  .strict()
+
+export const experienceSchema = z.discriminatedUnion("operation", [
+  experienceSetSchema,
+  experienceLevelUpSchema,
+  experienceUndoSchema,
+])
 
 export const allocateSchema = z.object({
   allocation: partialVectorSchema,

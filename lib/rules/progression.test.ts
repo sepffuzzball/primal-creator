@@ -7,6 +7,9 @@ import {
   deriveRaceLevel,
   evolveGrade,
   evolveTrackGrade,
+  experiencePercentFor,
+  levelUpFromExperience,
+  setExperiencePercent,
 } from "./progression"
 import { calculateStatus } from "./calculate"
 import { character, config, trackDef } from "./testUtils"
@@ -897,5 +900,287 @@ describe("advanceRaceQuarter (monster race-only cadence)", () => {
       available: true,
     })
     expect(result.state.race.level).toBe(10)
+  })
+})
+
+describe("experiencePercentFor (authoritative EXP percent)", () => {
+  it("returns the explicit percent when present", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 37
+    state.tracks["class"].quarter = 1
+    expect(experiencePercentFor(state, "class")).toBe(37)
+  })
+
+  it("legacy quarter 3 displays 75 via quarter*25 fallback", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].quarter = 3
+    // No explicit experiencePercent is set, so the legacy quarter cadence is used.
+    expect(experiencePercentFor(state, "class")).toBe(75)
+  })
+
+  it("falls back to 0 for a missing race quarter and a missing track", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    expect(experiencePercentFor(state, "race")).toBe(0)
+    expect(experiencePercentFor(state, "bogus")).toBe(0)
+  })
+
+  it("exposes the explicit percent of an independent race", () => {
+    const state = character({
+      classLevel: 1,
+      professionLevel: 1,
+      raceMode: "independent",
+      raceLevel: 0,
+      raceGrade: "F",
+    })
+    state.race.experiencePercent = 50
+    state.race.quarter = 2
+    expect(experiencePercentFor(state, "race")).toBe(50)
+  })
+})
+
+describe("setExperiencePercent (authoritative EXP percent)", () => {
+  function monsterState(
+    overrides: { level?: number; quarter?: number; grade?: Grade } = {}
+  ): CharacterState {
+    return createCharacterState({
+      baseAttributes: zeroVector(),
+      tracks: {},
+      race: {
+        level: overrides.level ?? 0,
+        grade: overrides.grade ?? "F",
+        mode: "independent",
+        quarter: overrides.quarter ?? 0,
+      },
+    })
+  }
+
+  const monsterRaceDef = {
+    id: "monster:F",
+    perLevel: { strength: 2 },
+    freePerLevel: 1,
+  }
+  const monsterCfg = config({ raceDefinitions: { F: monsterRaceDef } })
+
+  it("advances 24% -> 25% with a single turn and no level-up", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 24
+    state.tracks["class"].quarter = 0
+    const result = setExperiencePercent(
+      state,
+      "class",
+      25,
+      trackDef("class-def", { strength: 1 }, 0),
+      config()
+    )
+    expect(result.journal.turnsAdvanced).toBe(1)
+    expect(result.journal.leveledUp).toBe(false)
+    expect(result.state.turn).toBe(state.turn + 1)
+    expect(result.state.tracks["class"].experiencePercent).toBe(25)
+    expect(result.state.tracks["class"].quarter).toBe(1)
+    expect(result.state.tracks["class"].level).toBe(1)
+  })
+
+  it("levels up exactly once from 75% -> 100% and awards once", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 75
+    state.tracks["class"].quarter = 3
+    const result = setExperiencePercent(
+      state,
+      "class",
+      100,
+      trackDef("class-def", { strength: 3, agility: 2 }, 5),
+      config()
+    )
+    expect(result.journal.turnsAdvanced).toBe(1)
+    expect(result.journal.leveledUp).toBe(true)
+    expect(result.state.turn).toBe(state.turn + 1)
+    expect(result.state.tracks["class"].level).toBe(2)
+    expect(result.state.tracks["class"].experiencePercent).toBe(0)
+    expect(result.state.tracks["class"].quarter).toBe(0)
+    expect(result.state.historicalLevelAwards).toHaveLength(1)
+    expect(result.state.historicalLevelAwards[0].track).toBe("class")
+    expect(result.state.historicalLevelAwards[0].fixed.strength).toBe(3)
+    expect(result.state.historicalLevelAwards[0].free).toBe(5)
+  })
+
+  it("ticks exactly 3 turns from 40% -> 100% (crossing 50/75/100)", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 40
+    state.tracks["class"].quarter = 1
+    const result = setExperiencePercent(
+      state,
+      "class",
+      100,
+      trackDef("class-def", { strength: 3, agility: 2 }, 5),
+      config()
+    )
+    expect(result.journal.turnsAdvanced).toBe(3)
+    expect(result.state.turn).toBe(state.turn + 3)
+    expect(result.state.tracks["class"].level).toBe(2)
+    expect(result.state.tracks["class"].experiencePercent).toBe(0)
+    expect(result.state.tracks["class"].quarter).toBe(0)
+  })
+
+  it("aggregates the journal across a 0->100 level-up (initial before values retained)", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    const result = setExperiencePercent(
+      state,
+      "class",
+      100,
+      trackDef("class-def", { strength: 3, agility: 2 }, 5),
+      config()
+    )
+    const j = result.journal
+    // The journal must describe the WHOLE operation, not the last 25% step.
+    expect(j.levelBefore).toBe(1)
+    expect(j.quarterBefore).toBe(0)
+    expect(j.raceLevelBefore).toBe(state.race.level)
+    expect(j.turnsAdvanced).toBe(4)
+    expect(j.percentBefore).toBe(0)
+    expect(j.percentAfter).toBe(0)
+    // Final after / award / offer values are retained from the last engine step.
+    expect(j.leveledUp).toBe(true)
+    expect(j.levelAfter).toBe(2)
+    expect(j.quarterAfter).toBe(0)
+    expect(j.raceLevelAfter).toBe(j.raceLevelBefore)
+    expect(j.award).toBeDefined()
+    expect(j.award?.definitionId).toBe("class-def")
+    expect(j.levelAfter).toBeGreaterThan(j.levelBefore)
+  })
+
+  it("aggregates the journal across a 40->100 level-up (initial before values retained)", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 40
+    state.tracks["class"].quarter = 1
+    const result = setExperiencePercent(
+      state,
+      "class",
+      100,
+      trackDef("class-def", { strength: 3, agility: 2 }, 5),
+      config()
+    )
+    const j = result.journal
+    // The journal must describe the WHOLE operation, not the last 25% step.
+    expect(j.levelBefore).toBe(1)
+    expect(j.quarterBefore).toBe(1)
+    expect(j.raceLevelBefore).toBe(state.race.level)
+    expect(j.turnsAdvanced).toBe(3)
+    expect(j.percentBefore).toBe(40)
+    expect(j.percentAfter).toBe(0)
+    // Final after / award / offer values are retained from the last engine step.
+    expect(j.leveledUp).toBe(true)
+    expect(j.levelAfter).toBe(2)
+    expect(j.quarterAfter).toBe(0)
+    expect(j.award).toBeDefined()
+    expect(j.award?.definitionId).toBe("class-def")
+    expect(j.levelAfter).toBeGreaterThan(j.levelBefore)
+  })
+
+  it("lowers 70% -> 10% (quarter 0) without advancing the turn or revoking awards", () => {
+    const state = character({ classLevel: 5, professionLevel: 5 })
+    state.tracks["class"].experiencePercent = 70
+    state.tracks["class"].quarter = 2
+    const def = trackDef("class-def", { strength: 1 }, 0)
+    const result = setExperiencePercent(state, "class", 10, def, config())
+    expect(result.journal.turnsAdvanced).toBe(0)
+    expect(result.journal.leveledUp).toBe(false)
+    expect(result.state.turn).toBe(state.turn)
+    expect(result.state.tracks["class"].experiencePercent).toBe(10)
+    expect(result.state.tracks["class"].quarter).toBe(0)
+    expect(result.journal.levelBefore).toBe(5)
+    expect(result.journal.levelAfter).toBe(5)
+    // Awards are never revoked by a backward set.
+    expect(result.state.historicalLevelAwards).toEqual(
+      state.historicalLevelAwards
+    )
+  })
+
+  it("is a no-op (no turn change) when target equals current", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 25
+    state.tracks["class"].quarter = 1
+    const result = setExperiencePercent(
+      state,
+      "class",
+      25,
+      trackDef("class-def", { strength: 1 }, 0),
+      config()
+    )
+    expect(result.journal.turnsAdvanced).toBe(0)
+    expect(result.state).toBe(state)
+    expect(result.state.turn).toBe(state.turn)
+  })
+
+  it("sets EXP percent on an independent (monster) race, and rejects a derived race", () => {
+    const state = monsterState({ grade: "F" })
+    const result = setExperiencePercent(
+      state,
+      "race",
+      25,
+      monsterRaceDef,
+      monsterCfg
+    )
+    expect(result.state.race.experiencePercent).toBe(25)
+    expect(result.state.race.quarter).toBe(1)
+    expect(result.state.turn).toBe(1)
+    expect(result.journal.turnsAdvanced).toBe(1)
+
+    const derived = character({ classLevel: 1, professionLevel: 1 })
+    expect(() =>
+      setExperiencePercent(derived, "race", 25, monsterRaceDef, monsterCfg)
+    ).toThrow(/independent race mode/)
+  })
+
+  it("fails atomically (no partial state) when a 100% level-up would push past a closed grade gate", () => {
+    // Monster at grade F, level 25, quarter 3 (75%): the next level-up pushes to
+    // 26, past E's entry (25), while still grade F => advanceRaceQuarter throws.
+    const state = monsterState({ grade: "F", level: 25, quarter: 3 })
+    expect(() =>
+      setExperiencePercent(state, "race", 100, monsterRaceDef, monsterCfg)
+    ).toThrow(/past the F->E threshold/)
+    // The input state is untouched (the engine is pure).
+    expect(state.race.level).toBe(25)
+    expect(state.race.quarter).toBe(3)
+  })
+
+  it("snapshots the level award immutably when leveling via EXP percent", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 75
+    state.tracks["class"].quarter = 3
+    const def = {
+      id: "class-def",
+      name: "class-def",
+      fixed: { strength: 7 },
+      free: 0,
+    }
+    const result = setExperiencePercent(state, "class", 100, def, config())
+    const snapshot = result.state.historicalLevelAwards[0].fixed
+    expect(snapshot.strength).toBe(7)
+    // Mutating the source definition must not change the stored snapshot.
+    ;(def.fixed as { strength: number }).strength = 99
+    expect(result.state.historicalLevelAwards[0].fixed.strength).toBe(7)
+  })
+})
+
+describe("levelUpFromExperience", () => {
+  it("levels a track from any percentage (including 0) and resets percent to 0", () => {
+    const state = character({ classLevel: 1, professionLevel: 1 })
+    state.tracks["class"].experiencePercent = 0
+    state.tracks["class"].quarter = 0
+    const result = levelUpFromExperience(
+      state,
+      "class",
+      trackDef("class-def", { strength: 3, agility: 2 }, 5),
+      config()
+    )
+    expect(result.journal.leveledUp).toBe(true)
+    expect(result.journal.turnsAdvanced).toBe(4)
+    expect(result.state.turn).toBe(state.turn + 4)
+    expect(result.state.tracks["class"].level).toBe(2)
+    expect(result.state.tracks["class"].experiencePercent).toBe(0)
+    expect(result.state.tracks["class"].quarter).toBe(0)
+    expect(result.state.historicalLevelAwards).toHaveLength(1)
+    // The journal merges the final engine step's award snapshot.
+    expect(result.journal.award?.definitionId).toBe("class-def")
   })
 })

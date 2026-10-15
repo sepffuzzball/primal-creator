@@ -7,7 +7,6 @@ import {
   ChevronRightIcon,
   DownloadIcon,
   ArchiveIcon,
-  ArrowUpIcon,
   RotateCcwIcon,
   SparklesIcon,
   Trash2Icon,
@@ -26,7 +25,6 @@ import {
   type CharacterAssociationView,
   type CharacterDetail,
   type CharacterResponse,
-  type AdvanceResponse,
   type AllocateResponse,
   type AssociationResponse,
   type ConsumeResponse,
@@ -51,6 +49,20 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
+import {
+  Progress,
+  ProgressTrack,
+  ProgressIndicator,
+  ProgressLabel,
+  ProgressValue,
+} from "@/components/ui/progress"
+import {
+  Slider,
+  SliderControl,
+  SliderTrack,
+  SliderIndicator,
+  SliderThumb,
+} from "@/components/ui/slider"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Sheet,
@@ -164,15 +176,33 @@ function evolutionTarget(level: number, current: Grade): Grade | null {
 }
 
 function JournalPanel({ journal }: { journal: JournalDelta }) {
+  const experienceJournal = journal as JournalDelta & {
+    percentBefore?: number
+    percentAfter?: number
+    turnsAdvanced?: number
+  }
   return (
     <div className="flex flex-col gap-2 text-xs/relaxed">
       <div className="flex flex-wrap gap-1.5">
         <Badge variant="outline">
           {journal.track} {journal.levelBefore} {"->"} {journal.levelAfter}
         </Badge>
-        <Badge variant="outline">
-          Quarter {journal.quarterBefore} {"->"} {journal.quarterAfter}
-        </Badge>
+        {experienceJournal.percentBefore != null ||
+        experienceJournal.percentAfter != null ? (
+          <Badge variant="outline">
+            EXP {experienceJournal.percentBefore ?? 0}% {"->"}{" "}
+            {experienceJournal.percentAfter ?? 0}%
+          </Badge>
+        ) : (
+          <Badge variant="outline">
+            Quarter {journal.quarterBefore} {"->"} {journal.quarterAfter}
+          </Badge>
+        )}
+        {experienceJournal.turnsAdvanced != null ? (
+          <Badge variant="outline">
+            {experienceJournal.turnsAdvanced} turn(s) advanced
+          </Badge>
+        ) : null}
         <Badge variant="outline">
           Race level {journal.raceLevelBefore} {"->"} {journal.raceLevelAfter}
         </Badge>
@@ -219,6 +249,102 @@ function MetaRow({
   )
 }
 
+function ExperienceControl({
+  track,
+  percent,
+  level,
+  editable,
+  busy,
+  draft,
+  onDraft,
+  onCommit,
+  onLevel,
+}: {
+  track: "race" | "class" | "profession"
+  percent: number
+  level: number
+  editable: boolean
+  busy: boolean
+  draft: number | undefined
+  onDraft: (value: number) => void
+  onCommit: (value: number) => void
+  onLevel: (operation: "levelUp" | "undo") => void
+}) {
+  const value = draft ?? percent
+  const label = `${track === "race" ? "Race" : track === "class" ? "Class" : "Profession"} experience`
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border bg-card p-3">
+      <div className="flex items-center justify-between gap-3">
+        <Progress value={value} aria-label={`${label} ${value}%`}>
+          <div className="flex items-center justify-between gap-2 text-sm">
+            <ProgressLabel className="font-medium">{label}</ProgressLabel>
+            <span className="text-muted-foreground tabular-nums">{value}%</span>
+            <ProgressValue className="sr-only" />
+          </div>
+          <ProgressTrack className="mt-2">
+            <ProgressIndicator />
+          </ProgressTrack>
+        </Progress>
+      </div>
+      <div className="flex items-center gap-2">
+        {editable ? (
+          <>
+            <Button
+              aria-label={`Decrease ${track} level`}
+              variant="outline"
+              size="sm"
+              disabled={busy || (track !== "race" && level <= 1)}
+              onClick={() => onLevel("undo")}
+            >
+              - Level
+            </Button>
+            <Slider
+              aria-label={label}
+              min={0}
+              max={100}
+              step={1}
+              value={[value]}
+              disabled={busy}
+              onValueChange={(next) =>
+                onDraft(Array.isArray(next) ? (next[0] ?? 0) : (next as number))
+              }
+              onValueCommitted={(next) =>
+                onCommit(
+                  Array.isArray(next) ? (next[0] ?? 0) : (next as number)
+                )
+              }
+            >
+              <SliderControl>
+                <SliderTrack>
+                  <SliderIndicator />
+                </SliderTrack>
+                <SliderThumb />
+              </SliderControl>
+            </Slider>
+            <Button
+              aria-label={`Increase ${track} level`}
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => onLevel("levelUp")}
+            >
+              + Level
+            </Button>
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Average of available class and profession experience
+          </p>
+        )}
+      </div>
+      <div className="flex justify-between text-xs text-muted-foreground">
+        <span>Level {level}</span>
+        <span className="tabular-nums">{value}%</span>
+      </div>
+    </div>
+  )
+}
+
 function formatVector(
   v: Partial<Record<AttributeKey, number>> | undefined
 ): string {
@@ -242,6 +368,17 @@ function eventsForTrack(
     const payload = payloadRecord(event.payload)
     if (event.kind === "create") return true
     if (event.kind === "profession_set") return track === "profession"
+    if (event.kind === "experience_set" || event.kind === "level_undo") {
+      const changedTrack = payload.track
+      if (changedTrack === track) return true
+      const journal = payloadRecord(payload.journal)
+      return (
+        track === "race" &&
+        (changedTrack === "class" || changedTrack === "profession") &&
+        (journal.raceLevelBefore !== undefined ||
+          journal.raceLevelAfter !== undefined)
+      )
+    }
     if (event.kind === "advance" || event.kind === "evolve") {
       const changedTrack = payload.track
       if (changedTrack === track) return true
@@ -1369,6 +1506,9 @@ export function CharacterDetail({
   const [journal, setJournal] = React.useState<JournalDelta | null>(null)
   const [journalOpen, setJournalOpen] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
+  const [experienceDrafts, setExperienceDrafts] = React.useState<
+    Record<string, number>
+  >({})
   const [events, setEvents] = React.useState<ExportResponse["events"] | null>(
     null
   )
@@ -1708,24 +1848,94 @@ export function CharacterDetail({
       )
   }, [activeTab, professionOptions.length])
 
-  const advance = React.useCallback(
-    async (track: "class" | "profession" | "race") => {
+  const experienceAction = React.useCallback(
+    async (
+      track: "race" | "class" | "profession",
+      operation: "set" | "levelUp" | "undo",
+      percent?: number
+    ) => {
       if (!character) return
+      if (operation === "set") {
+        const currentState = character.state
+        const currentTrack =
+          track === "race"
+            ? currentState.race.mode === "independent"
+              ? (currentState.race as typeof currentState.race & {
+                  experiencePercent?: number
+                })
+              : undefined
+            : (currentState.tracks[track] as
+                | ((typeof currentState.tracks)[typeof track] & {
+                    experiencePercent?: number
+                  })
+                | undefined)
+        const currentPercent = currentTrack
+          ? Math.min(
+              100,
+              Math.max(
+                0,
+                currentTrack.experiencePercent ??
+                  (currentTrack.quarter ?? 0) * 25
+              )
+            )
+          : 0
+        if (percent === currentPercent) {
+          setExperienceDrafts((drafts) => {
+            const next = { ...drafts }
+            delete next[track]
+            return next
+          })
+          return
+        }
+      }
       setBusy(true)
       setError(null)
       try {
-        const res = await apiFetch<AdvanceResponse>(
-          `/api/characters/${character.id}/advance`,
-          {
-            ...jsonInit("POST", { track, version: character.version }),
-          }
-        )
-        setJournal(res.journal)
-        setJournalOpen(true)
+        const res = await apiFetch<{
+          character: CharacterDetail
+          journal: JournalDelta & { leveledUp?: boolean }
+        }>(`/api/characters/${character.id}/experience`, {
+          ...jsonInit("POST", {
+            operation,
+            track,
+            ...(operation === "set" ? { percent } : {}),
+            version: character.version,
+          }),
+        })
+        setExperienceDrafts((drafts) => ({
+          ...drafts,
+          [track]:
+            res.character.state.race.mode === "independent" && track === "race"
+              ? ((res.character.state.race as { experiencePercent?: number })
+                  .experiencePercent ?? 0)
+              : track === "class"
+                ? ((
+                    res.character.state.tracks.class as
+                      { experiencePercent?: number } | undefined
+                  )?.experiencePercent ?? 0)
+                : track === "profession"
+                  ? ((
+                      res.character.state.tracks.profession as
+                        { experiencePercent?: number } | undefined
+                    )?.experiencePercent ?? 0)
+                  : 0,
+        }))
+        if (res.journal.leveledUp) {
+          setJournal(res.journal)
+          setJournalOpen(true)
+        }
         await reload()
-        void refreshEvents()
+        await refreshEvents()
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Advance failed.")
+        setExperienceDrafts((drafts) => {
+          const next = { ...drafts }
+          delete next[track]
+          return next
+        })
+        await reload()
+        setError(
+          err instanceof Error ? err.message : "Experience update failed."
+        )
       } finally {
         setBusy(false)
       }
@@ -2258,6 +2468,48 @@ export function CharacterDetail({
   const status = character.status
   const raceGrade = state.race.grade
   const evolveTarget = evolutionTarget(state.race.level, raceGrade)
+  const classPercent = Math.min(
+    100,
+    Math.max(
+      0,
+      (
+        classTrack as
+          (typeof classTrack & { experiencePercent?: number }) | undefined
+      )?.experiencePercent ?? (classTrack?.quarter ?? 0) * 25
+    )
+  )
+  const professionPercent = Math.min(
+    100,
+    Math.max(
+      0,
+      (
+        professionTrack as
+          (typeof professionTrack & { experiencePercent?: number }) | undefined
+      )?.experiencePercent ?? (professionTrack?.quarter ?? 0) * 25
+    )
+  )
+  const racePercent =
+    state.race.mode === "independent"
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            (state.race as typeof state.race & { experiencePercent?: number })
+              .experiencePercent ?? (state.race.quarter ?? 0) * 25
+          )
+        )
+      : Math.round(
+          [
+            classTrack ? classPercent : null,
+            professionTrack ? professionPercent : null,
+          ]
+            .filter((v): v is number => v !== null)
+            .reduce((a, b) => a + b, 0) /
+            Math.max(
+              1,
+              Number(Boolean(classTrack)) + Number(Boolean(professionTrack))
+            )
+        )
 
   // Archived linked equipment is not synthesized into `status`, so it never
   // appears in the live table. Keep it visible so the link can be removed.
@@ -2444,15 +2696,6 @@ export function CharacterDetail({
             <Button
               variant="outline"
               size="sm"
-              onClick={() => advance("race")}
-              disabled={busy}
-            >
-              <ArrowUpIcon /> Advance race (L{state.race.level} Q
-              {state.race.quarter})
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
               className="gap-1"
               onClick={() => {
                 setEvolveError(null)
@@ -2480,45 +2723,6 @@ export function CharacterDetail({
           </>
         ) : (
           <>
-            {character.classId == null || state.race.mode === "independent" ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1"
-                onClick={() => advance("race")}
-                disabled={busy}
-              >
-                <ArrowUpIcon />
-                Advance race (L{state.race.level} Q{state.race.quarter})
-              </Button>
-            ) : (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1"
-                onClick={() => advance("class")}
-                disabled={busy || !classTrack}
-              >
-                <ArrowUpIcon />
-                Advance class
-                {classTrack
-                  ? ` (L${classTrack.level} Q${classTrack.quarter})`
-                  : ""}
-              </Button>
-            )}
-            {character.classId != null && professionTrack ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1"
-                onClick={() => advance("profession")}
-                disabled={busy}
-              >
-                <ArrowUpIcon />
-                Advance profession (L{professionTrack.level} Q
-                {professionTrack.quarter})
-              </Button>
-            ) : null}
             {character.classId != null && classTrack ? (
               <Button
                 variant="outline"
@@ -3104,26 +3308,168 @@ export function CharacterDetail({
         </TabsContent>
 
         <TabsContent value="overview" className="pt-3">
-          <Card>
-            <CardContent>
-              <div className="flex flex-col gap-1">
-                <MetaRow label="Description">
-                  {character.description?.trim() || "No description"}
-                </MetaRow>
-                <MetaRow label="Origin">{character.origin}</MetaRow>
-                <MetaRow label="Race">
-                  {character.raceName ?? "Not set"}
-                </MetaRow>
-                <MetaRow label="Class">
-                  {character.className ?? "Not set"}
-                </MetaRow>
-                <MetaRow label="Profession">
-                  {character.professionName ?? "None"}
-                </MetaRow>
-                <MetaRow label="Updated">{character.updatedAt}</MetaRow>
+          <div className="flex flex-col gap-4">
+            <Card>
+              <CardContent>
+                <section
+                  aria-labelledby="character-profile-heading"
+                  className="flex flex-col gap-3"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h2
+                        id="character-profile-heading"
+                        className="font-heading text-lg font-semibold"
+                      >
+                        {character.nickname?.trim() || character.name}
+                      </h2>
+                      <p className="text-sm text-muted-foreground">
+                        {[
+                          character.raceName,
+                          character.className,
+                          character.professionName,
+                        ]
+                          .filter(Boolean)
+                          .join(" / ")}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <Badge variant="outline" className="capitalize">
+                        {character.origin}
+                      </Badge>
+                      {character.archived ? <Badge>Archived</Badge> : null}
+                      {character.imported ? (
+                        <Badge variant="outline">
+                          Imported - unverified backup
+                        </Badge>
+                      ) : null}
+                    </div>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    {character.description?.trim() || "No description"}
+                  </p>
+                  <div className="grid gap-2 text-xs sm:grid-cols-2">
+                    <MetaRow label="Nickname">
+                      {character.nickname?.trim() || "Not set"}
+                    </MetaRow>
+                    <MetaRow label="Updated">{character.updatedAt}</MetaRow>
+                  </div>
+                </section>
+              </CardContent>
+            </Card>
+
+            <section
+              aria-labelledby="character-tracks-heading"
+              className="flex flex-col gap-2"
+            >
+              <h2
+                id="character-tracks-heading"
+                className="font-heading text-sm font-semibold"
+              >
+                Progression
+              </h2>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {[
+                  {
+                    label: "Race",
+                    name: character.raceName,
+                    level: state.race.level,
+                    grade: state.race.grade,
+                  },
+                  ...(character.classId != null && classTrack
+                    ? [
+                        {
+                          label: "Class",
+                          name: character.className,
+                          level: classTrack.level,
+                          grade: classTrack.grade,
+                        },
+                      ]
+                    : []),
+                  ...(character.classId != null && professionTrack
+                    ? [
+                        {
+                          label: "Profession",
+                          name: character.professionName,
+                          level: professionTrack.level,
+                          grade: professionTrack.grade,
+                        },
+                      ]
+                    : []),
+                ].map((track) => (
+                  <Card key={track.label}>
+                    <CardContent>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <h3 className="text-xs font-medium text-muted-foreground">
+                            {track.label}
+                          </h3>
+                          <p className="truncate text-sm font-semibold">
+                            {track.name ?? "Not set"}
+                          </p>
+                        </div>
+                        <Badge variant="outline">
+                          Grade {track.grade ?? "-"}
+                        </Badge>
+                      </div>
+                      <p
+                        className="mt-2 text-2xl font-semibold tabular-nums"
+                        aria-label={`${track.label} level ${track.level}`}
+                      >
+                        {track.level}
+                        <span className="ml-1 text-xs font-normal text-muted-foreground">
+                          level
+                        </span>
+                      </p>
+                    </CardContent>
+                  </Card>
+                ))}
               </div>
-            </CardContent>
-          </Card>
+            </section>
+
+            <section
+              aria-labelledby="character-attributes-heading"
+              className="flex flex-col gap-2"
+            >
+              <div>
+                <h2
+                  id="character-attributes-heading"
+                  className="font-heading text-sm font-semibold"
+                >
+                  Current attributes
+                </h2>
+                <p className="text-xs text-muted-foreground">
+                  Calculated values from the character status.
+                </p>
+              </div>
+              {status?.attributes ? (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-9">
+                  {ATTRIBUTE_KEYS.map((attr) => (
+                    <Card key={attr}>
+                      <CardContent className="flex flex-col items-center gap-1 text-center">
+                        <span className="text-[0.6875rem] font-medium text-muted-foreground">
+                          {labelFor(attr)}
+                        </span>
+                        <span
+                          className="text-2xl font-semibold tabular-nums"
+                          aria-label={`${labelFor(attr)} ${status.attributes[attr]}`}
+                        >
+                          {status.attributes[attr]}
+                        </span>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              ) : (
+                <p
+                  className="rounded-lg border p-4 text-sm text-muted-foreground"
+                  role="status"
+                >
+                  Current calculated attributes are unavailable right now.
+                </p>
+              )}
+            </section>
+          </div>
         </TabsContent>
 
         <TabsContent value="powers" className="pt-3">
@@ -3369,6 +3715,23 @@ export function CharacterDetail({
         <TabsContent value="race" className="pt-3">
           <Card>
             <CardContent>
+              <ExperienceControl
+                track="race"
+                percent={racePercent}
+                level={state.race.level}
+                editable={state.race.mode === "independent"}
+                busy={busy}
+                draft={experienceDrafts.race}
+                onDraft={(value) =>
+                  setExperienceDrafts((drafts) => ({ ...drafts, race: value }))
+                }
+                onCommit={(value) =>
+                  void experienceAction("race", "set", value)
+                }
+                onLevel={(operation) =>
+                  void experienceAction("race", operation)
+                }
+              />
               <div className="flex flex-col gap-1">
                 <MetaRow label="Race">
                   {character.raceName ?? "Not set"}
@@ -3389,26 +3752,35 @@ export function CharacterDetail({
           <TabsContent value="class" className="pt-3">
             <Card>
               <CardContent>
+                {classTrack ? (
+                  <ExperienceControl
+                    track="class"
+                    percent={classPercent}
+                    level={classTrack.level}
+                    editable={state.race.mode !== "independent"}
+                    busy={busy}
+                    draft={experienceDrafts.class}
+                    onDraft={(value) =>
+                      setExperienceDrafts((drafts) => ({
+                        ...drafts,
+                        class: value,
+                      }))
+                    }
+                    onCommit={(value) =>
+                      void experienceAction("class", "set", value)
+                    }
+                    onLevel={(operation) =>
+                      void experienceAction("class", operation)
+                    }
+                  />
+                ) : null}
                 <div className="flex flex-col gap-1">
                   <MetaRow label="Class">
                     {character.className ?? "Not set"}
                   </MetaRow>
                   <MetaRow label="Grade">{classTrack?.grade ?? "-"}</MetaRow>
                   <MetaRow label="Level">{classTrack?.level ?? "-"}</MetaRow>
-                  <MetaRow label="Quarter">
-                    {classTrack?.quarter ?? "-"}
-                  </MetaRow>
                 </div>
-                {character.classId != null && classTrack ? (
-                  <Button
-                    className="mt-3"
-                    variant="outline"
-                    onClick={() => void advance("class")}
-                    disabled={busy}
-                  >
-                    Advance class
-                  </Button>
-                ) : null}
                 {classTrack && classTrack.grade ? (
                   <Button
                     className="mt-2"
@@ -3432,6 +3804,28 @@ export function CharacterDetail({
           <TabsContent value="profession" className="pt-3">
             <Card>
               <CardContent>
+                {professionTrack ? (
+                  <ExperienceControl
+                    track="profession"
+                    percent={professionPercent}
+                    level={professionTrack.level}
+                    editable={state.race.mode !== "independent"}
+                    busy={busy}
+                    draft={experienceDrafts.profession}
+                    onDraft={(value) =>
+                      setExperienceDrafts((drafts) => ({
+                        ...drafts,
+                        profession: value,
+                      }))
+                    }
+                    onCommit={(value) =>
+                      void experienceAction("profession", "set", value)
+                    }
+                    onLevel={(operation) =>
+                      void experienceAction("profession", operation)
+                    }
+                  />
+                ) : null}
                 <div className="flex flex-col gap-3">
                   <div className="flex flex-col gap-1">
                     <MetaRow label="Profession">
@@ -3442,9 +3836,6 @@ export function CharacterDetail({
                     </MetaRow>
                     <MetaRow label="Level">
                       {professionTrack?.level ?? "-"}
-                    </MetaRow>
-                    <MetaRow label="Quarter">
-                      {professionTrack?.quarter ?? "-"}
                     </MetaRow>
                   </div>
                   {!professionTrack ? (
@@ -3518,15 +3909,6 @@ export function CharacterDetail({
                       )}
                     </>
                   ) : null}
-                  {character.classId != null && professionTrack ? (
-                    <Button
-                      variant="outline"
-                      onClick={() => void advance("profession")}
-                      disabled={busy}
-                    >
-                      Advance profession
-                    </Button>
-                  ) : null}
                   {professionTrack?.grade ? (
                     <Button
                       variant="outline"
@@ -3589,7 +3971,9 @@ export function CharacterDetail({
                               {offer.track === "class" ? "Class" : "Profession"}{" "}
                               level {offer.level} - {offer.choiceGroup}
                             </span>
-                            {selected ? (
+                            {offer.canceledAt ? (
+                              <Badge variant="outline">Canceled</Badge>
+                            ) : selected ? (
                               <Badge variant="outline">Selected</Badge>
                             ) : allArchived ? (
                               <Badge variant="outline">Blocked</Badge>
@@ -3597,7 +3981,23 @@ export function CharacterDetail({
                               <Badge variant="outline">Pending</Badge>
                             )}
                           </div>
-                          {selected ? (
+                          {offer.canceledAt ? (
+                            <div className="mt-1 flex flex-col gap-1.5">
+                              {offer.options.map((option) => (
+                                <div
+                                  key={option.definitionId}
+                                  className="rounded-md border bg-background/40 p-1.5 text-sm text-muted-foreground"
+                                >
+                                  {option.nameSnapshot}
+                                  {option.archived ? " (archived)" : ""}
+                                </div>
+                              ))}
+                              <p className="text-xs text-muted-foreground">
+                                This offer was canceled by undo and is kept in
+                                history.
+                              </p>
+                            </div>
+                          ) : selected ? (
                             <div className="text-xs text-muted-foreground">
                               Selected: {selectedName ?? "?"}
                             </div>

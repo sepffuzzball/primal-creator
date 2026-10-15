@@ -57,6 +57,79 @@ interface DashboardState {
 
 const STORAGE_KEY = "primal-dashboard-state"
 
+const gradeBadgeClasses = {
+  G: "border-stone-400 bg-stone-100 text-stone-900 dark:border-stone-500 dark:bg-stone-800 dark:text-stone-100",
+  F: "border-red-500 bg-red-100 text-red-950 dark:border-red-400 dark:bg-red-950 dark:text-red-100",
+  E: "border-orange-500 bg-orange-100 text-orange-950 dark:border-orange-400 dark:bg-orange-950 dark:text-orange-100",
+  D: "border-amber-500 bg-amber-100 text-amber-950 dark:border-amber-400 dark:bg-amber-950 dark:text-amber-100",
+  C: "border-lime-600 bg-lime-100 text-lime-950 dark:border-lime-400 dark:bg-lime-950 dark:text-lime-100",
+  B: "border-emerald-600 bg-emerald-100 text-emerald-950 dark:border-emerald-400 dark:bg-emerald-950 dark:text-emerald-100",
+  A: "border-sky-600 bg-sky-100 text-sky-950 dark:border-sky-400 dark:bg-sky-950 dark:text-sky-100",
+  S: "border-violet-600 bg-violet-100 text-violet-950 dark:border-violet-400 dark:bg-violet-950 dark:text-violet-100",
+} as const
+
+type LevelTier = "Early" | "Mid" | "Developing" | "Late" | "Pinnacle"
+
+const E_GRADE_BAND = { min: 25, max: 99 }
+
+export function getRaceLevelTier(
+  level: number,
+  band: { min: number; max: number } | null,
+  grade?: CharacterListItem["raceGrade"]
+): LevelTier | null {
+  if (!band) return null
+  if (
+    grade === "E" &&
+    band.min === E_GRADE_BAND.min &&
+    band.max === E_GRADE_BAND.max
+  ) {
+    if (level < 50) return "Early"
+    if (level < 75) return "Mid"
+    if (level < 95) return "Late"
+    return "Pinnacle"
+  }
+  if (level < band.min) return "Early"
+  if (level >= band.max) return "Pinnacle"
+  if (band.max === band.min) return "Pinnacle"
+  const fraction = (level - band.min) / (band.max - band.min)
+  // Tier thresholds: <25% Early, <75% Developing, <90% Late, otherwise Pinnacle.
+  if (fraction < 0.25) return "Early"
+  if (fraction < 0.75) return "Developing"
+  if (fraction < 0.9) return "Late"
+  return "Pinnacle"
+}
+
+export function RaceBadges({ item }: { item: CharacterListItem }) {
+  const tier = getRaceLevelTier(
+    item.raceLevel,
+    item.raceGradeBand,
+    item.raceGrade
+  )
+  const inferredTier =
+    item.raceGrade !== "E" ||
+    item.raceGradeBand?.min !== E_GRADE_BAND.min ||
+    item.raceGradeBand?.max !== E_GRADE_BAND.max
+  return (
+    <div className="flex flex-wrap gap-1.5" aria-label="Race progression">
+      <Badge className={gradeBadgeClasses[item.raceGrade]}>
+        {item.raceGrade} grade
+      </Badge>
+      <Badge
+        variant="outline"
+        aria-label={
+          tier
+            ? `Level ${item.raceLevel}, ${tier}${inferredTier ? ", inferred" : ""}`
+            : `Level ${item.raceLevel}`
+        }
+      >
+        {tier
+          ? `L${item.raceLevel} - ${tier}${inferredTier ? " (inferred)" : ""}`
+          : `Level ${item.raceLevel}`}
+      </Badge>
+    </div>
+  )
+}
+
 function formatUpdated(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
@@ -417,6 +490,7 @@ export function CharactersDashboard() {
                       .filter(Boolean)
                       .join(" / ") || "No choices yet"}
                   </CardDescription>
+                  <RaceBadges item={item} />
                 </CardHeader>
                 <CardContent>
                   <div className="flex flex-col gap-2">

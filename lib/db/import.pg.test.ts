@@ -33,6 +33,7 @@ import {
   IMPORT_SCHEMA_V3,
   IMPORT_SCHEMA_V4,
   IMPORT_SCHEMA_V5,
+  IMPORT_SCHEMA_V6,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
 import { resolveDbIntegration } from "@/lib/test/db-integration"
@@ -339,7 +340,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const rawDoc = await exportCharacter(src.id, ownerUser)
     const doc = rawDoc as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/5")
+    expect(doc.schema).toBe("primal-character/6")
     expect(doc.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(doc.identity).toMatchObject({
       name: "Source Hero",
@@ -499,7 +500,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const raw = await exportCharacter(src.id, ownerUser)
     const doc = raw as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/5")
+    expect(doc.schema).toBe("primal-character/6")
     const v4 = doc as unknown as {
       inventory: Array<{
         definition: { kind: string; stableId: string }
@@ -555,7 +556,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       where: { characterId: imported.id, kind: "import" },
     })
     const payload = importEvent!.payload as Record<string, unknown>
-    expect(payload.backupSchema).toBe("primal-character/5")
+    expect(payload.backupSchema).toBe("primal-character/6")
     expect(payload.inventoryCount).toBe(2)
   })
 
@@ -1159,7 +1160,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       src.id,
       ownerUser
     )) as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/5")
+    expect(doc.schema).toBe("primal-character/6")
     const ringAssocs = (
       doc.associations as Array<{
         kind: string
@@ -1477,7 +1478,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       imported.id,
       adminUser
     )) as unknown as CharacterImportDocument
-    expect(exported.schema).toBe(IMPORT_SCHEMA_V5)
+    expect(exported.schema).toBe(IMPORT_SCHEMA_V6)
     const eq = (
       exported.associations as Array<{
         kind: string
@@ -1625,5 +1626,165 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       status: 400,
       code: "import_ring_position_required",
     })
+  })
+
+  it("defaults a v5 backup's skill offer to generation 0 / canceledAt null (back-compat)", async () => {
+    const doc = {
+      schema: IMPORT_SCHEMA_V5,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "V5 Hero",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      // A legacy v5 offer omits `generation` and `canceledAt` entirely.
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          offeredAt: "2026-02-02T00:00:00.000Z",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      ],
+    } as CharacterImportDocument
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+
+    const offer = await prisma.skillOffer.findFirst({
+      where: { characterId: imported.id },
+    })
+    expect(offer).not.toBeNull()
+    expect(offer!.generation).toBe(0)
+    expect(offer!.canceledAt).toBeNull()
+  })
+
+  it("preserves a canceled offer's generation and canceledAt across a v6 backup round trip", async () => {
+    const src = await createCharacter(
+      {
+        name: "Undo Hero",
+        description: "v6 canceled offer round trip",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: null,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    // A voided (canceled) offer at generation 1. Append-only: it must survive the
+    // backup export verbatim (never dropped, never rewritten).
+    const canceledAt = new Date("2026-03-03T12:00:00.000Z")
+    await prisma.skillOffer.create({
+      data: {
+        characterId: src.id,
+        track: "class",
+        level: 1,
+        choiceGroup: "standard",
+        generation: 1,
+        canceledAt,
+        selectedDefinitionId: null,
+        offeredAt: new Date("2026-03-03T00:00:00.000Z"),
+        options: {
+          create: [
+            {
+              definitionId: CATALOG.skill1,
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      },
+    })
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    expect(doc.schema).toBe(IMPORT_SCHEMA_V6)
+    expect(doc.skillOffers).toHaveLength(1)
+    const exportedOffer = doc.skillOffers[0]
+    expect(exportedOffer.generation).toBe(1)
+    expect(exportedOffer.canceledAt).toBe(canceledAt.toISOString())
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+
+    const offer = await prisma.skillOffer.findFirst({
+      where: { characterId: imported.id },
+    })
+    expect(offer).not.toBeNull()
+    expect(offer!.generation).toBe(1)
+    expect(offer!.canceledAt?.toISOString()).toBe(canceledAt.toISOString())
+  })
+
+  it("rejects a v6 backup with an invalid skill-offer canceledAt and commits nothing", async () => {
+    const before = await prisma.character.count({
+      where: { ownerId: adminUser.id },
+    })
+    const offersBefore = await prisma.skillOffer.count()
+    const doc = {
+      schema: IMPORT_SCHEMA_V6,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Invalid Canceled",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          generation: 1,
+          canceledAt: "not-a-date",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: {},
+            },
+          ],
+        },
+      ],
+    } as CharacterImportDocument
+
+    await expect(importCharacter(doc, adminUser)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_import",
+    })
+
+    // The failed import committed nothing: no character, no offer row.
+    const after = await prisma.character.count({
+      where: { ownerId: adminUser.id },
+    })
+    expect(after).toBe(before)
+    expect(await prisma.skillOffer.count()).toBe(offersBefore)
   })
 })

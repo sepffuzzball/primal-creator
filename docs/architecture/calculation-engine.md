@@ -202,6 +202,57 @@ through distinct `capUsage` names (`equipment-percent-individual` /
 verbatim. Ineligible or archived items contribute neither a flat nor a percent
 request, so nothing is reserved from the shared budgets.
 
+## Experience percentage (quarter cadence replaced)
+
+The engine no longer treats the quarter index as the primary progression input for
+new or modernized state. A track (class/profession) or an independent (monster)
+race carries an optional authoritative `experiencePercent` (integer 0..99):
+
+- `TrackState.experiencePercent` is the source of truth for the class/profession
+  EXP percentage within the current level; `RaceState.experiencePercent` exists only
+  on independent (monster) races. A derived (enlightened) race never carries its own
+  percent.
+- When `experiencePercent` is present, the corresponding `quarter` MUST equal
+  `floor(experiencePercent / 25)` (enforced by the Zod schemas at the API boundary).
+  The `quarter` field is retained as the legacy 25% turn-boundary marker and is what
+  the quarter engine still advances.
+- A **legacy state** that predates explicit EXP tracking simply omits
+  `experiencePercent`. It is never rewritten by a read:
+  `experiencePercentFor(state, track)` returns the explicit percent when present,
+  otherwise `quarter * 25` (a missing race quarter defaults to 0). A legacy state is
+  given an explicit percent only when it is advanced (`advanceQuarter` /
+  `advanceRaceQuarter` always set `experiencePercent = quarterAfter * 25` on the
+  state they mutate).
+
+The quarter engine (`advanceQuarter` / `advanceRaceQuarter`) is reused unchanged for
+the 25% turn boundaries and for level awards. The new pure gate is
+`setExperiencePercent(state, track, target, definition, config)`:
+
+- `target` is an integer 0..100. 100 requests a level-up; 0..99 sets the
+  percentage within the current level.
+- The `race` track requires `state.race.mode === "independent"`; a class/profession
+  track must already exist.
+- **Backward** (`target < current`): sets `experiencePercent = target` and
+  `quarter = floor(target / 25)`, never decrements `state.turn`, never revokes
+  awards, journal `turnsAdvanced: 0`.
+- **No-op** (`target === current`): returns the input state unchanged (no turn
+  change).
+- **Forward** (`target > current`): for each crossed 25/50/75/100 boundary calls
+  `advanceQuarter` / `advanceRaceQuarter` exactly once (each increments `state.turn`
+  and applies its own grade gate, race-gain, evolution offer and effect-expiry
+  logic). The final call at 100 levels up, or fails atomically on a grade gate. A
+  target below 100 ends with `experiencePercent = target` and
+  `quarter = floor(target / 25)`.
+
+`levelUpFromExperience(state, track, definition, config)` is a thin wrapper over
+`setExperiencePercent(..., 100)`: it may level from ANY percentage (including 0),
+resets the percent to 0 after the level-up, and never synthesizes skill offers (the
+service adds those only on an actual level-up). No percent-only effect or stat gain
+is ever applied - only the level boundary grants stats, exactly as the quarter
+engine already did. The displayed percentage for a derived race is a read-only
+average of the available class/profession EXP percentages computed by the UI; it
+does not change the configurable race-level strategy (`deriveRaceLevel`).
+
 ## Verification status of inputs
 
 - **Verified:** grade/level bands; race-level = average of class/profession;
@@ -326,15 +377,21 @@ deliberately **not** authoritative character state. The contract is:
 ## Trusted-backup character export / import (contract)
 
 A saved character can be exported as a **trusted backup** JSON document (schema
-`primal-character/5`) and re-imported into any instance of the app. The document
+`primal-character/6`) and re-imported into any instance of the app. The document
 is a backup, **not** authoritative server-verified state: the contract is. The
-older `primal-character/4` and `primal-character/3` documents are still ACCEPTED on
-import (so existing backups keep working) but are never generated; a v3 backup
-carries no inventory and no grandfathering marker, so importing it restores zero
-stock and marks every equipment link as grandfathered. The current v5 backup
-carries owned inventory, the `legacyUnowned` marker, and a per-link ring
-`equipmentPosition` for `Ring`-slot equipment associations so a character's two
-ring positions round-trip.
+older `primal-character/3` through `primal-character/5` documents are still
+ACCEPTED on import (so existing backups keep working) but are never generated; a
+v3 backup carries no inventory and no grandfathering marker, so importing it
+restores zero stock and marks every equipment link as grandfathered. The current
+v6 backup carries everything v5 did - owned inventory, the `legacyUnowned`
+marker, and a per-link ring `equipmentPosition` for `Ring`-slot equipment
+associations so a character's two ring positions round-trip - plus the append-only
+skill-offer generation and cancellation state: every exported offer records a
+non-negative `generation` and a nullable `canceledAt`, so a restore preserves the
+full historical offer identity and cancellation state. The v5 backup carried those
+inventory / ownership / position features but no skill-offer generation or
+cancellation fields; a legacy v3/v4/v5 backup omits both, and on import the
+importer defaults them to `0`/`null`.
 
 - **Stable identifiers, not internal ids.** The document carries `identity`
   (name, description, the nullable profile-metadata fields `nickname`,
@@ -388,7 +445,7 @@ ring positions round-trip.
   rejected. The owned-stock rows, association markers, and events are written in
   the SAME transaction as the character, so any resolution/validation failure
   rolls the whole import back; the returned detail exposes the imported inventory
-  rows. The `import` marker records `backupSchema` (v3 or v4) and
+  rows. The `import` marker records `backupSchema` (v3, v4, v5 or v6) and
   `inventoryCount`. A v3 backup imports no stock and grandfathers every equipment
   link (preserving the old backup behavior). Distinct inventory definitions are
   capped at 500 by the inventory adjustment route (a 409), so an exported character

@@ -70,10 +70,14 @@ ENV NODE_ENV="production" \
     PORT="3000" \
     HOSTNAME="0.0.0.0"
 
-# Non-root app user. The named upload volume is initialised from this tree
-# (nextjs-owned), so the process can write to /app/data/uploads.
-RUN groupadd --system --gid 1001 nodejs \
-    && useradd --system --uid 1001 --gid nodejs --home-dir /app nextjs \
+# Non-root app user. The uid/gid (1100) intentionally match the production
+# bind mount / PVC (owner 1100:1100, mode 775) so the mounted /app/data tree is
+# writable by the app user. The named upload volume is initialised from this
+# tree on first use (nextjs-owned); for a bind mount or PVC the mount's own
+# ownership governs, because the mount masks the image-layer ownership that
+# `chown -R nextjs:nodejs /app` below set up (see docs/deployment.md).
+RUN groupadd --system --gid 1100 nodejs \
+    && useradd --system --uid 1100 --gid nodejs --home-dir /app nextjs \
     && mkdir -p /app/data/uploads
 
 # The complete standalone output: server.js, its traced node_modules, and any

@@ -352,15 +352,27 @@ model SkillOffer {
   level                Int
   // Choice group the offered options share ("standard" when none is configured).
   choiceGroup          String
+  // Sequential offer generation for the same (characterId, track, level,
+  // choiceGroup). The initial offer is generation 0; a re-offer after a
+  // cancellation increments it (max existing generation + 1). Lets a canceled
+  // offer be superseded by a new generation while historical snapshots stay
+  // immutable (append-only): the old offer is never deleted or rewritten.
+  generation           Int                @default(0)
   // The option the character selected. Null while the offer is still pending.
   selectedDefinitionId String?
   selectedDefinition   CatalogDefinition? @relation("SkillOfferSelection", fields: [selectedDefinitionId], references: [id], onDelete: Restrict)
   offeredAt            DateTime           @default(now())
   // Set only when an option is selected (atomic with the link + event).
   selectedAt           DateTime?
+  // Set when the pending offer is canceled (append-only: the row is never
+  // deleted). Null while the offer is still active/selectable. At most one offer
+  // per (characterId, track, level, choiceGroup) may be active at a time; the
+  // active/uniqueness invariant is enforced at the application layer (see
+  // createSkillOffersForAdvance and runSkillOfferInvariants on import).
+  canceledAt           DateTime?
   options              SkillOfferOption[]
 
-  @@unique([characterId, track, level, choiceGroup])
+  @@unique([characterId, track, level, choiceGroup, generation])
   @@index([characterId])
   @@index([track, level])
   @@map("skill_offers")

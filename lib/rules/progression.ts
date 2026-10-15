@@ -101,6 +101,26 @@ export interface JournalDelta {
   evolutionBlocked?: Grade | null
   raceGain?: RaceGainJournal | null
   notes: string[]
+  /**
+   * Authoritative experience percentage before the operation (0..99, or 100 when
+   * the caller targeted a level-up). Present only on journals produced by
+   * `setExperiencePercent` / `levelUpFromExperience`; null/undefined on journals
+   * from the raw `advanceQuarter` / `advanceRaceQuarter` calls.
+   */
+  percentBefore?: number
+  /**
+   * Authoritative experience percentage stored in the result state after the
+   * operation. For a level-up (target 100) this is 0 (the new level starts at 0%),
+   * otherwise it is the requested target. Present only on journals produced by
+   * `setExperiencePercent` / `levelUpFromExperience`.
+   */
+  percentAfter?: number
+  /**
+   * Number of quarter advances (turn increments) the operation performed. 0 for a
+   * backward set or a no-op. Present only on journals produced by
+   * `setExperiencePercent` / `levelUpFromExperience`.
+   */
+  turnsAdvanced?: number
 }
 
 export interface AdvanceResult {
@@ -191,6 +211,10 @@ export function advanceQuarter(
     level: newLevel,
     quarter: newQuarter,
     definitionId: definition.id,
+    // The engine always carries the authoritative EXP percent explicitly on any
+    // track it mutates. Synced to the quarter boundary so quarter and percent stay
+    // consistent (`quarter === floor(experiencePercent / 25)`).
+    experiencePercent: newQuarter * 25,
   }
 
   const journal: JournalDelta = {
@@ -602,7 +626,16 @@ export function advanceRaceQuarter(
     ...state,
     baseAttributes: { ...state.baseAttributes },
     tracks: { ...state.tracks },
-    race: { ...race, level: newLevel, quarter: newQuarter },
+    // The engine always carries the authoritative EXP percent explicitly on any
+    // race state it mutates. Synced to the quarter boundary so quarter and percent
+    // stay consistent (`quarter === floor(experiencePercent / 25)`). Only set on
+    // independent (monster) races; derived races never get their own percent.
+    race: {
+      ...race,
+      level: newLevel,
+      quarter: newQuarter,
+      experiencePercent: newQuarter * 25,
+    },
     historicalLevelAwards: [...state.historicalLevelAwards],
     allocations: [...state.allocations],
     permanentGains: [...state.permanentGains],
@@ -698,4 +731,318 @@ export function advanceRaceQuarter(
 
 export function nextGradeFor(grade: Grade): Grade | null {
   return nextGrade(grade)
+}
+
+/* ------------------------------------------------------------------ *
+ * Authoritative experience percentage
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the authoritative experience percentage of a track (or the race). When
+ * the state carries an explicit `experiencePercent` that is the source of truth
+ * and is returned verbatim. Otherwise the engine falls back to the legacy quarter
+ * cadence (`quarter * 25`, defaulting a missing race quarter to 0). This is a
+ * read-only helper: it never rewrites the absent field on a legacy state - an old
+ * state is only given an explicit percent when it is advanced.
+ */
+export function experiencePercentFor(
+  state: CharacterState,
+  track: TrackId
+): number {
+  if (track === "race") {
+    if (state.race.experiencePercent != null) {
+      return state.race.experiencePercent
+    }
+    return (state.race.quarter ?? 0) * 25
+  }
+  const existing = state.tracks[track]
+  if (!existing) return 0
+  if (existing.experiencePercent != null) return existing.experiencePercent
+  return existing.quarter * 25
+}
+
+/**
+ * Build a journal for an operation that performed no quarter advance (a backward
+ * set, a same-quarter forward set, or a no-op). All level/race-grade fields are
+ * unchanged; `turnsAdvanced` is 0 and the EXP percent fields are recorded.
+ */
+function staticPercentJournal(
+  state: CharacterState,
+  track: TrackId,
+  levelBefore: number,
+  quarterBefore: number,
+  quarterAfter: number,
+  percentBefore: number,
+  percentAfter: number,
+  turnsAdvanced: number
+): JournalDelta {
+  return {
+    track,
+    levelBefore,
+    levelAfter: levelBefore,
+    quarterBefore,
+    quarterAfter,
+    leveledUp: false,
+    raceLevelBefore: state.race.level,
+    raceLevelAfter: state.race.level,
+    evolutionOffer: null,
+    evolutionBlocked: null,
+    raceGain: null,
+    notes: [],
+    percentBefore,
+    percentAfter,
+    turnsAdvanced,
+  }
+}
+
+function withTrackPercent(
+  state: CharacterState,
+  track: TrackId,
+  percent: number,
+  quarter: number
+): CharacterState {
+  return {
+    ...state,
+    tracks: {
+      ...state.tracks,
+      [track]: {
+        ...state.tracks[track],
+        experiencePercent: percent,
+        quarter,
+      },
+    },
+  }
+}
+
+function withRacePercent(
+  state: CharacterState,
+  percent: number,
+  quarter: number
+): CharacterState {
+  return {
+    ...state,
+    race: {
+      ...state.race,
+      experiencePercent: percent,
+      quarter,
+    },
+  }
+}
+
+/**
+ * Set the authoritative experience percentage of a track (class/profession) or of
+ * an independent (monster) race, reusing the existing quarter engine for 25% turn
+ * boundaries and level awards.
+ *
+ * - The race track requires `state.race.mode === "independent"`; a class or
+ *   profession track must already exist.
+ * - `target` is an integer 0..100. A target of 100 requests a level-up; a target
+ *   of 0..99 sets the percentage within the current level.
+ * - Backward (`target < current`): set `experiencePercent` to `target` and
+ *   `quarter` to `floor(target / 25)`, never decrement `state.turn`, never revoke
+ *   awards. The journal reports `turnsAdvanced: 0`.
+ * - No-op (`target === current`): returns the input state unchanged (no turn
+ *   change) with a `turnsAdvanced: 0` journal.
+ * - Forward (`target > current`): for each crossed 25/50/75/100 boundary, call
+ *   the existing `advanceQuarter` / `advanceRaceQuarter` exactly once (each
+ *   increments `state.turn` and applies its own expiry/alternative logic). At 100
+ *   the final call levels up (or fails atomically on a grade gate). A target below
+ *   100 ends with `experiencePercent = target` and `quarter = floor(target / 25)`.
+ *
+ * The function is pure: on any engine rejection (e.g. a closed grade gate) it
+ * throws without returning a partial state.
+ */
+export function setExperiencePercent(
+  state: CharacterState,
+  track: TrackId,
+  target: number,
+  definition: TrackDefinition,
+  config: RulesConfig
+): AdvanceResult
+export function setExperiencePercent(
+  state: CharacterState,
+  track: "race",
+  target: number,
+  definition: RaceDefinition,
+  config: RulesConfig
+): AdvanceResult
+export function setExperiencePercent(
+  state: CharacterState,
+  track: TrackId,
+  target: number,
+  definition: TrackDefinition | RaceDefinition,
+  config: RulesConfig
+): AdvanceResult {
+  if (!Number.isInteger(target) || target < 0 || target > 100) {
+    throw new Error(
+      `setExperiencePercent: target must be an integer in 0..100 (got ${String(target)})`
+    )
+  }
+
+  const isRace = track === "race"
+  const existingTrack = state.tracks[track]
+
+  if (isRace) {
+    if (state.race.mode !== "independent") {
+      throw new Error(
+        `setExperiencePercent: race track "${track}" requires independent race mode (got "${state.race.mode}")`
+      )
+    }
+  } else if (!existingTrack) {
+    throw new Error(`setExperiencePercent: unknown track "${track}"`)
+  }
+
+  const current = experiencePercentFor(state, track)
+  const currentQ = Math.floor(current / 25)
+  const targetQ = Math.floor(target / 25)
+  const storedPercent = target === 100 ? 0 : target
+  const storedQuarter = target === 100 ? 0 : targetQ
+  const level = isRace ? state.race.level : existingTrack!.level
+
+  // No-op: target equals the current authoritative percent. No turn, no state change.
+  if (target === current) {
+    return {
+      state,
+      journal: staticPercentJournal(
+        state,
+        track,
+        level,
+        currentQ,
+        currentQ,
+        current,
+        current,
+        0
+      ),
+    }
+  }
+
+  // Backward set: only ever lower the percent/quarter; never decrement the turn or
+  // revoke awards.
+  if (target < current) {
+    const next = isRace
+      ? withRacePercent(state, storedPercent, storedQuarter)
+      : withTrackPercent(state, track, storedPercent, storedQuarter)
+    return {
+      state: next,
+      journal: staticPercentJournal(
+        state,
+        track,
+        level,
+        currentQ,
+        storedQuarter,
+        current,
+        storedPercent,
+        0
+      ),
+    }
+  }
+
+  // Forward set. Determine how many quarter boundaries are crossed.
+  const advancesNeeded = target === 100 ? 4 - currentQ : targetQ - currentQ
+
+  if (advancesNeeded === 0) {
+    // Same quarter, higher percent: no boundary crossed, so no engine advance. Only
+    // the authoritative percent/quarter is updated; the turn is untouched.
+    const next = isRace
+      ? withRacePercent(state, storedPercent, storedQuarter)
+      : withTrackPercent(state, track, storedPercent, storedQuarter)
+    return {
+      state: next,
+      journal: staticPercentJournal(
+        state,
+        track,
+        level,
+        currentQ,
+        storedQuarter,
+        current,
+        storedPercent,
+        0
+      ),
+    }
+  }
+
+  let s = state
+  let lastJournal: JournalDelta | null = null
+  for (let i = 0; i < advancesNeeded; i++) {
+    const r = isRace
+      ? advanceRaceQuarter(s, definition as RaceDefinition, config)
+      : advanceQuarter(s, track, definition as TrackDefinition, config)
+    s = r.state
+    lastJournal = r.journal
+  }
+
+  // Override the synced quarter*25 percent with the authoritative requested value.
+  const next = isRace
+    ? withRacePercent(s, storedPercent, storedQuarter)
+    : withTrackPercent(s, track, storedPercent, storedQuarter)
+
+  // The journal must describe the WHOLE operation, not the last 25% step. The
+  // engine's `advanceQuarter` / `advanceRaceQuarter` journals only carry the values
+  // immediately before the final step, so override the "before" fields with the
+  // initial state captured above and retain the final "after" / award / race gain /
+  // evolution offer from the last engine step.
+  const journal: JournalDelta = {
+    ...(lastJournal ??
+      staticPercentJournal(
+        state,
+        track,
+        level,
+        currentQ,
+        storedQuarter,
+        current,
+        storedPercent,
+        advancesNeeded
+      )),
+    levelBefore: level,
+    quarterBefore: currentQ,
+    raceLevelBefore: state.race.level,
+    percentBefore: current,
+    percentAfter: storedPercent,
+    turnsAdvanced: advancesNeeded,
+  }
+
+  return { state: next, journal }
+}
+
+/**
+ * Level a track (or race) up from experience. A thin wrapper over
+ * `setExperiencePercent(..., 100)`: it may level from ANY percentage (including 0)
+ * and resets the percent to 0 after the level-up. The journal carries the
+ * percent-before/after and the merged final level/award/race-gain/evolution offer
+ * from the final engine step; skill offers are NOT synthesized by the engine (the
+ * service adds them only on an actual level-up).
+ */
+export function levelUpFromExperience(
+  state: CharacterState,
+  track: TrackId,
+  definition: TrackDefinition,
+  config: RulesConfig
+): AdvanceResult
+export function levelUpFromExperience(
+  state: CharacterState,
+  track: "race",
+  definition: RaceDefinition,
+  config: RulesConfig
+): AdvanceResult
+export function levelUpFromExperience(
+  state: CharacterState,
+  track: TrackId,
+  definition: TrackDefinition | RaceDefinition,
+  config: RulesConfig
+): AdvanceResult {
+  return track === "race"
+    ? setExperiencePercent(
+        state,
+        "race",
+        100,
+        definition as RaceDefinition,
+        config
+      )
+    : setExperiencePercent(
+        state,
+        track,
+        100,
+        definition as TrackDefinition,
+        config
+      )
 }

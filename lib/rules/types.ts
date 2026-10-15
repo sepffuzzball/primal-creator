@@ -196,6 +196,16 @@ export interface TrackState {
   quarter: number
   definitionId: string
   /**
+   * Authoritative class/profession experience percentage within the current level
+   * (integer 0..99). When present this is the source of truth for quarter cadence:
+   * the track's `quarter` MUST equal `Math.floor(experiencePercent / 25)` (enforced
+   * by the Zod schema). Absent on legacy states that predate explicit EXP tracking;
+   * for those the engine falls back to the legacy quarter via `quarter * 25`
+   * (see `experiencePercentFor`). The engine never rewrites an absent field on a
+   * read; it only sets it when the track is advanced.
+   */
+  experiencePercent?: number
+  /**
    * Optional explicit class/profession grade state. When present the track is
    * "graded": its level-up is independently capped at the entry level of the NEXT
    * grade (it may reach exactly that threshold but may not pass it) until the
@@ -225,6 +235,17 @@ export interface RaceState {
    * use it - their race level is derived from the class/profession tracks.
    */
   quarter?: number
+  /**
+   * Authoritative race-level experience percentage within the current race level
+   * (integer 0..99), present on independent (monster) races only. Mirrors
+   * `TrackState.experiencePercent`: when present, the race's `quarter` MUST equal
+   * `Math.floor(experiencePercent / 25)` (enforced by the Zod schema). Absent on
+   * legacy states and on derived (enlightened) races, which never carry a percent
+   * of their own (their displayed percent is a read-only average of the
+   * class/profession EXP percentages, computed by the UI, not the engine). The
+   * engine never rewrites an absent field on a read.
+   */
+  experiencePercent?: number
   /**
    * Provenance of the starting grade, recorded at character creation: `born`
    * races enter at F-grade, `integrated` races at G-grade. Used to resolve the

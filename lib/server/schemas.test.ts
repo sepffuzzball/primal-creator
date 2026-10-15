@@ -13,6 +13,7 @@ import {
   equipmentPositionSchema,
   equipmentRaritySchema,
   evolveSchema,
+  experienceSchema,
   godConfigSchema,
   gradeDescriptionsSchema,
   hasInvalidNaturalGradeConfig,
@@ -666,6 +667,178 @@ describe("race advancement (raceType / quarter / track)", () => {
     ).toBe(false)
   })
 
+  it("experienceSchema accepts a set operation with a percent", () => {
+    const parsed = experienceSchema.safeParse({
+      operation: "set",
+      track: "class",
+      percent: 50,
+      version: 0,
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toEqual({
+        operation: "set",
+        track: "class",
+        percent: 50,
+        version: 0,
+      })
+    }
+  })
+
+  it("experienceSchema accepts the percent bounds 0 and 100", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "race",
+        percent: 0,
+        version: 0,
+      }).success
+    ).toBe(true)
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "profession",
+        percent: 100,
+        version: 0,
+      }).success
+    ).toBe(true)
+  })
+
+  it("experienceSchema accepts a levelUp operation with no percent", () => {
+    const parsed = experienceSchema.safeParse({
+      operation: "levelUp",
+      track: "race",
+      version: 2,
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({
+        operation: "levelUp",
+        track: "race",
+        version: 2,
+      })
+      expect((parsed.data as { percent?: number }).percent).toBeUndefined()
+    }
+  })
+
+  it("experienceSchema accepts an undo operation with no percent", () => {
+    const parsed = experienceSchema.safeParse({
+      operation: "undo",
+      track: "class",
+      version: 3,
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({
+        operation: "undo",
+        track: "class",
+        version: 3,
+      })
+      expect((parsed.data as { percent?: number }).percent).toBeUndefined()
+    }
+  })
+
+  it("experienceSchema rejects an undo operation carrying a percent", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "undo",
+        track: "profession",
+        percent: 75,
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects an undo operation with a non-integer or negative version", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "undo",
+        track: "class",
+        version: -1,
+      }).success
+    ).toBe(false)
+    expect(
+      experienceSchema.safeParse({
+        operation: "undo",
+        track: "class",
+        version: 1.5,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects a set operation with no percent", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "class",
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects a levelUp operation carrying a percent", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "levelUp",
+        track: "class",
+        percent: 75,
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects a percent outside 0..100", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "class",
+        percent: 101,
+        version: 0,
+      }).success
+    ).toBe(false)
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "class",
+        percent: -1,
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects a non-integer percent", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "class",
+        percent: 33.5,
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects an unknown operation", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "grant",
+        track: "class",
+        percent: 25,
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
+  it("experienceSchema rejects an unknown track", () => {
+    expect(
+      experienceSchema.safeParse({
+        operation: "set",
+        track: "monster",
+        percent: 25,
+        version: 0,
+      }).success
+    ).toBe(false)
+  })
+
   it("characterCreateSchema accepts a null class and profession (a monster)", () => {
     const parsed = characterCreateSchema.safeParse({
       name: "Kael",
@@ -1153,5 +1326,109 @@ describe("gradeDescriptionsSchema (catalog grade-specific prose)", () => {
 
   it("rejects a non-object / array value", () => {
     expect(gradeDescriptionsSchema.safeParse([]).success).toBe(false)
+  })
+})
+
+describe("characterStateSchema experiencePercent validation", () => {
+  function baseState(overrides: Record<string, unknown> = {}) {
+    return {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [],
+      currentResources: {},
+      turn: 0,
+      ...overrides,
+    }
+  }
+
+  it("accepts a track with a matching explicit experiencePercent and quarter", () => {
+    const state = baseState({
+      tracks: {
+        class: {
+          level: 1,
+          quarter: 1,
+          definitionId: "d",
+          experiencePercent: 25,
+        },
+      },
+    })
+    expect(characterStateSchema.safeParse(state).success).toBe(true)
+  })
+
+  it("rejects a track whose quarter does not match experiencePercent", () => {
+    const state = baseState({
+      tracks: {
+        class: {
+          level: 1,
+          quarter: 2,
+          definitionId: "d",
+          experiencePercent: 25,
+        },
+      },
+    })
+    expect(characterStateSchema.safeParse(state).success).toBe(false)
+  })
+
+  it("accepts an independent race with a matching experiencePercent and quarter", () => {
+    const state = baseState({
+      race: {
+        level: 0,
+        grade: "F",
+        mode: "independent",
+        quarter: 2,
+        experiencePercent: 50,
+      },
+    })
+    expect(characterStateSchema.safeParse(state).success).toBe(true)
+  })
+
+  it("rejects a race whose quarter does not match experiencePercent", () => {
+    const state = baseState({
+      race: {
+        level: 0,
+        grade: "F",
+        mode: "independent",
+        quarter: 1,
+        experiencePercent: 50,
+      },
+    })
+    expect(characterStateSchema.safeParse(state).success).toBe(false)
+  })
+
+  it("accepts legacy state with a quarter but no explicit experiencePercent", () => {
+    const state = baseState({
+      tracks: {
+        class: { level: 1, quarter: 3, definitionId: "d" },
+      },
+      race: { level: 0, grade: "F", mode: "independent", quarter: 3 },
+    })
+    expect(characterStateSchema.safeParse(state).success).toBe(true)
+  })
+
+  it("rejects an experiencePercent outside 0..99 or non-integer", () => {
+    const badTracks = [
+      { level: 1, quarter: 0, definitionId: "d", experiencePercent: 100 },
+      { level: 1, quarter: 0, definitionId: "d", experiencePercent: -1 },
+      { level: 1, quarter: 0, definitionId: "d", experiencePercent: 25.5 },
+    ]
+    for (const track of badTracks) {
+      const state = baseState({ tracks: { class: track } })
+      expect(characterStateSchema.safeParse(state).success).toBe(false)
+    }
   })
 })
