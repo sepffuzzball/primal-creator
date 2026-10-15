@@ -692,6 +692,49 @@ export function normalizeCatalogKind(kind: string): string {
 }
 
 /**
+ * A `gods` catalog entry carries no grade band: a god's power, divine rank and
+ * blessing tier are expressed through `blessingEffects[tier]` (and the optional
+ * `pantheon` / `divineRank` metadata), never through the shared
+ * `catalog_definitions.grade` column that races/classes/professions and other
+ * graded kinds use. Migration 0020 nulled any pre-existing god grade, and from
+ * here on every write/import path for a god must reject a non-null grade -
+ * only `null` (or an omitted grade, which reads back as null) is legal.
+ *
+ * Returns true when `kind` is `gods` AND `grade` is a non-null value, which is
+ * exactly the case the service/import layer must reject with 400
+ * `invalid_grade`. Centralized here so the create/update service path and every
+ * catalog import path share the same invariant rather than each inlining it.
+ */
+export function godGradeForbidden(kind: string, grade: unknown): boolean {
+  return kind === "gods" && grade != null
+}
+
+/**
+ * The advancement-track kinds that always carry a required catalog grade. A
+ * race/class/profession is graded by definition - its `grade` is how the engine
+ * pins a track to a per-grade definition (see `resolveTrackDefinition`) and is
+ * never null after a migration that stamped graded tracks. A PATCH that tries to
+ * clear such a grade to null must be rejected before any write, so a valid grade
+ * can never be accidentally erased by a generic optional-grade clear.
+ *
+ * Returns true when `kind` is one of races/classes/professions AND `grade` is the
+ * explicit `null` value, which is exactly the case the service update path must
+ * reject with 400 `invalid_grade`. An omitted grade (`undefined`) is legal - it
+ * preserves the existing non-null value, so a metadata-only PATCH never trips
+ * this. Centralized here so the update path shares the invariant instead of
+ * inlining kind-specific logic, mirroring `godGradeForbidden`.
+ */
+export function requiredGradeNullForbidden(
+  kind: string,
+  grade: unknown
+): boolean {
+  return (
+    (kind === "races" || kind === "classes" || kind === "professions") &&
+    grade === null
+  )
+}
+
+/**
  * Grade-specific prose descriptions for a catalog entry, keyed by the grade
  * ladder (G..S). Authored independently of the legacy `description` string and of
  * the entry's own `grade` band (a legacy race whose `grade` is null may still
@@ -721,6 +764,90 @@ export const gradeDescriptionsSchema = z
       }
     }
   }) as z.ZodType<Partial<Record<Grade, string>>>
+
+/**
+ * Grade-specific automatic skill grants for a race or class/profession track,
+ * keyed by the grade ladder (G..S). Each value is a list of `skills` catalog
+ * `stableId` entries the engine grants automatically at the moment the
+ * character reaches that grade: on create for the starting grade, on profession
+ * assignment for the newly assigned track grade, or on evolution into the target
+ * grade of the new selected catalog definition. Optional and may be empty: a
+ * missing or `{}` value means the entry declares no auto-grant (it reads back as
+ * an empty map, never a fabricated list). Keys are STRICT - only G..S are
+ * accepted, so a typo like `"H"` is rejected rather than silently dropped. Each
+ * list must be internally unique and every id nonempty; a repeated id for a
+ * grade is rejected. The service layer resolves each id to an unarchived skill on
+ * a NEW or config-changing write and rejects a missing or archived reference.
+ */
+export const gradeGrantedSkillStableIdsSchema = z
+  .record(z.string(), z.array(z.string().min(1)))
+  .superRefine((map, ctx) => {
+    for (const [grade, ids] of Object.entries(map)) {
+      if (
+        !gradeSchema.options.includes(
+          grade as (typeof gradeSchema.options)[number]
+        )
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `gradeGrantedSkillStableIds has an invalid grade key "${grade}"`,
+          path: [grade],
+        })
+      }
+      if (Array.isArray(ids)) {
+        const seen = new Set<string>()
+        for (const id of ids) {
+          if (seen.has(id)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `"${id}" is granted more than once for grade "${grade}" in "gradeGrantedSkillStableIds"`,
+              path: [grade],
+            })
+            break
+          }
+          seen.add(id)
+        }
+      }
+    }
+  }) as z.ZodType<Partial<Record<Grade, string[]>>>
+
+/**
+ * Extract the grade-specific granted skill stableIds declared for a single grade
+ * from a race/class/profession config. A missing or malformed map yields `[]`
+ * (never a fabricated list), so a legacy config that predates the field grants
+ * nothing.
+ */
+export function gradeSkillStableIdsFor(
+  config: Record<string, unknown>,
+  grade: Grade
+): string[] {
+  const byGrade = config.gradeGrantedSkillStableIds
+  if (!byGrade || typeof byGrade !== "object" || Array.isArray(byGrade))
+    return []
+  const ids = (byGrade as Record<string, unknown>)[grade]
+  if (!Array.isArray(ids)) return []
+  return ids.filter((id): id is string => typeof id === "string")
+}
+
+/**
+ * Collect every skill stableId referenced across all grades in a
+ * race/class/profession config's `gradeGrantedSkillStableIds`. Used by the import
+ * allow-set resolution to reject a reference that would dangle after the upload.
+ */
+export function allGradeGrantedSkillStableIds(
+  config: Record<string, unknown>
+): string[] {
+  const byGrade = config.gradeGrantedSkillStableIds
+  if (!byGrade || typeof byGrade !== "object" || Array.isArray(byGrade))
+    return []
+  const out: string[] = []
+  for (const ids of Object.values(byGrade as Record<string, unknown>)) {
+    if (Array.isArray(ids)) {
+      for (const id of ids) if (typeof id === "string") out.push(id)
+    }
+  }
+  return out
+}
 
 const catalogBase = {
   name: z.string().min(1),
@@ -763,6 +890,7 @@ export const raceConfigSchema = z
     raceType: z.enum(["enlightened", "monster"]).optional(),
     naturalGrade: gradeSchema.optional(),
     raceDefinitions: z.record(z.string(), raceDefinitionSchema).optional(),
+    gradeGrantedSkillStableIds: gradeGrantedSkillStableIdsSchema.optional(),
   })
   .passthrough()
 
@@ -826,6 +954,7 @@ export const trackConfigSchema = z
         })
       )
       .optional(),
+    gradeGrantedSkillStableIds: gradeGrantedSkillStableIdsSchema.optional(),
   })
   .passthrough()
 

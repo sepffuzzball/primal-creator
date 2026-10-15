@@ -56,6 +56,64 @@ function canonicalEquipmentConfig(
   return { slot: "Ring", rarity: "Common", ...extra }
 }
 
+function raceEntry(
+  stableId: string,
+  config: Record<string, unknown>,
+  name = stableId
+): WikiReviewedEntry {
+  return {
+    kind: "races",
+    stableId,
+    name,
+    description: `Description for ${name}`,
+    sourceUrl: `https://example.com/${stableId}`,
+    config,
+  }
+}
+
+function classEntry(
+  stableId: string,
+  config: Record<string, unknown>,
+  name = stableId
+): WikiReviewedEntry {
+  return {
+    kind: "classes",
+    stableId,
+    name,
+    description: `Description for ${name}`,
+    sourceUrl: `https://example.com/${stableId}`,
+    config,
+  }
+}
+
+function professionEntry(
+  stableId: string,
+  config: Record<string, unknown>,
+  name = stableId
+): WikiReviewedEntry {
+  return {
+    kind: "professions",
+    stableId,
+    name,
+    description: `Description for ${name}`,
+    sourceUrl: `https://example.com/${stableId}`,
+    config,
+  }
+}
+
+/** A valid, canonical modern race config (raceType + naturalGrade). */
+function canonicalRaceConfig(
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return { raceType: "enlightened", naturalGrade: "F", ...extra }
+}
+
+function canonicalTrackConfig(
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return { grades: { F: { fixed: { agility: 1 }, free: 0 } }, ...extra }
+}
+
 describe("catalog import (unit, mocked db)", () => {
   beforeEach(() => {
     dbMock.store.reset()
@@ -793,5 +851,326 @@ describe("catalog import (unit, mocked db)", () => {
     expect(ring.config).toMatchObject({
       grantedSkillStableIds: ["existing-skill"],
     })
+  })
+
+  it("rejects a race/class/profession entry that references a missing grade skill", async () => {
+    const bad: WikiReviewedEntry[] = [
+      raceEntry(
+        "race-g",
+        canonicalRaceConfig({
+          gradeGrantedSkillStableIds: { F: ["no-such-skill"] },
+        })
+      ),
+      classEntry(
+        "cls-g",
+        canonicalTrackConfig({
+          gradeGrantedSkillStableIds: { F: ["no-such-skill"] },
+        })
+      ),
+      professionEntry(
+        "prof-g",
+        canonicalTrackConfig({
+          gradeGrantedSkillStableIds: { F: ["no-such-skill"] },
+        })
+      ),
+    ]
+    for (const entries of bad.map((e) => [e])) {
+      await expect(previewWikiReviewedImport(entries)).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_config",
+      })
+      await expect(applyWikiReviewedImport(entries)).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_config",
+      })
+    }
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a race/class/profession entry that references an archived grade skill", async () => {
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const bad: WikiReviewedEntry[] = [
+      raceEntry(
+        "race-g",
+        canonicalRaceConfig({
+          gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+        })
+      ),
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rejects a grade-grant to a skill the manifest also lists when the catalog skill is archived (manifest entry skipped)", async () => {
+    // A skill row already exists archived, AND the manifest also lists that same
+    // skill. Because existing rows are never overwritten, the manifest skill entry
+    // is skipped (status skip_existing), so the skill stays archived. The import
+    // must NOT treat the merely-included manifest skill as unarchived, so a
+    // race entry granting it is rejected in both preview and apply.
+    dbMock.store.addCatalog({
+      id: "dual-skill",
+      kind: "skills",
+      stableId: "dual-skill",
+      name: "Dual Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      skillEntry("dual-skill"),
+      raceEntry(
+        "race-g",
+        canonicalRaceConfig({
+          gradeGrantedSkillStableIds: { F: ["dual-skill"] },
+        })
+      ),
+    ]
+    await expect(previewWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "dual-skill"
+    )!
+    expect(row.archived).toBe(true)
+  })
+
+  it("accepts a race/class/profession entry that grants a grade skill created by the same manifest", async () => {
+    // Import always creates rows with archived=false, so a skill created by this
+    // manifest satisfies the unarchived grade-grant resolution.
+    const good: WikiReviewedEntry[] = [
+      skillEntry("manifest-skill"),
+      raceEntry(
+        "race-g",
+        canonicalRaceConfig({
+          gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+        })
+      ),
+      classEntry(
+        "cls-g",
+        canonicalTrackConfig({
+          gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+        })
+      ),
+      professionEntry(
+        "prof-g",
+        canonicalTrackConfig({
+          gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+        })
+      ),
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(4)
+    expect(result.skipCount).toBe(0)
+    const race = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "race-g"
+    )!
+    expect(race.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+    })
+  })
+
+  it("accepts a race/class/profession entry that grants an existing unarchived grade skill", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: false,
+    })
+    const good: WikiReviewedEntry[] = [
+      raceEntry(
+        "race-g",
+        canonicalRaceConfig({
+          gradeGrantedSkillStableIds: { F: ["existing-skill"] },
+        })
+      ),
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const race = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "race-g"
+    )!
+    expect(race.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["existing-skill"] },
+    })
+  })
+
+  it("skips an already-existing race whose grade-granted skill was archived rather than rejecting the reference", async () => {
+    // An active race already occupies the key and its grade-granted skill was later
+    // archived. Because the race is skipped (existing rows are never overwritten),
+    // its config is preserved untouched and the import must NOT revalidate the
+    // now-archived grade-skill reference on it.
+    dbMock.store.addCatalog({
+      id: "existing-race",
+      kind: "races",
+      stableId: "existing-race",
+      name: "Existing Race",
+      config: canonicalRaceConfig({
+        gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+      }),
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      raceEntry(
+        "existing-race",
+        canonicalRaceConfig({
+          gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+        })
+      ),
+    ]
+    const preview = await previewWikiReviewedImport(manifest)
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    expect(preview.entries[0].status).toBe("skip_existing")
+    const applied = await applyWikiReviewedImport(manifest)
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    // Neither the pre-existing race nor the archived skill was touched or created.
+    expect(dbMock.store.catalog.size).toBe(2)
+    const race = dbMock.store.catalog.get("existing-race")!
+    expect(race.archived).toBe(false)
+    expect(race.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+    })
+  })
+
+  it("skips an already-existing equipment row whose granted skill was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-ring",
+      kind: "equipment",
+      stableId: "existing-ring",
+      name: "Existing Ring",
+      config: canonicalEquipmentConfig({
+        grantedSkillStableIds: ["arch-skill"],
+      }),
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      equipmentEntry(
+        "existing-ring",
+        canonicalEquipmentConfig({ grantedSkillStableIds: ["arch-skill"] })
+      ),
+    ]
+    const preview = await previewWikiReviewedImport(manifest)
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    const applied = await applyWikiReviewedImport(manifest)
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("skips an already-existing equipment row whose patron god was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-ring",
+      kind: "equipment",
+      stableId: "existing-ring",
+      name: "Existing Ring",
+      config: canonicalEquipmentConfig({ requiredGodStableId: "arch-god" }),
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-god",
+      kind: "gods",
+      stableId: "arch-god",
+      name: "Archived God",
+      config: { blessingEffects: {} },
+      archived: true,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      equipmentEntry(
+        "existing-ring",
+        canonicalEquipmentConfig({ requiredGodStableId: "arch-god" })
+      ),
+    ]
+    const preview = await previewWikiReviewedImport(manifest)
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    const applied = await applyWikiReviewedImport(manifest)
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("rejects a gods manifest entry that carries a non-null grade (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        kind: "gods",
+        stableId: "graded-god",
+        name: "Graded God",
+        description: "A god that mistakenly carries a catalog grade",
+        grade: "S",
+        sourceUrl: "https://example.com/graded-god",
+        config: { blessingEffects: {} },
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("accepts a gods manifest entry that omits grade (null) and persists a null column", async () => {
+    const good: WikiReviewedEntry[] = [
+      {
+        kind: "gods",
+        stableId: "ungraded-god",
+        name: "Ungraded God",
+        description: "A god with no grade band",
+        sourceUrl: "https://example.com/ungraded-god",
+        config: { blessingEffects: {} },
+      },
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    const god = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "ungraded-god"
+    )!
+    expect(god.kind).toBe("gods")
+    expect(god.grade).toBeNull()
   })
 })

@@ -9520,6 +9520,208 @@ describe("catalog blessing / bloodline / god foundations", () => {
     })
     expect(item.stableId).toBe("renamed-god")
   })
+
+  it("rejects a gods create that carries a non-null catalog grade", async () => {
+    await expect(
+      createCatalogItem("gods", {
+        stableId: "graded-god",
+        name: "Graded God",
+        grade: "S",
+        config: { pantheon: "Void" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("creates a gods entry with no grade (grade reads back null)", async () => {
+    const item = await createCatalogItem("gods", {
+      stableId: "ungraded-god",
+      name: "Ungraded God",
+      config: { pantheon: "Void" },
+    })
+    expect(item.grade).toBeNull()
+  })
+
+  it("rejects a gods PATCH that sets a non-null catalog grade", async () => {
+    dbMock.store.addCatalog({
+      id: "migrated-god",
+      kind: "gods",
+      stableId: "migrated-god",
+      name: "Migrated God",
+      config: { pantheon: "Void" },
+      grade: null,
+    })
+    await expect(
+      updateCatalogItem("gods", "migrated-god", { grade: "A" })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    // The row is unchanged; the rejected PATCH never wrote.
+    const row = dbMock.store.catalog.get("migrated-god")!
+    expect(row.grade).toBeNull()
+  })
+
+  it("allows a metadata-only PATCH on a migrated god (grade stays null)", async () => {
+    dbMock.store.addCatalog({
+      id: "migrated-god",
+      kind: "gods",
+      stableId: "migrated-god",
+      name: "Migrated God",
+      config: { pantheon: "Void" },
+      grade: null,
+    })
+    const item = await updateCatalogItem("gods", "migrated-god", {
+      name: "Renamed God",
+    })
+    expect(item.name).toBe("Renamed God")
+    expect(item.grade).toBeNull()
+  })
+
+  it("allows a gods PATCH that clears grade to null (no-op on a migrated row)", async () => {
+    dbMock.store.addCatalog({
+      id: "migrated-god",
+      kind: "gods",
+      stableId: "migrated-god",
+      name: "Migrated God",
+      config: { pantheon: "Void" },
+      grade: null,
+    })
+    const item = await updateCatalogItem("gods", "migrated-god", {
+      grade: null,
+    })
+    expect(item.grade).toBeNull()
+  })
+})
+
+describe("updateCatalogItem PATCH grade semantics (clear optional grades, never clear required)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCatalog(
+    id: string,
+    kind: string,
+    config: Record<string, unknown> = {},
+    grade: string | null = null,
+    name = `Entry ${id}`
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind,
+      stableId: id,
+      name,
+      config,
+      grade,
+    })
+  }
+
+  it("clears a title's optional catalog grade when the PATCH sends grade: null", async () => {
+    seedCatalog("title-g", "titles", { flat: { strength: 3 } }, "C", "Title G")
+    const item = await updateCatalogItem("titles", "title-g", { grade: null })
+    expect(item.grade).toBeNull()
+    const row = dbMock.store.catalog.get("title-g")!
+    expect(row.grade).toBeNull()
+  })
+
+  it("clears an item's optional catalog grade when the PATCH sends grade: null", async () => {
+    seedCatalog("item-g", "items", {}, "D", "Item G")
+    const item = await updateCatalogItem("items", "item-g", { grade: null })
+    expect(item.grade).toBeNull()
+    const row = dbMock.store.catalog.get("item-g")!
+    expect(row.grade).toBeNull()
+  })
+
+  it("clears a bloodline's optional catalog grade when the PATCH sends grade: null", async () => {
+    seedCatalog("blood-g", "bloodlines", { effects: [] }, "B", "Blood G")
+    const item = await updateCatalogItem("bloodlines", "blood-g", {
+      grade: null,
+    })
+    expect(item.grade).toBeNull()
+    const row = dbMock.store.catalog.get("blood-g")!
+    expect(row.grade).toBeNull()
+  })
+
+  it("clears a transcendent skill's optional catalog grade when the PATCH sends grade: null", async () => {
+    seedCatalog(
+      "trans-g",
+      "transcendent_skills",
+      { passiveEffects: [] },
+      "A",
+      "Trans G"
+    )
+    const item = await updateCatalogItem("transcendent_skills", "trans-g", {
+      grade: null,
+    })
+    expect(item.grade).toBeNull()
+  })
+
+  it("leaves an existing grade untouched when the PATCH omits grade", async () => {
+    seedCatalog(
+      "title-keep",
+      "titles",
+      { flat: { strength: 3 } },
+      "C",
+      "Title Keep"
+    )
+    const item = await updateCatalogItem("titles", "title-keep", {
+      name: "Renamed Title",
+    })
+    expect(item.grade).toBe("C")
+    expect(item.name).toBe("Renamed Title")
+  })
+
+  it("preserves description and gradeDescriptions when clearing only grade", async () => {
+    seedCatalog(
+      "title-desc",
+      "titles",
+      { flat: { strength: 3 } },
+      "C",
+      "Title Desc"
+    )
+    const item = await updateCatalogItem("titles", "title-desc", {
+      grade: null,
+      description: "New description",
+    })
+    expect(item.grade).toBeNull()
+    expect(item.description).toBe("New description")
+    expect(item.gradeDescriptions).toEqual({})
+  })
+
+  it("rejects a grade: null clear on a race with 400 invalid_grade (no write)", async () => {
+    seedCatalog("race-null", "races", {}, "B", "Race Null")
+    await expect(
+      updateCatalogItem("races", "race-null", { grade: null })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    const row = dbMock.store.catalog.get("race-null")!
+    expect(row.grade).toBe("B")
+  })
+
+  it("rejects a grade: null clear on a class and profession with 400 invalid_grade", async () => {
+    seedCatalog("cls-null", "classes", {}, "F", "Class Null")
+    seedCatalog("prof-null", "professions", {}, "E", "Prof Null")
+    await expect(
+      updateCatalogItem("classes", "cls-null", { grade: null })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    await expect(
+      updateCatalogItem("professions", "prof-null", { grade: null })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+  })
+
+  it("allows a gods PATCH that clears grade to null (legal and no-op)", async () => {
+    seedCatalog("god-null", "gods", { pantheon: "Void" }, null, "God Null")
+    const item = await updateCatalogItem("gods", "god-null", { grade: null })
+    expect(item.grade).toBeNull()
+  })
+
+  it("still applies a non-null grade on an optional kind (no accidental clear)", async () => {
+    seedCatalog(
+      "title-up",
+      "titles",
+      { flat: { strength: 3 } },
+      "C",
+      "Title Up"
+    )
+    const item = await updateCatalogItem("titles", "title-up", { grade: "A" })
+    expect(item.grade).toBe("A")
+  })
 })
 
 describe("skill offers (milestone choice model)", () => {
@@ -16049,5 +16251,1178 @@ describe("grade ceiling level-up blockers (service read)", () => {
     seedDerived({ classLevel: 25, professionLevel: 24 })
     const detail = await getCharacter("chr-1", user)
     expect(detail.levelUpBlocked ?? {}).toEqual({})
+  })
+})
+
+describe("grade-granted skills (per-grade automatic skill grants)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedSkillGrant(
+    id: string,
+    config: Record<string, unknown> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: `Skill ${id}`,
+      config: { rarity: "Common", ...config },
+    })
+  }
+
+  function seedRaceGrant(
+    id: string,
+    opts: {
+      naturalGrade?: Grade
+      grants?: Partial<Record<Grade, string[]>>
+      defs?: Record<string, unknown>
+    } = {}
+  ): void {
+    const naturalGrade = opts.naturalGrade ?? "F"
+    const defs = opts.defs ?? {
+      G: { id: `${id}:G`, perLevel: { strength: 1 }, freePerLevel: 1 },
+      F: { id: `${id}:F`, perLevel: { strength: 1 }, freePerLevel: 1 },
+    }
+    dbMock.store.addCatalog({
+      id,
+      kind: "races",
+      stableId: `race-${id}`,
+      name: `Race ${id}`,
+      config: {
+        raceType: "enlightened",
+        naturalGrade,
+        raceDefinitions: defs,
+        ...(opts.grants ? { gradeGrantedSkillStableIds: opts.grants } : {}),
+      },
+    })
+  }
+
+  function seedClassGrant(
+    id: string,
+    grade: Grade,
+    grants?: Partial<Record<Grade, string[]>>
+  ): void {
+    dbMock.store.addCatalog({
+      id,
+      kind: "classes",
+      stableId: `cls-${id}`,
+      name: `Class ${id}`,
+      grade,
+      config: {
+        grades: { [grade]: { fixed: { agility: 1 }, free: 0 } },
+        ...(grants ? { gradeGrantedSkillStableIds: grants } : {}),
+      },
+    })
+  }
+
+  function seedProfGrant(
+    id: string,
+    grade: Grade,
+    grants?: Partial<Record<Grade, string[]>>
+  ): void {
+    dbMock.store.addCatalog({
+      id,
+      kind: "professions",
+      stableId: `prof-${id}`,
+      name: `Profession ${id}`,
+      grade,
+      config: {
+        grades: { [grade]: { fixed: { wisdom: 1 }, free: 0 } },
+        ...(grants ? { gradeGrantedSkillStableIds: grants } : {}),
+      },
+    })
+  }
+
+  function skillIds(detail: {
+    associations: Array<{ kind: string; definitionId: string }>
+  }): string[] {
+    return detail.associations
+      .filter((a) => a.kind === "skill")
+      .map((a) => a.definitionId)
+      .sort()
+  }
+
+  function seedIntegratedCharacter(): unknown {
+    const state = createInitialState("integrated", null, null)
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedProfWithGrants(
+    id: string,
+    grade: Grade,
+    grants?: Partial<Record<Grade, string[]>>
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "professions",
+      stableId: id,
+      name: `Prof ${id}`,
+      grade,
+      config: {
+        grades: { [grade]: { fixed: { wisdom: 1 }, free: 0 } },
+        ...(grants ? { gradeGrantedSkillStableIds: grants } : {}),
+      },
+    })
+  }
+
+  // ------------------------------------------------------------------ //
+  // createCharacter
+  // ------------------------------------------------------------------ //
+
+  it("grants the race grade skill at G and class/profession grade skills at the track grade on an integrated create", async () => {
+    seedSkillGrant("race-skill")
+    seedSkillGrant("class-skill")
+    seedSkillGrant("prof-skill")
+    seedRaceGrant("race-gg", {
+      naturalGrade: "F",
+      grants: { G: ["race-skill"] },
+    })
+    seedClassGrant("cls-gg", "F", { F: ["class-skill"] })
+    seedProfGrant("prof-gg", "F", { F: ["prof-skill"] })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+        professionId: "prof-gg",
+      },
+      user
+    )
+    expect(skillIds(detail)).toEqual([
+      "class-skill",
+      "prof-skill",
+      "race-skill",
+    ])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string; name: string }>
+      }
+    }
+    const granted = payload.skillGrants.granted
+      .map((g) => ({ stableId: g.stableId, grade: g.grade }))
+      .sort((a, b) => a.stableId.localeCompare(b.stableId))
+    expect(granted).toEqual([
+      { stableId: "class-skill", grade: "F" },
+      { stableId: "prof-skill", grade: "F" },
+      { stableId: "race-skill", grade: "G" },
+    ])
+  })
+
+  it("grants the race/class/profession grade skills at the natural grade on a born create", async () => {
+    seedSkillGrant("race-skill")
+    seedSkillGrant("class-skill")
+    seedSkillGrant("prof-skill")
+    seedRaceGrant("race-gg", {
+      naturalGrade: "F",
+      grants: { F: ["race-skill"] },
+    })
+    seedClassGrant("cls-gg", "F", { F: ["class-skill"] })
+    seedProfGrant("prof-gg", "F", { F: ["prof-skill"] })
+    const detail = await createCharacter(
+      {
+        name: "Bael",
+        origin: "born",
+        raceId: "race-gg",
+        classId: "cls-gg",
+        professionId: "prof-gg",
+      },
+      user
+    )
+    expect(skillIds(detail)).toEqual([
+      "class-skill",
+      "prof-skill",
+      "race-skill",
+    ])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: { granted: Array<{ grade: string }> }
+    }
+    expect(payload.skillGrants.granted).toHaveLength(3)
+    for (const g of payload.skillGrants.granted) expect(g.grade).toBe("F")
+  })
+
+  it("does not stack when the same skill is granted by race and class (noop on the duplicate)", async () => {
+    seedSkillGrant("shared")
+    seedRaceGrant("race-gg", { naturalGrade: "F", grants: { G: ["shared"] } })
+    seedClassGrant("cls-gg", "F", { F: ["shared"] })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+      },
+      user
+    )
+    expect(skillIds(detail)).toEqual(["shared"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string }>
+        noop: Array<{ stableId: string; grade: string }>
+      }
+    }
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "shared",
+      grade: "G",
+    })
+    expect(payload.skillGrants.noop).toHaveLength(1)
+    expect(payload.skillGrants.noop[0]).toMatchObject({
+      stableId: "shared",
+      grade: "F",
+    })
+  })
+
+  it("reconciles a multi-track create so a race/class duplicate that upgrades never claims the superseded Common skill is granted", async () => {
+    seedSkillGrant("sk-a", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-b", { rarity: "Uncommon", upgradeGroup: "grp" })
+    seedRaceGrant("race-gg", { naturalGrade: "F", grants: { G: ["sk-a"] } })
+    seedClassGrant("cls-gg", "F", { F: ["sk-a"] })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+      },
+      user
+    )
+    // Only the Uncommon tier persists; the Common link was planned then superseded.
+    expect(skillIds(detail)).toEqual(["sk-b"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string }>
+        upgraded: Array<{
+          fromStableId: string
+          toStableId: string
+          grade: string
+        }>
+        superseded: Array<{ stableId: string; grade: string }>
+      }
+    }
+    // No pre-existing source was displaced, so the Uncommon tier is granted fresh
+    // and the phantom race-grade Common intermediate is only reported as superseded.
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "sk-b",
+      grade: "F",
+    })
+    // Nothing was upgraded from a real persisted link - the Common tier was never
+    // written, so there is no upgrade transition at all (no imaginary source).
+    expect(payload.skillGrants.upgraded).toHaveLength(0)
+    // The superseded Common skill is recorded with its originating race grade so
+    // the trail explains how the planned grant was replaced by a later upgrade.
+    expect(payload.skillGrants.superseded).toHaveLength(1)
+    expect(payload.skillGrants.superseded[0]).toMatchObject({
+      stableId: "sk-a",
+      grade: "G",
+    })
+    // Only the Uncommon link is ever written to the association table.
+    const stored = dbMock.store.associations.filter(
+      (a) => a.characterId === detail.id && a.kind === "SKILL"
+    )
+    expect(stored.map((a) => a.definitionId)).toEqual(["sk-b"])
+  })
+
+  it("reconciles a multi-track create so a class/profession duplicate that upgrades reports only the persisted tier", async () => {
+    seedSkillGrant("sk-a", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-b", { rarity: "Uncommon", upgradeGroup: "grp" })
+    seedRaceGrant("race-gg", { naturalGrade: "F", grants: {} })
+    seedClassGrant("cls-gg", "F", { F: ["sk-a"] })
+    seedProfGrant("prof-gg", "F", { F: ["sk-a"] })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+        professionId: "prof-gg",
+      },
+      user
+    )
+    expect(skillIds(detail)).toEqual(["sk-b"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string }>
+        upgraded: Array<{
+          fromStableId: string
+          toStableId: string
+          grade: string
+        }>
+        superseded: Array<{ stableId: string; grade: string }>
+      }
+    }
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "sk-b",
+      grade: "F",
+    })
+    expect(payload.skillGrants.upgraded).toHaveLength(0)
+    expect(payload.skillGrants.superseded).toHaveLength(1)
+    expect(payload.skillGrants.superseded[0]).toMatchObject({
+      stableId: "sk-a",
+      grade: "F",
+    })
+  })
+
+  it("leaves a genuine same-skill no-op untouched (no superseded entry, persisted grant retained)", async () => {
+    seedSkillGrant("shared", { rarity: "Common", upgradeGroup: "grp" })
+    seedRaceGrant("race-gg", { naturalGrade: "F", grants: { G: ["shared"] } })
+    seedClassGrant("cls-gg", "F", { F: ["shared"] })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+      },
+      user
+    )
+    expect(skillIds(detail)).toEqual(["shared"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string }>
+        noop: Array<{ stableId: string; grade: string }>
+        superseded?: Array<{ stableId: string; grade: string }>
+      }
+    }
+    // The race-grade grant persists; the class duplicate is a no-op, not an upgrade.
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "shared",
+      grade: "G",
+    })
+    expect(payload.skillGrants.noop).toHaveLength(1)
+    expect(payload.skillGrants.noop[0]).toMatchObject({
+      stableId: "shared",
+      grade: "F",
+    })
+    // Nothing was planned and then replaced: no superseded entries.
+    expect(payload.skillGrants.superseded ?? []).toHaveLength(0)
+  })
+
+  it("truthfully journals a 3-stage race/class/profession chain with no pre-existing source (intermediates superseded, final granted)", async () => {
+    seedSkillGrant("sk-a", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-b", { rarity: "Uncommon", upgradeGroup: "grp" })
+    seedSkillGrant("sk-c", { rarity: "Rare", upgradeGroup: "grp" })
+    seedRaceGrant("race-gg", { naturalGrade: "F", grants: { G: ["sk-a"] } })
+    seedClassGrant("cls-gg", "F", { F: ["sk-b"] })
+    seedProfGrant("prof-gg", "F", { F: ["sk-c"] })
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+        professionId: "prof-gg",
+      },
+      user
+    )
+    // Only the Rare tier persists; the Common/Uncommon intermediates were planned
+    // but never written.
+    expect(skillIds(detail)).toEqual(["sk-c"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string; name: string }>
+        upgraded: Array<{
+          fromStableId: string
+          toStableId: string
+          grade: string
+        }>
+        superseded: Array<{ stableId: string; grade: string; name: string }>
+      }
+    }
+    // No pre-existing source was displaced -> C is granted, never upgraded from a
+    // phantom intermediate B.
+    expect(payload.skillGrants.upgraded).toHaveLength(0)
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "sk-c",
+      grade: "F",
+    })
+    // Every intermediate planned grant is reported once under superseded with its
+    // original acquisition grade.
+    const superseded = payload.skillGrants.superseded
+      .map((s) => ({ stableId: s.stableId, grade: s.grade }))
+      .sort((a, b) => a.stableId.localeCompare(b.stableId))
+    expect(superseded).toEqual([
+      { stableId: "sk-a", grade: "G" },
+      { stableId: "sk-b", grade: "F" },
+    ])
+    // The persisted association matches the journal: only the Rare tier.
+    const stored = dbMock.store.associations.filter(
+      (a) => a.characterId === detail.id && a.kind === "SKILL"
+    )
+    expect(stored.map((a) => a.definitionId)).toEqual(["sk-c"])
+  })
+
+  it("journals a single X->A upgrade when a pre-existing source is upgraded directly (no intermediate)", async () => {
+    seedSkillGrant("sk-x", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-a", { rarity: "Uncommon", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-x",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-a"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-a"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string }>
+        upgraded: Array<{ fromStableId: string; toStableId: string }>
+        superseded: Array<{ stableId: string }>
+      }
+    }
+    expect(payload.skillGrants.upgraded).toHaveLength(1)
+    expect(payload.skillGrants.upgraded[0]).toMatchObject({
+      fromStableId: "sk-x",
+      toStableId: "sk-a",
+    })
+    expect(payload.skillGrants.granted).toHaveLength(0)
+    expect(payload.skillGrants.superseded ?? []).toHaveLength(0)
+    const stored = dbMock.store.associations.filter(
+      (a) => a.characterId === "chr-1" && a.kind === "SKILL"
+    )
+    expect(stored.map((a) => a.definitionId)).toEqual(["sk-a"])
+  })
+
+  it("journals a single X->B upgrade (and A as superseded) when a pre-existing source is upgraded through an intermediate in the same acquisition", async () => {
+    seedSkillGrant("sk-x", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-a", { rarity: "Uncommon", upgradeGroup: "grp" })
+    seedSkillGrant("sk-b", { rarity: "Rare", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-x",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-a", "sk-b"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-b"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string }>
+        upgraded: Array<{
+          fromStableId: string
+          toStableId: string
+          grade: string
+        }>
+        superseded: Array<{ stableId: string; grade: string }>
+      }
+    }
+    expect(dbMock.store.events[0].kind).toBe("profession_set")
+    // The pre-existing source X is upgraded DIRECTLY to the final B - one real
+    // pre/post transition, never X->A (A was never persisted).
+    expect(payload.skillGrants.upgraded).toHaveLength(1)
+    expect(payload.skillGrants.upgraded[0]).toMatchObject({
+      fromStableId: "sk-x",
+      toStableId: "sk-b",
+      grade: "G",
+    })
+    // A was planned but never written; it is superseded with its original grade.
+    expect(payload.skillGrants.superseded).toHaveLength(1)
+    expect(payload.skillGrants.superseded[0]).toMatchObject({
+      stableId: "sk-a",
+      grade: "G",
+    })
+    // No claim the pre-existing X is still linked: granted is empty because the
+    // final link was an upgrade.
+    expect(payload.skillGrants.granted).toHaveLength(0)
+    const stored = dbMock.store.associations.filter(
+      (a) => a.characterId === "chr-1" && a.kind === "SKILL"
+    )
+    expect(stored.map((a) => a.definitionId)).toEqual(["sk-b"])
+  })
+
+  it("leaves a grant in a different upgrade group untouched (granted) when another group upgrades from a pre-existing source", async () => {
+    seedSkillGrant("sk-x", { rarity: "Common", upgradeGroup: "grp1" })
+    seedSkillGrant("sk-a", { rarity: "Uncommon", upgradeGroup: "grp1" })
+    seedSkillGrant("g2-a", { rarity: "Common", upgradeGroup: "grp2" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-x",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-a", "g2-a"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character).sort()).toEqual(["g2-a", "sk-a"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        granted: Array<{ stableId: string; grade: string }>
+        upgraded: Array<{ fromStableId: string; toStableId: string }>
+        superseded: Array<{ stableId: string }>
+      }
+    }
+    // grp1: the pre-existing X is upgraded to sk-a.
+    expect(payload.skillGrants.upgraded).toHaveLength(1)
+    expect(payload.skillGrants.upgraded[0]).toMatchObject({
+      fromStableId: "sk-x",
+      toStableId: "sk-a",
+    })
+    // grp2: g2-a is a fresh grant, unaffected by the grp1 upgrade.
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "g2-a",
+      grade: "G",
+    })
+    expect(payload.skillGrants.superseded ?? []).toHaveLength(0)
+  })
+
+  it("skips an archived grade skill at create (journaled, never linked)", async () => {
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { rarity: "Common" },
+      archived: true,
+    })
+    seedRaceGrant("race-gg", {
+      naturalGrade: "F",
+      grants: { G: ["arch-skill"] },
+    })
+    seedClassGrant("cls-gg", "F")
+    const detail = await createCharacter(
+      {
+        name: "Kael",
+        origin: "integrated",
+        raceId: "race-gg",
+        classId: "cls-gg",
+      },
+      user
+    )
+    expect(skillIds(detail)).toEqual([])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: { skipped: Array<{ stableId: string; grade: string }> }
+    }
+    expect(payload.skillGrants.skipped).toEqual([
+      { stableId: "arch-skill", grade: "G" },
+    ])
+  })
+
+  it("rolls back the whole create when a serialization failure occurs after resolving grade grants", async () => {
+    seedSkillGrant("race-skill")
+    seedRaceGrant("race-gg", {
+      naturalGrade: "F",
+      grants: { G: ["race-skill"] },
+    })
+    seedClassGrant("cls-gg", "F")
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        createCharacter(
+          {
+            name: "Kael",
+            origin: "integrated",
+            raceId: "race-gg",
+            classId: "cls-gg",
+          },
+          user
+        )
+      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.associations).toHaveLength(0)
+  })
+
+  // ------------------------------------------------------------------ //
+  // setCharacterProfession
+  // ------------------------------------------------------------------ //
+
+  it("grants the newly assigned profession track grade skill and journals it", async () => {
+    seedSkillGrant("prof-skill")
+    seedIntegratedCharacter()
+    seedProfWithGrants("prof-g", "G", { G: ["prof-skill"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["prof-skill"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: { granted: Array<{ stableId: string; grade: string }> }
+    }
+    expect(dbMock.store.events[0].kind).toBe("profession_set")
+    expect(payload.skillGrants.granted).toHaveLength(1)
+    expect(payload.skillGrants.granted[0]).toMatchObject({
+      stableId: "prof-skill",
+      grade: "G",
+    })
+  })
+
+  it("records a no-op when the granted skill is already owned (no stacking)", async () => {
+    seedSkillGrant("prof-skill")
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "prof-skill",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["prof-skill"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["prof-skill"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: { noop: Array<{ stableId: string; grade: string }> }
+    }
+    expect(payload.skillGrants.noop).toHaveLength(1)
+    expect(payload.skillGrants.noop[0]).toMatchObject({
+      stableId: "prof-skill",
+      grade: "G",
+    })
+  })
+
+  it("upgrades to the next authored strictly-higher rarity in the group and removes the superseded link", async () => {
+    seedSkillGrant("sk-common", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-rare", { rarity: "Rare", upgradeGroup: "grp" })
+    seedSkillGrant("sk-req", { rarity: "Common", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-common",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-req"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-rare"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        upgraded: Array<{ fromStableId: string; toStableId: string }>
+      }
+    }
+    expect(payload.skillGrants.upgraded).toHaveLength(1)
+    expect(payload.skillGrants.upgraded[0]).toMatchObject({
+      fromStableId: "sk-common",
+      toStableId: "sk-rare",
+    })
+    // The superseded Common link is gone; only the Rare link persists.
+    const stored = dbMock.store.associations.filter(
+      (a) => a.characterId === "chr-1" && a.kind === "SKILL"
+    )
+    expect(stored.map((a) => a.definitionId)).toEqual(["sk-rare"])
+  })
+
+  it("tie-breaks equal-rarity candidates by stableId lexicographic order", async () => {
+    seedSkillGrant("sk-a", { rarity: "Rare", upgradeGroup: "grp" })
+    seedSkillGrant("sk-b", { rarity: "Rare", upgradeGroup: "grp" })
+    seedSkillGrant("sk-common", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-req", { rarity: "Common", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-common",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-req"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-a"])
+  })
+
+  it("retains the owned skill and journals a no-op when no strictly-higher authored rarity exists", async () => {
+    seedSkillGrant("sk-common", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-req", { rarity: "Common", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-common",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-req"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-common"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: { noop: Array<{ stableId: string }> }
+    }
+    expect(payload.skillGrants.noop.map((n) => n.stableId)).toContain("sk-req")
+  })
+
+  it("treats a Unique owned skill as incomparable (nothing is strictly higher, so no-op)", async () => {
+    seedSkillGrant("sk-unique", { rarity: "Unique", upgradeGroup: "grp" })
+    seedSkillGrant("sk-req", { rarity: "Common", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-unique",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-req"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-unique"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: { noop: Array<{ stableId: string }> }
+    }
+    expect(payload.skillGrants.noop.map((n) => n.stableId)).toContain("sk-req")
+  })
+
+  it("retains a Unique owned skill alongside a Common one when a same-group upgrade collides (no data loss)", async () => {
+    // A group holding BOTH an incomparable Unique skill and a comparable Common
+    // skill must not have the Unique deleted when a same-group duplicate request
+    // arrives: nothing authored is strictly higher than Unique, so the whole
+    // acquisition is a no-op and both links are preserved.
+    seedSkillGrant("sk-unique", { rarity: "Unique", upgradeGroup: "grp" })
+    seedSkillGrant("sk-common", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-rare", { rarity: "Rare", upgradeGroup: "grp" })
+    seedSkillGrant("sk-req", { rarity: "Common", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-unique",
+      kind: "SKILL",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-common",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-req"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    // No upgrade, no deletion: both the Unique and the Common skills persist.
+    expect(skillIds(res.character)).toEqual(["sk-common", "sk-unique"])
+    const stored = dbMock.store.associations
+      .filter((a) => a.characterId === "chr-1" && a.kind === "SKILL")
+      .map((a) => a.definitionId)
+      .sort()
+    expect(stored).toEqual(["sk-common", "sk-unique"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        noop: Array<{ stableId: string; reason?: string }>
+      }
+    }
+    const noopReq = payload.skillGrants.noop.find(
+      (n) => n.stableId === "sk-req"
+    )
+    expect(noopReq).toBeTruthy()
+    expect(noopReq?.reason).toMatch(/incomparable|missing rarity/i)
+  })
+
+  it("retains a missing-rarity owned skill alongside a Common one when a same-group upgrade collides (no data loss)", async () => {
+    // A skill that omits `rarity` is incomparable exactly like Unique: a
+    // same-group duplicate request must not delete it just because a Common
+    // sibling is comparable. The whole acquisition is a no-op.
+    seedSkillGrant("sk-norarity", { rarity: undefined, upgradeGroup: "grp" })
+    seedSkillGrant("sk-common", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-req", { rarity: "Common", upgradeGroup: "grp" })
+    seedIntegratedCharacter()
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-norarity",
+      kind: "SKILL",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-common",
+      kind: "SKILL",
+    })
+    seedProfWithGrants("prof-g", "G", { G: ["sk-req"] })
+    const res = await setCharacterProfession(
+      "chr-1",
+      { professionId: "prof-g", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual(["sk-common", "sk-norarity"])
+    const stored = dbMock.store.associations
+      .filter((a) => a.characterId === "chr-1" && a.kind === "SKILL")
+      .map((a) => a.definitionId)
+      .sort()
+    expect(stored).toEqual(["sk-common", "sk-norarity"])
+    const payload = dbMock.store.events[0].payload as {
+      skillGrants: {
+        noop: Array<{ stableId: string; reason?: string }>
+      }
+    }
+    const noopReq = payload.skillGrants.noop.find(
+      (n) => n.stableId === "sk-req"
+    )
+    expect(noopReq).toBeTruthy()
+    expect(noopReq?.reason).toMatch(/incomparable|missing rarity/i)
+  })
+
+  it("rejects a stale version with 409 and writes no event or association", async () => {
+    seedSkillGrant("prof-skill")
+    seedIntegratedCharacter()
+    seedProfWithGrants("prof-g", "G", { G: ["prof-skill"] })
+    await expect(
+      setCharacterProfession(
+        "chr-1",
+        { professionId: "prof-g", version: 5 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(
+      dbMock.store.associations.filter(
+        (a) => a.characterId === "chr-1" && a.kind === "SKILL"
+      )
+    ).toHaveLength(0)
+  })
+
+  // ------------------------------------------------------------------ //
+  // evolveCharacter
+  // ------------------------------------------------------------------ //
+
+  function seedGradedClassCharacter(opts: {
+    classId: string
+    classStableId: string
+    grade: Grade
+    level: number
+  }): unknown {
+    const classRow = {
+      stableId: opts.classStableId,
+    } as Parameters<typeof createInitialState>[3]
+    const state = createInitialState("integrated", null, null, classRow)
+    state.race = { level: 0, grade: "G", mode: "derived", origin: "integrated" }
+    if (state.tracks.class) {
+      state.tracks.class.level = opts.level
+      state.tracks.class.grade = opts.grade
+      state.tracks.class.definitionId = `${opts.classStableId}:${opts.grade}`
+    }
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      classId: opts.classId,
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedEvolveClass(
+    id: string,
+    stableId: string,
+    grades: Record<string, unknown>,
+    grants?: Partial<Record<Grade, string[]>>
+  ): void {
+    dbMock.store.addCatalog({
+      id,
+      kind: "classes",
+      stableId,
+      name: `Class ${stableId}`,
+      config: {
+        grades,
+        ...(grants ? { gradeGrantedSkillStableIds: grants } : {}),
+      },
+    })
+  }
+
+  it("evolves a class to the target grade and grants the destination's grade skill, journaling the upgrade", async () => {
+    seedSkillGrant("sk-d1", { rarity: "Common", upgradeGroup: "grp" })
+    seedSkillGrant("sk-d2", { rarity: "Rare", upgradeGroup: "grp" })
+    seedEvolveClass("cls-archer", "archer", {
+      F: { fixed: { agility: 2 }, free: 1 },
+      E: { fixed: { agility: 3 }, free: 1 },
+    })
+    seedEvolveClass("cls-ev", "archer", {
+      F: { fixed: { agility: 2 }, free: 0 },
+      E: { fixed: { agility: 3 }, free: 0 },
+    })
+    // The character holds the Common tier; the E destination grants the Rare tier.
+    seedGradedClassCharacter({
+      classId: "cls-archer",
+      classStableId: "archer",
+      grade: "F",
+      level: 30,
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-d1",
+      kind: "SKILL",
+    })
+    // Upgrade the destination row to grant sk-d2 at E.
+    await updateCatalogItem("classes", "cls-ev", {
+      config: {
+        grades: {
+          F: { fixed: { agility: 2 }, free: 0 },
+          E: { fixed: { agility: 3 }, free: 0 },
+        },
+        gradeGrantedSkillStableIds: { E: ["sk-d2"] },
+      },
+    })
+    const res = await evolveCharacter(
+      "chr-1",
+      { track: "class", optionId: "cls-ev", version: 0 },
+      user
+    )
+    expect(res.character.classId).toBe("cls-ev")
+    expect(skillIds(res.character)).toEqual(["sk-d2"])
+    expect(res.journal).toMatchObject({
+      track: "class",
+      from: "F",
+      to: "E",
+      source: "track",
+    })
+    const skillGrants = (res.journal as Record<string, unknown>)
+      .skillGrants as {
+      upgraded: Array<{ fromStableId: string; toStableId: string }>
+    }
+    expect(skillGrants.upgraded).toHaveLength(1)
+    expect(skillGrants.upgraded[0]).toMatchObject({
+      fromStableId: "sk-d1",
+      toStableId: "sk-d2",
+    })
+    const stored = dbMock.store.associations.filter(
+      (a) => a.characterId === "chr-1" && a.kind === "SKILL"
+    )
+    expect(stored.map((a) => a.definitionId)).toEqual(["sk-d2"])
+  })
+
+  it("skips an archived destination grade skill at evolve and still commits", async () => {
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { rarity: "Common" },
+      archived: true,
+    })
+    seedEvolveClass("cls-archer", "archer", {
+      F: { fixed: { agility: 2 }, free: 1 },
+      E: { fixed: { agility: 4 }, free: 1 },
+    })
+    // The destination is seeded directly with an archived grade-grant reference, so
+    // the catalog-ref integrity check never sees it (a live create/update would
+    // reject an archived ref up front; the acquisition path simply skips it).
+    dbMock.store.addCatalog({
+      id: "cls-ev",
+      kind: "classes",
+      stableId: "archer",
+      name: "Class archer",
+      config: {
+        grades: {
+          F: { fixed: { agility: 2 }, free: 0 },
+          E: { fixed: { agility: 4 }, free: 0 },
+        },
+        gradeGrantedSkillStableIds: { E: ["arch-skill"] },
+      },
+    })
+    seedGradedClassCharacter({
+      classId: "cls-archer",
+      classStableId: "archer",
+      grade: "F",
+      level: 30,
+    })
+    const res = await evolveCharacter(
+      "chr-1",
+      { track: "class", optionId: "cls-ev", version: 0 },
+      user
+    )
+    expect(skillIds(res.character)).toEqual([])
+    const skillGrants = (res.journal as Record<string, unknown>)
+      .skillGrants as { skipped: Array<{ stableId: string; grade: string }> }
+    expect(skillGrants.skipped).toEqual([
+      { stableId: "arch-skill", grade: "E" },
+    ])
+  })
+
+  // ------------------------------------------------------------------ //
+  // Catalog create / update reference validation
+  // ------------------------------------------------------------------ //
+
+  it("rejects a new race config that references a missing grade skill", async () => {
+    await expect(
+      createCatalogItem("races", {
+        stableId: "race-ref",
+        name: "Race Ref",
+        config: {
+          raceType: "enlightened",
+          naturalGrade: "F",
+          gradeGrantedSkillStableIds: { F: ["no-such-skill"] },
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("no-such-skill"),
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a new race config that references an archived grade skill", async () => {
+    seedSkillGrant("arch-skill")
+    ;(
+      dbMock.store.catalog.get("arch-skill") as { archived: boolean }
+    ).archived = true
+    await expect(
+      createCatalogItem("races", {
+        stableId: "race-ref",
+        name: "Race Ref",
+        config: {
+          raceType: "enlightened",
+          naturalGrade: "F",
+          gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("arch-skill"),
+    })
+  })
+
+  it("accepts a new race config that references an existing unarchived grade skill", async () => {
+    seedSkillGrant("ok-skill")
+    const item = await createCatalogItem("races", {
+      stableId: "race-ref",
+      name: "Race Ref",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        gradeGrantedSkillStableIds: { F: ["ok-skill"] },
+      },
+    })
+    expect(item.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["ok-skill"] },
+    })
+  })
+
+  it("rejects a config-changing class update that references a missing grade skill", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    await expect(
+      updateCatalogItem("classes", "cls-1", {
+        config: {
+          grades: { F: { fixed: { agility: 2 }, free: 1 } },
+          gradeGrantedSkillStableIds: { F: ["missing-skill"] },
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("missing-skill"),
+    })
+  })
+
+  it("accepts a config-changing profession update that references a valid grade skill", async () => {
+    seedSkillGrant("ok-skill")
+    dbMock.store.addCatalog({
+      id: "prof-1",
+      kind: "professions",
+      stableId: "alchemist",
+      name: "Alchemist",
+      grade: "F",
+      config: { grades: { F: { fixed: { wisdom: 1 }, free: 0 } } },
+    })
+    const item = await updateCatalogItem("professions", "prof-1", {
+      config: {
+        grades: { F: { fixed: { wisdom: 1 }, free: 0 } },
+        gradeGrantedSkillStableIds: { F: ["ok-skill"] },
+      },
+    })
+    expect(item.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["ok-skill"] },
+    })
+  })
+
+  // ------------------------------------------------------------------ //
+  // Skill stableId rename block (grade-grant references, incl. archived rows)
+  // ------------------------------------------------------------------ //
+
+  it("blocks a skill stableId rename while a race grade config references the old id", async () => {
+    seedSkillGrant("sk-g", { rarity: "Common" })
+    dbMock.store.addCatalog({
+      id: "race-ref",
+      kind: "races",
+      stableId: "race-ref",
+      name: "Race Ref",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        gradeGrantedSkillStableIds: { F: ["sk-g"] },
+      },
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-g", { stableId: "sk-g2" })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "skill_stable_id_in_use",
+      message: expect.stringContaining("races:race-ref"),
+    })
+  })
+
+  it("blocks a skill stableId rename even when the referencing race/class row is archived", async () => {
+    seedSkillGrant("sk-arch", { rarity: "Common" })
+    dbMock.store.addCatalog({
+      id: "race-arch",
+      kind: "races",
+      stableId: "race-arch",
+      name: "Race Arch",
+      archived: true,
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        gradeGrantedSkillStableIds: { F: ["sk-arch"] },
+      },
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-arch", { stableId: "sk-arch2" })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "skill_stable_id_in_use",
+      message: expect.stringContaining("races:race-arch"),
+    })
+  })
+
+  it("allows a skill stableId rename when no race/class/profession grade config references it", async () => {
+    seedSkillGrant("sk-free", { rarity: "Common" })
+    const item = await updateCatalogItem("skills", "sk-free", {
+      stableId: "sk-free-2",
+    })
+    expect(item.stableId).toBe("sk-free-2")
   })
 })

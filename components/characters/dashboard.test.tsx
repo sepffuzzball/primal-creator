@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, fireEvent } from "@testing-library/react"
 import { afterEach } from "vitest"
 import type { CharacterListItem, Grade } from "@/lib/api"
 import { CharacterPortrait, getRaceLevelTier, RaceBadges } from "./dashboard"
@@ -44,7 +44,9 @@ describe("race progression badges", () => {
   it("uses the provided grade independently from level", () => {
     render(<RaceBadges item={item({ raceGrade: "G", raceLevel: 9 })} />)
     expect(screen.getByText("G grade")).toBeTruthy()
-    expect(screen.getByText("L9 - Pinnacle (inferred)")).toBeTruthy()
+    expect(screen.getByText("9").getAttribute("aria-label")).toBe(
+      "Race level 9, Pinnacle, inferred"
+    )
   })
 
   it("classifies band boundaries and clamped out-of-band levels", () => {
@@ -81,7 +83,9 @@ describe("race progression badges", () => {
         item={item({ raceGrade: "E", raceLevel: 50, raceGradeBand: band })}
       />
     )
-    expect(screen.getByText("L50 - Mid")).toBeTruthy()
+    expect(screen.getByText("50").getAttribute("aria-label")).toBe(
+      "Race level 50, Mid"
+    )
   })
 
   it("keeps custom E bands on the generic inferred fraction tiers", () => {
@@ -94,7 +98,9 @@ describe("race progression badges", () => {
         }}
       />
     )
-    expect(screen.getByText("L50 - Developing (inferred)")).toBeTruthy()
+    expect(screen.getByText("50").getAttribute("aria-label")).toBe(
+      "Race level 50, Developing, inferred"
+    )
   })
 
   it("keeps high-grade level zero early and uses a neutral level without a band", () => {
@@ -108,9 +114,13 @@ describe("race progression badges", () => {
       />
     )
     expect(screen.getByText("B grade")).toBeTruthy()
-    expect(screen.getByText("L0 - Early (inferred)")).toBeTruthy()
+    expect(screen.getByText("0").getAttribute("aria-label")).toBe(
+      "Race level 0, Early, inferred"
+    )
     render(<RaceBadges item={item({ raceGradeBand: null, raceLevel: 12 })} />)
-    expect(screen.getByText("Level 12")).toBeTruthy()
+    expect(screen.getByText("12").getAttribute("aria-label")).toBe(
+      "Race level 12"
+    )
   })
 })
 
@@ -125,11 +135,35 @@ describe("character portrait", () => {
     )
     const image = screen.getByRole("img", { name: "Test portrait" })
     expect(image.getAttribute("src")).toBe("/api/assets/asset-1")
+    expect(screen.queryByText("T")).toBeNull()
   })
 
   it("shows stable initials when no portrait exists", () => {
     render(<CharacterPortrait item={item({ portrait: null, name: "Mira" })} />)
     expect(screen.getByText("M")).toBeTruthy()
     expect(screen.queryByRole("img")).toBeNull()
+  })
+
+  it("shows initials after image failure and resets when portrait URL changes", () => {
+    const first = item({
+      portrait: { assetId: "one", url: "/one" },
+      name: "Mira",
+    })
+    const { rerender } = render(<CharacterPortrait item={first} />)
+    fireEvent.error(screen.getByRole("img", { name: "Mira portrait" }))
+    expect(screen.getByText("M")).toBeTruthy()
+    rerender(
+      <CharacterPortrait
+        item={{
+          ...first,
+          portrait: { assetId: "two", url: "/two" },
+          name: "Nova",
+        }}
+      />
+    )
+    expect(
+      screen.getByRole("img", { name: "Nova portrait" }).getAttribute("src")
+    ).toBe("/two")
+    expect(screen.queryByText("N")).toBeNull()
   })
 })

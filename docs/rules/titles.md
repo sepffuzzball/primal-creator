@@ -81,6 +81,18 @@ effect (an unresolved placeholder), matching the wiki-uncertain note above.
 
 ## Ranked title improvement (sequential)
 
+### Catalog editor
+
+Administrators configure ranked titles with the Ranked series controls rather
+than editing JSON: choose a series ID (existing IDs are suggested, and new IDs
+are allowed), rank 1-100, and minimum race grade G-S. The editor writes
+`improvement` and its matching `upgradeGroup` together. Turning ranking off
+removes those fields only when the upgrade group matches the ranking; a
+different manual upgrade group is retained. The title catalog groups ranked
+entries under expandable series rows ordered by rank. Search matches individual
+titles within their series, and archived titles remain available via Show
+archived.
+
 A ranked title is a member of a `seriesId` that represents a ladder of
 improvements, e.g. the **Dungeon Pioneer** series ranks I-XV. A character holds
 **at most one** title from a given series; the ranked entries replace one another

@@ -418,25 +418,31 @@ ${missingItemWarnings.join("\n")}`
     ).toEqual([])
 
     // ------------------------------------------------------------------ //
-    // The special-ability selections persisted: the Powers tab shows the
-    // linked blessing + bloodline, the detail API returns the associations,
-    // the resumable draft was consumed atomically, and the atomic create
-    // progression event recorded the selection snapshot.
-    // ------------------------------------------------------------------ //
-    await page.getByRole("tab", { name: "Powers" }).click()
-    const powers = page
+    // The special-ability selections persisted in their dedicated tabs.
+    await page.getByRole("tab", { name: "Blessings", exact: true }).click()
+    const blessingsPanel = page
       .locator("[role=tabpanel]")
-      .filter({ hasText: "Blessings and bloodlines" })
+      .filter({ hasText: "True Blessing of the Malefic Viper" })
     await expect(
-      powers.getByText("True Blessing of the Malefic Viper")
+      blessingsPanel.getByText("True Blessing of the Malefic Viper")
+    ).toBeVisible()
+    await page.getByRole("tab", { name: "Bloodlines", exact: true }).click()
+    const bloodlinesPanel = page
+      .locator("[role=tabpanel]")
+      .filter({ hasText: "Bloodline of the Primal Hunter" })
+    await expect(
+      bloodlinesPanel.getByText("Bloodline of the Primal Hunter")
     ).toBeVisible()
     await expect(
-      powers.getByText("Bloodline of the Primal Hunter")
-    ).toBeVisible()
-    // The curated manifest ships no transcendent skill, so none is linked and
-    // the section reports an empty state (never a fabricated link).
+      bloodlinesPanel.getByText("No linked bloodlines.")
+    ).toBeHidden()
+    await page
+      .getByRole("tab", { name: "Transcendent skills", exact: true })
+      .click()
     await expect(
-      powers.getByText("No linked transcendent skills.")
+      page
+        .locator("[role=tabpanel]")
+        .getByText("No linked transcendent skills.")
     ).toBeVisible()
 
     const characterId = new URL(characterUrl).pathname.split("/").pop()!

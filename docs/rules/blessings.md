@@ -99,6 +99,17 @@ No catalog create/import grants or resolves a blessing and no `patronId` row,
 column or index is written (the FK, index and column were dropped). Blessings are
 created only through the association flows below.
 
+A `gods` entry carries **no catalog grade band**. Divine power, divine rank and
+blessing tier are expressed through `blessingEffects[tier]` and the optional
+`pantheon` / `divineRank` metadata, never through the shared `catalog_definitions.grade`
+column that races/classes/professions and other graded kinds use. The only legal
+`grade` on a gods row is `null`; a create/update, a wiki-reviewed manifest import,
+or a bulk upload that attempts to set a non-null grade on a god is rejected with
+400 `invalid_grade` before any write.
+`config.grade` is a separate, inert legacy key that is still accepted (it reads
+back through the permissive god config passthrough) - it is not the catalog grade
+column.
+
 ## Character associations (wired)
 
 A blessing is linked as an association: `associateCharacter` (or create) accepts a
@@ -163,3 +174,19 @@ carry a null `blessingTier`. The check is added AFTER the legacy BLESSING links
 are deleted, so a pre-existing null-tier row can never violate it; from here on
 the application (schema + service) and the database agree that a blessing link is
 never created with a null tier.
+
+## Migration (0020)
+
+Migration `0020_ungrade_gods` is **non-destructive**: it runs
+`UPDATE catalog_definitions SET grade = NULL WHERE kind = 'gods' AND grade IS NOT NULL`,
+which only clears the `grade` column on god rows. No rows are deleted and no other
+columns/tables/FKs are changed - each god's `config` (including `blessingEffects`,
+`pantheon`, `divineRank`) and any `BLESSING` associations / equipment patron
+references to it are preserved untouched. After this migration every god reads back
+with `grade IS NULL` (a god GET naturally shows `grade: null`). No backup is
+required for this migration alone (nothing user-visible is lost).
+
+From here on the application enforces the same invariant at every write boundary:
+a create/update of a god, a wiki-reviewed manifest god, and a bulk upload god that
+carries a non-null `grade` are all rejected with 400 `invalid_grade` before any
+write (a bulk row error also names the offending row line).

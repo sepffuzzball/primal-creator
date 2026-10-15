@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   advanceSchema,
+  allGradeGrantedSkillStableIds,
   associationSchema,
   BLESSING_TIER_ORDER,
   blessingTierAtLeast,
@@ -18,6 +19,9 @@ import {
   experienceSchema,
   godConfigSchema,
   gradeDescriptionsSchema,
+  gradeGrantedSkillStableIdsSchema,
+  gradeSkillStableIdsFor,
+  godGradeForbidden,
   hasInvalidNaturalGradeConfig,
   hasInvalidRaceTypeConfig,
   hasLegacyEquipmentRequirements,
@@ -36,11 +40,13 @@ import {
   raceConfigSchema,
   rarityOrderIndex,
   raritySchema,
+  requiredGradeNullForbidden,
   skillConfigSchema,
   skillUpgradeSchema,
   specialAbilitiesSchema,
   titleConfigSchema,
   titleImprovementSchema,
+  trackConfigSchema,
   transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
@@ -1622,6 +1628,206 @@ describe("gradeDescriptionsSchema (catalog grade-specific prose)", () => {
 
   it("rejects a non-object / array value", () => {
     expect(gradeDescriptionsSchema.safeParse([]).success).toBe(false)
+  })
+})
+
+describe("gradeGrantedSkillStableIdsSchema (per-grade automatic skill grants)", () => {
+  it("accepts a valid grade-keyed map of nonempty unique ids", () => {
+    const res = gradeGrantedSkillStableIdsSchema.safeParse({
+      G: ["blood-rage", "iron-skin"],
+      S: ["final-form"],
+    })
+    expect(res.success).toBe(true)
+    if (res.success)
+      expect(res.data).toEqual({
+        G: ["blood-rage", "iron-skin"],
+        S: ["final-form"],
+      })
+  })
+
+  it("accepts an empty map ({} means no authored grade grants)", () => {
+    const res = gradeGrantedSkillStableIdsSchema.safeParse({})
+    expect(res.success).toBe(true)
+    if (res.success) expect(res.data).toEqual({})
+  })
+
+  it("raceConfigSchema accepts a legacy config without the field", () => {
+    expect(
+      raceConfigSchema.safeParse({ raceType: "enlightened", naturalGrade: "F" })
+        .success
+    ).toBe(true)
+  })
+
+  it("rejects an unknown grade key", () => {
+    const res = gradeGrantedSkillStableIdsSchema.safeParse({ H: ["nope"] })
+    expect(res.success).toBe(false)
+    if (!res.success) {
+      expect(
+        res.error.issues.some((i) => /invalid grade key "H"/.test(i.message))
+      ).toBe(true)
+    }
+  })
+
+  it("rejects a duplicate id granted twice for the same grade", () => {
+    const res = gradeGrantedSkillStableIdsSchema.safeParse({ G: ["a", "a"] })
+    expect(res.success).toBe(false)
+    if (!res.success) {
+      expect(
+        res.error.issues.some((i) => /granted more than once/.test(i.message))
+      ).toBe(true)
+    }
+  })
+
+  it("rejects an empty-string id", () => {
+    expect(
+      gradeGrantedSkillStableIdsSchema.safeParse({ G: [""] }).success
+    ).toBe(false)
+  })
+
+  it("rejects an invalid grade key even when the other grades are valid", () => {
+    const res = gradeGrantedSkillStableIdsSchema.safeParse({
+      G: ["a"],
+      X: ["b"],
+    })
+    expect(res.success).toBe(false)
+  })
+})
+
+describe("grade skill stable-id config plumbing", () => {
+  it("raceConfigSchema accepts a gradeGrantedSkillStableIds map", () => {
+    const res = raceConfigSchema.safeParse({
+      raceType: "enlightened",
+      naturalGrade: "F",
+      gradeGrantedSkillStableIds: { F: ["blood-rage"] },
+    })
+    expect(res.success).toBe(true)
+  })
+
+  it("trackConfigSchema accepts a gradeGrantedSkillStableIds map", () => {
+    const res = trackConfigSchema.safeParse({
+      grades: { F: { fixed: { agility: 1 }, free: 0 } },
+      gradeGrantedSkillStableIds: { F: ["blood-rage"] },
+    })
+    expect(res.success).toBe(true)
+  })
+
+  it("trackConfigSchema rejects an invalid grade key in the map", () => {
+    const res = trackConfigSchema.safeParse({
+      gradeGrantedSkillStableIds: { Q: ["x"] },
+    })
+    expect(res.success).toBe(false)
+  })
+
+  it("gradeSkillStableIdsFor returns the declared list for a valid grade", () => {
+    expect(
+      gradeSkillStableIdsFor(
+        { gradeGrantedSkillStableIds: { G: ["a", "b"] } },
+        "G"
+      )
+    ).toEqual(["a", "b"])
+  })
+
+  it("gradeSkillStableIdsFor returns [] for a grade with no authored entry", () => {
+    expect(
+      gradeSkillStableIdsFor({ gradeGrantedSkillStableIds: { G: ["a"] } }, "F")
+    ).toEqual([])
+  })
+
+  it("gradeSkillStableIdsFor returns [] for a legacy config missing the field", () => {
+    expect(gradeSkillStableIdsFor({}, "G")).toEqual([])
+  })
+
+  it("gradeSkillStableIdsFor returns [] for a malformed (non-object) field", () => {
+    expect(
+      gradeSkillStableIdsFor({ gradeGrantedSkillStableIds: [] }, "G")
+    ).toEqual([])
+    expect(
+      gradeSkillStableIdsFor({ gradeGrantedSkillStableIds: "nope" }, "G")
+    ).toEqual([])
+  })
+
+  it("gradeSkillStableIdsFor filters non-string ids to strings", () => {
+    expect(
+      gradeSkillStableIdsFor(
+        { gradeGrantedSkillStableIds: { G: ["a", 1, null] } },
+        "G"
+      )
+    ).toEqual(["a"])
+  })
+
+  it("allGradeGrantedSkillStableIds collects ids across every grade", () => {
+    const ids = allGradeGrantedSkillStableIds({
+      gradeGrantedSkillStableIds: { G: ["a"], F: ["b", "c"] },
+    })
+    expect(ids.sort()).toEqual(["a", "b", "c"])
+  })
+
+  it("allGradeGrantedSkillStableIds returns [] for a legacy config missing the field", () => {
+    expect(allGradeGrantedSkillStableIds({})).toEqual([])
+  })
+
+  it("allGradeGrantedSkillStableIds returns [] for a malformed field", () => {
+    expect(
+      allGradeGrantedSkillStableIds({ gradeGrantedSkillStableIds: [] })
+    ).toEqual([])
+  })
+})
+
+describe("godGradeForbidden (gods carry no catalog grade)", () => {
+  it("allows a gods entry with a null grade and with a missing (undefined) grade", () => {
+    expect(godGradeForbidden("gods", null)).toBe(false)
+    expect(godGradeForbidden("gods", undefined)).toBe(false)
+  })
+
+  it("rejects a gods entry with any non-null grade value", () => {
+    for (const grade of ["G", "F", "E", "D", "C", "B", "A", "S"]) {
+      expect(godGradeForbidden("gods", grade)).toBe(true)
+    }
+  })
+
+  it("is only triggered for the gods kind", () => {
+    // A graded race/class/profession (and all other graded kinds) never trips the
+    // god invariant.
+    expect(godGradeForbidden("races", "S")).toBe(false)
+    expect(godGradeForbidden("classes", "B")).toBe(false)
+    expect(godGradeForbidden("professions", "A")).toBe(false)
+    expect(godGradeForbidden("titles", "C")).toBe(false)
+    expect(godGradeForbidden("skills", "D")).toBe(false)
+    // A non-god kind with a null grade is also fine.
+    expect(godGradeForbidden("items", null)).toBe(false)
+    expect(godGradeForbidden("bloodlines", undefined)).toBe(false)
+  })
+})
+
+describe("requiredGradeNullForbidden (races/classes/professions never clear grade to null)", () => {
+  it("rejects an explicit null grade on a race, class or profession", () => {
+    expect(requiredGradeNullForbidden("races", null)).toBe(true)
+    expect(requiredGradeNullForbidden("classes", null)).toBe(true)
+    expect(requiredGradeNullForbidden("professions", null)).toBe(true)
+  })
+
+  it("allows an omitted grade and a non-null grade on the graded kinds", () => {
+    // Omitting grade (undefined) preserves the existing value - never rejected.
+    expect(requiredGradeNullForbidden("races", undefined)).toBe(false)
+    expect(requiredGradeNullForbidden("classes", undefined)).toBe(false)
+    expect(requiredGradeNullForbidden("professions", undefined)).toBe(false)
+    // A valid explicit grade is always legal.
+    for (const grade of ["G", "F", "E", "D", "C", "B", "A", "S"]) {
+      expect(requiredGradeNullForbidden("races", grade)).toBe(false)
+      expect(requiredGradeNullForbidden("classes", grade)).toBe(false)
+      expect(requiredGradeNullForbidden("professions", grade)).toBe(false)
+    }
+  })
+
+  it("is only triggered for the graded kinds", () => {
+    // The optional/clearable kinds (and gods) never trip the required-grade guard.
+    expect(requiredGradeNullForbidden("items", null)).toBe(false)
+    expect(requiredGradeNullForbidden("titles", null)).toBe(false)
+    expect(requiredGradeNullForbidden("bloodlines", null)).toBe(false)
+    expect(requiredGradeNullForbidden("transcendent_skills", null)).toBe(false)
+    expect(requiredGradeNullForbidden("equipment", null)).toBe(false)
+    expect(requiredGradeNullForbidden("skills", null)).toBe(false)
+    expect(requiredGradeNullForbidden("gods", null)).toBe(false)
   })
 })
 

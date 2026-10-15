@@ -73,13 +73,13 @@ const CATALOG_KINDS = [
   { kind: "races", label: "Races" },
   { kind: "classes", label: "Classes" },
   { kind: "professions", label: "Professions" },
-  { kind: "titles", label: "Titles" },
-  { kind: "equipment", label: "Equipment" },
   { kind: "skills", label: "Skills" },
-  { kind: "bloodlines", label: "Bloodlines" },
   { kind: "transcendent_skills", label: "Transcendent Skills" },
-  { kind: "items", label: "Items" },
+  { kind: "bloodlines", label: "Bloodlines" },
+  { kind: "titles", label: "Titles" },
   { kind: "gods", label: "Gods" },
+  { kind: "equipment", label: "Equipment" },
+  { kind: "items", label: "Items" },
 ] as const
 
 function isCatalogActive(pathname: string, kind: string): boolean {
@@ -174,7 +174,7 @@ export function AppShell({ breadcrumbs, children }: AppShellProps) {
                   render={
                     <Link href="/">
                       <SparklesIcon />
-                      <span className="font-heading">Primal Forge</span>
+                      <span className="font-heading">The Primal Creator</span>
                     </Link>
                   }
                 />

@@ -42,8 +42,10 @@ import { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/db/client"
 import { badRequest, conflict } from "@/lib/server/errors"
 import {
+  allGradeGrantedSkillStableIds,
   catalogCreateSchema,
   catalogKindSchema,
+  godGradeForbidden,
   hasInvalidSkillTrack,
   hasLegacyEquipmentRequirements,
   isIncompleteEquipmentConfig,
@@ -197,6 +199,15 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     throw badRequest("invalid_kind", `Unknown catalog kind "${entry.kind}"`)
   }
   assertHttpsSourceUrl(entry.sourceUrl, entry.stableId)
+  // A gods manifest entry carries no catalog grade band (see `godGradeForbidden`):
+  // a non-null grade is rejected before any write, so both preview and apply fail
+  // up front (migration 0020 nulled any pre-existing god grade).
+  if (godGradeForbidden(kind, entry.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      `Manifest god entry "${entry.stableId}" carries a grade; gods have no catalog grade band`
+    )
+  }
   const parsed = catalogCreateSchema.safeParse({
     stableId: entry.stableId,
     name: entry.name,
@@ -431,6 +442,40 @@ function assertManifestEquipmentSkillRefs(
 }
 
 /**
+ * Verify that every race/class/profession manifest entry's grade-granted skill
+ * reference (`gradeGrantedSkillStableIds`) resolves to a skill that will exist
+ * unarchived after the import: either an existing unarchived skill row, or a
+ * skill created by this same manifest (import always creates rows with
+ * `archived: false`). A dangling or archived skill would render the grade grant
+ * permanently inert, so it is rejected up front before any write. No-op when the
+ * entry is not a race/class/profession or grants no grade skill.
+ */
+function assertManifestGradeGrantedSkillRefs(
+  entries: readonly Pick<WikiReviewedEntry, "kind" | "stableId" | "config">[],
+  unarchivedSkillStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (
+      entry.kind !== "races" &&
+      entry.kind !== "classes" &&
+      entry.kind !== "professions"
+    ) {
+      continue
+    }
+    const refs = allGradeGrantedSkillStableIds(entry.config)
+    for (const stableId of refs) {
+      if (typeof stableId !== "string" || stableId.length === 0) continue
+      if (!unarchivedSkillStableIds.has(stableId)) {
+        throw badRequest(
+          "invalid_config",
+          `Manifest entry "${entry.stableId}" (${entry.kind}) grants grade skill "${stableId}" which is neither an unarchived catalog skill nor a skill created by this manifest`
+        )
+      }
+    }
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row with that (kind, stableId) yet)
  * or `skip_existing` (a row already occupies the key, so it is never overwritten).
@@ -441,6 +486,15 @@ export async function previewWikiReviewedImport(
   const validated = validateEntries(entries)
   const rows = await prisma.catalogDefinition.findMany({})
   const byKey = new Map(rows.map((row) => [keyOf(row.kind, row.stableId), row]))
+  // Only entries whose (kind, stableId) key is ABSENT from the existing catalog
+  // will actually be written; an entry already occupying the key is skipped and
+  // its config is never touched. Reference availability is therefore only
+  // meaningful for the NEW entries that would be created, so a skipped row whose
+  // referenced god/skill was later archived (or never existed) must not fail the
+  // import.
+  const newEntries = validated.filter(
+    (entry) => !byKey.has(keyOf(entry.kind, entry.stableId))
+  )
   const unarchivedGods = new Set(
     rows.filter((r) => r.kind === "gods" && !r.archived).map((r) => r.stableId)
   )
@@ -448,8 +502,8 @@ export async function previewWikiReviewedImport(
   // ABSENT from the existing catalog. If a god row already exists - even archived -
   // the manifest entry is skipped (existing rows are never overwritten), so the god
   // keeps its current archived state and must NOT satisfy an equipment patron ref.
-  for (const entry of validated) {
-    if (entry.kind === "gods" && !byKey.has(keyOf("gods", entry.stableId))) {
+  for (const entry of newEntries) {
+    if (entry.kind === "gods") {
       unarchivedGods.add(entry.stableId)
     }
   }
@@ -463,16 +517,14 @@ export async function previewWikiReviewedImport(
       .filter((r) => r.kind === "skills" && !r.archived)
       .map((r) => r.stableId)
   )
-  for (const entry of validated) {
-    if (
-      entry.kind === "skills" &&
-      !byKey.has(keyOf("skills", entry.stableId))
-    ) {
+  for (const entry of newEntries) {
+    if (entry.kind === "skills") {
       unarchivedSkillStableIds.add(entry.stableId)
     }
   }
-  assertManifestEquipmentGodRefs(validated, unarchivedGods)
-  assertManifestEquipmentSkillRefs(validated, unarchivedSkillStableIds)
+  assertManifestEquipmentGodRefs(newEntries, unarchivedGods)
+  assertManifestEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
+  assertManifestGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
   let createCount = 0
   let skipCount = 0
   const resultEntries = validated.map((entry) => {
@@ -513,6 +565,15 @@ export async function applyWikiReviewedImport(
         const byKey = new Map(
           rows.map((row) => [keyOf(row.kind, row.stableId), row])
         )
+        // Only entries whose (kind, stableId) key is ABSENT from the existing
+        // catalog will actually be written; an entry already occupying the key is
+        // skipped and its config is never touched. Reference availability is only
+        // meaningful for NEW entries, so a skipped row whose referenced god/skill
+        // was later archived must not fail the import. Recomputed INSIDE the
+        // serializable transaction so an apply never trusts a stale preview.
+        const newEntries = validated.filter(
+          (entry) => !byKey.has(keyOf(entry.kind, entry.stableId))
+        )
         const unarchivedGods = new Set(
           rows
             .filter((r) => r.kind === "gods" && !r.archived)
@@ -523,11 +584,8 @@ export async function applyWikiReviewedImport(
         // exists - even archived - is skipped (existing rows are never
         // overwritten), so it keeps its current archived state and must NOT
         // satisfy an equipment patron reference.
-        for (const entry of validated) {
-          if (
-            entry.kind === "gods" &&
-            !byKey.has(keyOf("gods", entry.stableId))
-          ) {
+        for (const entry of newEntries) {
+          if (entry.kind === "gods") {
             unarchivedGods.add(entry.stableId)
           }
         }
@@ -541,16 +599,17 @@ export async function applyWikiReviewedImport(
             .filter((r) => r.kind === "skills" && !r.archived)
             .map((r) => r.stableId)
         )
-        for (const entry of validated) {
-          if (
-            entry.kind === "skills" &&
-            !byKey.has(keyOf("skills", entry.stableId))
-          ) {
+        for (const entry of newEntries) {
+          if (entry.kind === "skills") {
             unarchivedSkillStableIds.add(entry.stableId)
           }
         }
-        assertManifestEquipmentGodRefs(validated, unarchivedGods)
-        assertManifestEquipmentSkillRefs(validated, unarchivedSkillStableIds)
+        assertManifestEquipmentGodRefs(newEntries, unarchivedGods)
+        assertManifestEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
+        assertManifestGradeGrantedSkillRefs(
+          newEntries,
+          unarchivedSkillStableIds
+        )
         const createdIds: string[] = []
         let skipCount = 0
         const resultEntries: CatalogImportEntryPreview[] = []

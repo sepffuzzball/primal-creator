@@ -78,6 +78,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogTitle,
+  AlertDialogClose,
+} from "@/components/ui/alert-dialog"
+import {
   Select,
   SelectContent,
   SelectGroup,
@@ -433,6 +440,8 @@ function upgradeGroupFor(item: CatalogItem): string | undefined {
 function AssociationSheet({
   open,
   onOpenChange,
+  associationTab,
+  onAssociationTabChange,
   character,
   titles,
   equipment,
@@ -451,6 +460,8 @@ function AssociationSheet({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  associationTab: string
+  onAssociationTabChange: (value: string) => void
   character: CharacterDetail
   titles: CatalogItem[]
   equipment: CatalogItem[]
@@ -485,6 +496,14 @@ function AssociationSheet({
   const [ringPositions, setRingPositions] = React.useState<
     Record<string, "Ring 1" | "Ring 2">
   >({})
+  const [powerConfirmation, setPowerConfirmation] = React.useState<{
+    kind: "blessing" | "bloodline" | "transcendent"
+    definitionId: string
+    tier?: string
+    action: "add" | "remove"
+    title: string
+    description: string
+  } | null>(null)
   const linked = new Map(character.associations.map((a) => [a.definitionId, a]))
   const equipmentStatusById = new Map(
     (character.status?.equipment.items ?? []).map((item) => [item.id, item])
@@ -493,6 +512,47 @@ function AssociationSheet({
     character.inventory?.find(
       (row) => row.definitionId === definitionId && !row.archived
     )?.quantity ?? 0
+
+  function requestPowerAction(
+    kind: "blessing" | "bloodline" | "transcendent",
+    definitionId: string,
+    action: "add" | "remove",
+    tier?: string
+  ) {
+    const association = character.associations.find(
+      (a) => a.kind === kind && a.definitionId === definitionId
+    )
+    const catalog =
+      kind === "blessing"
+        ? blessings
+        : kind === "bloodline"
+          ? bloodlines
+          : transcendentSkills
+    const item = catalog.find((entry) => entry.id === definitionId)
+    const name = association?.name ?? item?.name ?? "this power"
+    const displaced =
+      action === "add"
+        ? character.associations.filter(
+            (a) => a.kind === kind && a.definitionId !== definitionId
+          )
+        : []
+    const displacedNames = displaced.map(
+      (a) => `${a.name}${a.definitionArchived ? " (archived, inert)" : ""}`
+    )
+    setPowerConfirmation({
+      kind,
+      definitionId,
+      tier,
+      action,
+      title: action === "add" ? `Add ${name}?` : `Remove ${name}?`,
+      description:
+        action === "remove"
+          ? `Remove ${name}${association?.tier && kind === "blessing" ? ` (${association.tier} tier)` : ""} from ${character.name}?`
+          : displacedNames.length
+            ? `${name} will replace ${displacedNames.join(", ")}. Continue?`
+            : `Add ${kind === "blessing" && tier ? `${tier} ` : ""}${name} to ${character.name}?`,
+    })
+  }
 
   // Archived linked entries are NOT in the active catalog lists (listCatalog
   // filters archived:false), so they would otherwise disappear and become
@@ -930,7 +990,13 @@ function AssociationSheet({
           </SheetDescription>
         </SheetHeader>
 
-        <Tabs defaultValue="titles" className="flex min-h-0 flex-1 flex-col">
+        <Tabs
+          value={associationTab}
+          onValueChange={(value) => {
+            if (value) onAssociationTabChange(value)
+          }}
+          className="flex min-h-0 flex-1 flex-col"
+        >
           <TabsList variant="line">
             <TabsTrigger value="titles">Titles</TabsTrigger>
             <TabsTrigger value="equipment">Equipment</TabsTrigger>
@@ -1104,7 +1170,9 @@ function AssociationSheet({
                                 variant="outline"
                                 size="sm"
                                 disabled={busy}
-                                onClick={() => onPowerRemove(kind, item.id)}
+                                onClick={() =>
+                                  requestPowerAction(kind, item.id, "remove")
+                                }
                               >
                                 Remove
                               </Button>
@@ -1114,9 +1182,10 @@ function AssociationSheet({
                                 size="sm"
                                 disabled={busy}
                                 onClick={() =>
-                                  onPowerAdd(
+                                  requestPowerAction(
                                     kind,
                                     item.id,
+                                    "add",
                                     kind === "blessing"
                                       ? blessingTier
                                       : undefined
@@ -1229,7 +1298,11 @@ function AssociationSheet({
                             size="sm"
                             disabled={busy}
                             onClick={() =>
-                              onPowerRemove("transcendent", item.id)
+                              requestPowerAction(
+                                "transcendent",
+                                item.id,
+                                "remove"
+                              )
                             }
                           >
                             Remove
@@ -1245,7 +1318,9 @@ function AssociationSheet({
                                 (a) => a.kind === "transcendent"
                               ).length >= maxTranscendentSkills
                             }
-                            onClick={() => onPowerAdd("transcendent", item.id)}
+                            onClick={() =>
+                              requestPowerAction("transcendent", item.id, "add")
+                            }
                           >
                             Attach
                           </Button>
@@ -1313,6 +1388,39 @@ function AssociationSheet({
             </DialogFooter>
           </DialogContent>
         </Dialog>
+        <AlertDialog
+          open={powerConfirmation !== null}
+          onOpenChange={(open) => {
+            if (!open && !busy) setPowerConfirmation(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogTitle>{powerConfirmation?.title}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {powerConfirmation?.description}
+            </AlertDialogDescription>
+            <div className="flex justify-end gap-2">
+              <AlertDialogClose
+                render={<Button variant="outline" disabled={busy} />}
+              >
+                Cancel
+              </AlertDialogClose>
+              <Button
+                disabled={busy || !powerConfirmation}
+                onClick={() => {
+                  if (!powerConfirmation || busy) return
+                  const pending = powerConfirmation
+                  setPowerConfirmation(null)
+                  if (pending.action === "add")
+                    onPowerAdd(pending.kind, pending.definitionId, pending.tier)
+                  else onPowerRemove(pending.kind, pending.definitionId)
+                }}
+              >
+                Confirm
+              </Button>
+            </div>
+          </AlertDialogContent>
+        </AlertDialog>
       </SheetContent>
     </Sheet>
   )
@@ -1359,6 +1467,7 @@ export function CharacterDetail({
     "race" | "class" | "profession" | null
   >(null)
   const [associationsOpen, setAssociationsOpen] = React.useState(false)
+  const [associationTab, setAssociationTab] = React.useState("titles")
   const [titlesCatalog, setTitlesCatalog] = React.useState<CatalogItem[]>([])
   const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
     []
@@ -1919,26 +2028,37 @@ export function CharacterDetail({
     }
   }, [])
 
-  const openAssociations = React.useCallback(() => {
-    setAssociationsOpen(true)
-    void loadCreationRules()
-    if (titlesCatalog.length === 0) void loadCatalog("titles")
-    if (equipmentCatalog.length === 0) void loadCatalog("equipment")
-    if (itemsCatalog.length === 0) void loadCatalog("items")
-    if (blessingsCatalog.length === 0) void loadCatalog("gods")
-    if (bloodlinesCatalog.length === 0) void loadCatalog("bloodlines")
-    if (transcendentCatalog.length === 0)
-      void loadCatalog("transcendent_skills")
-  }, [
-    titlesCatalog.length,
-    equipmentCatalog.length,
-    itemsCatalog.length,
-    blessingsCatalog.length,
-    bloodlinesCatalog.length,
-    transcendentCatalog.length,
-    loadCatalog,
-    loadCreationRules,
-  ])
+  const openAssociations = React.useCallback(
+    (kind?: "blessing" | "bloodline" | "transcendent") => {
+      if (kind)
+        setAssociationTab(
+          kind === "blessing"
+            ? "blessings"
+            : kind === "bloodline"
+              ? "bloodlines"
+              : "transcendent"
+        )
+      setAssociationsOpen(true)
+      void loadCreationRules()
+      if (titlesCatalog.length === 0) void loadCatalog("titles")
+      if (equipmentCatalog.length === 0) void loadCatalog("equipment")
+      if (itemsCatalog.length === 0) void loadCatalog("items")
+      if (blessingsCatalog.length === 0) void loadCatalog("gods")
+      if (bloodlinesCatalog.length === 0) void loadCatalog("bloodlines")
+      if (transcendentCatalog.length === 0)
+        void loadCatalog("transcendent_skills")
+    },
+    [
+      titlesCatalog.length,
+      equipmentCatalog.length,
+      itemsCatalog.length,
+      blessingsCatalog.length,
+      bloodlinesCatalog.length,
+      transcendentCatalog.length,
+      loadCatalog,
+      loadCreationRules,
+    ]
+  )
 
   const addAssociation = React.useCallback(
     async (
@@ -2274,7 +2394,7 @@ export function CharacterDetail({
                 {character.origin}
               </Badge>
               <Badge variant="outline">
-                Grade {state.race.grade} (level {state.race.level})
+                Grade {state.race.grade} / Level {state.race.level}
               </Badge>
               <Badge variant="outline">v{character.version}</Badge>
             </div>
@@ -2475,7 +2595,9 @@ export function CharacterDetail({
             <TabsTrigger value="profession">Profession</TabsTrigger>
           ) : null}
           <TabsTrigger value="skills">Skills</TabsTrigger>
-          <TabsTrigger value="powers">Powers</TabsTrigger>
+          <TabsTrigger value="blessings">Blessings</TabsTrigger>
+          <TabsTrigger value="bloodlines">Bloodlines</TabsTrigger>
+          <TabsTrigger value="transcendent">Transcendent skills</TabsTrigger>
           <TabsTrigger value="titles">Titles</TabsTrigger>
           <TabsTrigger value="equipment">Equipment</TabsTrigger>
           <TabsTrigger value="inventory">Inventory</TabsTrigger>
@@ -3156,51 +3278,67 @@ export function CharacterDetail({
           </div>
         </TabsContent>
 
-        <TabsContent value="powers" className="pt-3">
-          <Card>
-            <CardContent>
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h3 className="font-heading text-sm font-medium">
-                      Blessings and bloodlines
-                    </h3>
-                    <p className="text-xs text-muted-foreground">
-                      Linked blessing and bloodline effects are catalog-defined.
-                      Numeric status and effective values are calculated by the
-                      server; this sheet does not assume canonical bonuses or
-                      treat narrative power as numeric.
-                    </p>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={openAssociations}
-                  >
-                    Manage powers
-                  </Button>
-                </div>
-                {(["blessing", "bloodline"] as const).map((kind) => {
-                  const links = character.associations.filter(
-                    (a) => a.kind === kind
-                  )
-                  return (
-                    <section
-                      key={kind}
-                      aria-label={
-                        kind === "blessing" ? "Blessing" : "Bloodlines"
-                      }
-                    >
-                      <h4 className="text-xs font-medium capitalize">
-                        {kind === "blessing" ? "Blessing" : "Bloodlines"}
-                      </h4>
-                      {links.length ? (
-                        <div className="mt-1 flex flex-col gap-2">
-                          {links.map((a) => (
-                            <div
-                              key={a.id}
-                              className="rounded-lg border bg-input/20 p-2"
-                            >
+        {(["blessing", "bloodline", "transcendent"] as const).map((kind) => {
+          const tabValue =
+            kind === "blessing"
+              ? "blessings"
+              : kind === "bloodline"
+                ? "bloodlines"
+                : "transcendent"
+          const heading =
+            kind === "blessing"
+              ? "Blessings"
+              : kind === "bloodline"
+                ? "Bloodlines"
+                : "Transcendent skills"
+          const links = character.associations.filter((a) => a.kind === kind)
+          return (
+            <TabsContent key={kind} value={tabValue} className="pt-3">
+              <Card>
+                <CardContent>
+                  <div className="flex flex-col gap-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="font-heading text-sm font-medium">
+                        {heading}
+                      </h3>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => openAssociations(kind)}
+                      >
+                        Manage {heading.toLowerCase()}
+                      </Button>
+                    </div>
+                    {kind === "transcendent" ? (
+                      <>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {character.isTranscendent ? (
+                            <Badge variant="outline">Transcendent</Badge>
+                          ) : null}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Transcendent skills are distinct from blessings,
+                          bloodlines, and acquired skills. Listed descriptions
+                          and costs are reference only; this app does not
+                          activate skills or deduct costs.
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        Linked {heading.toLowerCase()} effects are
+                        catalog-defined. Numeric status and effective values are
+                        calculated by the server; this sheet does not assume
+                        canonical bonuses or treat narrative power as numeric.
+                      </p>
+                    )}
+                    {links.length ? (
+                      <div className="flex flex-col gap-2">
+                        {links.map((a) => (
+                          <div
+                            key={a.id}
+                            className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                          >
+                            <div className="min-w-0">
                               <div className="flex flex-wrap items-center gap-1.5 font-medium">
                                 {kind === "blessing" && a.tier
                                   ? `${a.tier} Blessing of ${a.name}`
@@ -3220,107 +3358,46 @@ export function CharacterDetail({
                                     "No description for this grade")
                                   : null}
                               </p>
-                              <p className="text-[0.6875rem] text-muted-foreground">
-                                {a.definitionArchived
-                                  ? "linked but not effective"
-                                  : ""}
-                              </p>
+                              {a.definitionArchived ? (
+                                <p className="text-[0.6875rem] text-muted-foreground">
+                                  linked but not effective
+                                </p>
+                              ) : null}
                             </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          No linked {kind}s.
-                        </p>
-                      )}
-                    </section>
-                  )
-                })}
-                <section aria-label="Transcendent skills">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h4 className="text-xs font-medium">Transcendent skills</h4>
-                    {character.isTranscendent ? (
-                      <Badge variant="outline">Transcendent</Badge>
-                    ) : null}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Transcendent skills are distinct from blessings, bloodlines,
-                    and acquired skills. Listed descriptions and costs are
-                    reference only; this app does not activate skills or deduct
-                    costs.
-                  </p>
-                  {character.associations.filter(
-                    (a) => a.kind === "transcendent"
-                  ).length ? (
-                    <div className="mt-1 flex flex-col gap-2">
-                      {character.associations
-                        .filter((a) => a.kind === "transcendent")
-                        .map((a) => (
-                          <div
-                            key={a.id}
-                            className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
-                          >
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-1.5 font-medium">
-                                {a.name}
-                                {a.definitionArchived ? (
-                                  <Badge variant="outline">
-                                    Archived - inert
-                                  </Badge>
-                                ) : null}
-                                {a.grade ? (
-                                  <Badge variant="outline">{a.grade}</Badge>
-                                ) : null}
-                              </div>
-                              <p className="text-xs whitespace-pre-wrap text-muted-foreground">
-                                {a.grade
-                                  ? (a.gradeDescription ??
-                                    "No description for this grade")
-                                  : null}
-                              </p>
-                              <p className="text-[0.6875rem] text-muted-foreground">
-                                {a.definitionArchived
-                                  ? "linked but not effective"
-                                  : ""}
-                              </p>
-                            </div>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={assocBusy}
-                              onClick={() => {
-                                if (
-                                  window.confirm(
-                                    `Remove ${a.name} from ${character.name}?`
-                                  )
-                                )
-                                  void removeAssociation(
-                                    "transcendent",
-                                    a.definitionId
-                                  )
-                              }}
-                            >
-                              Remove
-                            </Button>
+                            {kind === "transcendent" ? (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={assocBusy}
+                                onClick={() => openAssociations("transcendent")}
+                              >
+                                Remove
+                              </Button>
+                            ) : null}
                           </div>
                         ))}
-                    </div>
-                  ) : (
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      No linked transcendent skills.
-                    </p>
-                  )}
-                </section>
-                {status ? (
-                  <p className="text-xs text-muted-foreground">
-                    Current attribute values below reflect server-calculated
-                    live effects.
-                  </p>
-                ) : null}
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        No linked{" "}
+                        {kind === "transcendent"
+                          ? "transcendent skills"
+                          : `${kind}s`}
+                        .
+                      </p>
+                    )}
+                    {status && kind !== "transcendent" ? (
+                      <p className="text-xs text-muted-foreground">
+                        Current attribute values below reflect server-calculated
+                        live effects.
+                      </p>
+                    ) : null}
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          )
+        })}
 
         <TabsContent value="attributes" className="pt-3">
           {status ? (
@@ -3357,54 +3434,61 @@ export function CharacterDetail({
                         </TableCell>
                         <TableCell>
                           <div className="flex flex-col gap-0.5">
-                            {trace.phases.map((phase) => (
-                              <div key={phase.phase}>
-                                <span className="flex justify-between text-[0.6875rem] text-muted-foreground">
-                                  <span>{phase.phase}</span>
-                                  <span className="tabular-nums">
-                                    {phase.value}
-                                    {phase.delta >= 0 ? " (+" : " ("}
-                                    {phase.delta}){" "}
+                            {trace.phases.map((phase) => {
+                              if (phase.phase === "historical-fixed") {
+                                const fixedByTrack = (
+                                  status as typeof status & {
+                                    historicalFixedByTrack?: Partial<
+                                      Record<
+                                        "race" | "class" | "profession",
+                                        Partial<Record<AttributeKey, number>>
+                                      >
+                                    >
+                                  }
+                                ).historicalFixedByTrack
+                                const sources = [
+                                  ["Race fixed", "race"],
+                                  ["Class fixed", "class"],
+                                  ["Profession fixed", "profession"],
+                                ] as const
+                                let cumulative = phase.value - phase.delta
+                                return sources.map(([label, track], index) => {
+                                  const delta =
+                                    fixedByTrack?.[track]?.[
+                                      trace.attribute as AttributeKey
+                                    ] ?? 0
+                                  cumulative =
+                                    index === sources.length - 1
+                                      ? phase.value
+                                      : cumulative + delta
+                                  return (
+                                    <span
+                                      key={`${phase.phase}-${track}`}
+                                      className="flex justify-between pl-3 text-[0.6875rem] text-muted-foreground"
+                                    >
+                                      <span>{label}</span>
+                                      <span className="tabular-nums">
+                                        {cumulative}
+                                        {delta >= 0 ? " (+" : " ("}
+                                        {delta})
+                                      </span>
+                                    </span>
+                                  )
+                                })
+                              }
+                              return (
+                                <div key={phase.phase}>
+                                  <span className="flex justify-between text-[0.6875rem] text-muted-foreground">
+                                    <span>{phase.phase}</span>
+                                    <span className="tabular-nums">
+                                      {phase.value}
+                                      {phase.delta >= 0 ? " (+" : " ("}
+                                      {phase.delta}){" "}
+                                    </span>
                                   </span>
-                                </span>
-                                {phase.phase === "historical-fixed"
-                                  ? (
-                                      [
-                                        ["Race", "race"],
-                                        ["Class", "class"],
-                                        ["Profession", "profession"],
-                                      ] as const
-                                    ).map(([source, track]) => {
-                                      const fixed =
-                                        (
-                                          status as typeof status & {
-                                            historicalFixedByTrack?: Partial<
-                                              Record<
-                                                "race" | "class" | "profession",
-                                                Partial<
-                                                  Record<AttributeKey, number>
-                                                >
-                                              >
-                                            >
-                                          }
-                                        ).historicalFixedByTrack?.[track]?.[
-                                          trace.attribute as AttributeKey
-                                        ] ?? 0
-                                      return (
-                                        <span
-                                          key={track}
-                                          className="flex justify-between pl-3 text-[0.6875rem] text-muted-foreground"
-                                        >
-                                          <span>{source} fixed</span>
-                                          <span className="tabular-nums">
-                                            {fixed}
-                                          </span>
-                                        </span>
-                                      )
-                                    })
-                                  : null}
-                              </div>
-                            ))}
+                                </div>
+                              )
+                            })}
                           </div>
                         </TableCell>
                       </TableRow>
@@ -3458,17 +3542,21 @@ export function CharacterDetail({
                 <MetaRow label="Race">
                   {character.raceName ?? "Not set"}
                 </MetaRow>
-                <MetaRow label="Race grade">
-                  {state.race.grade} (mode {state.race.mode})
-                </MetaRow>
-                <MetaRow label="Race level">{state.race.level}</MetaRow>
+                <MetaRow label="Grade">{state.race.grade}</MetaRow>
+                <MetaRow label="Level">{state.race.level}</MetaRow>
               </div>
             </CardContent>
           </Card>
           <p className="mt-3 text-sm whitespace-pre-wrap text-muted-foreground">
             {character.raceGradeDescription ?? "No description for this grade"}
           </p>
-          {trackHistory("race")}
+          <section
+            className="mt-3 flex flex-col gap-2"
+            aria-label="Race track history"
+          >
+            <h3 className="text-sm font-medium">Track history</h3>
+            {trackHistory("race")}
+          </section>
         </TabsContent>
         {state.race.mode !== "independent" ? (
           <TabsContent value="class" className="pt-3">
@@ -3506,7 +3594,7 @@ export function CharacterDetail({
                 </div>
                 {classTrack && classTrack.grade ? (
                   <Button
-                    className="mt-2"
+                    className="mt-2 w-full"
                     variant="outline"
                     onClick={() => setTrackEvolveTrack("class")}
                     disabled={busy}
@@ -3514,13 +3602,19 @@ export function CharacterDetail({
                     Evolve class
                   </Button>
                 ) : null}
-                {trackHistory("class")}
-                <p className="mt-3 text-sm whitespace-pre-wrap text-muted-foreground">
-                  {character.classGradeDescription ??
-                    "No description for this grade"}
-                </p>
               </CardContent>
             </Card>
+            <p className="mt-3 text-sm whitespace-pre-wrap text-muted-foreground">
+              {character.classGradeDescription ??
+                "No description for this grade"}
+            </p>
+            <section
+              className="mt-3 flex flex-col gap-2"
+              aria-label="Class track history"
+            >
+              <h3 className="text-sm font-medium">Track history</h3>
+              {trackHistory("class")}
+            </section>
           </TabsContent>
         ) : null}
         {state.race.mode !== "independent" ? (
@@ -3636,20 +3730,27 @@ export function CharacterDetail({
                   {professionTrack?.grade ? (
                     <Button
                       variant="outline"
+                      className="mt-2 w-full"
                       onClick={() => setTrackEvolveTrack("profession")}
                       disabled={busy}
                     >
                       Evolve profession
                     </Button>
                   ) : null}
-                  {trackHistory("profession")}
-                  <p className="text-sm whitespace-pre-wrap text-muted-foreground">
-                    {character.professionGradeDescription ??
-                      "No description for this grade"}
-                  </p>
                 </div>
               </CardContent>
             </Card>
+            <p className="mt-3 text-sm whitespace-pre-wrap text-muted-foreground">
+              {character.professionGradeDescription ??
+                "No description for this grade"}
+            </p>
+            <section
+              className="mt-3 flex flex-col gap-2"
+              aria-label="Profession track history"
+            >
+              <h3 className="text-sm font-medium">Track history</h3>
+              {trackHistory("profession")}
+            </section>
           </TabsContent>
         ) : null}
 
@@ -4010,7 +4111,11 @@ export function CharacterDetail({
                     history is unchanged.
                   </p>
                 </div>
-                <Button variant="outline" size="sm" onClick={openAssociations}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => openAssociations()}
+                >
                   Manage titles & equipment
                 </Button>
               </div>
@@ -4062,7 +4167,11 @@ export function CharacterDetail({
               Bonuses are capped by the house assumption of 20% per attribute
               (aggregate) and 15% overall.
             </p>
-            <Button variant="outline" size="sm" onClick={openAssociations}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => openAssociations()}
+            >
               Manage titles & equipment
             </Button>
           </div>
@@ -4356,6 +4465,8 @@ export function CharacterDetail({
       <AssociationSheet
         open={associationsOpen}
         onOpenChange={setAssociationsOpen}
+        associationTab={associationTab}
+        onAssociationTabChange={setAssociationTab}
         character={character}
         titles={titlesCatalog}
         equipment={equipmentCatalog}
@@ -4373,48 +4484,11 @@ export function CharacterDetail({
         onRemove={(kind, definitionId) =>
           void removeAssociation(kind, definitionId)
         }
-        onPowerAdd={(kind, definitionId, tier) => {
-          if (kind === "transcendent") {
-            const item = transcendentCatalog.find(
-              (entry) => entry.id === definitionId
-            )
-            if (
-              item &&
-              window.confirm(`Attach ${item.name} to ${character.name}?`)
-            )
-              void addAssociation(kind, definitionId)
-            return
-          }
-          const displaced = character.associations.filter(
-            (a) => a.kind === kind && a.definitionId !== definitionId
-          )
-          const item = [...blessingsCatalog, ...bloodlinesCatalog].find(
-            (entry) => entry.id === definitionId
-          )
-          const names = displaced.map((a) =>
-            a.definitionArchived ? `${a.name} (archived, inert)` : a.name
-          )
-          if (
-            names.length &&
-            !window.confirm(
-              `${item?.name ?? "Power"} will replace ${names.join(", ")}. Continue?`
-            )
-          )
-            return
-          if (
-            !window.confirm(
-              `Add ${item?.name ?? "this power"} to ${character.name}?`
-            )
-          )
-            return
+        onPowerAdd={(kind, definitionId, tier) =>
           void addAssociation(kind, definitionId, undefined, undefined, tier)
-        }}
+        }
         onPowerRemove={(kind, definitionId) => {
-          const name =
-            character.associations.find((a) => a.definitionId === definitionId)
-              ?.name ?? "this power"
-          if (window.confirm(`Remove ${name} from ${character.name}?`))
-            void removeAssociation(kind, definitionId)
+          void removeAssociation(kind, definitionId)
         }}
       />
 

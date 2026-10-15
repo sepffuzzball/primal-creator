@@ -25,6 +25,14 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -48,7 +56,31 @@ import {
 } from "@/lib/server/schemas"
 
 const GRADES = ["G", "F", "E", "D", "C", "B", "A", "S"] as const
+const OPTIONAL_GRADE_KINDS = [
+  "items",
+  "titles",
+  "bloodlines",
+  "transcendent_skills",
+]
 const RARITIES = [...EQUIPMENT_RARITIES, EQUIPMENT_UNIQUE_RARITY] as const
+const BLESSING_TIERS = [
+  "Baptism",
+  "Minor",
+  "Lesser",
+  "Intermediate",
+  "Major",
+  "Greater",
+  "Divine",
+  "True",
+] as const
+type BlessingTier = (typeof BLESSING_TIERS)[number]
+type BlessingEffect =
+  | { phase: "flat"; amount: Record<string, number>; [key: string]: unknown }
+  | {
+      phase: "percent"
+      basisPoints: Record<string, number>
+      [key: string]: unknown
+    }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -201,8 +233,13 @@ export function CatalogManager({ kind }: { kind: string }) {
     Array<{ stableId: string; name: string }>
   >([])
   const [skills, setSkills] = React.useState<CatalogItem[]>([])
+  const [skillGrantGrade, setSkillGrantGrade] =
+    React.useState<(typeof GRADES)[number]>("G")
+  const [skillToGrant, setSkillToGrant] = React.useState("")
   const [descriptionGrade, setDescriptionGrade] =
     React.useState<(typeof GRADES)[number]>("G")
+  const [blessingTier, setBlessingTier] =
+    React.useState<BlessingTier>("Baptism")
   const structuredConfig = React.useMemo(() => {
     try {
       const parsed: unknown = JSON.parse(form.configText || "{}")
@@ -228,6 +265,29 @@ export function CatalogManager({ kind }: { kind: string }) {
       }
     })
   }, [])
+  const updateBlessingEffects = React.useCallback(
+    (tier: BlessingTier, effects: BlessingEffect[] | undefined) => {
+      setForm((current) => {
+        try {
+          const config = JSON.parse(current.configText || "{}") as Record<
+            string,
+            unknown
+          >
+          const oldEffects = isRecord(config.blessingEffects)
+            ? config.blessingEffects
+            : {}
+          const blessingEffects = { ...oldEffects }
+          if (effects === undefined) delete blessingEffects[tier]
+          else blessingEffects[tier] = effects
+          config.blessingEffects = blessingEffects
+          return { ...current, configText: JSON.stringify(config, null, 2) }
+        } catch {
+          return current
+        }
+      })
+    },
+    []
+  )
   const updateEquipmentConfig = React.useCallback(
     (key: string, value: unknown) => {
       setForm((current) => {
@@ -249,6 +309,9 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [submitting, setSubmitting] = React.useState(false)
   const [formError, setFormError] = React.useState<string | null>(null)
   const [showArchived, setShowArchived] = React.useState(false)
+  const [expandedSeries, setExpandedSeries] = React.useState<
+    Record<string, boolean>
+  >({})
   const [unarchiving, setUnarchiving] = React.useState<string | null>(null)
   const [unarchiveError, setUnarchiveError] = React.useState<string | null>(
     null
@@ -532,7 +595,12 @@ export function CatalogManager({ kind }: { kind: string }) {
   }, [kind])
 
   React.useEffect(() => {
-    if (kind !== "equipment") return
+    if (
+      !(["equipment", "races", "classes", "professions"] as string[]).includes(
+        kind
+      )
+    )
+      return
     let active = true
     apiFetch<CatalogListResponse>("/api/catalog/skills")
       .then((response) => {
@@ -580,6 +648,52 @@ export function CatalogManager({ kind }: { kind: string }) {
     )
   }, [items, query, isAdmin, showArchived])
 
+  const rankedSeries = React.useMemo(() => {
+    if (kind !== "titles") return []
+    return [
+      ...new Set(
+        (items ?? []).flatMap((item) => {
+          const config = isRecord(item.config) ? item.config : {}
+          const improvement = isRecord(config.improvement)
+            ? config.improvement
+            : null
+          return typeof improvement?.seriesId === "string"
+            ? [improvement.seriesId]
+            : []
+        })
+      ),
+    ].sort()
+  }, [items, kind])
+
+  const updateImprovement = React.useCallback(
+    (update: Record<string, unknown> | null) => {
+      setForm((current) => {
+        try {
+          const config = JSON.parse(current.configText || "{}") as Record<
+            string,
+            unknown
+          >
+          const previous = isRecord(config.improvement)
+            ? config.improvement
+            : null
+          if (update) {
+            config.improvement = update
+            config.upgradeGroup = update.seriesId
+          } else {
+            delete config.improvement
+            // Only remove the mirrored group if it still belongs to the ranking.
+            if (previous && config.upgradeGroup === previous.seriesId)
+              delete config.upgradeGroup
+          }
+          return { ...current, configText: JSON.stringify(config, null, 2) }
+        } catch {
+          return current
+        }
+      })
+    },
+    []
+  )
+
   const unarchive = React.useCallback(
     async (item: CatalogItem) => {
       if (!isAdmin || !window.confirm(`Unarchive "${item.name}"?`)) return
@@ -609,6 +723,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     setEditing(null)
     setForm(EMPTY_FORM)
     setDescriptionGrade("G")
+    setBlessingTier("Baptism")
     setFormError(null)
     setDialogOpen(true)
   }, [])
@@ -617,6 +732,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     setEditing(item)
     setForm(toForm(item))
     setDescriptionGrade("G")
+    setBlessingTier("Baptism")
     setFormError(null)
     setDialogOpen(true)
   }, [])
@@ -705,6 +821,83 @@ export function CatalogManager({ kind }: { kind: string }) {
               : "Flat equipment bonuses must be finite nonnegative numbers."
           )
           return
+        }
+      }
+    }
+    if (kind === "titles") {
+      const improvement = isRecord(config.improvement)
+        ? config.improvement
+        : null
+      if (improvement) {
+        const seriesId =
+          typeof improvement.seriesId === "string"
+            ? improvement.seriesId.trim()
+            : ""
+        const rank = improvement.rank
+        if (
+          !seriesId ||
+          typeof rank !== "number" ||
+          !Number.isInteger(rank) ||
+          rank < 1 ||
+          rank > 100 ||
+          !GRADES.includes(improvement.minRaceGrade as (typeof GRADES)[number])
+        ) {
+          setFormError(
+            "Ranked titles require a nonempty series ID, an integer rank from 1 to 100, and a minimum race grade from G to S."
+          )
+          return
+        }
+        config.improvement = {
+          seriesId,
+          rank,
+          minRaceGrade: improvement.minRaceGrade,
+        }
+        config.upgradeGroup = seriesId
+      }
+    }
+    if (kind === "gods" && config.blessingEffects !== undefined) {
+      if (!isRecord(config.blessingEffects)) {
+        setFormError("Blessing effects must be organized by tier.")
+        return
+      }
+      for (const [tier, effects] of Object.entries(config.blessingEffects)) {
+        if (
+          !BLESSING_TIERS.includes(tier as BlessingTier) ||
+          !Array.isArray(effects)
+        ) {
+          setFormError(
+            "Blessing effects must use supported tiers and effect lists."
+          )
+          return
+        }
+        for (const effect of effects) {
+          if (
+            !isRecord(effect) ||
+            !["flat", "percent"].includes(String(effect.phase))
+          ) {
+            setFormError(`${tier} effects require a flat or percent phase.`)
+            return
+          }
+          const vectorKey = effect.phase === "flat" ? "amount" : "basisPoints"
+          const vector = effect[vectorKey]
+          if (
+            !isRecord(vector) ||
+            Object.values(vector).some(
+              (value) =>
+                typeof value !== "number" ||
+                !Number.isFinite(value) ||
+                (effect.phase === "flat"
+                  ? !Number.isInteger(value)
+                  : !Number.isInteger(value) || value < 0)
+            )
+          ) {
+            setFormError(
+              effect.phase === "flat"
+                ? `${tier} flat effects must use whole-number values.`
+                : `${tier} percent effects must use nonnegative basis points.`
+            )
+            return
+          }
         }
       }
     }
@@ -922,7 +1115,8 @@ export function CatalogManager({ kind }: { kind: string }) {
               ),
             }
           : {}),
-        ...(form.grade.trim() &&
+        ...(kind !== "gods" &&
+        form.grade.trim() &&
         (kind !== "races" ||
           !editing ||
           form.grade !==
@@ -931,6 +1125,11 @@ export function CatalogManager({ kind }: { kind: string }) {
               ? editing.config.naturalGrade
               : editing.grade))
           ? { grade: form.grade }
+          : {}),
+        ...(OPTIONAL_GRADE_KINDS.includes(kind) &&
+        editing &&
+        form.grade !== (editing.grade ?? "")
+          ? { grade: form.grade || null }
           : {}),
         ...(form.sourceUrl.trim() ? { sourceUrl: form.sourceUrl } : {}),
         // On an EDIT whose parsed config is semantically unchanged from the
@@ -960,7 +1159,13 @@ export function CatalogManager({ kind }: { kind: string }) {
       setDialogOpen(false)
       await load()
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : "Save failed.")
+      setFormError(
+        err instanceof ApiError && err.status === 409
+          ? `${err.message} This title may be linked to a character. Retry without changing its identity fields, or ask an administrator to resolve the link.`
+          : err instanceof Error
+            ? err.message
+            : "Save failed."
+      )
     } finally {
       setSubmitting(false)
     }
@@ -1082,61 +1287,198 @@ export function CatalogManager({ kind }: { kind: string }) {
                   </TableCell>
                 </TableRow>
               ) : (
-                visible.map((item) => (
-                  <TableRow key={item.id}>
-                    <TableCell className="font-medium">
-                      {item.name}
-                      {item.archived ? (
-                        <span className="ml-2 rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                          Archived
-                        </span>
-                      ) : null}
-                    </TableCell>
-                    <TableCell>{item.grade ?? "-"}</TableCell>
-                    <TableCell className="font-mono text-[0.6875rem]">
-                      {item.stableId}
-                    </TableCell>
-                    <TableCell>
-                      {item.sourceUrl ? (
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          aria-label="Open source"
-                          onClick={() => openSource(item.sourceUrl)}
-                        >
-                          <LinkIcon />
-                        </Button>
-                      ) : (
-                        "-"
-                      )}
-                    </TableCell>
-                    {isAdmin ? (
-                      <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label="Edit"
-                          onClick={() => openEdit(item)}
-                        >
-                          <PencilIcon />
-                        </Button>
-                        {item.archived ? (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={unarchiving === item.id}
-                            onClick={() => unarchive(item)}
-                          >
-                            <ArchiveRestoreIcon />
-                            {unarchiving === item.id
-                              ? "Unarchiving..."
-                              : "Unarchive"}
-                          </Button>
+                <>
+                  {visible
+                    .filter(
+                      (item) =>
+                        kind !== "titles" ||
+                        !isRecord(item.config) ||
+                        !isRecord(item.config.improvement)
+                    )
+                    .map((item) => (
+                      <TableRow key={item.id}>
+                        <TableCell className="font-medium">
+                          {item.name}
+                          {item.archived ? (
+                            <span className="ml-2 rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                              Archived
+                            </span>
+                          ) : null}
+                        </TableCell>
+                        <TableCell>{item.grade ?? "-"}</TableCell>
+                        <TableCell className="font-mono text-[0.6875rem]">
+                          {item.stableId}
+                        </TableCell>
+                        <TableCell>
+                          {item.sourceUrl ? (
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              aria-label="Open source"
+                              onClick={() => openSource(item.sourceUrl)}
+                            >
+                              <LinkIcon />
+                            </Button>
+                          ) : (
+                            "-"
+                          )}
+                        </TableCell>
+                        {isAdmin ? (
+                          <TableCell className="text-right">
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label="Edit"
+                              onClick={() => openEdit(item)}
+                            >
+                              <PencilIcon />
+                            </Button>
+                            {item.archived ? (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={unarchiving === item.id}
+                                onClick={() => unarchive(item)}
+                              >
+                                <ArchiveRestoreIcon />
+                                {unarchiving === item.id
+                                  ? "Unarchiving..."
+                                  : "Unarchive"}
+                              </Button>
+                            ) : null}
+                          </TableCell>
                         ) : null}
-                      </TableCell>
-                    ) : null}
-                  </TableRow>
-                ))
+                      </TableRow>
+                    ))}
+                  {kind === "titles"
+                    ? rankedSeries.map((seriesId) => {
+                        const children = visible
+                          .filter(
+                            (entry) =>
+                              isRecord(entry.config) &&
+                              isRecord(entry.config.improvement) &&
+                              entry.config.improvement.seriesId === seriesId
+                          )
+                          .sort(
+                            (a, b) =>
+                              Number(
+                                (a.config as Record<string, unknown>)
+                                  .improvement &&
+                                  ((
+                                    a.config as Record<
+                                      string,
+                                      { rank?: number }
+                                    >
+                                  ).improvement?.rank ??
+                                    0)
+                              ) -
+                              Number(
+                                (b.config as Record<string, { rank?: number }>)
+                                  .improvement?.rank ?? 0
+                              )
+                          )
+                        if (!children.length) return null
+                        const expanded =
+                          query.trim() !== "" ||
+                          (expandedSeries[seriesId] ?? false)
+                        return (
+                          <React.Fragment key={`series-${seriesId}`}>
+                            <TableRow>
+                              <TableCell>
+                                <button
+                                  type="button"
+                                  aria-expanded={expanded}
+                                  aria-label={`${expanded ? "Collapse" : "Expand"} series ${seriesId}`}
+                                  className="font-medium"
+                                  onClick={() =>
+                                    setExpandedSeries((current) => ({
+                                      ...current,
+                                      [seriesId]: !expanded,
+                                    }))
+                                  }
+                                >
+                                  {expanded ? "▾" : "▸"} {seriesId}
+                                </button>
+                              </TableCell>
+                              <TableCell>{children.length} titles</TableCell>
+                              <TableCell className="font-mono text-[0.6875rem]">
+                                Series
+                              </TableCell>
+                              <TableCell>-</TableCell>
+                              {isAdmin ? <TableCell /> : null}
+                            </TableRow>
+                            {expanded
+                              ? children.map((child) => (
+                                  <TableRow key={child.id}>
+                                    <TableCell className="pl-8">
+                                      {child.name}
+                                      {child.archived ? (
+                                        <span className="ml-2 rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                                          Archived
+                                        </span>
+                                      ) : null}
+                                    </TableCell>
+                                    <TableCell>
+                                      Rank{" "}
+                                      {String(
+                                        (
+                                          child.config as Record<
+                                            string,
+                                            { rank?: number }
+                                          >
+                                        ).improvement?.rank ?? "-"
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="font-mono text-[0.6875rem]">
+                                      {child.stableId}
+                                    </TableCell>
+                                    <TableCell>
+                                      {child.sourceUrl ? (
+                                        <Button
+                                          variant="ghost"
+                                          size="icon-xs"
+                                          aria-label="Open source"
+                                          onClick={() =>
+                                            openSource(child.sourceUrl)
+                                          }
+                                        >
+                                          <LinkIcon />
+                                        </Button>
+                                      ) : (
+                                        "-"
+                                      )}
+                                    </TableCell>
+                                    {isAdmin ? (
+                                      <TableCell className="text-right">
+                                        <Button
+                                          variant="ghost"
+                                          size="icon-sm"
+                                          aria-label={`Edit ${child.name}`}
+                                          onClick={() => openEdit(child)}
+                                        >
+                                          <PencilIcon />
+                                        </Button>
+                                        {child.archived ? (
+                                          <Button
+                                            variant="outline"
+                                            size="sm"
+                                            disabled={unarchiving === child.id}
+                                            onClick={() => unarchive(child)}
+                                          >
+                                            <ArchiveRestoreIcon />
+                                            Unarchive
+                                          </Button>
+                                        ) : null}
+                                      </TableCell>
+                                    ) : null}
+                                  </TableRow>
+                                ))
+                              : null}
+                          </React.Fragment>
+                        )
+                      })
+                    : null}
+                </>
               )}
             </TableBody>
           </Table>
@@ -1176,7 +1518,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                   }
                 />
               </div>
-              {!form.grade ||
+              {kind === "items" ||
+              !form.grade ||
               ![...GRADES].includes(form.grade as (typeof GRADES)[number]) ? (
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="cat-description">Description</Label>
@@ -1212,120 +1555,96 @@ export function CatalogManager({ kind }: { kind: string }) {
                   </div>
                 </details>
               )}
-              {!!form.grade ||
-              ["races", "classes", "professions", "skills"].includes(kind) ? (
-                <section
-                  aria-label="Grade descriptions"
-                  className="flex flex-col gap-2 rounded-md border p-3"
-                >
-                  <h3 className="text-sm font-medium">Descriptions by grade</h3>
-                  <p className="text-xs text-muted-foreground">
-                    Optional grade-specific descriptions. Blank text removes
-                    that grade&apos;s description.
-                  </p>
-                  <div
-                    role="tablist"
-                    aria-label="Description grade"
-                    className="flex flex-wrap gap-1"
+              {kind !== "items" &&
+                (!!form.grade ||
+                ["races", "classes", "professions", "skills"].includes(kind) ? (
+                  <section
+                    aria-label="Grade descriptions"
+                    className="flex flex-col gap-2 rounded-md border p-3"
                   >
-                    {GRADES.map((grade) => (
-                      <Button
-                        key={grade}
-                        type="button"
-                        role="tab"
-                        aria-selected={descriptionGrade === grade}
-                        variant={
-                          descriptionGrade === grade ? "secondary" : "outline"
-                        }
-                        size="sm"
-                        onClick={() => setDescriptionGrade(grade)}
-                      >
-                        {grade}
-                      </Button>
-                    ))}
-                  </div>
-                  <Label htmlFor="grade-description">
-                    {descriptionGrade}-grade description
-                  </Label>
-                  <Textarea
-                    id="grade-description"
-                    maxLength={8000}
-                    value={form.gradeDescriptions[descriptionGrade] ?? ""}
-                    placeholder="No description for this grade"
-                    onChange={(event) =>
-                      setForm((current) => ({
-                        ...current,
-                        gradeDescriptions: {
-                          ...current.gradeDescriptions,
-                          [descriptionGrade]: event.target.value,
-                        },
-                      }))
-                    }
-                  />
-                  {!form.gradeDescriptions[descriptionGrade]?.trim() ? (
+                    <h3 className="text-sm font-medium">
+                      Descriptions by grade
+                    </h3>
                     <p className="text-xs text-muted-foreground">
-                      No description for this grade
+                      Optional grade-specific descriptions. Blank text removes
+                      that grade&apos;s description.
                     </p>
-                  ) : null}
-                </section>
-              ) : null}
+                    <div
+                      role="tablist"
+                      aria-label="Description grade"
+                      className="flex flex-wrap gap-1"
+                    >
+                      {GRADES.map((grade) => (
+                        <Button
+                          key={grade}
+                          type="button"
+                          role="tab"
+                          aria-selected={descriptionGrade === grade}
+                          variant={
+                            descriptionGrade === grade ? "secondary" : "outline"
+                          }
+                          size="sm"
+                          onClick={() => setDescriptionGrade(grade)}
+                        >
+                          {grade}
+                        </Button>
+                      ))}
+                    </div>
+                    <Label htmlFor="grade-description">
+                      {descriptionGrade}-grade description
+                    </Label>
+                    <Textarea
+                      id="grade-description"
+                      maxLength={8000}
+                      value={form.gradeDescriptions[descriptionGrade] ?? ""}
+                      placeholder="No description for this grade"
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          gradeDescriptions: {
+                            ...current.gradeDescriptions,
+                            [descriptionGrade]: event.target.value,
+                          },
+                        }))
+                      }
+                    />
+                    {!form.gradeDescriptions[descriptionGrade]?.trim() ? (
+                      <p className="text-xs text-muted-foreground">
+                        No description for this grade
+                      </p>
+                    ) : null}
+                  </section>
+                ) : null)}
               {structuredKind ? (
                 <div className="flex flex-col gap-2">
                   <Label htmlFor="cat-grade">
                     {kind === "races" ? "Natural grade" : "Initial grade"}
                   </Label>
-                  <div
-                    id="cat-grade"
-                    role="radiogroup"
-                    aria-label={
-                      kind === "races" ? "Natural grade" : "Initial grade"
+                  <Select
+                    value={form.grade}
+                    onValueChange={(grade) =>
+                      setForm((f) => ({ ...f, grade: String(grade ?? "") }))
                     }
-                    className="grid grid-cols-8 overflow-hidden rounded-md border"
-                    onKeyDown={(event) => {
-                      const current = GRADES.indexOf(
-                        form.grade as (typeof GRADES)[number]
-                      )
-                      const next =
-                        event.key === "ArrowRight" || event.key === "ArrowDown"
-                          ? (current + 1) % GRADES.length
-                          : event.key === "ArrowLeft" || event.key === "ArrowUp"
-                            ? (current - 1 + GRADES.length) % GRADES.length
-                            : event.key === "Home"
-                              ? 0
-                              : event.key === "End"
-                                ? GRADES.length - 1
-                                : -1
-                      if (next >= 0) {
-                        event.preventDefault()
-                        const buttons =
-                          event.currentTarget.querySelectorAll("button")
-                        ;(buttons[next] as HTMLButtonElement)?.focus()
-                        setForm((f) => ({ ...f, grade: GRADES[next] }))
-                      }
-                    }}
                   >
-                    {GRADES.map((grade) => (
-                      <Button
-                        key={grade}
-                        type="button"
-                        size="sm"
-                        role="radio"
-                        disabled={!structuredConfig}
-                        variant={form.grade === grade ? "secondary" : "outline"}
-                        aria-checked={form.grade === grade}
-                        tabIndex={
-                          form.grade === grade ||
-                          (!form.grade && grade === GRADES[0])
-                            ? 0
-                            : -1
-                        }
-                        className="rounded-none border-0 border-r last:border-r-0 focus-visible:z-10"
-                        onClick={() => setForm((f) => ({ ...f, grade }))}
-                      >
-                        {grade}
-                      </Button>
-                    ))}
-                  </div>
+                    <SelectTrigger
+                      id="cat-grade"
+                      aria-label={
+                        kind === "races" ? "Natural grade" : "Initial grade"
+                      }
+                      disabled={!structuredConfig}
+                    >
+                      <SelectValue placeholder="Choose a grade" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        {GRADES.map((grade) => (
+                          <SelectItem key={grade} value={grade}>
+                            {grade}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
                   {kind === "races" ? (
                     <div className="flex flex-col gap-2">
                       <Label htmlFor="race-type">Race type</Label>
@@ -1598,21 +1917,288 @@ export function CatalogManager({ kind }: { kind: string }) {
                           </TableBody>
                         </Table>
                       </div>
+                      <section
+                        aria-label="Grade skill grants"
+                        className="flex flex-col gap-2 rounded-md border p-3"
+                      >
+                        <h3 className="text-sm font-medium">
+                          Skills granted at each grade
+                        </h3>
+                        <p className="text-xs text-muted-foreground">
+                          These are automatic grants for characters acquiring
+                          this grade (race characters receive them when they
+                          reach the grade). Catalog edits do not retroactively
+                          grant skills to existing characters.
+                        </p>
+                        <Label htmlFor="skill-grant-grade">Grant grade</Label>
+                        <div
+                          aria-label="Grant grade"
+                          className="flex flex-wrap gap-1"
+                        >
+                          {GRADES.map((grade) => (
+                            <Button
+                              key={grade}
+                              type="button"
+                              size="sm"
+                              variant={
+                                skillGrantGrade === grade
+                                  ? "secondary"
+                                  : "outline"
+                              }
+                              aria-pressed={skillGrantGrade === grade}
+                              onClick={() => setSkillGrantGrade(grade)}
+                            >
+                              {grade}
+                            </Button>
+                          ))}
+                        </div>
+                        {(() => {
+                          const configured = isRecord(
+                            structuredConfig?.gradeGrantedSkillStableIds
+                          )
+                            ? structuredConfig.gradeGrantedSkillStableIds
+                            : {}
+                          const existing = Array.isArray(
+                            configured[skillGrantGrade]
+                          )
+                            ? configured[skillGrantGrade].filter(
+                                (value): value is string =>
+                                  typeof value === "string"
+                              )
+                            : []
+                          const uniqueExisting = [...new Set(existing)]
+                          const addSkill = () => {
+                            if (
+                              !skillToGrant ||
+                              existing.includes(skillToGrant)
+                            )
+                              return
+                            setConfigValue("gradeGrantedSkillStableIds", {
+                              ...configured,
+                              [skillGrantGrade]: [
+                                ...uniqueExisting,
+                                skillToGrant,
+                              ],
+                            })
+                            setSkillToGrant("")
+                          }
+                          const removeSkill = (stableId: string) => {
+                            const remaining = uniqueExisting.filter(
+                              (id) => id !== stableId
+                            )
+                            const next = { ...configured }
+                            if (remaining.length)
+                              next[skillGrantGrade] = remaining
+                            else delete next[skillGrantGrade]
+                            setConfigValue("gradeGrantedSkillStableIds", next)
+                          }
+                          const selectable = skills.filter(
+                            (skill) => !existing.includes(skill.stableId)
+                          )
+                          return (
+                            <>
+                              <ul className="flex flex-col gap-1">
+                                {uniqueExisting.map((stableId) => {
+                                  const skill = skills.find(
+                                    (entry) => entry.stableId === stableId
+                                  )
+                                  return (
+                                    <li
+                                      key={stableId}
+                                      className="flex items-center justify-between gap-2 text-sm"
+                                    >
+                                      <span>
+                                        {skill?.name ??
+                                          `${stableId} (archived or unavailable)`}
+                                      </span>
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        variant="outline"
+                                        aria-label={`Remove ${skill?.name ?? stableId}`}
+                                        onClick={() => removeSkill(stableId)}
+                                      >
+                                        Remove
+                                      </Button>
+                                    </li>
+                                  )
+                                })}
+                              </ul>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Label
+                                  className="sr-only"
+                                  htmlFor="skill-grant-choice"
+                                >
+                                  Skill to grant
+                                </Label>
+                                <select
+                                  id="skill-grant-choice"
+                                  aria-label="Skill to grant"
+                                  className="h-9 min-w-48 rounded-md border bg-background px-3 text-sm"
+                                  value={skillToGrant}
+                                  onChange={(event) =>
+                                    setSkillToGrant(event.target.value)
+                                  }
+                                >
+                                  <option value="">Choose a skill</option>
+                                  {selectable.map((skill) => (
+                                    <option
+                                      key={skill.stableId}
+                                      value={skill.stableId}
+                                    >
+                                      {skill.name}
+                                    </option>
+                                  ))}
+                                </select>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  disabled={!skillToGrant}
+                                  onClick={addSkill}
+                                >
+                                  Add skill
+                                </Button>
+                              </div>
+                            </>
+                          )
+                        })()}
+                      </section>
                     </div>
                   ) : null}
                 </div>
-              ) : !["equipment", "skills"].includes(kind) ? (
+              ) : !["equipment", "skills", "gods"].includes(kind) ? (
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="cat-grade">Grade</Label>
-                  <Input
-                    id="cat-grade"
-                    value={form.grade}
-                    onChange={(e) =>
-                      setForm((f) => ({ ...f, grade: e.target.value }))
+                  <Select
+                    value={form.grade || "none"}
+                    onValueChange={(grade) =>
+                      setForm((f) => ({
+                        ...f,
+                        grade: grade === "none" ? "" : String(grade ?? ""),
+                      }))
                     }
-                  />
+                  >
+                    <SelectTrigger id="cat-grade" aria-label="Grade">
+                      <SelectValue placeholder="No grade" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="none">No grade</SelectItem>
+                        {GRADES.map((grade) => (
+                          <SelectItem key={grade} value={grade}>
+                            {grade}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
                 </div>
               ) : null}
+              {kind === "titles"
+                ? (() => {
+                    const improvement = isRecord(structuredConfig?.improvement)
+                      ? structuredConfig.improvement
+                      : null
+                    const enabled = improvement !== null
+                    return (
+                      <section
+                        aria-label="Ranked series"
+                        className="flex flex-col gap-3 rounded-md border p-3"
+                      >
+                        <label className="flex items-center gap-2 text-sm font-medium">
+                          <input
+                            aria-label="Ranked series"
+                            type="checkbox"
+                            checked={enabled}
+                            onChange={(event) => {
+                              if (event.target.checked)
+                                updateImprovement({
+                                  seriesId: "",
+                                  rank: 1,
+                                  minRaceGrade: "G",
+                                })
+                              else updateImprovement(null)
+                            }}
+                          />
+                          Ranked series
+                        </label>
+                        {enabled ? (
+                          <>
+                            <div className="flex flex-col gap-1.5">
+                              <Label htmlFor="title-series-id">Series ID</Label>
+                              <Input
+                                id="title-series-id"
+                                list="title-series-suggestions"
+                                value={String(improvement.seriesId ?? "")}
+                                onChange={(event) =>
+                                  updateImprovement({
+                                    ...improvement,
+                                    seriesId: event.target.value.trimStart(),
+                                  })
+                                }
+                              />
+                              <datalist id="title-series-suggestions">
+                                {rankedSeries.map((series) => (
+                                  <option key={series} value={series} />
+                                ))}
+                              </datalist>
+                            </div>
+                            <div className="flex flex-col gap-1.5">
+                              <Label htmlFor="title-rank">Rank</Label>
+                              <Input
+                                id="title-rank"
+                                type="number"
+                                min="1"
+                                max="100"
+                                step="1"
+                                value={String(improvement.rank ?? "")}
+                                onChange={(event) =>
+                                  updateImprovement({
+                                    ...improvement,
+                                    rank:
+                                      event.target.value === ""
+                                        ? ""
+                                        : Number(event.target.value),
+                                  })
+                                }
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1.5">
+                              <Label htmlFor="title-min-grade">
+                                Minimum Race Grade
+                              </Label>
+                              <Select
+                                value={String(improvement.minRaceGrade ?? "G")}
+                                onValueChange={(value) =>
+                                  updateImprovement({
+                                    ...improvement,
+                                    minRaceGrade: String(value ?? "G"),
+                                  })
+                                }
+                              >
+                                <SelectTrigger
+                                  id="title-min-grade"
+                                  aria-label="Minimum Race Grade"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectGroup>
+                                    {GRADES.map((grade) => (
+                                      <SelectItem key={grade} value={grade}>
+                                        {grade}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectGroup>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          </>
+                        ) : null}
+                      </section>
+                    )
+                  })()
+                : null}
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="cat-source">Source URL</Label>
                 <Input
@@ -2183,6 +2769,245 @@ export function CatalogManager({ kind }: { kind: string }) {
                       </p>
                     ) : null}
                   </div>
+                ) : null}
+                {kind === "gods" ? (
+                  <section
+                    aria-label="Blessing tier bonuses"
+                    className="flex flex-col gap-3 rounded-md border p-3"
+                  >
+                    <div>
+                      <h3 className="text-sm font-medium">
+                        Blessing tier bonuses
+                      </h3>
+                      <p className="text-xs text-muted-foreground">
+                        Configure stat bonuses by blessing tier. Keep a tier
+                        with an empty effects list for narrative-only bonuses.
+                      </p>
+                    </div>
+                    <Label htmlFor="blessing-tier">Blessing tier</Label>
+                    <Select
+                      value={blessingTier}
+                      onValueChange={(value) =>
+                        setBlessingTier(value as BlessingTier)
+                      }
+                    >
+                      <SelectTrigger
+                        id="blessing-tier"
+                        aria-label="Blessing tier"
+                      >
+                        <SelectValue placeholder="Choose a tier" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {BLESSING_TIERS.map((tier) => (
+                            <SelectItem key={tier} value={tier}>
+                              {tier}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    {(() => {
+                      const all = isRecord(structuredConfig?.blessingEffects)
+                        ? structuredConfig.blessingEffects
+                        : {}
+                      const present = Object.hasOwn(all, blessingTier)
+                      const rows = Array.isArray(all[blessingTier])
+                        ? (all[blessingTier] as BlessingEffect[])
+                        : []
+                      const replace = (next: BlessingEffect[]) =>
+                        updateBlessingEffects(blessingTier, next)
+                      return (
+                        <div className="flex flex-col gap-3">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs text-muted-foreground">
+                              {present
+                                ? rows.length
+                                  ? `${rows.length} effect${rows.length === 1 ? "" : "s"}`
+                                  : "Narrative-only tier (empty effects list)"
+                                : "No numeric effects configured"}
+                            </span>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              disabled={!structuredConfig}
+                              onClick={() =>
+                                replace([
+                                  ...rows,
+                                  { phase: "flat", amount: {} },
+                                ])
+                              }
+                            >
+                              Add effect
+                            </Button>
+                            {present ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                disabled={!structuredConfig}
+                                onClick={() =>
+                                  updateBlessingEffects(blessingTier, undefined)
+                                }
+                              >
+                                Remove tier bonuses
+                              </Button>
+                            ) : null}
+                          </div>
+                          {rows.map((effect, index) => {
+                            const vector =
+                              effect.phase === "flat"
+                                ? effect.amount
+                                : effect.basisPoints
+                            const updateVector = (
+                              attribute: string,
+                              raw: string
+                            ) => {
+                              const next = { ...(vector ?? {}) }
+                              if (!raw) delete next[attribute]
+                              else
+                                next[attribute] =
+                                  effect.phase === "flat"
+                                    ? Number(raw)
+                                    : Math.round(Number(raw) * 100)
+                              replace(
+                                rows.map((row, i) =>
+                                  i === index
+                                    ? effect.phase === "flat"
+                                      ? { ...effect, amount: next }
+                                      : { ...effect, basisPoints: next }
+                                    : row
+                                )
+                              )
+                            }
+                            return (
+                              <div
+                                key={index}
+                                className="flex flex-col gap-2 rounded-md border p-3"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <Label htmlFor={`blessing-phase-${index}`}>
+                                    Effect phase
+                                  </Label>
+                                  <Select
+                                    value={effect.phase}
+                                    onValueChange={(phase) =>
+                                      replace(
+                                        rows.map((row, i) => {
+                                          if (i !== index) return row
+                                          const extra = { ...row } as Record<
+                                            string,
+                                            unknown
+                                          >
+                                          delete extra.amount
+                                          delete extra.basisPoints
+                                          return phase === "flat"
+                                            ? ({
+                                                ...extra,
+                                                phase,
+                                                amount: {},
+                                              } as BlessingEffect)
+                                            : ({
+                                                ...extra,
+                                                phase,
+                                                basisPoints: {},
+                                              } as BlessingEffect)
+                                        })
+                                      )
+                                    }
+                                  >
+                                    <SelectTrigger
+                                      id={`blessing-phase-${index}`}
+                                      aria-label={`Effect ${index + 1} phase`}
+                                    >
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectGroup>
+                                        <SelectItem value="flat">
+                                          Flat
+                                        </SelectItem>
+                                        <SelectItem value="percent">
+                                          Percent
+                                        </SelectItem>
+                                      </SelectGroup>
+                                    </SelectContent>
+                                  </Select>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    aria-label={`Remove effect ${index + 1}`}
+                                    onClick={() =>
+                                      replace(
+                                        rows.filter((_, i) => i !== index)
+                                      )
+                                    }
+                                  >
+                                    Remove effect
+                                  </Button>
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+                                  {ATTRIBUTE_KEYS.map((attribute) => (
+                                    <div
+                                      key={attribute}
+                                      className="flex flex-col gap-1"
+                                    >
+                                      <Label
+                                        htmlFor={`blessing-${index}-${attribute}`}
+                                      >
+                                        {attribute}
+                                      </Label>
+                                      <Input
+                                        id={`blessing-${index}-${attribute}`}
+                                        aria-label={`Effect ${index + 1} ${attribute}`}
+                                        type="number"
+                                        step={
+                                          effect.phase === "flat" ? "1" : "0.01"
+                                        }
+                                        placeholder={
+                                          effect.phase === "flat" ? "Flat" : "%"
+                                        }
+                                        value={
+                                          vector?.[attribute] == null
+                                            ? ""
+                                            : effect.phase === "flat"
+                                              ? String(vector[attribute])
+                                              : String(vector[attribute] / 100)
+                                        }
+                                        onChange={(event) =>
+                                          updateVector(
+                                            attribute,
+                                            event.target.value
+                                          )
+                                        }
+                                      />
+                                    </div>
+                                  ))}
+                                </div>
+                                <p className="text-xs text-muted-foreground">
+                                  {effect.phase === "flat"
+                                    ? "Whole-number stat changes; negative values are valid debuffs."
+                                    : "Enter a human-readable percent; values are saved as integer basis points."}
+                                </p>
+                                <p className="text-xs text-muted-foreground">
+                                  Preview:{" "}
+                                  {ATTRIBUTE_KEYS.flatMap((attribute) =>
+                                    typeof vector?.[attribute] === "number"
+                                      ? [
+                                          `${attribute} ${effect.phase === "flat" ? (vector[attribute] >= 0 ? "+" : "") + vector[attribute] : (vector[attribute] >= 0 ? "+" : "") + (vector[attribute] / 100).toFixed(2) + "%"}`,
+                                        ]
+                                      : []
+                                  ).join(" · ") || "No stat changes"}
+                                </p>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )
+                    })()}
+                  </section>
                 ) : null}
                 <details className="rounded-md border p-3">
                   <summary className="cursor-pointer text-sm font-medium">

@@ -60,9 +60,12 @@ import {
   type HouseRulesRow,
 } from "@/lib/db/ruleset"
 import {
+  allGradeGrantedSkillStableIds,
   blessingTierAtLeast,
   characterStateSchema,
+  godGradeForbidden,
   gradeSchema,
+  gradeSkillStableIdsFor,
   hasInvalidNaturalGradeConfig,
   hasInvalidRaceTypeConfig,
   hasInvalidSkillTrack,
@@ -77,6 +80,7 @@ import {
   normalizeEquipmentSlot,
   parseCatalogConfig,
   rarityOrderIndex,
+  requiredGradeNullForbidden,
   titleImprovementSchema,
   legacyRingPositionForConfig,
   type BlessingTier,
@@ -2230,6 +2234,60 @@ export async function createCharacter(
         houseRules.config.maxTranscendentSkills
       )
 
+      // Build the ordered grade-grant request list: race, then class, then
+      // profession (deterministic). Each request is stamped with the grade the
+      // source will START at in the newly-created state - the race at
+      // `state.race.grade` (G for an integrated character, the race's natural
+      // grade for a born one) and the class/profession at their OWN starting
+      // track grade. A monster race has no class/profession tracks, so only the
+      // race grants apply. A missing/archived skill is resolved (and journaled as
+      // skipped) rather than aborting the create.
+      const grantRequests: GradeGrantRequest[] = []
+      const raceGrantGrade = state.race.grade
+      for (const stableId of gradeSkillStableIdsFor(
+        raceConfig,
+        raceGrantGrade
+      )) {
+        grantRequests.push({ stableId, grade: raceGrantGrade })
+      }
+      if (cls) {
+        const classGrade = state.tracks.class?.grade
+        if (classGrade) {
+          const classConfig = parseCatalogConfig(cls.kind, cls.config ?? {})
+          for (const stableId of gradeSkillStableIdsFor(
+            classConfig,
+            classGrade
+          )) {
+            grantRequests.push({ stableId, grade: classGrade })
+          }
+        }
+      }
+      if (profession) {
+        const professionGrade = state.tracks.profession?.grade
+        if (professionGrade) {
+          const professionConfig = parseCatalogConfig(
+            profession.kind,
+            profession.config ?? {}
+          )
+          for (const stableId of gradeSkillStableIdsFor(
+            professionConfig,
+            professionGrade
+          )) {
+            grantRequests.push({ stableId, grade: professionGrade })
+          }
+        }
+      }
+      // Resolve the grade-grant requests against the live unarchived skill catalog
+      // inside the transaction so the resulting links/journal are part of the same
+      // atomic write as the character + event. A new character owns no SKILL links,
+      // so the existing-skill set is empty.
+      const createSkillMap = await loadUnarchivedSkillMap(tx)
+      const gradeResolution = resolveGradeSkillGrants(
+        [],
+        grantRequests,
+        createSkillMap
+      )
+
       // Create the character and append the "create" progression event atomically: a
       // character row must never exist without its corresponding journal entry.
       const created = await tx.character.create({
@@ -2280,6 +2338,12 @@ export async function createCharacter(
             // Selection snapshots, present only when the caller supplied
             // a non-empty special-ability selection.
             ...(special.journal ? { specialAbilities: special.journal } : {}),
+            // Grade-granted skill acquisition record (granted / upgraded / noop /
+            // skipped), present only when the create actually granted or attempted
+            // a grade skill.
+            ...(hasGradeGrantJournalEntries(gradeResolution.journal)
+              ? { skillGrants: gradeResolution.journal }
+              : {}),
             ...(suppliedMetadataFields.length
               ? { metadataFields: suppliedMetadataFields }
               : {}),
@@ -2302,6 +2366,12 @@ export async function createCharacter(
           },
         })
       }
+
+      // Persist the resolved grade-granted skill links (SKILL associations) with
+      // the create. A duplicate/upgrade resolved by the policy above replaces the
+      // superseded link rather than stacking; a no-op/skipped request writes
+      // nothing.
+      await persistGradeSkillGrants(tx, created.id, gradeResolution)
 
       // The wizard's final create step consumes the matching draft atomically: the
       // draft delete is committed or rolled back with the character + event. A
@@ -3681,6 +3751,536 @@ async function removeSameUpgradeGroupSkills(
   return removed
 }
 
+// ------------------------------------------------------------------ //
+// Grade-granted skill acquisition helpers
+// ------------------------------------------------------------------ //
+
+/** A SKILL association currently owned by a character (persisted or planned). */
+type OwnedSkillLink = {
+  definitionId: string
+  stableId: string
+  name: string
+  config: Record<string, unknown>
+}
+
+/** One requested grade-granted skill: a stableId plus the source grade. */
+type GradeGrantRequest = {
+  stableId: string
+  grade: Grade
+}
+
+/** The immutable audit journal for a grade-grant acquisition. */
+type GradeGrantJournal = {
+  /** Skills newly linked directly in this acquisition. */
+  granted: Array<{ stableId: string; name: string; grade: Grade }>
+  /** Skills upgraded (replaced) from a lower-rarity owned link to a higher one. */
+  upgraded: Array<{
+    fromStableId: string
+    fromName: string
+    toStableId: string
+    toName: string
+    grade: Grade
+  }>
+  /**
+   * Requested skills already owned with no eligible authored upgrade (retained).
+   * `reason` records WHY the acquisition was retained as a no-op - the relevant
+   * one here is an owned same-group link carrying an incomparable rarity
+   * (`Unique`, or a missing/unrecognized value), which nothing can be strictly
+   * higher than, so the existing links are preserved rather than deleted.
+   */
+  noop: Array<{
+    stableId: string
+    name: string
+    grade: Grade
+    reason: string
+  }>
+  /** Requested skills that could not be resolved (missing/archived), never omitted. */
+  skipped: Array<{ stableId: string; grade: Grade }>
+  /**
+   * Skills that were planned as a `granted` (or intermediate upgrade source) link
+   * in this acquisition but were later SUPERSEDED by a subsequent grant in the same
+   * transaction (e.g. a race-grade Common grant that a class-grade duplicate
+   * upgraded to a higher-rarity tier in the same upgrade group). A superseded link
+   * was never actually persisted, so it never appears in `granted`/`upgraded` as a
+   * live link; it is recorded here with its originating grade so the audit trail
+   * explains how a planned grant was replaced by a later upgrade.
+   */
+  superseded: Array<{ stableId: string; name: string; grade: Grade }>
+}
+
+/** The outcome of resolving a set of grade-grant requests. */
+type GradeGrantResolution = {
+  toCreate: Array<{ definitionId: string; stableId: string; grade: Grade }>
+  toDeleteDefinitionIds: string[]
+  journal: GradeGrantJournal
+}
+
+/** Whether a grant journal carries any meaningful record. */
+function hasGradeGrantJournalEntries(j: GradeGrantJournal): boolean {
+  return (
+    j.granted.length > 0 ||
+    j.upgraded.length > 0 ||
+    j.noop.length > 0 ||
+    j.skipped.length > 0 ||
+    j.superseded.length > 0
+  )
+}
+
+/**
+ * Extract every currently-owned SKILL association on the character as a
+ * `OwnedSkillLink` so the grade-grant duplicate/upgrade policy can see what the
+ * character already holds. Only SKILL-kind links are considered (a blessing /
+ * bloodline / transcendent never participates in a skill upgrade group).
+ */
+function ownedSkillLinksFrom(
+  associations: CharacterWithCatalog["associations"]
+): OwnedSkillLink[] {
+  const links: OwnedSkillLink[] = []
+  for (const link of associations) {
+    if (link.kind !== "SKILL") continue
+    const def = link.definition
+    links.push({
+      definitionId: link.definitionId,
+      stableId: def?.stableId ?? link.definitionId,
+      name: def?.name ?? "(unresolved)",
+      config: (def?.config ?? {}) as Record<string, unknown>,
+    })
+  }
+  return links
+}
+
+/** Read a config's `upgradeGroup`, or undefined when absent/blank. */
+function configUpgradeGroup(
+  config: Record<string, unknown>
+): string | undefined {
+  const group = config.upgradeGroup
+  return typeof group === "string" && group.length > 0 ? group : undefined
+}
+
+/** Read a config's `rarity`, or undefined when absent/blank. */
+function configRarity(config: Record<string, unknown>): string | undefined {
+  const rarity = config.rarity
+  return typeof rarity === "string" && rarity.length > 0 ? rarity : undefined
+}
+
+/**
+ * Resolve a set of grade-grant requests against the currently-owned skills and the
+ * live unarchived skill catalog, producing EXACTLY the links to create and the
+ * existing links to remove, plus an immutable journal. Never grants a missing or
+ * archived skill (an unresolvable stableId is skipped and journaled), and never
+ * invents a skill.
+ *
+ * Duplicate policy: requesting a skill that is ALREADY owned - either the exact
+ * same skill, or another skill whose `upgradeGroup` collides - does not stack. The
+ * collision is resolved by searching the group's current unarchived skills for the
+ * NEXT authored rarity STRICTLY HIGHER than the strongest owned skill in the group
+ * (ladder Inferior..Divine; `Unique` is incomparable and never strictly higher). If
+ * such an authored skill exists it replaces the owned skill(s) (one-group invariant
+ * preserved); otherwise the owned skill is retained and the request journals a
+ * no-op. An unresolvable request is skipped, never crash a partial grant.
+ *
+ * Incomparable guard: if ANY owned same-group link carries an incomparable rarity
+ * (`Unique`, or a missing/unrecognized value) then nothing authored can be
+ * strictly higher than it, so the acquisition is a no-op - no owned link is
+ * deleted and no replacement is written. This prevents an automatic per-grade
+ * grant from silently deleting an incomparable `Unique` (or missing-rarity) skill
+ * just because another same-group link happens to be comparable. Only when EVERY
+ * owned same-group link has a comparable rarity is a replacement attempted, and
+ * it is written only when strictly higher than all of them.
+ */
+function resolveGradeSkillGrants(
+  existingSkills: OwnedSkillLink[],
+  requests: GradeGrantRequest[],
+  skillMap: Map<string, UnarchivedSkillDef>
+): GradeGrantResolution {
+  const empty = {
+    granted: [],
+    upgraded: [],
+    noop: [],
+    skipped: [],
+    superseded: [],
+  } as GradeGrantJournal
+  if (requests.length === 0) {
+    return { toCreate: [], toDeleteDefinitionIds: [], journal: empty }
+  }
+
+  // Working set of currently-owned skills (persisted + newly planned). Each entry
+  // carries its provenance so the audit journal can tell a real persisted link from
+  // an intermediate THIS transaction planned but never wrote.
+  const owned: Array<
+    OwnedSkillLink & {
+      provenance: "persisted" | "planned"
+      plannedGrade?: Grade
+    }
+  > = existingSkills.map((s) => ({ ...s, provenance: "persisted" }))
+  const existingIds = new Set(existingSkills.map((s) => s.definitionId))
+  const toCreate = new Map<
+    string,
+    { definitionId: string; stableId: string; grade: Grade }
+  >()
+  const newlyPlanned = new Set<string>()
+  const toDeleteDefinitionIds = new Set<string>()
+  const noop: GradeGrantJournal["noop"] = []
+  const skipped: GradeGrantJournal["skipped"] = []
+  // Every skill planned in this transaction (granted directly or chosen as an
+  // upgrade replacement), keyed by stableId, carrying its ORIGINAL planned grade so
+  // a later-superseded intermediate can be journaled truthfully under `superseded`.
+  const plannedByStableId = new Map<
+    string,
+    { stableId: string; name: string; grade: Grade }
+  >()
+  const recordPlanned = (
+    stableId: string,
+    name: string,
+    grade: Grade
+  ): void => {
+    if (!plannedByStableId.has(stableId)) {
+      plannedByStableId.set(stableId, { stableId, name, grade })
+    }
+  }
+
+  // Record a retained (no-op) acquisition with the reason it was not applied.
+  const recordNoop = (
+    stableId: string,
+    name: string,
+    grade: Grade,
+    reason: string
+  ): void => {
+    noop.push({ stableId, name, grade, reason })
+  }
+
+  const removeOwned = (defId: string): void => {
+    const idx = owned.findIndex((s) => s.definitionId === defId)
+    if (idx >= 0) owned.splice(idx, 1)
+    if (existingIds.has(defId)) {
+      toDeleteDefinitionIds.add(defId)
+    } else if (toCreate.has(defId)) {
+      toCreate.delete(defId)
+      newlyPlanned.delete(defId)
+    }
+  }
+
+  for (const request of requests) {
+    const def = skillMap.get(request.stableId)
+    if (!def) {
+      // Missing or archived: graceful skip, never a partial grant.
+      skipped.push({ stableId: request.stableId, grade: request.grade })
+      continue
+    }
+    const defGroup = configUpgradeGroup(def.config)
+
+    // Collision: the exact skill is owned, or a nonempty upgradeGroup is shared.
+    const colliding = owned.filter(
+      (s) =>
+        s.stableId === request.stableId ||
+        (defGroup != null && configUpgradeGroup(s.config) === defGroup)
+    )
+
+    if (colliding.length === 0) {
+      // No collision - link directly.
+      toCreate.set(def.id, {
+        definitionId: def.id,
+        stableId: def.stableId,
+        grade: request.grade,
+      })
+      newlyPlanned.add(def.id)
+      owned.push({
+        definitionId: def.id,
+        stableId: def.stableId,
+        name: def.name,
+        config: def.config,
+        provenance: "planned",
+        plannedGrade: request.grade,
+      })
+      recordPlanned(def.stableId, def.name, request.grade)
+      continue
+    }
+
+    // Collision -> duplicate policy.
+    const group = defGroup ?? configUpgradeGroup(colliding[0].config)
+    if (group == null) {
+      // No upgrade group to search - retain the owned skill as a no-op.
+      recordNoop(
+        def.stableId,
+        def.name,
+        request.grade,
+        "no upgrade group to search for a higher-rarity replacement"
+      )
+      continue
+    }
+    const inGroup = colliding.filter(
+      (s) => configUpgradeGroup(s.config) === group
+    )
+    if (inGroup.length === 0) {
+      recordNoop(
+        def.stableId,
+        def.name,
+        request.grade,
+        "no owned same-group skill to replace"
+      )
+      continue
+    }
+
+    // Incomparable guard: if ANY owned same-group link carries an incomparable
+    // rarity (`Unique`, or a missing/unrecognized value), nothing authored can be
+    // strictly higher than it, so this acquisition is a no-op - no owned link is
+    // deleted and no replacement written. This prevents an automatic per-grade
+    // grant from silently deleting an incomparable `Unique` (or missing-rarity)
+    // skill just because another same-group link happens to be comparable.
+    const incomparable = inGroup.find(
+      (s) => rarityOrderIndex(configRarity(s.config)) == null
+    )
+    if (incomparable != null) {
+      recordNoop(
+        def.stableId,
+        def.name,
+        request.grade,
+        `owned same-group skill "${incomparable.name}" carries an incomparable/missing rarity (cannot be strictly upgraded)`
+      )
+      continue
+    }
+
+    // Base rarity: the strongest (highest comparable) owned skill in the group, so
+    // the chosen replacement is strictly higher than EVERY removed link.
+    let baseIndex: number | null = null
+    for (const s of inGroup) {
+      const idx = rarityOrderIndex(configRarity(s.config))
+      if (idx != null && (baseIndex == null || idx > baseIndex)) baseIndex = idx
+    }
+    if (baseIndex == null) {
+      // Defensive: every owned skill in the group is incomparable (see guard
+      // above); nothing can be strictly higher, so retain as a no-op.
+      recordNoop(
+        def.stableId,
+        def.name,
+        request.grade,
+        "owned same-group skills carry incomparable/missing rarities"
+      )
+      continue
+    }
+
+    const candidates: UnarchivedSkillDef[] = []
+    for (const candidate of skillMap.values()) {
+      if (configUpgradeGroup(candidate.config) !== group) continue
+      const idx = rarityOrderIndex(configRarity(candidate.config))
+      if (idx == null || idx <= baseIndex) continue
+      candidates.push(candidate)
+    }
+    // Smallest strictly-higher rarity, then stableId lexicographic tie-break.
+    candidates.sort((a, b) => {
+      const ai = rarityOrderIndex(configRarity(a.config))!
+      const bi = rarityOrderIndex(configRarity(b.config))!
+      if (ai !== bi) return ai - bi
+      return a.stableId < b.stableId ? -1 : a.stableId > b.stableId ? 1 : 0
+    })
+    if (candidates.length === 0) {
+      recordNoop(
+        def.stableId,
+        def.name,
+        request.grade,
+        `no authored rarity strictly higher than the strongest owned skill in upgrade group "${group}"`
+      )
+      continue
+    }
+
+    const chosen = candidates[0]
+    const displaced = [...inGroup]
+    for (const s of displaced) removeOwned(s.definitionId)
+    toCreate.set(chosen.id, {
+      definitionId: chosen.id,
+      stableId: chosen.stableId,
+      grade: request.grade,
+    })
+    newlyPlanned.add(chosen.id)
+    owned.push({
+      definitionId: chosen.id,
+      stableId: chosen.stableId,
+      name: chosen.name,
+      config: chosen.config,
+      provenance: "planned",
+      plannedGrade: request.grade,
+    })
+    recordPlanned(chosen.stableId, chosen.name, request.grade)
+  }
+
+  // Derive the truthful journal from the FINAL plan and the provenance ledger. The
+  // incremental snapshots that would have been recorded during the loop claim links
+  // the acquisition never persisted (e.g. a chain race Common A -> class Uncommon B
+  // -> profession Rare C leaves only C, with A and B never written). So we rebuild
+  // the story instead:
+  //   - a final link with no displaced PERSISTED same-group source is `granted`;
+  //   - a final link that displaced a real persisted same-group link is `upgraded`
+  //     from the STRONGEST such persisted source (never from a phantom
+  //     intermediate planned in this transaction);
+  //   - every intermediate this transaction planned but never wrote is
+  //     `superseded` with its ORIGINAL planned grade.
+  const finalStableIds = new Set<string>()
+  for (const c of toCreate.values()) finalStableIds.add(c.stableId)
+
+  // Removed persisted same-group links, grouped by upgrade group - the only
+  // legitimate `upgraded` source (a link that actually existed before this
+  // transaction and was replaced by a final plan).
+  const removedPersistedByGroup = new Map<string, OwnedSkillLink[]>()
+  for (const defId of toDeleteDefinitionIds) {
+    const existing = existingSkills.find((s) => s.definitionId === defId)
+    if (!existing) continue
+    const group = configUpgradeGroup(existing.config)
+    if (group == null) continue
+    const arr = removedPersistedByGroup.get(group) ?? []
+    arr.push(existing)
+    removedPersistedByGroup.set(group, arr)
+  }
+
+  const granted: GradeGrantJournal["granted"] = []
+  const upgraded: GradeGrantJournal["upgraded"] = []
+  for (const c of toCreate.values()) {
+    const def = skillMap.get(c.stableId)
+    const name = def?.name ?? c.stableId
+    const group = def ? configUpgradeGroup(def.config) : undefined
+    const removed =
+      group != null ? removedPersistedByGroup.get(group) : undefined
+    if (removed != null && removed.length > 0) {
+      // A real persisted same-group link was displaced; report the actual
+      // pre/post transition from the STRONGEST such source to the final link.
+      const strongest = removed.reduce(
+        (acc, s) => {
+          const idx = rarityOrderIndex(configRarity(s.config))
+          if (idx != null && (acc.idx == null || idx > acc.idx)) {
+            return { idx, s }
+          }
+          return acc
+        },
+        { idx: null as number | null, s: removed[0] }
+      )
+      upgraded.push({
+        fromStableId: strongest.s.stableId,
+        fromName: strongest.s.name,
+        toStableId: c.stableId,
+        toName: name,
+        grade: c.grade,
+      })
+    } else {
+      granted.push({ stableId: c.stableId, name, grade: c.grade })
+    }
+  }
+
+  const superseded: GradeGrantJournal["superseded"] = []
+  for (const [stableId, plan] of plannedByStableId) {
+    if (finalStableIds.has(stableId)) continue
+    superseded.push({ stableId, name: plan.name, grade: plan.grade })
+  }
+
+  const resolution: GradeGrantResolution = {
+    toCreate: [...toCreate.values()],
+    toDeleteDefinitionIds: [...toDeleteDefinitionIds],
+    journal: { granted, upgraded, noop, skipped, superseded },
+  }
+  reconcileGradeSkillGrantJournal(resolution)
+  return resolution
+}
+
+/**
+ * Reconcile a grade-grant journal against the FINAL association plan that is
+ * actually persisted, so the journal never claims a skill is still linked when a
+ * later grant in the same acquisition superseded (replaced) it.
+ *
+ * A newly-planned link that a later grant upgraded away never left the database.
+ * It must not appear under `granted` (which would claim it is a live link), and
+ * it should be recorded under `superseded` (with its originating grade) so the
+ * audit trail explains how a planned grant was replaced by a later upgrade. This
+ * matters for a single acquisition that carries MULTIPLE track grants in one
+ * transaction (e.g. race + class, or class + profession), where an intermediate
+ * planned grant is replaced by a later upgrade in the same resolution.
+ *
+ * Unrelated `granted`/`upgraded` links, and any no-op/skip, are untouched. The
+ * function is idempotent: running it again on an already-reconciled journal is a
+ * no-op.
+ */
+function reconcileGradeSkillGrantJournal(
+  resolution: GradeGrantResolution
+): void {
+  const journal = resolution.journal
+  const finalStableIds = new Set(resolution.toCreate.map((c) => c.stableId))
+  const superseded: GradeGrantJournal["superseded"] = [
+    ...(journal.superseded ?? []),
+  ]
+  const seen = new Set(superseded.map((s) => s.stableId))
+  const recordSuperseded = (entry: {
+    stableId: string
+    name: string
+    grade: Grade
+  }): void => {
+    if (!finalStableIds.has(entry.stableId) && !seen.has(entry.stableId)) {
+      seen.add(entry.stableId)
+      superseded.push(entry)
+    }
+  }
+
+  // A `granted` entry whose stableId no longer appears in the final plan was
+  // superseded; drop it from `granted` and record it under `superseded`.
+  const keptGranted: GradeGrantJournal["granted"] = []
+  for (const g of journal.granted) {
+    if (finalStableIds.has(g.stableId)) keptGranted.push(g)
+    else recordSuperseded(g)
+  }
+  journal.granted = keptGranted
+
+  // An upgrade whose `toStableId` no longer appears in the final plan was itself
+  // superseded by a later upgrade; it is not a live link. Its source (if not
+  // already recorded and not persisted) is tracked as superseded.
+  const keptUpgraded: GradeGrantJournal["upgraded"] = []
+  for (const u of journal.upgraded) {
+    if (finalStableIds.has(u.toStableId)) {
+      keptUpgraded.push(u)
+    } else if (!finalStableIds.has(u.fromStableId)) {
+      recordSuperseded({
+        stableId: u.fromStableId,
+        name: u.fromName,
+        grade: u.grade,
+      })
+    }
+  }
+  journal.upgraded = keptUpgraded
+
+  journal.superseded = superseded
+}
+
+/**
+ * Persist a resolved grade-grant set for a character: remove every superseded
+ * SKILL link, then create every resulting link (kind SKILL). Idempotent against
+ * a definitionId that was never actually persisted (e.g. a newly-planned skill
+ * superseded before the write landed), and safe to run inside the same
+ * transaction as the owning mutation.
+ *
+ * Before writing, it reconciles the granted/upgraded journal snapshots against the
+ * FINAL association plan, so a grant that was planned then superseded by a later
+ * upgrade in the same acquisition is never reported as a live link. The journal
+ * and the persisted links stay consistent: only actually-persisted skills appear
+ * under `granted`/`upgraded`, and a superseded intermediate grant is recorded
+ * under `superseded` (with its originating grade) rather than omitted.
+ */
+async function persistGradeSkillGrants(
+  tx: DbClient,
+  characterId: string,
+  resolution: GradeGrantResolution
+): Promise<void> {
+  reconcileGradeSkillGrantJournal(resolution)
+  for (const defId of resolution.toDeleteDefinitionIds) {
+    await tx.characterAssociation.deleteMany({
+      where: { characterId, definitionId: defId },
+    })
+  }
+  for (const c of resolution.toCreate) {
+    await tx.characterAssociation.create({
+      data: {
+        characterId,
+        definitionId: c.definitionId,
+        kind: "SKILL" as never,
+      },
+    })
+  }
+}
+
 type SkillSelectInput = {
   operation: "select"
   offerId: string
@@ -4623,6 +5223,24 @@ async function evolveRaceDefinition(
     )
   }
 
+  // Grade-granted skills for the TARGET grade of the NEW selected race
+  // definition (the grade the character is evolving into). Resolve against the
+  // character's existing SKILL links so an already-owned / colliding skill
+  // follows the duplicate/upgrade policy, persist the result alongside the
+  // evolution, and journal it below.
+  const grantGrade = targetGrade
+  const grantRequests: GradeGrantRequest[] = []
+  for (const stableId of gradeSkillStableIdsFor(destConfigParsed, grantGrade)) {
+    grantRequests.push({ stableId, grade: grantGrade })
+  }
+  const raceSkillMap = await loadUnarchivedSkillMap(tx)
+  const gradeResolution = resolveGradeSkillGrants(
+    ownedSkillLinksFrom(row.associations),
+    grantRequests,
+    raceSkillMap
+  )
+  await persistGradeSkillGrants(tx, row.id, gradeResolution)
+
   const reason =
     typeof body.reason === "string" && body.reason.trim().length > 0
       ? body.reason.trim()
@@ -4647,6 +5265,9 @@ async function evolveRaceDefinition(
     oldDefinitionId: state.race.definitionId,
     newDefinitionId: destDef ?? result.state.race.definitionId,
     reason,
+    ...(hasGradeGrantJournalEntries(gradeResolution.journal)
+      ? { skillGrants: gradeResolution.journal }
+      : {}),
   }
 
   await tx.progressionEvent.create({
@@ -4790,6 +5411,24 @@ async function evolveTrackDefinition(
     )
   }
 
+  // Grade-granted skills for the TARGET grade of the NEW selected track
+  // definition (the grade the track is evolving into). Resolve against the
+  // character's existing SKILL links so an already-owned / colliding skill
+  // follows the duplicate/upgrade policy, persist the result alongside the
+  // evolution, and journal it below.
+  const grantGrade = targetGrade
+  const grantRequests: GradeGrantRequest[] = []
+  for (const stableId of gradeSkillStableIdsFor(destConfig, grantGrade)) {
+    grantRequests.push({ stableId, grade: grantGrade })
+  }
+  const trackSkillMap = await loadUnarchivedSkillMap(tx)
+  const gradeResolution = resolveGradeSkillGrants(
+    ownedSkillLinksFrom(row.associations),
+    grantRequests,
+    trackSkillMap
+  )
+  await persistGradeSkillGrants(tx, row.id, gradeResolution)
+
   const reason =
     typeof body.reason === "string" && body.reason.trim().length > 0
       ? body.reason.trim()
@@ -4810,6 +5449,9 @@ async function evolveTrackDefinition(
       grade: targetGrade,
     },
     reason,
+    ...(hasGradeGrantJournalEntries(gradeResolution.journal)
+      ? { skillGrants: gradeResolution.journal }
+      : {}),
   }
 
   await tx.progressionEvent.create({
@@ -5899,6 +6541,30 @@ export async function setCharacterProfession(
         }
         const serialized = serializeState(nextState)
 
+        // Grade-granted skills for the newly assigned profession at the grade the
+        // new profession track is stamped with (the character's current race
+        // grade). Resolve against the character's existing SKILL links inside the
+        // transaction so a granted skill that is already owned (or collides in an
+        // upgrade group) follows the duplicate/upgrade policy rather than stacking.
+        const professionConfig = parseCatalogConfig(
+          definition.kind,
+          definition.config ?? {}
+        )
+        const grantGrade = currentRaceGrade
+        const grantRequests: GradeGrantRequest[] = []
+        for (const stableId of gradeSkillStableIdsFor(
+          professionConfig,
+          grantGrade
+        )) {
+          grantRequests.push({ stableId, grade: grantGrade })
+        }
+        const professionSkillMap = await loadUnarchivedSkillMap(tx)
+        const gradeResolution = resolveGradeSkillGrants(
+          ownedSkillLinksFrom(row.associations),
+          grantRequests,
+          professionSkillMap
+        )
+
         // CAS: only the profession column, the engine state and the version change;
         // the class/race tracks and every ledger are left untouched.
         const updatedMany = await tx.character.updateMany({
@@ -5915,6 +6581,10 @@ export async function setCharacterProfession(
             `Version mismatch: expected ${body.version}, got a newer version`
           )
         }
+
+        // Persist the resolved grade-granted skill links alongside the profession
+        // assignment (inside the same transaction), then journal the acquisition.
+        await persistGradeSkillGrants(tx, id, gradeResolution)
 
         await tx.progressionEvent.create({
           data: {
@@ -5936,6 +6606,9 @@ export async function setCharacterProfession(
                 professionId: definition.id,
                 track: professionTrack,
               },
+              ...(hasGradeGrantJournalEntries(gradeResolution.journal)
+                ? { skillGrants: gradeResolution.journal }
+                : {}),
             } as Prisma.InputJsonValue,
           },
         })
@@ -7532,6 +8205,16 @@ export async function createCatalogItem(
   }
 ): Promise<CatalogItem> {
   kind = normalizeCatalogKind(kind)
+  // A gods entry carries no catalog grade band: divine power / blessing tier live
+  // in `blessingEffects[tier]`, never the shared `grade` column. A non-null grade
+  // on a new god is rejected before any write; `null`/omitted is the only legal
+  // value (migration 0020 nulled any pre-existing god grade).
+  if (godGradeForbidden(kind, input.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'Gods carry no catalog grade: a gods entry must store "grade" as null'
+    )
+  }
   const config = parseConfigOr400(kind, input.config ?? {})
   if (kind === "skills" && isIncompleteSkillConfig(config)) {
     throw badRequest(
@@ -7610,18 +8293,22 @@ export async function createCatalogItem(
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || "entry"
   }
-  // Bloodlines AND equipment run under SERIALIZABLE isolation: two concurrent
-  // creates that race on the same (kind, stableId) cannot both commit, and the
-  // loser surfaces as P2034 which we map to a 409 rather than a silent 500.
-  // Equipment is additionally serializable because its create validates
-  // `requiredGodStableId` / `grantedSkillStableIds` against the live catalog
-  // inside the transaction: a concurrent god/skill stableId rename could
-  // otherwise commit between the ref read and the equipment write, leaving the
-  // created item dangling. SERIALIZABLE re-checks the read/write dependency at
-  // commit and aborts the equipment create (P2034 -> 409) rather than persisting
-  // a reference to a renamed-away stableId.
+  // Bloodlines, equipment, races, classes and professions run under SERIALIZABLE
+  // isolation: two concurrent creates that race on the same (kind, stableId)
+  // cannot both commit, and the loser surfaces as P2034 which we map to a 409
+  // rather than a silent 500. Equipment, race/class/profession and bloodline
+  // creates also validate catalog references (god patron, granted/graded skills)
+  // against the live catalog inside the transaction, so a concurrent skill/god
+  // stableId rename (or a race-type change) cannot commit between the ref read
+  // and the write, leaving a dangling reference. SERIALIZABLE re-checks the
+  // read/write dependency at commit and aborts the create (P2034 -> 409) rather
+  // than persisting a reference to a renamed-away stableId.
   const serializable =
-    kind === "bloodlines" || kind === "equipment"
+    kind === "bloodlines" ||
+    kind === "equipment" ||
+    kind === "races" ||
+    kind === "classes" ||
+    kind === "professions"
       ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       : undefined
   try {
@@ -7631,6 +8318,11 @@ export async function createCatalogItem(
       // A NEW equipment write must not grant a missing/archived passive skill.
       if (kind === "equipment")
         await assertEquipmentGrantedSkillsRefs(tx, config)
+      // A NEW race/class/profession write must not reference a missing/archived
+      // grade-granted skill.
+      if (kind === "races" || kind === "classes" || kind === "professions") {
+        await assertGradeGrantedSkillsRefs(tx, config)
+      }
       const row = await tx.catalogDefinition.create({
         data: {
           kind: kind as never,
@@ -7848,6 +8540,45 @@ async function assertEquipmentGrantedSkillsRefs(
 }
 
 /**
+ * Verify that a race/class/profession config's grade-granted skill references
+ * (`gradeGrantedSkillStableIds`) all resolve to an existing, unarchived `skills`
+ * catalog definition. Used on a NEW / config-changing race/class/profession write
+ * so a config never references a skill that does not exist (or is archived, which
+ * would render the grade grant permanently inert and silently skip it). No-op when
+ * the config grants no skill. A skill created by the same write is not considered
+ * here (import paths build their own allow-set); this helper only checks the live
+ * catalog.
+ */
+async function assertGradeGrantedSkillsRefs(
+  tx: DbClient,
+  config: Record<string, unknown>
+): Promise<void> {
+  const refs = allGradeGrantedSkillStableIds(config)
+  if (refs.length === 0) return
+  const rows = await tx.catalogDefinition.findMany({
+    where: { kind: "skills" },
+  })
+  const unarchivedStableIds = new Set(
+    rows.filter((r) => !r.archived).map((r) => r.stableId)
+  )
+  const allStableIds = new Set(rows.map((r) => r.stableId))
+  for (const stableId of refs) {
+    if (typeof stableId !== "string" || stableId.length === 0) continue
+    if (unarchivedStableIds.has(stableId)) continue
+    if (allStableIds.has(stableId)) {
+      throw badRequest(
+        "invalid_config",
+        `Grade-granted skill "${stableId}" is archived`
+      )
+    }
+    throw badRequest(
+      "invalid_config",
+      `Grade-granted skill "${stableId}" does not exist in the catalog`
+    )
+  }
+}
+
+/**
  * Prevent a god `stableId` rename that would dangle any equipment config whose
  * `requiredGodStableId` names the OLD id. Archiving a god is always allowed (an
  * archived patron simply renders referencing equipment ineligible), but a rename
@@ -7881,11 +8612,13 @@ async function assertGodStableIdRename(
 
 /**
  * Prevent a skill `stableId` rename that would dangle any equipment config whose
- * `grantedSkillStableIds` names the OLD id. Archiving a skill is always allowed
- * (an archived granted skill is simply inert), but a rename must be blocked while
- * ANY equipment entry - including an archived one - names the old id in its
- * granted-skill list, otherwise the grant silently dangles and the item's passive
- * is lost. No-op unless a skill's stableId is actually changing.
+ * `grantedSkillStableIds` names the OLD id, or any race/class/profession config
+ * whose `gradeGrantedSkillStableIds` names the OLD id for any grade. Archiving a
+ * skill is always allowed (an archived granted/graded skill is simply inert), but
+ * a rename must be blocked while ANY referencing row - including archived rows -
+ * names the old id in its granted-skill or grade-granted list, otherwise the
+ * grant silently dangles and the item's passive / grade skill is lost. No-op
+ * unless a skill's stableId is actually changing.
  */
 async function assertSkillStableIdRename(
   tx: DbClient,
@@ -7910,6 +8643,31 @@ async function assertSkillStableIdRename(
     throw conflict(
       "skill_stable_id_in_use",
       `Skill "${existingStableId}" is granted by ${refs.length} equipment entr${refs.length === 1 ? "y" : "ies"} (${refs.join(", ")}); renaming it would leave those grants dangling`
+    )
+  }
+  // A skill rename must ALSO be blocked while any race/class/profession config's
+  // `gradeGrantedSkillStableIds` (for ANY grade, including archived track rows)
+  // names the old id - otherwise the grade grant silently dangles and the skill is
+  // silently skipped at acquisition. Read every row (including archived) so a
+  // config that still references an archived definition is protected.
+  const gradeTrackKinds = ["races", "classes", "professions"] as const
+  const gradeRefs: Array<{ kind: string; stableId: string }> = []
+  for (const trackKind of gradeTrackKinds) {
+    const rows = await tx.catalogDefinition.findMany({
+      where: { kind: trackKind },
+    })
+    for (const row of rows) {
+      const cfg = parseCatalogConfig(trackKind, row.config ?? {})
+      if (allGradeGrantedSkillStableIds(cfg).includes(existingStableId)) {
+        gradeRefs.push({ kind: trackKind, stableId: row.stableId })
+      }
+    }
+  }
+  if (gradeRefs.length > 0) {
+    const labels = gradeRefs.map((r) => `${r.kind}:${r.stableId}`).join(", ")
+    throw conflict(
+      "skill_stable_id_in_use",
+      `Skill "${existingStableId}" is granted by ${gradeRefs.length} race/class/profession grade entr${gradeRefs.length === 1 ? "y" : "ies"} (${labels}); renaming it would leave those grants dangling`
     )
   }
 }
@@ -8046,6 +8804,27 @@ export async function updateCatalogItem(
   }
 ): Promise<CatalogItem> {
   kind = normalizeCatalogKind(kind)
+  // A gods entry carries no catalog grade band (see `godGradeForbidden`): a PATCH
+  // that tries to set a non-null grade on a god is rejected before any write;
+  // `grade: null` (or omitting grade) is the only legal value. A migrated god
+  // already stores `grade IS NULL`, so clearing it is a harmless no-op.
+  if (godGradeForbidden(kind, patch.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'Gods carry no catalog grade: a gods entry must store "grade" as null'
+    )
+  }
+  // A race/class/profession always carries a required catalog grade (see
+  // `requiredGradeNullForbidden`): a PATCH that explicitly clears it to null is
+  // rejected before any write, so a valid grade is never accidentally erased by
+  // a generic optional-grade clear. Omitting grade stays legal (the existing
+  // non-null value is preserved).
+  if (requiredGradeNullForbidden(kind, patch.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'A race/class/profession always carries a required catalog grade: "grade" cannot be cleared to null'
+    )
+  }
   // A god stableId change, a race `raceType` change, every blessing / bloodline
   // config change, and every ranked-title identity guard (which reads the linked
   // character associations) read the existing row and then write it, so they run
@@ -8054,14 +8833,16 @@ export async function updateCatalogItem(
   // to a 409. A race type change is serializable so it also conflicts correctly
   // with an in-flight `createCharacter` that has read the race row (a serializable
   // read / write dependency), instead of silently allowing a character built from
-  // a stale `raceType`. Equipment is serializable too: a config-changing
-  // equipment PATCH re-validates `requiredGodStableId` / `grantedSkillStableIds`
-  // against the live catalog inside the transaction, so it must run SERIALIZABLE
-  // to abort (P2034 -> 409) instead of persisting a reference to a god/skill that
-  // a concurrent rename stableId-changed away.
+  // a stale `raceType`. Equipment, race/class/profession config-changing PATCHes
+  // are serializable too: they re-validate catalog references (god patron,
+  // granted/graded skills) against the live catalog inside the transaction, so
+  // they must run SERIALIZABLE to abort (P2034 -> 409) instead of persisting a
+  // reference to a god/skill that a concurrent rename stableId-changed away.
   const serializable =
     kind === "gods" ||
     kind === "races" ||
+    kind === "classes" ||
+    kind === "professions" ||
     kind === "bloodlines" ||
     kind === "titles" ||
     kind === "skills" ||
@@ -8197,6 +8978,11 @@ export async function updateCatalogItem(
         // passive skill.
         if (kind === "equipment")
           await assertEquipmentGrantedSkillsRefs(tx, config)
+        // A config-changing race/class/profession write must not reference a
+        // missing/archived grade-granted skill.
+        if (kind === "races" || kind === "classes" || kind === "professions") {
+          await assertGradeGrantedSkillsRefs(tx, config)
+        }
       }
       const finalConfig =
         config ?? parseCatalogConfig(kind, existing.config ?? {})
@@ -8291,7 +9077,7 @@ export async function updateCatalogItem(
           ...(patch.description != null
             ? { description: patch.description }
             : {}),
-          ...(patch.grade != null ? { grade: patch.grade } : {}),
+          ...(patch.grade !== undefined ? { grade: patch.grade } : {}),
           ...(patch.sourceUrl != null ? { sourceUrl: patch.sourceUrl } : {}),
           ...(patch.archived != null ? { archived: patch.archived } : {}),
           ...(config != null

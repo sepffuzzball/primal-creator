@@ -120,7 +120,7 @@ vi.mock("@/components/ui/dialog", () => ({
 }))
 
 vi.mock("@/components/ui/select", () => {
-  const changes: Array<(value: string) => void> = []
+  const SelectChange = React.createContext<(value: string) => void>(() => {})
   return {
     Select: ({
       children,
@@ -130,26 +130,43 @@ vi.mock("@/components/ui/select", () => {
       onValueChange?: (value: string) => void
       disabled?: boolean
     }) => {
-      changes.length = 0
-      if (onValueChange) changes.push(onValueChange)
-      return <div data-disabled={disabled}>{children}</div>
+      return (
+        <SelectChange.Provider value={onValueChange ?? (() => {})}>
+          <div data-disabled={disabled}>{children}</div>
+        </SelectChange.Provider>
+      )
     },
     SelectContent: ({ children }: React.ComponentProps<"div">) => (
+      <div>{children}</div>
+    ),
+    SelectGroup: ({ children }: React.ComponentProps<"div">) => (
       <div>{children}</div>
     ),
     SelectItem: ({
       children,
       value,
-    }: React.ComponentProps<"div"> & { value?: string }) => (
+    }: React.ComponentProps<"div"> & { value?: string }) => {
+      const change = React.useContext(SelectChange)
+      return (
+        <button
+          type="button"
+          role="option"
+          aria-selected={false}
+          onClick={() => change(value ?? "")}
+        >
+          {children}
+        </button>
+      )
+    },
+    SelectTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
       <button
-        type="button"
-        onClick={() => changes.forEach((change) => change(value ?? ""))}
+        role="combobox"
+        aria-controls="select-options"
+        aria-expanded={false}
+        {...props}
       >
         {children}
       </button>
-    ),
-    SelectTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
-      <button {...props}>{children}</button>
     ),
     SelectValue: () => <span />,
   }
@@ -536,6 +553,212 @@ describe("CatalogManager config omission on edit", () => {
   })
 })
 
+describe("grade skill grants", () => {
+  afterEach(() => cleanup())
+
+  function setupStructuredEdit(
+    kind: "classes" | "professions",
+    config: Record<string, unknown>
+  ) {
+    const record = {
+      ...item,
+      id: `${kind}-record-id`,
+      kind,
+      stableId: `${kind}-stable`,
+      name: `Test ${kind}`,
+      grade: "G",
+      config,
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === `/api/catalog/${kind}`) return { items: [record] }
+      if (url === "/api/catalog/skills")
+        return {
+          items: [
+            {
+              ...item,
+              id: "db-skill-one",
+              stableId: "skill-one",
+              name: "Skill One",
+              archived: false,
+            },
+            {
+              ...item,
+              id: "db-skill-two",
+              stableId: "skill-two",
+              name: "Skill Two",
+              archived: false,
+            },
+          ],
+        }
+      if (init?.method === "PATCH") return { item: record }
+      throw new Error(`unexpected url ${url}`)
+    })
+    return mock
+  }
+
+  function chooseGrantGrade(grade: string) {
+    const controls = screen.getByLabelText("Grant grade")
+    const button = [...controls.querySelectorAll("button")].find(
+      (entry) => entry.textContent === grade
+    )
+    if (!button) throw new Error(`missing grade button ${grade}`)
+    fireEvent.click(button)
+  }
+
+  function addGrant(stableId: string) {
+    fireEvent.change(screen.getByLabelText("Skill to grant"), {
+      target: { value: stableId },
+    })
+    fireEvent.click(screen.getByText("Add skill"))
+  }
+
+  function savedConfig(mock: ReturnType<typeof vi.fn>) {
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    return JSON.parse((call?.[1] as RequestInit).body as string)
+      .config as Record<string, unknown>
+  }
+
+  it("saves distinct skill stable IDs by race grade without changing gains rows", async () => {
+    const race = {
+      ...item,
+      id: "race-1",
+      kind: "races",
+      stableId: "race-one",
+      name: "Race One",
+      grade: "G",
+      config: {
+        naturalGrade: "G",
+        raceType: "enlightened",
+        raceDefinitions: {
+          G: { id: "race-g", perLevel: { strength: 1 }, freePerLevel: 0 },
+          F: { id: "race-f", perLevel: { agility: 2 }, freePerLevel: 1 },
+        },
+      },
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/races") return { items: [race] }
+      if (url === "/api/catalog/skills")
+        return {
+          items: [
+            {
+              ...item,
+              stableId: "skill-one",
+              name: "Skill One",
+              archived: false,
+            },
+            {
+              ...item,
+              stableId: "skill-two",
+              name: "Skill Two",
+              archived: false,
+            },
+          ],
+        }
+      if (init?.method === "PATCH") return { item: race }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="races" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    expect(screen.getByText("Race One")).toBeTruthy()
+    const grantControls = screen.getByLabelText("Grant grade")
+    fireEvent.click(
+      [...grantControls.querySelectorAll("button")].find(
+        (button) => button.textContent === "F"
+      )!
+    )
+    const choice = screen.getByLabelText("Skill to grant")
+    fireEvent.change(choice, { target: { value: "skill-one" } })
+    fireEvent.click(screen.getByText("Add skill"))
+    fireEvent.change(choice, { target: { value: "skill-one" } })
+    expect((screen.getByText("Add skill") as HTMLButtonElement).disabled).toBe(
+      true
+    )
+    fireEvent.change(choice, { target: { value: "skill-two" } })
+    fireEvent.click(screen.getByText("Add skill"))
+    expect(screen.getByText("Skill One")).toBeTruthy()
+    expect(screen.getByText("Skill Two")).toBeTruthy()
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    const body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body.config.gradeGrantedSkillStableIds.F).toEqual([
+      "skill-one",
+      "skill-two",
+    ])
+    expect(body.config.raceDefinitions).toEqual(race.config.raceDefinitions)
+  })
+
+  it("keeps independent class skill grants across grade switches and persists stable IDs", async () => {
+    const gains = {
+      G: { fixed: { strength: 1 }, free: 2 },
+      F: { fixed: { agility: 3 }, free: 4 },
+    }
+    const mock = setupStructuredEdit("classes", { grades: gains })
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    chooseGrantGrade("F")
+    addGrant("skill-one")
+    addGrant("skill-two")
+    expect((screen.getByText("Add skill") as HTMLButtonElement).disabled).toBe(
+      true
+    )
+    chooseGrantGrade("G")
+    addGrant("skill-two")
+    chooseGrantGrade("F")
+    expect(screen.getByText("Skill One")).toBeTruthy()
+    expect(screen.getByText("Skill Two")).toBeTruthy()
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const config = savedConfig(mock)
+    expect(config.gradeGrantedSkillStableIds).toEqual({
+      F: ["skill-one", "skill-two"],
+      G: ["skill-two"],
+    })
+    expect(JSON.stringify(config.gradeGrantedSkillStableIds)).not.toContain(
+      "db-skill"
+    )
+    expect(config.grades).toEqual(gains)
+  })
+
+  it("removes and adds profession grants while preserving grade gains", async () => {
+    const gains = {
+      G: { fixed: { wisdom: 2 }, free: 1 },
+      F: { fixed: { vitality: 3 }, free: 2 },
+    }
+    const mock = setupStructuredEdit("professions", {
+      grades: gains,
+      gradeGrantedSkillStableIds: { G: ["skill-one", "skill-one"] },
+    })
+    render(<CatalogManager kind="professions" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    expect(screen.getByText("Skill One")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Remove Skill One" }))
+    addGrant("skill-two")
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const config = savedConfig(mock)
+    expect(config.gradeGrantedSkillStableIds).toEqual({ G: ["skill-two"] })
+    expect(JSON.stringify(config.gradeGrantedSkillStableIds)).not.toContain(
+      "db-skill"
+    )
+    expect(config.grades).toEqual(gains)
+  })
+})
+
 describe("structured catalog editors", () => {
   afterEach(() => cleanup())
 
@@ -548,22 +771,49 @@ describe("structured catalog editors", () => {
     return mock
   }
 
-  it("exposes grade choices as an accessible single-select group", async () => {
+  it.each(["titles", "bloodlines", "transcendent_skills"])(
+    "sends grade null when clearing an optional grade on %s",
+    async (kind) => {
+      const fixture = {
+        ...item,
+        kind,
+        id: `${kind}-graded`,
+        stableId: `${kind}-graded`,
+        grade: "E",
+        name: "Graded entry",
+        config: {},
+      }
+      const mock = setupMock()
+      mock.mockImplementation(async (_url: string, init?: RequestInit) =>
+        init?.method === "PATCH"
+          ? { item: fixture }
+          : { kind, items: [fixture] }
+      )
+      render(<CatalogManager kind={kind as "titles"} />)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Edit"))
+      fireEvent.click(screen.getByRole("option", { name: "No grade" }))
+      fireEvent.click(screen.getByRole("button", { name: "Save" }))
+      await flush()
+      const request = mock.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+      )
+      expect(
+        JSON.parse((request?.[1] as RequestInit).body as string).grade
+      ).toBeNull()
+    }
+  )
+
+  it("exposes grade choices through a select", async () => {
     useCreateMock("races")
     render(<CatalogManager kind="races" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "New entry" }))
-    const group = screen.getByRole("radiogroup", { name: "Natural grade" })
-    const gradeA = screen.getByRole("radio", { name: "A" })
+    const group = screen.getByLabelText("Natural grade")
+    const gradeA = screen.getByRole("option", { name: "A" })
     fireEvent.click(gradeA)
-    expect(
-      screen.getByRole("radio", { name: "A" }).getAttribute("aria-checked")
-    ).toBe("true")
-    fireEvent.click(screen.getByRole("radio", { name: "B" }))
-    expect(
-      screen.getByRole("radio", { name: "B" }).getAttribute("aria-checked")
-    ).toBe("true")
-    expect(group.querySelectorAll('[aria-checked="true"]')).toHaveLength(1)
+    expect(group).toBeTruthy()
+    expect(screen.queryByRole("radiogroup")).toBeNull()
   })
 
   it("creates a race with a deterministic A-grade row and preserves explicit zero", async () => {
@@ -574,7 +824,7 @@ describe("structured catalog editors", () => {
     fireEvent.change(screen.getByLabelText(/Name/), {
       target: { value: "Ashkin" },
     })
-    fireEvent.click(screen.getByRole("radio", { name: "A" }))
+    fireEvent.click(screen.getByRole("option", { name: "A" }))
     fireEvent.change(screen.getByLabelText("Race type"), {
       target: { value: "monster" },
     })
@@ -630,6 +880,174 @@ describe("structured catalog editors", () => {
       soulbound: true,
       minimumLevel: 0,
     })
+  })
+
+  it("creates an Item with optional E grade and one general description", async () => {
+    const mock = useCreateMock("items")
+    render(<CatalogManager kind="items" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New Item" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Charm" },
+    })
+    expect(screen.getAllByLabelText("Description")).toHaveLength(1)
+    expect(screen.queryByLabelText("G-grade description")).toBeNull()
+    fireEvent.click(screen.getByRole("option", { name: "E" }))
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "A small charm" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body).toMatchObject({ grade: "E", description: "A small charm" })
+  })
+
+  it("allows an Item's grade to be cleared on PATCH and has no free-text grade input", async () => {
+    const fixture = {
+      ...item,
+      kind: "items",
+      id: "item-1",
+      grade: "E",
+      name: "Charm",
+      config: {},
+    }
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") return { item: fixture }
+      return { kind: "items", items: [fixture] }
+    })
+    render(<CatalogManager kind="items" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    expect(screen.queryByLabelText("G-grade description")).toBeNull()
+    expect(screen.queryByRole("textbox", { name: "Grade" })).toBeNull()
+    fireEvent.click(screen.getByRole("option", { name: "No grade" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    expect(
+      JSON.parse((request?.[1] as RequestInit).body as string).grade
+    ).toBeNull()
+  })
+
+  it("hides God grade controls and omits grade on create", async () => {
+    const mock = useCreateMock("gods")
+    render(<CatalogManager kind="gods" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    expect(screen.queryByLabelText("Grade")).toBeNull()
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Sol" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(
+      JSON.parse((request?.[1] as RequestInit).body as string)
+    ).not.toHaveProperty("grade")
+  })
+
+  it("creates structured per-tier God bonuses with percentage basis points and no grade", async () => {
+    const mock = useCreateMock("gods")
+    render(<CatalogManager kind="gods" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Sol" },
+    })
+    fireEvent.click(screen.getByRole("option", { name: "Major" }))
+    fireEvent.click(screen.getByRole("button", { name: "Add effect" }))
+    fireEvent.click(screen.getByRole("option", { name: "Percent" }))
+    fireEvent.change(screen.getByLabelText("Effect 1 strength"), {
+      target: { value: "2.5" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Add effect" }))
+    fireEvent.change(screen.getByLabelText("Effect 2 agility"), {
+      target: { value: "-3" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body).not.toHaveProperty("grade")
+    expect(body.config.blessingEffects.Major).toEqual([
+      { phase: "percent", basisPoints: { strength: 250 } },
+      { phase: "flat", amount: { agility: -3 } },
+    ])
+  })
+
+  it("switches tiers without losing edits and preserves unrelated config while removing one tier", async () => {
+    const god = {
+      ...item,
+      kind: "gods",
+      grade: null,
+      config: {
+        blessingEffects: {
+          True: [
+            {
+              phase: "flat",
+              amount: { strength: 4 },
+              condition: "night",
+              group: "moon",
+              stacking: "add",
+            },
+          ],
+          Minor: [{ phase: "flat", amount: { wisdom: 1 } }],
+        },
+        note: "keep me",
+        pantheon: "Dawn",
+        divineRank: 7,
+      },
+    }
+    const mock = setupMock()
+    mock.mockImplementation(async (url: string, init?: RequestInit) =>
+      init?.method === "PATCH" ? { item: god } : { kind: "gods", items: [god] }
+    )
+    render(<CatalogManager kind="gods" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.click(screen.getByRole("option", { name: "True" }))
+    expect(
+      (screen.getByLabelText("Effect 1 strength") as HTMLInputElement).value
+    ).toBe("4")
+    fireEvent.click(screen.getByRole("option", { name: "Minor" }))
+    expect(
+      (screen.getByLabelText("Effect 1 wisdom") as HTMLInputElement).value
+    ).toBe("1")
+    fireEvent.change(screen.getByLabelText("Effect 1 wisdom"), {
+      target: { value: "-2" },
+    })
+    fireEvent.click(screen.getByRole("option", { name: "True" }))
+    expect(
+      (screen.getByLabelText("Effect 1 strength") as HTMLInputElement).value
+    ).toBe("4")
+    fireEvent.click(screen.getByRole("button", { name: "Remove tier bonuses" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([url, init]) =>
+        String(url).startsWith("/api/catalog/gods/") &&
+        (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body.config).toMatchObject({
+      blessingEffects: { Minor: [{ phase: "flat", amount: { wisdom: -2 } }] },
+      note: "keep me",
+      pantheon: "Dawn",
+      divineRank: 7,
+    })
+    expect(body.config.blessingEffects).not.toHaveProperty("True")
+    expect(body.config.blessingEffects).not.toHaveProperty("Major")
+    expect(body).not.toHaveProperty("grade")
   })
 
   it("adds distinct catalog skills, removes one, and saves only stable ids", async () => {
@@ -692,7 +1110,7 @@ describe("structured catalog editors", () => {
     fireEvent.change(screen.getByLabelText(/Name/), {
       target: { value: "Vanguard" },
     })
-    fireEvent.click(screen.getByRole("radio", { name: "F" }))
+    fireEvent.click(screen.getByRole("option", { name: "F" }))
     for (const key of [
       "strength",
       "agility",
@@ -954,7 +1372,7 @@ describe("structured catalog editor legacy and sparse rows", () => {
     fireEvent.change(screen.getByLabelText(/Name/), {
       target: { value: "Ashkin" },
     })
-    fireEvent.click(screen.getByRole("radio", { name: "A" }))
+    fireEvent.click(screen.getByRole("option", { name: "A" }))
     fireEvent.change(screen.getByLabelText("Race type"), {
       target: { value: "monster" },
     })
@@ -983,7 +1401,7 @@ describe("structured catalog editor legacy and sparse rows", () => {
     fireEvent.change(screen.getByLabelText(/Name/), {
       target: { value: "Vanguard" },
     })
-    fireEvent.click(screen.getByRole("radio", { name: "F" }))
+    fireEvent.click(screen.getByRole("option", { name: "F" }))
     fireEvent.change(screen.getByLabelText("F Free points"), {
       target: { value: "2" },
     })
@@ -1005,7 +1423,7 @@ describe("structured catalog editor legacy and sparse rows", () => {
     fireEvent.change(screen.getByLabelText(/Name/), {
       target: { value: "Ashkin" },
     })
-    fireEvent.click(screen.getByRole("radio", { name: "A" }))
+    fireEvent.click(screen.getByRole("option", { name: "A" }))
     fireEvent.change(screen.getByLabelText("Race type"), {
       target: { value: "monster" },
     })
@@ -1182,6 +1600,208 @@ describe("CatalogManager import preview staleness", () => {
       ([url]) => url === "/api/catalog/gods"
     )
     expect(catalogFetches).toHaveLength(1)
+  })
+})
+
+describe("ranked title catalog controls", () => {
+  afterEach(() => cleanup())
+
+  const ranked = (
+    id: string,
+    name: string,
+    rank: number,
+    archived = false
+  ) => ({
+    ...item,
+    id,
+    kind: "titles",
+    stableId: id,
+    name,
+    archived,
+    grade: null,
+    config: {
+      improvement: { seriesId: "dungeon", rank, minRaceGrade: "G" },
+      upgradeGroup: "dungeon",
+      note: "kept",
+    },
+  })
+
+  function mockTitles(
+    entries: ReturnType<typeof ranked>[],
+    save?: () => Promise<never>
+  ) {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("includeArchived")) return { items: entries }
+      if (init?.method === "PATCH") {
+        if (save) return save()
+        return { item: entries[0] }
+      }
+      return { items: entries.filter((entry) => !entry.archived) }
+    })
+    return mock
+  }
+
+  it("creates a ranked title through fields and atomically mirrors upgradeGroup", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (_url: string, init?: RequestInit) =>
+      init?.method === "POST" ? { item } : { items: [] }
+    )
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Dungeon Pioneer II" },
+    })
+    fireEvent.click(screen.getByRole("checkbox", { name: "Ranked series" }))
+    fireEvent.change(screen.getByLabelText("Series ID"), {
+      target: { value: "dungeon-pioneer" },
+    })
+    fireEvent.change(screen.getByLabelText("Rank"), { target: { value: "2" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    const body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body.config.improvement).toEqual({
+      seriesId: "dungeon-pioneer",
+      rank: 2,
+      minRaceGrade: "G",
+    })
+    expect(body.config.upgradeGroup).toBe("dungeon-pioneer")
+  })
+
+  it("edits rank and series through structured fields without JSON", async () => {
+    const title = ranked("title-1", "Dungeon One", 1)
+    const mock = mockTitles([title])
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expand series dungeon" })
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Edit Dungeon One" }))
+    fireEvent.change(screen.getByLabelText("Rank"), { target: { value: "3" } })
+    fireEvent.change(screen.getByLabelText("Series ID"), {
+      target: { value: "new-ladder" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    const config = JSON.parse((call?.[1] as RequestInit).body as string).config
+    expect(config.improvement).toEqual({
+      seriesId: "new-ladder",
+      rank: 3,
+      minRaceGrade: "G",
+    })
+    expect(config.upgradeGroup).toBe("new-ladder")
+    expect(config.note).toBe("kept")
+  })
+
+  it("clears ranking while preserving an unrelated manual upgradeGroup", async () => {
+    const title = {
+      ...ranked("title-1", "Dungeon One", 1),
+      config: {
+        ...ranked("title-1", "Dungeon One", 1).config,
+        upgradeGroup: "manual-group",
+      },
+    }
+    const mock = mockTitles([title])
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expand series dungeon" })
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Edit Dungeon One" }))
+    fireEvent.click(screen.getByRole("checkbox", { name: "Ranked series" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    const config = JSON.parse((call?.[1] as RequestInit).body as string).config
+    expect(config).not.toHaveProperty("improvement")
+    expect(config.upgradeGroup).toBe("manual-group")
+  })
+
+  it("groups titles, expands/collapses, searches a matched rank and offers per-rank editing", async () => {
+    const mock = mockTitles([
+      ranked("title-1", "Dungeon One", 1),
+      ranked("title-2", "Hidden Dungeon Two", 2),
+    ])
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    expect(
+      screen.getByRole("button", { name: "Expand series dungeon" })
+    ).toBeTruthy()
+    expect(screen.queryByText("Dungeon One")).toBeNull()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expand series dungeon" })
+    )
+    expect(screen.getByText("Dungeon One")).toBeTruthy()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Collapse series dungeon" })
+    )
+    expect(screen.queryByText("Dungeon One")).toBeNull()
+    fireEvent.change(screen.getByLabelText("Search"), {
+      target: { value: "title-2" },
+    })
+    expect(screen.getByText("Hidden Dungeon Two")).toBeTruthy()
+    expect(screen.queryByText("Dungeon One")).toBeNull()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit Hidden Dungeon Two" })
+    )
+    expect(screen.getByLabelText("Rank")).toBeTruthy()
+    expect(mock).toHaveBeenCalled()
+  })
+
+  it("keeps archived ranked titles hidden until enabled and exposes their child action", async () => {
+    const old = ranked("old", "Archived Rank", 4, true)
+    const mock = mockTitles([old])
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    expect(screen.queryByText("Archived Rank")).toBeNull()
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    expect(
+      screen.getByRole("button", { name: "Expand series dungeon" })
+    ).toBeTruthy()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expand series dungeon" })
+    )
+    expect(screen.getByText("Archived")).toBeTruthy()
+    expect(
+      screen.getByRole("button", { name: "Edit Archived Rank" })
+    ).toBeTruthy()
+    expect(mock).toHaveBeenCalledWith("/api/catalog/titles?includeArchived=1")
+  })
+
+  it("leaves unranked titles standalone and shows an actionable identity conflict", async () => {
+    const standalone = {
+      ...ranked("plain", "Unranked Title", 1),
+      config: { upgradeGroup: "manual" },
+    } as ReturnType<typeof ranked>
+    mockTitles([standalone], async () => {
+      throw new ApiError(409, "conflict", "Title is linked.")
+    })
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    expect(screen.getByText("Unranked Title")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /series dungeon/i })).toBeNull()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Changed Identity" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(screen.getByRole("alert").textContent).toContain(
+      "ask an administrator to resolve the link"
+    )
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy()
   })
 })
 
@@ -1730,7 +2350,7 @@ describe("grade descriptions and equipment stats", () => {
         target: { value: "New entry" },
       })
       if (kind === "races")
-        fireEvent.click(screen.getByRole("radio", { name: "G" }))
+        fireEvent.click(screen.getByRole("option", { name: "G" }))
       fireEvent.change(screen.getByLabelText("G-grade description"), {
         target: { value: "  Grade G copy  " },
       })

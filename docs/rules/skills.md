@@ -215,6 +215,93 @@ resolve. The importer rejects:
   and
 - a row that is both **selected and canceled** (`import_selected_canceled`).
 
+## Per-grade automatic skill grants
+
+Alongside the milestone `choice` model, a race/class/profession catalog config may
+declare **automatic** grade-granted skills via `gradeGrantedSkillStableIds`. This is
+an optional, grade-keyed map; a missing or `{}` value means the entry declares no
+auto-grant (it reads back as an empty map, never a fabricated list). The field is
+optional and only meaningful on `races` / `classes` / `professions` configs.
+
+```ts
+{
+  // Grade-specific automatic skill grants, keyed by the grade ladder (G..S).
+  // Each list holds `skills` catalog stableId entries granted automatically at
+  // the moment the character reaches that grade. Keys are STRICT (only G..S are
+  // accepted; a typo like "H" is rejected). Each list must be internally unique
+  // and every id nonempty.
+  gradeGrantedSkillStableIds?: Partial<Record<Grade, string[]>>,
+}
+```
+
+- **When the grant fires.** On character **create** the service applies the race
+  entry at `state.race.grade` (G for an integrated character, the race's natural
+  grade for a born one) and the class/profession entries at their OWN starting
+  track grade. On **profession assignment** it applies the profession entry at the
+  grade the newly assigned track is stamped with (the character's current race
+  grade). On **evolution** it applies the entry at the TARGET grade of the NEW
+  selected catalog definition. The race, then class, then profession grant order is
+  deterministic. A monster race has no class/profession tracks, so only the race
+  grant applies.
+- **Resolution.** Each referenced stableId must resolve to an existing, unarchived
+  `skills` catalog definition. A missing or archived reference is never a hard
+  failure at acquisition - it is **skipped** and journaled (never invented, never
+  crash an otherwise-valid create/profession-set/evolve). A NEW or CONFIG-CHANGED
+  race/class/profession write runs the same resolution against the live catalog and
+  REJECTS a missing or archived reference with `invalid_config` up front (an
+  archived skill would render the grade grant permanently inert); the import
+  paths build an allow-set so a skill authored by the same upload/import counts as
+  unarchived.
+- **Persistence.** A granted skill is linked as an ordinary `CharacterAssociation`
+  (kind `SKILL`) and acquired ONCE per definition; it is never re-offered at a
+  later milestone. The acquisition does not store the skill in `Character.state`
+  and offers no milestone `skillOffer` - it is a direct link, synthesized live like
+  any other SKILL association.
+- **Duplicate / upgrade policy.** Requesting a skill that is ALREADY owned - either
+  the exact same skill, or another skill whose `upgradeGroup` collides - does not
+  stack. The collision is resolved by searching the upgrade group's current
+  unarchived skills for the NEXT authored rarity STRICTLY HIGHER than the strongest
+  owned skill in the group (the ordered ladder Inferior, Common, Uncommon, Rare,
+  Epic, Ancient, Legendary, Mythical, Sacred, Divine; `Unique` is incomparable and
+  never strictly higher). When such a skill exists it replaces the owned skill(s)
+  (one-group invariant preserved); when no eligible authored upgrade exists the
+  owned skill is retained and the request journals a no-op. Ties at the same lowest
+  eligible rarity break on stableId lexicographic order.
+- **Journaling.** The `create`, `profession_set` and `evolve` journal entries carry
+  a `skillGrants` snapshot (present only when the acquisition actually granted or
+  attempted a grade skill) with `granted`, `upgraded`, `noop`, `skipped` and
+  `superseded` arrays, each recording the stableId (and name where known) plus the
+  source grade. A failed/missing reference is always listed in `skipped`, never
+  omitted. When MULTIPLE track grants fire in the same transaction (race+class or
+  class+profession), the journal is reconciled against the FINAL persisted plan so
+  it never claims the acquisition wrote a link it did not:
+  - `granted` lists only links that are actually persisted and had NO pre-existing
+    same-group source displaced - including a final link that a later in-transaction
+    chain of same-group plans resolved to.
+  - `upgraded` is written ONLY when a real same-group link that was persisted before
+    the transaction is displaced; it reports the actual pre/post transition from
+    that persisted source to the final link (never an "upgrade" from an
+    intermediate the same transaction planned but never wrote).
+  - `superseded` records every intermediate a transaction planned but never
+    persisted (e.g. a Common tier planned at a race grade that a later class grant
+    upgraded away), once each, with its ORIGINAL planned grade.
+  - A skill that was planned as a `granted` link but was upgraded away by a later
+    grant in the same acquisition is reported as `superseded` (with its originating
+    grade), never as a live `granted` link. Only skills actually persisted appear
+    under `granted`/`upgraded`, and no journal entry claims a displaced source is
+    still linked.
+- **Rename block.** Renaming a `skills` stableId is rejected with 409
+  `skill_stable_id_in_use` while ANY race/class/profession config's
+  `gradeGrantedSkillStableIds` (for any grade, including an archived track row)
+  still names the old id - otherwise the grade grant silently dangles and the skill
+  is silently skipped at acquisition. Archiving a skill is always allowed (an
+  archived granted skill is simply inert). The same rename guard also covers
+  equipment `grantedSkillStableIds` references.
+- **Legacy / export.** A config that predates the field grants nothing (it reads
+  back as `[]`/an empty map). No retroactive grant is issued on import: the
+  exported association links remain the existing backup model, and importing a
+  backup never re-creates a grade-grant that was not already linked.
+
 ## Engine note
 
 Skill rarity is used as a qualitative scale. The engine should treat the rarity

@@ -71,25 +71,40 @@ const gradeBadgeClasses = {
 
 type LevelTier = "Early" | "Mid" | "Developing" | "Late" | "Pinnacle"
 
+const levelTierClasses: Record<LevelTier, string> = {
+  Early:
+    "border-stone-500 bg-stone-100 text-stone-900 dark:border-stone-400 dark:bg-stone-900 dark:text-stone-100",
+  Mid: "border-cyan-600 bg-cyan-100 text-cyan-950 dark:border-cyan-400 dark:bg-cyan-950 dark:text-cyan-100",
+  Developing:
+    "border-blue-600 bg-blue-100 text-blue-950 dark:border-blue-400 dark:bg-blue-950 dark:text-blue-100",
+  Late: "border-indigo-600 bg-indigo-100 text-indigo-950 dark:border-indigo-400 dark:bg-indigo-950 dark:text-indigo-100",
+  Pinnacle:
+    "border-purple-600 bg-purple-100 text-purple-950 dark:border-purple-400 dark:bg-purple-950 dark:text-purple-100",
+}
+
 const E_GRADE_BAND = { min: 25, max: 99 }
 
 export function CharacterPortrait({ item }: { item: CharacterListItem }) {
-  const [failed, setFailed] = React.useState(false)
+  const [failedUrl, setFailedUrl] = React.useState<string | null>(null)
+  const url = item.portrait?.url
+  const failed = !!url && failedUrl === url
   return (
     <Avatar size="lg" className="size-12 shrink-0">
-      {item.portrait?.url && !failed ? (
+      {url && !failed ? (
         // Private asset URLs require the authenticated browser request; bypass Next's optimizer.
         // eslint-disable-next-line @next/next/no-img-element
         <img
-          src={item.portrait.url}
+          key={`${item.id}:${url}`}
+          src={url}
           alt={`${item.name} portrait`}
           className="aspect-square size-full rounded-full object-cover"
-          onError={() => setFailed(true)}
+          onError={() => setFailedUrl(url)}
         />
-      ) : null}
-      <AvatarFallback className="text-sm">
-        {item.name.charAt(0).toUpperCase() || <UserIcon aria-hidden="true" />}
-      </AvatarFallback>
+      ) : (
+        <AvatarFallback className="text-sm">
+          {item.name.charAt(0).toUpperCase() || <UserIcon aria-hidden="true" />}
+        </AvatarFallback>
+      )}
     </Avatar>
   )
 }
@@ -138,15 +153,19 @@ export function RaceBadges({ item }: { item: CharacterListItem }) {
       </Badge>
       <Badge
         variant="outline"
+        className={tier ? levelTierClasses[tier] : undefined}
+        title={
+          tier
+            ? `Race level ${item.raceLevel}, ${tier}${inferredTier ? ", inferred" : ""}`
+            : `Race level ${item.raceLevel}`
+        }
         aria-label={
           tier
-            ? `Level ${item.raceLevel}, ${tier}${inferredTier ? ", inferred" : ""}`
-            : `Level ${item.raceLevel}`
+            ? `Race level ${item.raceLevel}, ${tier}${inferredTier ? ", inferred" : ""}`
+            : `Race level ${item.raceLevel}`
         }
       >
-        {tier
-          ? `L${item.raceLevel} - ${tier}${inferredTier ? " (inferred)" : ""}`
-          : `Level ${item.raceLevel}`}
+        {item.raceLevel}
       </Badge>
     </div>
   )

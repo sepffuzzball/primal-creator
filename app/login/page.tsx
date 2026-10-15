@@ -67,7 +67,7 @@ export default function LoginPage() {
             <div className="flex items-center gap-2">
               <SparklesIcon className="size-5 text-primary" />
               <CardTitle className="font-heading text-base">
-                Primal Forge
+                The Primal Creator
               </CardTitle>
             </div>
             <p className="text-xs text-muted-foreground">

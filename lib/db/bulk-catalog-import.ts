@@ -58,10 +58,12 @@ import {
   payloadTooLarge,
 } from "@/lib/server/errors"
 import {
+  allGradeGrantedSkillStableIds,
   catalogCreateSchema,
   catalogKindSchema,
   gradeDescriptionsSchema,
   gradeSchema,
+  godGradeForbidden,
   normalizeCatalogKind,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
@@ -411,6 +413,15 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     )
   }
   const grade = optionalGrade(raw.grade, row)
+  // A gods entry carries no catalog grade band (see `godGradeForbidden`): a
+  // non-null grade is rejected before any write, so both preview and apply fail
+  // up front with no partial write (migration 0020 nulled any existing grade).
+  if (godGradeForbidden(kind, grade)) {
+    throw badRequest(
+      "invalid_grade",
+      `Bulk row ${row}: a gods entry carries no catalog grade (got "${String(grade)}")`
+    )
+  }
   const sourceUrl = optionalNullableString(raw.sourceUrl, row, "sourceUrl")
   if (sourceUrl != null && sourceUrl.length > MAX_SOURCE_URL) {
     throw badRequest(
@@ -940,6 +951,40 @@ function assertBulkEquipmentSkillRefs(
 }
 
 /**
+ * Verify that every race/class/profession entry's grade-granted skill reference
+ * (`gradeGrantedSkillStableIds`) resolves to a skill that will exist unarchived
+ * after the upload: either an existing unarchived skill row, or a skill created by
+ * this same upload (import always creates rows with `archived: false`). A dangling
+ * or archived skill would render the grade grant permanently inert, so it is
+ * rejected up front before any write. No-op when the entry is not a
+ * race/class/profession or grants no grade skill.
+ */
+function assertBulkGradeGrantedSkillRefs(
+  entries: readonly BulkCatalogEntry[],
+  unarchivedSkillStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (
+      entry.kind !== "races" &&
+      entry.kind !== "classes" &&
+      entry.kind !== "professions"
+    ) {
+      continue
+    }
+    const refs = allGradeGrantedSkillStableIds(entry.config)
+    for (const stableId of refs) {
+      if (typeof stableId !== "string" || stableId.length === 0) continue
+      if (!unarchivedSkillStableIds.has(stableId)) {
+        throw badRequest(
+          "invalid_config",
+          `Bulk row ${entry.row}: ${entry.kind} entry grants grade skill "${stableId}" which is neither an unarchived catalog skill nor a skill created by this upload`
+        )
+      }
+    }
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row occupies that (kind, stableId)
  * yet) or `skip_existing` (a row already occupies the key, so it is never
@@ -953,6 +998,15 @@ export async function previewBulkImport(
   const byKey = new Map<string, BulkImportExistingRow>(
     rows.map((row) => [keyOf(row.kind, row.stableId), toExistingRow(row)])
   )
+  // Only entries whose (kind, stableId) key is ABSENT from the existing catalog
+  // will actually be written; an entry already occupying the key is skipped and
+  // its config is never touched. Reference availability is therefore only
+  // meaningful for the NEW entries that would be created, so a skipped row whose
+  // referenced god/skill was later archived (or never existed) must not fail the
+  // import.
+  const newEntries = entries.filter(
+    (entry) => !byKey.has(keyOf(entry.kind, entry.stableId))
+  )
   const unarchivedGods = new Set(
     rows.filter((r) => r.kind === "gods" && !r.archived).map((r) => r.stableId)
   )
@@ -960,8 +1014,8 @@ export async function previewBulkImport(
   // catalog is treated as newly unarchived. A god that already exists - even
   // archived - is skipped (existing rows are never overwritten), so it keeps its
   // current archived state and must NOT satisfy an equipment patron reference.
-  for (const entry of entries) {
-    if (entry.kind === "gods" && !byKey.has(keyOf("gods", entry.stableId))) {
+  for (const entry of newEntries) {
+    if (entry.kind === "gods") {
       unarchivedGods.add(entry.stableId)
     }
   }
@@ -975,16 +1029,14 @@ export async function previewBulkImport(
       .filter((r) => r.kind === "skills" && !r.archived)
       .map((r) => r.stableId)
   )
-  for (const entry of entries) {
-    if (
-      entry.kind === "skills" &&
-      !byKey.has(keyOf("skills", entry.stableId))
-    ) {
+  for (const entry of newEntries) {
+    if (entry.kind === "skills") {
       unarchivedSkillStableIds.add(entry.stableId)
     }
   }
-  assertBulkEquipmentGodRefs(entries, unarchivedGods)
-  assertBulkEquipmentSkillRefs(entries, unarchivedSkillStableIds)
+  assertBulkEquipmentGodRefs(newEntries, unarchivedGods)
+  assertBulkEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
+  assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
 
   let createCount = 0
   let skipCount = 0
@@ -1034,6 +1086,15 @@ export async function applyBulkImport(
           rows.map((row) => [keyOf(row.kind, row.stableId), toExistingRow(row)])
         )
         const statuses = computeStatuses(entries, byKey)
+        // Only entries whose (kind, stableId) key is ABSENT from the existing
+        // catalog will actually be written; an entry already occupying the key is
+        // skipped and its config is never touched. Reference availability is only
+        // meaningful for NEW entries, so a skipped row whose referenced god/skill
+        // was later archived must not fail the import. Recomputed INSIDE the
+        // serializable transaction so an apply never trusts a stale preview.
+        const newEntries = entries.filter(
+          (entry) => !byKey.has(keyOf(entry.kind, entry.stableId))
+        )
         const unarchivedGods = new Set(
           rows
             .filter((r) => r.kind === "gods" && !r.archived)
@@ -1045,11 +1106,8 @@ export async function applyBulkImport(
         // overwritten), so it keeps its current archived state and must NOT
         // satisfy an equipment patron reference. Recomputed INSIDE the
         // serializable transaction so an apply never trusts a stale preview.
-        for (const entry of entries) {
-          if (
-            entry.kind === "gods" &&
-            !byKey.has(keyOf("gods", entry.stableId))
-          ) {
+        for (const entry of newEntries) {
+          if (entry.kind === "gods") {
             unarchivedGods.add(entry.stableId)
           }
         }
@@ -1064,16 +1122,14 @@ export async function applyBulkImport(
             .filter((r) => r.kind === "skills" && !r.archived)
             .map((r) => r.stableId)
         )
-        for (const entry of entries) {
-          if (
-            entry.kind === "skills" &&
-            !byKey.has(keyOf("skills", entry.stableId))
-          ) {
+        for (const entry of newEntries) {
+          if (entry.kind === "skills") {
             unarchivedSkillStableIds.add(entry.stableId)
           }
         }
-        assertBulkEquipmentGodRefs(entries, unarchivedGods)
-        assertBulkEquipmentSkillRefs(entries, unarchivedSkillStableIds)
+        assertBulkEquipmentGodRefs(newEntries, unarchivedGods)
+        assertBulkEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
+        assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
 
         const creationOrder = entries
           .map((entry, index) => ({ entry, index }))

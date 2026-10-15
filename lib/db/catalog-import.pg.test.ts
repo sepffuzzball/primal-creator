@@ -181,4 +181,61 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
     })
     expect(pre).toBeNull()
   })
+
+  it("skips an existing race whose grade-granted skill was archived instead of rejecting it", async () => {
+    // An active race already occupies the key and its grade-granted skill was
+    // later archived. The reapply must skip the race (existing rows are never
+    // overwritten) rather than reject the now-archived grade-skill reference.
+    const raceStable = `pg-existing-race__${runSuffix}`
+    const skillStable = `pg-existing-arch-skill__${runSuffix}`
+    const raceRow = await prisma.catalogDefinition.create({
+      data: {
+        kind: "races",
+        stableId: raceStable,
+        name: "Existing Race",
+        config: {
+          raceType: "enlightened",
+          naturalGrade: "F",
+          gradeGrantedSkillStableIds: { F: [skillStable] },
+        },
+      },
+    })
+    createdIds.push(raceRow.id)
+    const skillRow = await prisma.catalogDefinition.create({
+      data: {
+        kind: "skills",
+        stableId: skillStable,
+        name: "Archived Skill",
+        config: { effects: [], rarity: "Common" },
+        archived: true,
+      },
+    })
+    createdIds.push(skillRow.id)
+
+    const manifest: WikiReviewedEntry[] = [
+      {
+        kind: "races",
+        stableId: raceStable,
+        name: "Existing Race",
+        description: "d",
+        sourceUrl: "https://example.com/existing-race",
+        config: {
+          raceType: "enlightened",
+          naturalGrade: "F",
+          gradeGrantedSkillStableIds: { F: [skillStable] },
+        },
+      },
+    ]
+    const result = await applyWikiReviewedImport(manifest)
+    expect(result.createCount).toBe(0)
+    expect(result.skipCount).toBe(1)
+    expect(result.createdIds).toHaveLength(0)
+    const persisted = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "races", stableId: raceStable } },
+    })
+    expect(persisted?.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: [skillStable] },
+    })
+    expect(persisted?.archived).toBe(false)
+  })
 })

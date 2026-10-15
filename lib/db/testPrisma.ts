@@ -974,7 +974,8 @@ export function createTestPrisma(): TestPrismaInstance {
         if (data.name != null) updated.name = data.name as string
         if (data.description !== undefined)
           updated.description = data.description as string | null
-        if (data.grade != null) updated.grade = data.grade as string | null
+        if (data.grade !== undefined)
+          updated.grade = data.grade as string | null
         if (data.sourceUrl != null)
           updated.sourceUrl = data.sourceUrl as string | null
         if (data.archived != null) updated.archived = data.archived as boolean

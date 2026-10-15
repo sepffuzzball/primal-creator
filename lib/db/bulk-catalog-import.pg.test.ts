@@ -356,4 +356,63 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
     })
     expect(ring).toBeNull()
   })
+
+  it("skips an existing race whose grade-granted skill was archived instead of rejecting it", async () => {
+    const raceStable = stable("pg-existing-race")
+    const skillStable = stable("pg-existing-arch-skill")
+    const raceRow = await prisma.catalogDefinition.create({
+      data: {
+        kind: "races",
+        stableId: raceStable,
+        name: "Existing Race",
+        config: {
+          raceType: "enlightened",
+          naturalGrade: "F",
+          gradeGrantedSkillStableIds: { F: [skillStable] },
+        },
+      },
+    })
+    createdIds.push(raceRow.id)
+    const skillRow = await prisma.catalogDefinition.create({
+      data: {
+        kind: "skills",
+        stableId: skillStable,
+        name: "Archived Skill",
+        config: { effects: [], rarity: "Common" },
+        archived: true,
+      },
+    })
+    createdIds.push(skillRow.id)
+
+    const upload = JSON.stringify([
+      {
+        kind: "races",
+        stableId: raceStable,
+        name: "Existing Race",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: {
+          raceType: "enlightened",
+          naturalGrade: "F",
+          gradeGrantedSkillStableIds: { F: [skillStable] },
+        },
+      },
+    ])
+    const entries = parseBulkEntries("json", upload)
+    const result = await applyBulkImport(
+      entries,
+      computeBulkRequestDigest("json", upload)
+    )
+    expect(result.createCount).toBe(0)
+    expect(result.skipCount).toBe(1)
+    expect(result.createdIds).toHaveLength(0)
+    const persisted = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "races", stableId: raceStable } },
+    })
+    expect(persisted?.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: [skillStable] },
+    })
+    expect(persisted?.archived).toBe(false)
+  })
 })

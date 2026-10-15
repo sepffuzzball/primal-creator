@@ -67,6 +67,42 @@ function equipment(stableId: string, extra: Record<string, unknown> = {}) {
   }
 }
 
+function race(stableId: string, extra: Record<string, unknown> = {}) {
+  return {
+    kind: "races",
+    stableId,
+    name: `Race ${stableId}`,
+    description: `Race of ${stableId}`,
+    provenance: "house",
+    sourceUrl: "https://example.com/race/" + stableId,
+    config: { raceType: "enlightened", naturalGrade: "F", ...extra },
+  }
+}
+
+function classRow(stableId: string, extra: Record<string, unknown> = {}) {
+  return {
+    kind: "classes",
+    stableId,
+    name: `Class ${stableId}`,
+    description: `Class of ${stableId}`,
+    provenance: "house",
+    sourceUrl: "https://example.com/class/" + stableId,
+    config: { grades: { F: { fixed: { agility: 1 }, free: 0 } }, ...extra },
+  }
+}
+
+function professionRow(stableId: string, extra: Record<string, unknown> = {}) {
+  return {
+    kind: "professions",
+    stableId,
+    name: `Profession ${stableId}`,
+    description: `Profession of ${stableId}`,
+    provenance: "house",
+    sourceUrl: "https://example.com/profession/" + stableId,
+    config: { grades: { F: { fixed: { wisdom: 1 }, free: 0 } }, ...extra },
+  }
+}
+
 function jsonContent(objs: unknown[]): string {
   return JSON.stringify(objs)
 }
@@ -221,6 +257,26 @@ describe("bulk JSON parsing and validation", () => {
     expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
       /Bulk row 1: invalid config/i
     )
+  })
+
+  it("rejects a gods entry that carries a non-null catalog grade", () => {
+    const bad = { ...god("graded-god"), grade: "S" }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_grade" })
+    )
+  })
+
+  it("reports the row number for a graded gods entry", () => {
+    const bad = { ...god("graded-god"), grade: "A" }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: a gods entry carries no catalog grade/i
+    )
+  })
+
+  it("accepts a gods entry that omits grade (null) and normalizes it to null", () => {
+    const entries = parseBulkEntries("json", jsonContent([god("odin")]))
+    expect(entries[0].kind).toBe("gods")
+    expect(entries[0].grade).toBeNull()
   })
 
   it("rejects a duplicate (kind, stableId) with the row number", () => {
@@ -1021,5 +1077,257 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       code: "invalid_config",
     })
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a race/class/profession row that grants a missing grade skill", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        race("race-g", {
+          gradeGrantedSkillStableIds: { F: ["no-such-skill"] },
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a race/class/profession row that grants an archived grade skill", async () => {
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        classRow("cls-g", {
+          gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rejects a grade-grant to a skill the upload also lists when the catalog skill is archived", async () => {
+    dbMock.store.addCatalog({
+      id: "dual-skill",
+      kind: "skills",
+      stableId: "dual-skill",
+      name: "Dual Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "dual-skill"),
+        race("race-g", { gradeGrantedSkillStableIds: { F: ["dual-skill"] } }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "dual-skill"
+    )!
+    expect(row.archived).toBe(true)
+  })
+
+  it("accepts a race/class/profession row that grants a grade skill created by the same upload", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "manifest-skill"),
+        race("race-g", {
+          gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+        }),
+        classRow("cls-g", {
+          gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+        }),
+        professionRow("prof-g", {
+          gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+        }),
+      ])
+    )
+    const result = await applyBulkImport(entries, "digest")
+    expect(result.createCount).toBe(4)
+    expect(result.skipCount).toBe(0)
+    const raceRow = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "race-g"
+    )!
+    expect(raceRow.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["manifest-skill"] },
+    })
+  })
+
+  it("accepts a race/class/profession row that grants an existing unarchived grade skill", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: false,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        professionRow("prof-g", {
+          gradeGrantedSkillStableIds: { F: ["existing-skill"] },
+        }),
+      ])
+    )
+    const result = await applyBulkImport(entries, "digest")
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const profRow = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "prof-g"
+    )!
+    expect(profRow.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["existing-skill"] },
+    })
+  })
+
+  it("skips an already-existing race whose grade-granted skill was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-race",
+      kind: "races",
+      stableId: "existing-race",
+      name: "Existing Race",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+      },
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        race("existing-race", {
+          gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    expect(preview.entries[0].status).toBe("skip_existing")
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
+    const raceRow = dbMock.store.catalog.get("existing-race")!
+    expect(raceRow.archived).toBe(false)
+    expect(raceRow.config).toMatchObject({
+      gradeGrantedSkillStableIds: { F: ["arch-skill"] },
+    })
+  })
+
+  it("skips an already-existing equipment row whose granted skill was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-ring",
+      kind: "equipment",
+      stableId: "existing-ring",
+      name: "Existing Ring",
+      config: {
+        slot: "Ring",
+        rarity: "Common",
+        grantedSkillStableIds: ["arch-skill"],
+      },
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("existing-ring", { grantedSkillStableIds: ["arch-skill"] }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("skips an already-existing equipment row whose patron god was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-ring",
+      kind: "equipment",
+      stableId: "existing-ring",
+      name: "Existing Ring",
+      config: {
+        slot: "Ring",
+        rarity: "Common",
+        requiredGodStableId: "arch-god",
+      },
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-god",
+      kind: "gods",
+      stableId: "arch-god",
+      name: "Archived God",
+      config: { blessingEffects: {} },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("existing-ring", { requiredGodStableId: "arch-god" }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
   })
 })

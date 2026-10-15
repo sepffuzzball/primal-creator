@@ -239,8 +239,11 @@ vi.mock("@/components/ui/tabs", () => {
     TabsList: ({ children }: React.ComponentProps<"div">) => (
       <div role="tablist">{children}</div>
     ),
-    TabsContent: ({ children }: React.ComponentProps<"div">) => (
-      <div>{children}</div>
+    TabsContent: ({
+      children,
+      value,
+    }: React.ComponentProps<"div"> & { value?: string }) => (
+      <div data-testid={value ? `panel-${value}` : undefined}>{children}</div>
     ),
     TabsTrigger: ({
       children,
@@ -1129,12 +1132,62 @@ describe("grade ceiling and historical stat provenance", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Stats" }))
     expect(screen.getByRole("tab", { name: "Stats" })).toBeTruthy()
-    expect(screen.getByText("historical-fixed")).toBeTruthy()
     expect(screen.getByText("Race fixed")).toBeTruthy()
     expect(screen.getByText("Class fixed")).toBeTruthy()
     expect(screen.getByText("Profession fixed")).toBeTruthy()
-    expect(screen.getByText("6 (+6)")).toBeTruthy()
+    expect(screen.getByText("1 (+1)")).toBeTruthy()
+    expect(screen.getByText("3 (+2)")).toBeTruthy()
+    expect(screen.getByText("6 (+3)")).toBeTruthy()
+    expect(screen.getAllByText("8").length).toBeGreaterThan(0)
+    expect(screen.queryByText(/historical-fixed/)).toBeNull()
+    expect(document.body.textContent).not.toContain("historical-fixed")
     expect(screen.getByRole("heading", { name: "Derived Stats" })).toBeTruthy()
+  })
+
+  it("splits legacy combined fixed totals using backend source vectors", async () => {
+    const legacyStatus = {
+      attributes: { strength: 12 },
+      derivedStats: { hp: 1, mp: 2, sp: 3 },
+      traces: [
+        {
+          attribute: "strength",
+          final: 12,
+          phases: [{ phase: "historical-fixed", value: 9, delta: 9 }],
+        },
+      ],
+      historicalFixedByTrack: {
+        race: { strength: 2 },
+        class: { strength: 3 },
+        profession: { strength: 4 },
+      },
+      availablePoints: 0,
+      totalFreePoints: 0,
+      allocatedPoints: 0,
+      resources: [],
+      equipment: {
+        requested: {},
+        applied: {},
+        suppressed: {},
+        items: [],
+        capUsage: [],
+      },
+      consumables: { requested: {}, applied: {}, suppressed: {}, capUsage: [] },
+      capUsage: [],
+    }
+    setupMock({
+      character: {
+        ...character,
+        status: legacyStatus,
+      } as unknown as import("@/lib/api").CharacterDetail,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Stats" }))
+
+    expect(screen.getByText("2 (+2)")).toBeTruthy()
+    expect(screen.getByText("5 (+3)")).toBeTruthy()
+    expect(screen.getByText("9 (+4)")).toBeTruthy()
+    expect(screen.getAllByText("12").length).toBeGreaterThan(0)
+    expect(document.body.textContent).not.toContain("historical-fixed")
   })
 })
 
@@ -1159,7 +1212,9 @@ describe("CharacterDetail ranked title claims", () => {
   it("requires a self-reported first-clear detail and sends it with version", async () => {
     setupMock({ titles: [rankedTitle("pioneer-1", "Pioneer I", 1)] })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
     expect(
@@ -1195,7 +1250,9 @@ describe("CharacterDetail ranked title claims", () => {
   it("blocks below-grade claims and skipped ranks", async () => {
     setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2, "C")] })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     expect(screen.getByText(/Locked: race grade G is below C/)).toBeTruthy()
     expect(
@@ -1210,7 +1267,9 @@ describe("CharacterDetail ranked title claims", () => {
   it("does not offer rank 2 when no rank 1 is linked", async () => {
     setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2)] })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     expect(screen.getByText(/Locked: only rank 1 is next/)).toBeTruthy()
     expect(
@@ -1245,7 +1304,9 @@ describe("CharacterDetail ranked title claims", () => {
       titles: [rankedTitle("pioneer-4", "Pioneer IV", 4, "E")],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     expect(screen.getByText("Rank 4 / minimum race grade E")).toBeTruthy()
     expect(
@@ -1278,7 +1339,9 @@ describe("CharacterDetail ranked title claims", () => {
       titles: [rankedTitle("pioneer-2", "Pioneer II", 2)],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     expect(
       screen.getByText(
@@ -1301,7 +1364,9 @@ describe("CharacterDetail ranked title claims", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     const titleRow =
       screen.getByText("Ordinary title").parentElement?.parentElement
@@ -1326,7 +1391,9 @@ describe("CharacterDetail ranked title claims", () => {
       titles: [rankedTitle("pioneer-1", "Pioneer I", 1)],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
     fireEvent.change(screen.getByLabelText("Qualifying first-clear details"), {
@@ -2136,8 +2203,11 @@ describe("CharacterDetail power associations", () => {
       },
     })
     await renderDetail()
-    fireEvent.click(screen.getByRole("tab", { name: "Powers" }))
-    expect(screen.getByText("True Blessing of The Malefic Viper")).toBeTruthy()
+    expect(
+      within(screen.getAllByTestId("panel-blessings")[0]).getByText(
+        "True Blessing of The Malefic Viper"
+      )
+    ).toBeTruthy()
   })
 
   it("confirms replacing the sole bloodline and names archived displaced links", async () => {
@@ -2164,9 +2234,8 @@ describe("CharacterDetail power associations", () => {
       bloodlines: [catalogItem({ id: "new", name: "New bloodline" })],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage bloodlines" }))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Bloodlines" }))
     const add = screen
       .getAllByRole("button", { name: "Add" })
       .find((button) =>
@@ -2174,9 +2243,13 @@ describe("CharacterDetail power associations", () => {
       )
     fireEvent.click(add!)
     await flush()
-    expect(confirmSpy).toHaveBeenCalledWith(
-      "New bloodline will replace Old active, Old archived (archived, inert). Continue?"
-    )
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+    expect(
+      screen.getByText(
+        /New bloodline will replace Old active, Old archived \(archived, inert\)/
+      )
+    ).toBeTruthy()
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
   it("shows the configured transcendent cap and disables Add at capacity", async () => {
@@ -2202,9 +2275,10 @@ describe("CharacterDetail power associations", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Manage transcendent skills" })
+    )
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Transcendent skills" }))
     expect(screen.getByText("Selected 1 / maximum 1")).toBeTruthy()
     const attach = screen.getByRole("button", {
       name: "Attach",
@@ -2224,9 +2298,10 @@ describe("CharacterDetail power associations", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Manage transcendent skills" })
+    )
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Transcendent skills" }))
     expect(screen.getByText(/rules offline/)).toBeTruthy()
     expect(
       (screen.getByRole("button", { name: "Attach" }) as HTMLButtonElement)
@@ -2263,11 +2338,11 @@ describe("CharacterDetail power associations", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Powers"))
-    await flush()
 
-    const blessingSection = within(screen.getByLabelText("Blessing"))
-    const bloodlineSection = within(screen.getByLabelText("Bloodlines"))
+    const blessingSection = within(screen.getAllByTestId("panel-blessings")[0])
+    const bloodlineSection = within(
+      screen.getAllByTestId("panel-bloodlines")[0]
+    )
     expect(blessingSection.getByText("Blessing of Fire")).toBeTruthy()
     expect(bloodlineSection.getByText("Wolf Bloodline")).toBeTruthy()
     // The archived linked blessing stays visible but is honestly marked inert.
@@ -2301,10 +2376,11 @@ describe("CharacterDetail power associations", () => {
     await renderDetail()
     // The Manage powers button is NOT gated on a class: a monster/classless
     // character can open the association sheet.
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage blessings" }))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
     await flush()
 
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
@@ -2330,7 +2406,7 @@ describe("CharacterDetail power associations", () => {
     })
 
     // The reload reflects the newly linked blessing on the powers tab.
-    const blessingSection = within(screen.getByLabelText("Blessing"))
+    const blessingSection = within(screen.getAllByTestId("panel-blessings")[0])
     expect(blessingSection.getByText("Monster Blessing")).toBeTruthy()
   })
 
@@ -2346,7 +2422,7 @@ describe("CharacterDetail power associations", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage blessings" }))
     await flush()
 
     expect(screen.getByLabelText("Blessing tier")).toBeTruthy()
@@ -2389,20 +2465,22 @@ describe("CharacterDetail power associations", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage blessings" }))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
     await flush()
 
     // The replacement confirmation lists ALL displaced links, not just the active
     // one: both the active and the archived blessing are named, and the archived
     // one carries the "(archived, inert)" marker.
-    const confirmMessages = confirmSpy.mock.calls.map((c) => c[0] as string)
-    expect(confirmMessages[0]).toBe(
-      "New Blessing will replace Blessing of Fire, Old Blessing (archived, inert). Continue?"
-    )
-    expect(confirmMessages[1]).toBe("Add New Blessing to Test?")
+    expect(
+      screen.getByText(
+        /New Blessing will replace Blessing of Fire, Old Blessing \(archived, inert\)/
+      )
+    ).toBeTruthy()
+    expect(confirmSpy).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
+    await flush()
 
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
     const addPost = mock.mock.calls.find(
@@ -2427,7 +2505,7 @@ describe("CharacterDetail power associations", () => {
     })
 
     // The successful reload reflects the newly linked blessing.
-    const blessingSection = within(screen.getByLabelText("Blessing"))
+    const blessingSection = within(screen.getAllByTestId("panel-blessings")[0])
     expect(blessingSection.getByText("New Blessing")).toBeTruthy()
   })
 
@@ -2449,11 +2527,11 @@ describe("CharacterDetail power associations", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage blessings" }))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
     await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
 
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
     const assocPosts = mock.mock.calls.filter(
@@ -2462,8 +2540,8 @@ describe("CharacterDetail power associations", () => {
         (init as RequestInit | undefined)?.method === "POST"
     )
     expect(assocPosts).toEqual([])
-    // The powers tab still shows only the original blessing - no fake success.
-    const blessingSection = within(screen.getByLabelText("Blessing"))
+    // The blessings tab still shows only the original blessing - no fake success.
+    const blessingSection = within(screen.getAllByTestId("panel-blessings")[0])
     expect(blessingSection.getByText("Blessing of Fire")).toBeTruthy()
     expect(blessingSection.queryByText("New Blessing")).toBeNull()
   })
@@ -2488,10 +2566,11 @@ describe("CharacterDetail power associations", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage bloodlines" }))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Bloodlines" }))
     fireEvent.click(screen.getByText("Remove"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
     await flush()
 
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
@@ -2514,8 +2593,10 @@ describe("CharacterDetail power associations", () => {
       version: 3,
     })
 
-    // The reload reflects the removal: the powers tab no longer lists it.
-    const bloodlineSection = within(screen.getByLabelText("Bloodlines"))
+    // The reload reflects the removal: the bloodlines tab no longer lists it.
+    const bloodlineSection = within(
+      screen.getAllByTestId("panel-bloodlines")[0]
+    )
     expect(bloodlineSection.queryByText("Wolf Bloodline")).toBeNull()
   })
 
@@ -2538,18 +2619,19 @@ describe("CharacterDetail power associations", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage blessings" }))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Blessings" }))
     fireEvent.click(screen.getByText("Add"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
     await flush()
 
     // The failure is surfaced, not swallowed.
     expect(toast.error).toHaveBeenCalledWith(
       expect.stringContaining("network down")
     )
-    // No fake success: the powers tab still lists only the original blessing.
-    const blessingSection = within(screen.getByLabelText("Blessing"))
+    // No fake success: the blessings tab still lists only the original blessing.
+    const blessingSection = within(screen.getAllByTestId("panel-blessings")[0])
     expect(blessingSection.getByText("Blessing of Fire")).toBeTruthy()
     expect(blessingSection.queryByText("New Blessing")).toBeNull()
   })
@@ -2580,10 +2662,8 @@ describe("CharacterDetail transcendent skills", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Powers"))
-    await flush()
 
-    const section = within(screen.getByLabelText("Transcendent skills"))
+    const section = within(screen.getAllByTestId("panel-transcendent")[0])
     // The badge is the server-computed flag, never a client derivation.
     expect(section.getByText("Transcendent")).toBeTruthy()
     expect(section.getByText("Zen Transcendence")).toBeTruthy()
@@ -2608,10 +2688,8 @@ describe("CharacterDetail transcendent skills", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Powers"))
-    await flush()
 
-    const section = within(screen.getByLabelText("Transcendent skills"))
+    const section = within(screen.getAllByTestId("panel-transcendent")[0])
     expect(section.getByText("Zen Transcendence")).toBeTruthy()
     // No client-derived activation: the badge is absent when the server says no.
     expect(section.queryByText("Transcendent")).toBeNull()
@@ -2638,10 +2716,27 @@ describe("CharacterDetail transcendent skills", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Manage transcendent skills" })
+    )
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "Transcendent skills" }))
-    fireEvent.click(screen.getAllByText("Remove")[0])
+    fireEvent.click(
+      screen.getAllByRole("tab", { name: "Transcendent skills" }).at(-1)!
+    )
+    await flush()
+    const removeOld = screen
+      .getAllByRole("button", { name: "Remove" })
+      .find((button) =>
+        button.parentElement?.parentElement?.textContent?.includes(
+          "Old Transcendence"
+        )
+      )
+    expect(removeOld).toBeTruthy()
+    fireEvent.click(removeOld!)
+    await flush()
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove" }).at(-1)!)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
     await flush()
 
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
@@ -2691,7 +2786,9 @@ describe("CharacterDetail transcendent skills", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Manage transcendent skills" })
+    )
     await flush()
 
     const attachA = screen
@@ -2701,6 +2798,8 @@ describe("CharacterDetail transcendent skills", () => {
       )
     expect(attachA).toBeTruthy()
     fireEvent.click(attachA!)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
     await flush()
 
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
@@ -2757,9 +2856,13 @@ describe("CharacterDetail transcendent skills", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Manage transcendent skills" })
+    )
     await flush()
     fireEvent.click(screen.getByText("Attach"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
     await flush()
 
     // The failure is surfaced, not swallowed.
@@ -2789,7 +2892,9 @@ describe("CharacterDetail inventory", () => {
     // The Tabs mock never fires onValueChange, so the inventory tab does not
     // load catalogs on its own; open the associations sheet to trigger the
     // catalog loads that back the Add stock dialog.
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
 
     fireEvent.click(screen.getByRole("button", { name: "Add stock" }))
@@ -2961,9 +3066,9 @@ describe("CharacterDetail inventory", () => {
     })
 
     await renderDetail()
-    fireEvent.click(screen.getByRole("tab", { name: "Powers" }))
-    await flush()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
 
     const sheetContent = screen
@@ -3352,7 +3457,9 @@ describe("CharacterDetail ring equipment position and gating", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     const sheetContent = screen
       .getByText("Character associations")
@@ -3550,7 +3657,9 @@ describe("CharacterDetail ring equipment position and gating", () => {
       equipmentCatalog: [helm, mail, blade],
     })
     await renderDetail()
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     const sheetContent = screen
       .getByText("Character associations")
@@ -3633,7 +3742,9 @@ describe("CharacterDetail linked grade descriptions", () => {
       screen.getAllByText("No description for this grade").length
     ).toBeGreaterThan(0)
 
-    fireEvent.click(screen.getByText("Manage powers"))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+    )
     await flush()
     const sheetContent = screen
       .getByText("Character associations")
