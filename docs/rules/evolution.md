@@ -33,6 +33,7 @@
 
 Evolution titles are awarded for completing grade evolutions and for the
 "perfect" version:
+
 - Evolution (D) / Perfect Evolution (D-grade)
 - Evolution (C) / Perfect Evolution (C-grade)
 - Evolution (B) / Perfect Evolution (B-grade)
@@ -53,6 +54,7 @@ and profession are all at **level 349** simultaneously.
 ## Engine note
 
 Evolution must be modeled as a **phase gate** in the engine:
+
 - It is triggered at a grade boundary (generally above D, or at a race's natural
   grade).
 - While an evolution is pending/not completed, **further experience gains are
@@ -63,117 +65,88 @@ Evolution must be modeled as a **phase gate** in the engine:
 The engine does **not** invent an evolution XP formula; the block is modeled as
 data. See `docs/architecture/calculation-engine.md`.
 
-## Race evolution paths (catalog-driven)
+## Race evolution (next-grade candidates)
 
-Race evolution in the app is not hard-coded to a single house formula. The
-catalog `evolutions` kind defines contextual RACE evolution paths, and the
-service exposes them as a choice the owner/admin must resolve before the grade
-changes.
+Race evolution is no longer gated by catalog `evolutions` paths. A race evolves
+into ANY unarchived compatible race definition at exactly the next grade, in the
+same advancement mode (same `raceType`). There is no legacy grade-only fallback.
 
-### Config shape
+### Candidates
 
-An **active race path** carries a full, validated config:
-`track: "race"`, `fromRaceStableId`, `toRaceStableId`, `fromGrade`, `toGrade`,
-plus the optional `minRaceLevel`, `requiredTitleStableIds`,
-`requiredSkillStableIds` and `manualRequirementsText`. Any entry missing a
-required field is not a usable path.
+GET `/api/characters/[id]/evolutions?track=race` (owner/admin, default `race`)
+returns `{ options, legacyAvailable: false }`. Each option is a DESTINATION race
+catalog definition that:
 
-A **legacy metadata-only** config (the old `{from, to, titleId}` shape) stays
-readable and editable, but is not selectable as a path. The service rejects a
-NEW or CONFIG-CHANGED `evolutions` entry that is not a valid full race path,
-mirroring the consumables/skills hardening.
+- is unarchived;
+- advances in the SAME mode as the current race (`raceType` matches - an
+  enlightened race can never evolve into a monster race without an explicit
+  conversion);
+- defines the next grade's `raceDefinitions[toGrade]`.
 
-### GET /api/characters/[id]/evolutions (owner/admin)
+`fromGrade` is the character's current race grade and `toGrade` is always the
+immediately following grade (one step at a time per the engine's grade-ceiling
+gate). `id` is the destination race definition id. `legacyAvailable` is always
+false: there is no grade-only house fallback to offer.
 
-Returns `{ options, legacyAvailable }` where each option describes one path that
-matches the character's **current race stableId, current grade, and the NEXT
-grade** (evolution is one step at a time per the engine's grade-ceiling gate).
-Archived entries, malformed configs, wrong-race / wrong-grade / non-next-grade
-entries, and paths whose destination race is missing, archived, or has no
-`raceDefinitions[toGrade]` are ignored.
-
-Each option exposes `eligible` (the mechanical requirements are met) and
-`blockers` (the unmet requirements) computed from the race/grade match,
-`minRaceLevel`, and the required title/skill associations (linked, unarchived
-definitions). `manualReview` is true when the path carries a
-`manualRequirementsText` narrative gate. `legacyAvailable` is true **only when
-no valid catalog path matches** - the client then falls back to the legacy
-grade-only house evolution.
+Each option exposes `eligible` (no engine-level blocker applies) and `blockers`
+(the unmet engine-level requirements, empty when eligible). The only blockers are
+the engine's own grade-band / grade-gate checks (the pure `evolveGrade` gate), so
+GET agrees with POST.
 
 ### POST /api/characters/[id]/evolve
 
-- **Path choice** (`{optionId, version, reason?}`): the server re-evaluates the
-  path eligibility inside the transaction. The destination race must exist, be
-  enabled, and define `raceDefinitions[toGrade]`, otherwise the request is
-  rejected. The engine evolution runs against the TARGET race's rules config
-  only (no invented rewards/skills); the character's `raceId`, race grade and
-  race `definitionId` are updated, while class/profession tracks,
-  `historicalLevelAwards` and `allocations` are preserved. The journal records
-  the option id, the prerequisites, and any (user or admin) reason.
-- **Manual gate:** a user reason never bypasses a mechanical blocker. A
-  `manualRequirementsText` gate is bypassed only by a **nonempty admin reason**.
-- **Legacy grade-only** (`{grade, version}`): if ANY valid catalog path to the
-  requested grade exists (even when every such path is currently blocked), the
-  request is rejected with `409 evolution_choice_required` so the client must
-  submit an `optionId`. Only when no valid path exists does the legacy grade-only
-  house fallback run as before.
+- **Race choice** (`{track: "race", optionId, version, reason?}`): the server
+  re-fetches the destination row and re-validates ALL of the predicates that built
+  the GET option INSIDE the SERIALIZABLE transaction - the destination must exist,
+  be unarchived, be a `races` definition, advance in the same `raceType`, and
+  define `raceDefinitions[toGrade]`; otherwise the request is rejected with a
+  specific error code. The pure engine `evolveGrade` then runs against the TARGET
+  race's rules config only (no invented rewards/skills); the character's
+  `raceId`, race grade and race `definitionId` are updated, while class/profession
+  tracks, `historicalLevelAwards` and `allocations` are preserved. The journal
+  records the option id, the old and new race/definition snapshots, and any reason.
+- There is no legacy grade-only payload: every request must name `track` and an
+  `optionId`, so a missing track is a 400 validation error.
 
-## Class/profession track evolution paths (catalog-driven)
+## Class/profession track evolution (next-grade candidates)
 
-Class and profession tracks are **graded** independently of the race. A new
-character created through the wizard is stamped with the race's **natural grade**
-(legacy `F` fallback when the race config declares none) and a
-`stableId:<grade>` definition on each selected track (see
-`docs/rules/classes.md` and `docs/rules/professions.md`), so the class and
-profession each have their **own** progression gate and never inherit the race
-grade. For these tracks evolution is a per-track catalog path choice - there is
-**no** grade-only legacy fallback for class/profession.
+Class and profession tracks are **graded** independently of the race (see
+`docs/rules/classes.md` and `docs/rules/professions.md`). Their evolution is a
+per-track next-grade candidate choice from the definitions catalog - there is no
+grade-only legacy fallback for class/profession and no catalog path/title/manual
+gate.
 
-### Config shape
+### Candidates
 
-An **active class/profession path** carries a full, validated config:
-`track: "class"` or `track: "profession"`, `fromDefinitionStableId`,
-`toDefinitionStableId`, `fromGrade`, `toGrade`, plus the optional `minTrackLevel`,
-`requiredTitleStableIds`, `requiredSkillStableIds` and
-`manualRequirementsText`. Any entry missing a required field is not a usable path.
+GET `/api/characters/[id]/evolutions?track=class|profession` (owner/admin)
+returns `{ options, legacyAvailable: false }`. Each option is a DESTINATION
+class/profession catalog definition that:
 
-A **legacy metadata-only** config (the old `{from, to, titleId}` shape) stays
-readable and editable, but is not selectable as a path. The service rejects a
-NEW or CONFIG-CHANGED `evolutions` entry that is not a valid **full race path OR
-a full class/profession path**, mirroring the consumables/skills hardening.
+- is unarchived;
+- defines the next grade's `grades[toGrade]` gain (a class/profession with no
+  per-grade config for the next grade is not a candidate).
 
-### GET /api/characters/[id]/evolutions?track=class|profession (owner/admin)
-
-The endpoint accepts an optional `?track=race|class|profession` query param
-(default `race`). For `class`/`profession` it returns `{ options,
-legacyAvailable: false }` where each option matches the character's **current
-class/profession definition stableId, that track's OWN grade, and the NEXT
-track grade** (one step at a time). Archived entries, malformed configs,
-wrong-track / wrong-definition / wrong-grade / non-next-grade entries, and paths
-whose destination definition is missing, archived, or has no
-`grades[toGrade]` are ignored.
-
-Each option exposes `eligible` and `blockers` from the definition-stableId match,
-the track grade match, `minTrackLevel`, and the required title/skill
-associations; `manualReview` is true when the path carries a
-`manualRequirementsText` narrative gate.
+`fromGrade` is the track's own grade and `toGrade` is always the immediately
+following grade. `id` is the destination definition id. `legacyAvailable` is
+always false.
 
 A track without an explicit `grade` (a legacy graded-unknown state) returns no
 options and no fallback - the UI shows a note that there is nothing to offer until
 the track is given an explicit grade.
 
+Each option exposes `eligible` and `blockers` from the engine-level grade-band /
+grade-gate checks (the pure `evolveTrackGrade` gate), so GET agrees with POST.
+
 ### POST /api/characters/[id]/evolve
 
-- **Track path choice** (`{track: "class"|"profession", optionId, version,
-  reason?}`): the server re-evaluates the path eligibility inside the transaction.
-  The destination definition must exist, be enabled, and define
-  `grades[toGrade]`, otherwise the request is rejected. The engine
-  `evolveTrackGrade` runs against the character's rules config and changes **only
-  the target track's** `grade` and `definitionId`; the race grade and every other
-  ledger (`historicalLevelAwards`, `allocations`, associations) are preserved. The
-  character's `classId` or `professionId` is updated and the journal records the
-  option id, the prerequisites, the old/new definition ids, and any (user or
-  admin) reason.
-- **Manual gate:** a user reason never bypasses a mechanical blocker. A
-  `manualRequirementsText` gate is bypassed only by a **nonempty admin reason**.
+- **Track choice** (`{track: "class"|"profession", optionId, version, reason?}`):
+  the server re-fetches the destination row and re-validates inside the
+  SERIALIZABLE transaction - the destination must exist, be unarchived, be a
+  class/profession definition of the right kind, and define `grades[toGrade]`;
+  otherwise the request is rejected. The engine `evolveTrackGrade` runs against
+  the character's rules config and changes ONLY the target track's `grade` and
+  `definitionId`; the race grade and every other ledger (`historicalLevelAwards`,
+  `allocations`, associations) are preserved. The character's `classId` or
+  `professionId` is updated and the journal records the option id, old/new
+  definition ids, and any reason.
 - The race grade is never auto-changed by a class/profession evolution.

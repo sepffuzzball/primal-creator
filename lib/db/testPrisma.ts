@@ -21,6 +21,7 @@
  */
 
 import { DEFAULT_HOUSE_RULES_CONFIG, HOUSE_RULES_ID } from "./ruleset"
+import { PORTRAIT_KIND } from "@/lib/storage/portraits"
 
 export interface TestCatalogRow {
   id: string
@@ -35,9 +36,6 @@ export interface TestCatalogRow {
   // Grade-specific prose descriptions keyed by G..S (the DB JSON column). Absent
   // / null reads back as an empty map.
   gradeDescriptions?: Record<string, string> | null
-  // The resolved patron-god FK for a `blessings` entry (self-FK to another
-  // catalog definition). Null for every non-blessing kind.
-  patronId?: string | null
   createdAt: Date
   updatedAt: Date
 }
@@ -47,7 +45,12 @@ export interface TestAssociationRow {
   characterId: string
   definitionId: string
   kind:
-    "TITLE" | "EQUIPMENT" | "SKILL" | "BLESSING" | "BLOODLINE" | "TRANSCENDENT"
+    | "TITLE"
+    | "EQUIPMENT"
+    | "SKILL"
+    | "BLESSING"
+    | "BLOODLINE"
+    | "TRANSCENDENT"
   // True only for equipment links that predate the inventory-ownership model.
   // New associations default to false.
   legacyUnowned: boolean
@@ -55,6 +58,11 @@ export interface TestAssociationRow {
   // null for a non-ring equipment link and for a ring link whose position is not
   // yet resolved.
   equipmentPosition: string | null
+  // The exact blessing tier, meaningful only on a BLESSING link (a blessing
+  // references a `gods` definition and stores the tier it was granted at).
+  // Null for every non-blessing kind and for a blessing link whose tier was not
+  // persisted.
+  blessingTier: string | null
   createdAt: Date
   // Relation, only set on the object returned by findUnique/create.
   definition?: TestCatalogRow | null
@@ -99,6 +107,18 @@ export interface TestSkillOfferRow {
   options?: TestSkillOfferOptionRow[]
 }
 
+export interface TestAssetRow {
+  id: string
+  kind: string
+  url: string
+  characterId: string | null
+  fileName: string | null
+  mimeType: string | null
+  sizeBytes: number | null
+  createdAt: Date
+  updatedAt: Date
+}
+
 export interface TestCharacterRow {
   id: string
   ownerId: string
@@ -127,6 +147,7 @@ export interface TestCharacterRow {
   associations?: TestAssociationRow[]
   inventory?: TestInventoryRow[]
   skillOffers?: TestSkillOfferRow[]
+  assets?: TestAssetRow[]
 }
 
 export interface TestEventRow {
@@ -204,7 +225,7 @@ export interface TestPrismaInstance {
         }
       }) => Promise<TestCatalogRow | null>
       findMany: (args: {
-        where?: { kind?: string; archived?: boolean; patronId?: string | null }
+        where?: { kind?: string; archived?: boolean }
       }) => Promise<TestCatalogRow[]>
       create: (args: {
         data: Record<string, unknown>
@@ -328,6 +349,7 @@ export interface TestPrismaInstance {
     events: TestEventRow[]
     skillOffers: TestSkillOfferRow[]
     skillOfferOptions: TestSkillOfferOptionRow[]
+    assets: TestAssetRow[]
     drafts: Map<string, TestDraftRow>
     users: Map<string, TestUserRow>
     houseRules: Map<string, TestHouseRulesRow>
@@ -335,6 +357,7 @@ export interface TestPrismaInstance {
     addCharacter(
       row: Partial<TestCharacterRow> & { id: string }
     ): TestCharacterRow
+    addAsset(row: Partial<TestAssetRow> & { id: string }): TestAssetRow
     addDraft(row: Partial<TestDraftRow> & { userId: string }): TestDraftRow
     addUser(row: Partial<TestUserRow> & { id: string }): TestUserRow
     addHouseRules(
@@ -423,7 +446,7 @@ interface Transaction {
       where: { id?: string; kind_stableId?: { kind: string; stableId: string } }
     }) => Promise<TestCatalogRow | null>
     findMany: (args: {
-      where?: { kind?: string; archived?: boolean; patronId?: string | null }
+      where?: { kind?: string; archived?: boolean }
     }) => Promise<TestCatalogRow[]>
     create: (args: { data: Record<string, unknown> }) => Promise<TestCatalogRow>
     update: (args: {
@@ -558,6 +581,7 @@ export function createTestPrisma(): TestPrismaInstance {
   const events: TestEventRow[] = []
   const skillOffers: TestSkillOfferRow[] = []
   const skillOfferOptions: TestSkillOfferOptionRow[] = []
+  const assets: TestAssetRow[] = []
   const drafts = new Map<string, TestDraftRow>()
   const users = new Map<string, TestUserRow>()
   const houseRules = new Map<string, TestHouseRulesRow>()
@@ -611,6 +635,19 @@ export function createTestPrisma(): TestPrismaInstance {
       }))
   }
 
+  /**
+   * Attach the single most-recent active portrait asset for a character, matching
+   * the filtered `assets` relation in `characterInclude` (kind = PORTRAIT_KIND,
+   * ordered by updatedAt desc, take 1). At most one portrait asset can exist per
+   * character in practice; the order/take mirrors the real include defensively.
+   */
+  function attachPortraitAssets(char: TestCharacterRow): TestAssetRow[] {
+    return assets
+      .filter((a) => a.characterId === char.id && a.kind === PORTRAIT_KIND)
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+      .slice(0, 1)
+  }
+
   function attachRelations(char: TestCharacterRow): TestCharacterRow {
     return {
       ...char,
@@ -622,6 +659,7 @@ export function createTestPrisma(): TestPrismaInstance {
       associations: attachAssociations(char),
       inventory: attachInventory(char),
       skillOffers: attachSkillOffers(char),
+      assets: attachPortraitAssets(char),
     }
   }
 
@@ -883,15 +921,13 @@ export function createTestPrisma(): TestPrismaInstance {
       findMany: async ({
         where,
       }: {
-        where?: { kind?: string; archived?: boolean; patronId?: string | null }
+        where?: { kind?: string; archived?: boolean }
       }) => {
         let results = [...catalog.values()]
         if (where?.kind != null)
           results = results.filter((r) => r.kind === where.kind)
         if (where?.archived != null)
           results = results.filter((r) => r.archived === where.archived)
-        if (where?.patronId != null)
-          results = results.filter((r) => r.patronId === where.patronId)
         return results
       },
       create: async ({ data }: { data: Record<string, unknown> }) => {
@@ -923,7 +959,6 @@ export function createTestPrisma(): TestPrismaInstance {
           gradeDescriptions:
             (data.gradeDescriptions as Record<string, string> | undefined) ??
             {},
-          patronId: (data.patronId as string | null) ?? null,
           createdAt: now,
           updatedAt: now,
         }
@@ -950,8 +985,6 @@ export function createTestPrisma(): TestPrismaInstance {
         if (data.archived != null) updated.archived = data.archived as boolean
         if (data.config !== undefined)
           updated.config = data.config as Record<string, unknown>
-        if (data.patronId !== undefined)
-          updated.patronId = data.patronId as string | null
         if (data.gradeDescriptions !== undefined) {
           updated.gradeDescriptions = data.gradeDescriptions as Record<
             string,
@@ -1015,6 +1048,7 @@ export function createTestPrisma(): TestPrismaInstance {
             | "TRANSCENDENT",
           legacyUnowned: (data.legacyUnowned as boolean) ?? false,
           equipmentPosition: (data.equipmentPosition as string | null) ?? null,
+          blessingTier: (data.blessingTier as string | null) ?? null,
           createdAt: new Date(),
           definition: catalog.get(data.definitionId as string) ?? null,
         }
@@ -1485,6 +1519,7 @@ export function createTestPrisma(): TestPrismaInstance {
       events,
       skillOffers,
       skillOfferOptions,
+      assets,
       drafts,
       users,
       houseRules,
@@ -1500,7 +1535,6 @@ export function createTestPrisma(): TestPrismaInstance {
           sourceUrl: row.sourceUrl ?? null,
           archived: row.archived ?? false,
           gradeDescriptions: row.gradeDescriptions ?? {},
-          patronId: row.patronId ?? null,
           createdAt: new Date(),
           updatedAt: new Date(),
         }
@@ -1531,6 +1565,22 @@ export function createTestPrisma(): TestPrismaInstance {
           updatedAt: row.updatedAt ?? new Date(),
         }
         characters.set(full.id, full)
+        return full
+      },
+      addAsset(row) {
+        const now = new Date()
+        const full: TestAssetRow = {
+          id: row.id,
+          kind: row.kind ?? PORTRAIT_KIND,
+          url: row.url ?? `/api/assets/${row.id}`,
+          characterId: row.characterId ?? null,
+          fileName: row.fileName ?? null,
+          mimeType: row.mimeType ?? null,
+          sizeBytes: row.sizeBytes ?? null,
+          createdAt: row.createdAt ?? now,
+          updatedAt: row.updatedAt ?? now,
+        }
+        assets.push(full)
         return full
       },
       addDraft(row) {
@@ -1582,6 +1632,7 @@ export function createTestPrisma(): TestPrismaInstance {
           kind: row.kind,
           legacyUnowned: row.legacyUnowned ?? false,
           equipmentPosition: row.equipmentPosition ?? null,
+          blessingTier: row.blessingTier ?? null,
           createdAt: row.createdAt ?? new Date(),
           definition: catalog.get(row.definitionId) ?? null,
         }
@@ -1611,6 +1662,7 @@ export function createTestPrisma(): TestPrismaInstance {
         events.splice(0, events.length)
         skillOffers.splice(0, skillOffers.length)
         skillOfferOptions.splice(0, skillOfferOptions.length)
+        assets.splice(0, assets.length)
         drafts.clear()
         users.clear()
         houseRules.clear()

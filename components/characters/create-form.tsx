@@ -39,6 +39,20 @@ import {
 
 const STORAGE_KEY = "primal-create-draft"
 
+// The eight-tier blessing hierarchy a god's blessing may be granted at. A
+// blessing link is a god + exact tier; the tier is persisted verbatim on the
+// link and the live effect is synthesized from the god's `blessingEffects[tier]`.
+const BLESSING_TIERS = [
+  "Baptism",
+  "Minor",
+  "Lesser",
+  "Intermediate",
+  "Major",
+  "Greater",
+  "Divine",
+  "True",
+] as const
+
 /**
  * Normalize a character-profile metadata field for the POST body. Converts ONLY
  * the exact empty string `""` to null (a blank field is omitted/cleared) and
@@ -109,7 +123,7 @@ interface Draft {
   biography: string | null
   notes: string | null
   specialAbilities: {
-    blessingId: string | null
+    blessing: { godId: string; tier: string } | null
     bloodlineIds: string[]
     transcendentSkillIds: string[]
   }
@@ -133,7 +147,7 @@ const EMPTY_DRAFT: Draft = {
   biography: null,
   notes: null,
   specialAbilities: {
-    blessingId: null,
+    blessing: null,
     bloodlineIds: [],
     transcendentSkillIds: [],
   },
@@ -152,14 +166,24 @@ function normalizeSpecialAbilities(raw: unknown): Draft["specialAbilities"] {
     raw && typeof raw === "object" && !Array.isArray(raw)
       ? (raw as Record<string, unknown>)
       : {}
-  const blessingId = typeof src.blessingId === "string" ? src.blessingId : null
+  let blessing: { godId: string; tier: string } | null = null
+  const stored = src.blessing
+  if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+    const b = stored as Record<string, unknown>
+    if (typeof b.godId === "string") {
+      blessing = {
+        godId: b.godId,
+        tier: typeof b.tier === "string" ? b.tier : "Minor",
+      }
+    }
+  }
   const bloodlineIds = Array.isArray(src.bloodlineIds)
     ? src.bloodlineIds.filter((x): x is string => typeof x === "string")
     : []
   const transcendentSkillIds = Array.isArray(src.transcendentSkillIds)
     ? src.transcendentSkillIds.filter((x): x is string => typeof x === "string")
     : []
-  return { blessingId, bloodlineIds, transcendentSkillIds }
+  return { blessing, bloodlineIds, transcendentSkillIds }
 }
 
 /**
@@ -253,7 +277,7 @@ function toServerData(
   // character feature.
   data.special = false
   data.specialAbilities = {
-    blessingId: draft.specialAbilities.blessingId ?? null,
+    blessing: draft.specialAbilities.blessing ?? undefined,
     bloodlineIds: [...(draft.specialAbilities.bloodlineIds ?? [])].sort(),
     transcendentSkillIds: [
       ...(draft.specialAbilities.transcendentSkillIds ?? []),
@@ -289,7 +313,7 @@ function fromServerData(data: DraftData): Partial<Draft> {
     d.special = data.special ? "yes" : "none"
   if (data.specialAbilities)
     d.specialAbilities = {
-      blessingId: data.specialAbilities.blessingId ?? null,
+      blessing: data.specialAbilities.blessing ?? null,
       bloodlineIds: data.specialAbilities.bloodlineIds ?? [],
       transcendentSkillIds: data.specialAbilities.transcendentSkillIds ?? [],
     }
@@ -378,7 +402,7 @@ function hasContent(draft: Draft): boolean {
     draft.raceId.length > 0 ||
     draft.classId.length > 0 ||
     draft.professionId.length > 0 ||
-    !!draft.specialAbilities.blessingId ||
+    !!draft.specialAbilities.blessing ||
     draft.specialAbilities.bloodlineIds.length > 0 ||
     draft.specialAbilities.transcendentSkillIds.length > 0 ||
     draft.special === "yes" ||
@@ -409,7 +433,8 @@ function draftsDiffer(a: Draft, b: Draft): boolean {
     a.raceId !== b.raceId ||
     a.classId !== b.classId ||
     a.professionId !== b.professionId ||
-    a.specialAbilities.blessingId !== b.specialAbilities.blessingId ||
+    a.specialAbilities.blessing?.godId !== b.specialAbilities.blessing?.godId ||
+    a.specialAbilities.blessing?.tier !== b.specialAbilities.blessing?.tier ||
     JSON.stringify([...a.specialAbilities.bloodlineIds].sort()) !==
       JSON.stringify([...b.specialAbilities.bloodlineIds].sort()) ||
     JSON.stringify([...a.specialAbilities.transcendentSkillIds].sort()) !==
@@ -446,10 +471,10 @@ function specialValidationError(
   bloodlines: CatalogItem[] | null,
   transcendentSkills: CatalogItem[] | null
 ): string | null {
-  const { blessingId, bloodlineIds, transcendentSkillIds } =
+  const { blessing, bloodlineIds, transcendentSkillIds } =
     draft.specialAbilities
   const anySelection =
-    !!blessingId || bloodlineIds.length > 0 || transcendentSkillIds.length > 0
+    !!blessing || bloodlineIds.length > 0 || transcendentSkillIds.length > 0
   // No selection: nothing to validate, so submission can proceed even when the
   // ability catalogs failed (the base catalogs gate the required race/class items).
   if (!anySelection) return null
@@ -458,13 +483,13 @@ function specialValidationError(
     return "Ability catalogs could not be loaded. Retry to validate the selected abilities."
   }
 
-  if (blessingId) {
-    const blessing = blessings.find((b) => b.id === blessingId)
-    if (!blessing) {
-      return `The selected blessing "${blessingId}" is no longer in the catalog. Re-select a blessing or choose None.`
+  if (blessing) {
+    const god = blessings.find((b) => b.id === blessing.godId)
+    if (!god) {
+      return `The selected blessing god "${blessing.godId}" is no longer in the catalog. Re-select a god or choose None.`
     }
-    if (blessing.archived) {
-      return `The selected blessing "${blessing.name}" is archived and cannot be linked. Re-select an available blessing or choose None.`
+    if (god.archived) {
+      return `The selected blessing god "${god.name}" is archived and cannot be linked. Re-select an available god or choose None.`
     }
   }
 
@@ -711,7 +736,7 @@ export function CreateCharacterForm() {
   const loadAbilityCatalogs = React.useCallback(async (): Promise<boolean> => {
     try {
       const [blessingRes, bloodlineRes, skillRes] = await Promise.all([
-        apiFetch<CatalogListResponse>("/api/catalog/blessings"),
+        apiFetch<CatalogListResponse>("/api/catalog/gods"),
         apiFetch<CatalogListResponse>("/api/catalog/bloodlines"),
         apiFetch<CatalogListResponse>("/api/catalog/transcendent_skills"),
       ])
@@ -1760,13 +1785,13 @@ export function CreateCharacterForm() {
                   <QuestionnaireChoices>
                     <QuestionnaireChoice
                       value=""
-                      checked={!draft.specialAbilities.blessingId}
+                      checked={!draft.specialAbilities.blessing}
                       onChange={() =>
                         setDraft((d) => ({
                           ...d,
                           specialAbilities: {
                             ...d.specialAbilities,
-                            blessingId: null,
+                            blessing: null,
                           },
                         }))
                       }
@@ -1777,21 +1802,32 @@ export function CreateCharacterForm() {
                       ?.filter(
                         (x) =>
                           !x.archived ||
-                          x.id === draft.specialAbilities.blessingId
+                          x.id === draft.specialAbilities.blessing?.godId
                       )
                       .map((x) => (
                         <QuestionnaireChoice
                           key={x.id}
                           value={x.id}
-                          checked={draft.specialAbilities.blessingId === x.id}
+                          checked={
+                            draft.specialAbilities.blessing?.godId === x.id
+                          }
                           onChange={() =>
-                            setDraft((d) => ({
-                              ...d,
-                              specialAbilities: {
-                                ...d.specialAbilities,
-                                blessingId: x.id,
-                              },
-                            }))
+                            setDraft((d) => {
+                              const current = d.specialAbilities.blessing
+                              return {
+                                ...d,
+                                specialAbilities: {
+                                  ...d.specialAbilities,
+                                  blessing: {
+                                    godId: x.id,
+                                    tier:
+                                      current?.godId === x.id
+                                        ? current.tier
+                                        : "Minor",
+                                  },
+                                },
+                              }
+                            })
                           }
                         >
                           {x.name}
@@ -1806,6 +1842,33 @@ export function CreateCharacterForm() {
                         </QuestionnaireChoice>
                       ))}
                   </QuestionnaireChoices>
+                  {draft.specialAbilities.blessing ? (
+                    <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                      <span>Blessing tier</span>
+                      <select
+                        className="rounded-md border p-1.5 text-sm"
+                        value={draft.specialAbilities.blessing.tier}
+                        onChange={(e) =>
+                          setDraft((d) => ({
+                            ...d,
+                            specialAbilities: {
+                              ...d.specialAbilities,
+                              blessing: {
+                                ...d.specialAbilities.blessing!,
+                                tier: e.target.value,
+                              },
+                            },
+                          }))
+                        }
+                      >
+                        {BLESSING_TIERS.map((tier) => (
+                          <option key={tier} value={tier}>
+                            {tier}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
                 </section>
                 {blessings && bloodlines && transcendentSkills ? (
                   <>
@@ -2075,9 +2138,9 @@ export function CreateCharacterForm() {
               <QuestionnaireItem name="review">
                 <QuestionnaireTitle>Review</QuestionnaireTitle>
                 <QuestionnaireDescription>
-                  Confirm your choices. Attributes are calculated server-side;
-                  at level 0 your base attributes are all 0 with no awards
-                  granted yet.
+                  Confirm your choices. Stats are calculated server-side; at
+                  level 0 your base attributes are all 0 with no awards granted
+                  yet.
                 </QuestionnaireDescription>
                 <div className="flex flex-col gap-1 rounded-lg border bg-input/20 p-3 text-xs/relaxed">
                   <div>
@@ -2159,10 +2222,13 @@ export function CreateCharacterForm() {
                       Special abilities:{" "}
                     </span>
                     {[
-                      draft.specialAbilities.blessingId &&
-                        blessings?.find(
-                          (x) => x.id === draft.specialAbilities.blessingId
-                        )?.name,
+                      draft.specialAbilities.blessing &&
+                        `${draft.specialAbilities.blessing.tier} Blessing of ${
+                          blessings?.find(
+                            (x) =>
+                              x.id === draft.specialAbilities.blessing?.godId
+                          )?.name ?? draft.specialAbilities.blessing.godId
+                        }`,
                       ...draft.specialAbilities.bloodlineIds.map(
                         (id) =>
                           bloodlines?.find((x) => x.id === id)?.name ??

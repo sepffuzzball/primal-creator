@@ -9,7 +9,6 @@ import {
   applyEvolve,
   associateCharacter,
   buildRulesConfig,
-  consumeCharacter,
   createCatalogItem,
   createCharacter,
   createInitialState,
@@ -39,6 +38,7 @@ import {
   IMPORT_SCHEMA_V4,
   IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
+  IMPORT_SCHEMA_V7,
   IMPORT_RULESET_VERSION,
   characterImportDocumentSchema,
   type CharacterImportDocument,
@@ -835,6 +835,17 @@ describe("optimistic concurrency (CAS)", () => {
   })
 
   it("evolveCharacter rejects a stale version and never writes a stale event", async () => {
+    dbMock.store.addCatalog({
+      id: "race-2",
+      kind: "races",
+      stableId: "elf",
+      name: "Elf",
+      config: {
+        raceDefinitions: {
+          F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+        },
+      },
+    })
     const state = createInitialState("integrated", null, null)
     state.tracks.class = { level: 20, quarter: 0, definitionId: "archer:F" }
     seedCharacter({ state: serializeState(state), version: 1 })
@@ -844,7 +855,11 @@ describe("optimistic concurrency (CAS)", () => {
     // so it must 409 on the stale version rather than write an event or grade.
     await updateCharacter("chr-1", { name: "Renamed", version: 1 }, user)
     await expect(
-      evolveCharacter("chr-1", { grade: "F", version: 1 }, user)
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-2", version: 1 },
+        user
+      )
     ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
 
     const fresh = dbMock.store.characters.get("chr-1")!
@@ -855,12 +870,31 @@ describe("optimistic concurrency (CAS)", () => {
   })
 
   it("evolveCharacter handles two concurrent same-version requests with one winner", async () => {
+    dbMock.store.addCatalog({
+      id: "race-2",
+      kind: "races",
+      stableId: "elf",
+      name: "Elf",
+      config: {
+        raceDefinitions: {
+          F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+        },
+      },
+    })
     const state = createInitialState("integrated", null, null)
     state.tracks.class = { level: 20, quarter: 0, definitionId: "archer:F" }
     seedCharacter({ state: serializeState(state), version: 2 })
     const results = await Promise.allSettled([
-      evolveCharacter("chr-1", { grade: "F", version: 2 }, user),
-      evolveCharacter("chr-1", { grade: "F", version: 2 }, user),
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-2", version: 2 },
+        user
+      ),
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-2", version: 2 },
+        user
+      ),
     ])
     const fulfilled = results.filter((r) => r.status === "fulfilled")
     const rejected = results.filter((r) => r.status === "rejected")
@@ -1490,12 +1524,26 @@ describe("createCharacter special abilities (atomic selection)", () => {
     config: Record<string, unknown>,
     extra: Partial<{ archived: boolean }> = {}
   ): unknown {
+    // A blessing link now points at a `gods` definition; the legacy `blessings`
+    // catalog kind is retired. Accept BOTH the modern god config ({blessingEffects})
+    // and the legacy blessing config ({tier, effects}) so existing fixtures keep
+    // their shape: the legacy shape is normalized into a single blessingEffects
+    // entry. The god id is used directly as the association definitionId.
+    const normalized =
+      config.blessingEffects != null
+        ? { ...config }
+        : {
+            blessingEffects: {
+              [(config.tier as string | undefined) ?? "Minor"]:
+                config.effects ?? [],
+            },
+          }
     return dbMock.store.addCatalog({
       id,
-      kind: "blessings",
+      kind: "gods",
       stableId: id,
       name: `Blessing ${id}`,
-      config,
+      config: normalized,
       ...(extra.archived != null ? { archived: extra.archived } : {}),
     })
   }
@@ -1561,7 +1609,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
         raceId: "race-1",
         classId: "cls-1",
         specialAbilities: {
-          blessingId: "bless-1",
+          blessing: { godId: "bless-1", tier: "Minor" },
           bloodlineIds: ["blood-1"],
           transcendentSkillIds: ["trans-1"],
         },
@@ -1616,7 +1664,9 @@ describe("createCharacter special abilities (atomic selection)", () => {
           origin: "integrated",
           raceId: "race-1",
           classId: "cls-1",
-          specialAbilities: { blessingId: "missing-bless" },
+          specialAbilities: {
+            blessing: { godId: "missing-bless", tier: "Minor" },
+          },
         },
         user
       )
@@ -1637,7 +1687,9 @@ describe("createCharacter special abilities (atomic selection)", () => {
           origin: "integrated",
           raceId: "race-1",
           classId: "cls-1",
-          specialAbilities: { blessingId: "blood-1" },
+          specialAbilities: {
+            blessing: { godId: "blood-1", tier: "Minor" },
+          },
         },
         user
       )
@@ -1657,7 +1709,9 @@ describe("createCharacter special abilities (atomic selection)", () => {
           origin: "integrated",
           raceId: "race-1",
           classId: "cls-1",
-          specialAbilities: { blessingId: "bless-1" },
+          specialAbilities: {
+            blessing: { godId: "bless-1", tier: "Minor" },
+          },
         },
         user
       )
@@ -1747,7 +1801,9 @@ describe("createCharacter special abilities (atomic selection)", () => {
           origin: "integrated",
           raceId: "race-1",
           classId: "cls-1",
-          specialAbilities: { blessingId: "bless-1" },
+          specialAbilities: {
+            blessing: { godId: "bless-1", tier: "Minor" },
+          },
           draftVersion: 3,
         },
         user
@@ -2337,6 +2393,80 @@ describe("associateCharacter (titles / equipment)", () => {
     )
     const phases = strengthTrace?.phases.map((p) => p.phase) ?? []
     expect(phases).not.toContain("equipment-percent")
+  })
+
+  it("synthesizes derived HP/MP/SP maxima bonuses from catalog config without disturbing attribute caps", async () => {
+    // Base attributes large enough that the 20%/15% attribute equipment caps apply
+    // to the flat attribute bonus but never touch the derived resource maxima.
+    seedCharacterWithBase({ vitality: 100, wisdom: 100, endurance: 100 })
+    seedEquipment("gear-derived", {
+      slot: "head",
+      bonus: { vitality: 10 },
+      derivedFlat: { hp: 50, mp: 25 },
+      derivedPercentBasisPoints: { hp: 1000, mp: 2000 }, // 10% HP / 20% MP
+    })
+    seedStock("gear-derived")
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-derived",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const items = res.character.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    // The attribute equipment bonus is capped as usual: vitality 10 on base 100
+    // (20% individual cap = 20, 15% overall cap = 15) applies fully.
+    expect(items[0].requested.vitality).toBe(10)
+    expect(items[0].applied.vitality).toBe(10)
+    expect(items[0].suppressed.vitality).toBe(0)
+    // The derived resource maxima are computed independently of the attribute caps.
+    const derived = res.character.status?.derivedStats
+    expect(derived).toBeDefined()
+    // HP base = final vitality (110) * 10 = 1100; flat +50; percent
+    // floor((1100 + 50) * 0.1) = 115 => 1265.
+    expect(derived?.hp).toBe(1265)
+    // MP base = wisdom (100) * 10 = 1000; flat +25; percent
+    // floor((1000 + 25) * 0.2) = 205 => 1230.
+    expect(derived?.mp).toBe(1230)
+    // SP base = endurance (100) * 10 = 1000; no flat / percent => 1000.
+    expect(derived?.sp).toBe(1000)
+  })
+
+  it("keeps equipment derived HP/MP/SP bonuses inert while the item is ineligible", async () => {
+    seedCharacterWithBase({ vitality: 100, wisdom: 100, endurance: 100 })
+    // The character's race level is 0, below the declared requirement.
+    seedEquipment("gear-inel-derived", {
+      slot: "head",
+      bonus: { vitality: 10 },
+      derivedFlat: { hp: 50, mp: 25 },
+      derivedPercentBasisPoints: { hp: 1000, mp: 2000 },
+      minRaceLevel: 5,
+    })
+    seedStock("gear-inel-derived")
+    // Link the item directly (bypassing the associateCharacter add gate, which
+    // rejects an unmet requirement with a 400) so the ineligible link can be read
+    // live and proven inert.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-inel-derived",
+      kind: "EQUIPMENT",
+    })
+    const detail = await getCharacter("chr-1", user)
+    const items = detail.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    // Ineligible => flat attribute bonus is inert (no request, no contribution).
+    expect(items[0].requested.vitality).toBe(0)
+    expect(items[0].applied.vitality).toBe(0)
+    expect(items[0].suppressed.vitality).toBe(0)
+    // The derived HP/MP/SP maxima bonuses are inert too: only the base remains.
+    const derived = detail.status?.derivedStats
+    expect(derived?.hp).toBe(1000)
+    expect(derived?.mp).toBe(1000)
+    expect(derived?.sp).toBe(1000)
   })
 
   it("equipment add replaces the item currently equipped in the same slot", async () => {
@@ -3263,10 +3393,10 @@ describe("ranked title progression (associateCharacter)", () => {
     })
     dbMock.store.addCatalog({
       id: "bless-baptism",
-      kind: "blessings",
+      kind: "gods",
       stableId: "bless-baptism",
       name: "Baptism Blessing",
-      config: { tier: "Baptism", effects: [] },
+      config: { blessingEffects: { Baptism: [] } },
     })
     const res = await associateCharacter(
       "chr-1",
@@ -3275,6 +3405,7 @@ describe("ranked title progression (associateCharacter)", () => {
         definitionId: "bless-baptism",
         operation: "add",
         version: 0,
+        tier: "Baptism",
       },
       user
     )
@@ -3447,12 +3578,23 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     config: Record<string, unknown>,
     extra: Partial<{ name: string; archived: boolean }> = {}
   ): unknown {
+    // A blessing link points at a `gods` definition; normalize the legacy
+    // `{tier, effects}` blessing config into a god `blessingEffects` entry.
+    const normalized =
+      config.blessingEffects != null
+        ? { ...config }
+        : {
+            blessingEffects: {
+              [(config.tier as string | undefined) ?? "Minor"]:
+                config.effects ?? [],
+            },
+          }
     return dbMock.store.addCatalog({
       id,
-      kind: "blessings",
+      kind: "gods",
       stableId: id,
       name: extra.name ?? `Blessing ${id}`,
-      config,
+      config: normalized,
       ...(extra.archived != null ? { archived: extra.archived } : {}),
     })
   }
@@ -3497,6 +3639,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-1",
         operation: "add",
         version: 0,
+        tier: "Minor",
       },
       user
     )
@@ -3527,10 +3670,33 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     expect(payload.definition).toMatchObject({
       id: "bless-1",
       name: "Blessing bless-1",
-      kind: "blessings",
+      kind: "gods",
       stableId: "bless-1",
       tier: "Minor",
     })
+  })
+
+  it("rejects a blessing add that omits the tier with 400 invalid_blessing_tier", async () => {
+    seedCharacter()
+    seedBlessing("bless-1", {
+      tier: "Minor",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "blessing",
+          definitionId: "bless-1",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_blessing_tier" })
+    // Nothing was written: no association link and no event.
+    expect(dbMock.store.associations).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(0)
   })
 
   it("blessing add atomically replaces ALL existing blessing links, including archived", async () => {
@@ -3566,6 +3732,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-new",
         operation: "add",
         version: 0,
+        tier: "Greater",
       },
       user
     )
@@ -3601,6 +3768,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-1",
         operation: "add",
         version: 0,
+        tier: "Minor",
       },
       user
     )
@@ -3611,6 +3779,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-2",
         operation: "add",
         version: 1,
+        tier: "Minor",
       },
       user
     )
@@ -3655,6 +3824,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-1",
         operation: "add",
         version: 0,
+        tier: "Minor",
       },
       user
     )
@@ -3715,6 +3885,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-1",
         operation: "add",
         version: 0,
+        tier: "Minor",
       },
       user
     )
@@ -3730,6 +3901,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
           definitionId: "bless-2",
           operation: "add",
           version: 0,
+          tier: "Greater",
         },
         user
       )
@@ -3754,15 +3926,16 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-1",
         operation: "add",
         version: 0,
+        tier: "Minor",
       },
       user
     )
     dbMock.store.addCatalog({
       id: "bless-1",
-      kind: "blessings",
+      kind: "gods",
       stableId: "bless-1",
       name: "Blessing bless-1",
-      config: { tier: "Minor", effects: [] },
+      config: { blessingEffects: { Minor: [] } },
       archived: true,
     })
     const res = await associateCharacter(
@@ -3896,6 +4069,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-cond",
         operation: "add",
         version: 0,
+        tier: "Minor",
       },
       user
     )
@@ -3974,6 +4148,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
         definitionId: "bless-live",
         operation: "add",
         version: 0,
+        tier: "Lesser",
       },
       user
     )
@@ -3981,11 +4156,12 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     expect(flatDelta(before.status, "strength")).toBe(5)
     const beforeVersion = before.version
     const beforeState = before.state
-    // Edit the blessing's effect magnitude in the catalog.
-    await updateCatalogItem("blessings", "bless-live", {
+    // Edit the god's blessing effect magnitude for the Lesser tier in the catalog.
+    await updateCatalogItem("gods", "bless-live", {
       config: {
-        tier: "Lesser",
-        effects: [{ phase: "flat", amount: { strength: 10 } }],
+        blessingEffects: {
+          Lesser: [{ phase: "flat", amount: { strength: 10 } }],
+        },
       },
     })
     const after = await getCharacter("chr-1", user)
@@ -4596,12 +4772,23 @@ describe("updateCatalogItem link-collision rejection", () => {
     config: Record<string, unknown>,
     extra: Partial<{ name: string; archived: boolean }> = {}
   ): unknown {
+    // A blessing link points at a `gods` definition; normalize the legacy
+    // `{tier, effects}` blessing config into a god `blessingEffects` entry.
+    const normalized =
+      config.blessingEffects != null
+        ? { ...config }
+        : {
+            blessingEffects: {
+              [(config.tier as string | undefined) ?? "Minor"]:
+                config.effects ?? [],
+            },
+          }
     return dbMock.store.addCatalog({
       id,
-      kind: "blessings",
+      kind: "gods",
       stableId: id,
       name: extra.name ?? `Blessing ${id}`,
-      config,
+      config: normalized,
       ...(extra.archived != null ? { archived: extra.archived } : {}),
     })
   }
@@ -4854,14 +5041,14 @@ describe("updateCatalogItem link-collision rejection", () => {
     ).toBeUndefined()
   })
 
-  it("rejects a blessing unarchive that would leave a character with two active blessings (409)", async () => {
+  it("unarchiving a god linked as a blessing succeeds even with another blessing link (gods are collision-exempt)", async () => {
     seedState()
     seedBlessing("bless-1", {
       tier: "Minor",
       effects: [{ phase: "flat", amount: { strength: 5 } }],
     })
-    // bless-2 is currently archived, so the character legitimately has only one
-    // active blessing link. Unarchiving it would produce a second active one.
+    // bless-2 is currently archived; unarchiving it is a gods config edit, and the
+    // service no longer applies slot/upgrade-group collision checks to gods.
     seedBlessing(
       "bless-2",
       { tier: "Lesser", effects: [{ phase: "flat", amount: { strength: 3 } }] },
@@ -4877,14 +5064,15 @@ describe("updateCatalogItem link-collision rejection", () => {
       definitionId: "bless-2",
       kind: "BLESSING",
     })
-    await expect(
-      updateCatalogItem("blessings", "bless-2", { archived: false })
-    ).rejects.toMatchObject({ status: 409, code: "link_collision" })
-    // The unarchive never applied - bless-2 stays archived.
-    expect(dbMock.store.catalog.get("bless-2")!.archived).toBe(true)
+    const item = await updateCatalogItem("gods", "bless-2", {
+      archived: false,
+    })
+    // The unarchive applied - bless-2 is now active.
+    expect(item.archived).toBe(false)
+    expect(dbMock.store.catalog.get("bless-2")!.archived).toBe(false)
   })
 
-  it("rejects a blessing config edit that would leave a character with two active blessings (409)", async () => {
+  it("applies a config edit to a god linked as a blessing without a collision (409)", async () => {
     seedState()
     seedBlessing("bless-1", {
       tier: "Minor",
@@ -4906,20 +5094,24 @@ describe("updateCatalogItem link-collision rejection", () => {
       definitionId: "bless-2",
       kind: "BLESSING",
     })
-    // Editing the archived link's config while unarchiving it collides too.
-    await expect(
-      updateCatalogItem("blessings", "bless-2", {
-        archived: false,
-        config: {
-          tier: "Greater",
-          effects: [{ phase: "flat", amount: { strength: 9 } }],
+    // Editing the god's blessingEffects config while unarchiving it does not collide.
+    const item = await updateCatalogItem("gods", "bless-2", {
+      archived: false,
+      config: {
+        blessingEffects: {
+          Greater: [{ phase: "flat", amount: { strength: 9 } }],
         },
-      })
-    ).rejects.toMatchObject({ status: 409, code: "link_collision" })
-    expect(dbMock.store.catalog.get("bless-2")!.archived).toBe(true)
+      },
+    })
+    expect(item.archived).toBe(false)
+    expect(item.config).toMatchObject({
+      blessingEffects: {
+        Greater: [{ phase: "flat", amount: { strength: 9 } }],
+      },
+    })
   })
 
-  it("allows unarchiving a blessing when the character has no other active blessing", async () => {
+  it("allows unarchiving a god when the character has no other active blessing", async () => {
     seedState()
     seedBlessing(
       "bless-1",
@@ -4931,7 +5123,7 @@ describe("updateCatalogItem link-collision rejection", () => {
       definitionId: "bless-1",
       kind: "BLESSING",
     })
-    const item = await updateCatalogItem("blessings", "bless-1", {
+    const item = await updateCatalogItem("gods", "bless-1", {
       archived: false,
     })
     expect(item.archived).toBe(false)
@@ -5372,7 +5564,7 @@ describe("exportCharacter (associations / live state)", () => {
       user
     )
     const portable = await exportCharacter("chr-1", user)
-    expect(portable.schema).toBe("primal-character/6")
+    expect(portable.schema).toBe("primal-character/7")
     expect(portable.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(portable.identity).toMatchObject({
       name: "Test",
@@ -5592,80 +5784,40 @@ describe("exportCharacter (associations / live state)", () => {
   })
 })
 
-describe("race evolution path choices", () => {
+describe("race evolution (next-grade candidates)", () => {
   beforeEach(() => {
     dbMock.store.reset()
   })
 
-  const validPathConfig = {
-    track: "race",
-    fromRaceStableId: "human",
-    toRaceStableId: "elf",
-    fromGrade: "G",
-    toGrade: "F",
-  }
-
-  function seedHumanRace() {
-    dbMock.store.addCatalog({
-      id: "race-human",
-      kind: "races",
-      stableId: "human",
-      name: "Human",
-      config: {
-        raceDefinitions: {
-          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
-        },
-      },
-    })
-  }
-
-  function seedElfRace() {
-    dbMock.store.addCatalog({
-      id: "race-elf",
-      kind: "races",
-      stableId: "elf",
-      name: "Elf",
-      config: {
-        raceDefinitions: {
-          F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
-        },
-      },
-    })
-  }
-
-  function seedEvolution(
+  function seedRace(
     id: string,
+    stableId: string,
     name: string,
     config: Record<string, unknown>,
     extra: Partial<{ archived: boolean }> = {}
   ) {
     dbMock.store.addCatalog({
       id,
-      kind: "evolutions",
-      stableId: id,
+      kind: "races",
+      stableId,
       name,
       config,
       ...extra,
     })
   }
 
-  function seedTitle(id: string, stableId: string) {
+  function seedClass(
+    id: string,
+    stableId: string,
+    name: string,
+    grades: Record<string, { fixed: Record<string, number>; free: number }>
+  ) {
     dbMock.store.addCatalog({
       id,
-      kind: "titles",
+      kind: "classes",
       stableId,
-      name: `Title ${id}`,
-      config: { flat: { strength: 1 } },
-    })
-  }
-
-  function seedSkill(id: string, stableId: string) {
-    dbMock.store.addCatalog({
-      id,
-      kind: "skills",
-      stableId,
-      name: `Skill ${id}`,
-      config: { effects: [{ phase: "flat", amount: { strength: 1 } }] },
+      name,
+      config: { grades },
     })
   }
 
@@ -5690,162 +5842,239 @@ describe("race evolution path choices", () => {
     })
   }
 
-  it("builds options from a valid unarchived race path matching current race/grade and the next grade", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+  it("builds next-grade candidates from unarchived races sharing the raceType", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
+    })
+    seedRace("race-dwarf", "dwarf", "Dwarf", {
+      raceDefinitions: {
+        F: { id: "dwarf:F", perLevel: { strength: 2 }, freePerLevel: 2 },
+      },
+    })
+    // A monster race advances in a different mode, so it must not be offered to an
+    // enlightened race.
+    seedRace("race-beast", "beast", "Beast", {
+      raceType: "monster",
+      naturalGrade: "F",
+      raceDefinitions: {
+        F: { id: "beast:F", perLevel: { strength: 3 }, freePerLevel: 2 },
+      },
+    })
     seedCharacter()
 
     const res = await getEvolutionOptions("chr-1", user)
-    expect(res.options).toHaveLength(1)
-    expect(res.options[0]).toMatchObject({
-      id: "evo-1",
-      name: "Human to Elf",
-      fromGrade: "G",
-      toGrade: "F",
-      toTrackName: "Elf",
-      track: "race",
-      sourceUrl: null,
-      eligible: true,
-      blockers: [],
-      manualReview: false,
-    })
     expect(res.legacyAvailable).toBe(false)
+    expect(res.options.map((o) => o.id).sort()).toEqual([
+      "race-dwarf",
+      "race-elf",
+    ])
+    for (const option of res.options) {
+      expect(option).toMatchObject({
+        fromGrade: "G",
+        toGrade: "F",
+        track: "race",
+        eligible: true,
+        blockers: [],
+      })
+      expect(option.toTrackName).toBe(option.name)
+    }
   })
 
-  it("marks an option blocked by minRaceLevel and required title/skill, then clears once met", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedTitle("title-1", "hero")
-    seedSkill("skill-1", "arcane")
-    seedEvolution("evo-1", "Ascension", {
-      ...validPathConfig,
-      minRaceLevel: 12,
-      requiredTitleStableIds: ["hero"],
-      requiredSkillStableIds: ["arcane"],
+  it("filters out archived, missing-next-grade and raceType-mismatched destinations", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
+    })
+    seedRace(
+      "race-archived",
+      "archived",
+      "Archived",
+      {
+        raceDefinitions: {
+          F: { id: "archived:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+      { archived: true }
+    )
+    seedRace("race-no-f", "no-f", "NoF", {
+      raceDefinitions: {
+        G: { id: "no-f:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-beast", "beast", "Beast", {
+      raceType: "monster",
+      raceDefinitions: {
+        F: { id: "beast:F", perLevel: { strength: 3 }, freePerLevel: 2 },
+      },
     })
     seedCharacter()
 
-    let res = await getEvolutionOptions("chr-1", user)
+    const res = await getEvolutionOptions("chr-1", user)
+    expect(res.legacyAvailable).toBe(false)
+    expect(res.options.map((o) => o.id)).toEqual(["race-elf"])
+  })
+
+  it("surfaces a grade-band blocker on GET and rejects the same choice on POST", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
+    })
+    // Class level 0 => derived race level 0, below F's entry level (10).
+    const state = createInitialState("integrated", null, null)
+    state.race = { level: 0, grade: "G", mode: "derived", origin: "integrated" }
+    state.tracks.class = { level: 0, quarter: 0, definitionId: "" }
+    seedCharacter({ state: serializeState(state) })
+
+    const res = await getEvolutionOptions("chr-1", user)
     expect(res.options).toHaveLength(1)
     expect(res.options[0].eligible).toBe(false)
-    expect(res.options[0].blockers).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining("race level 12"),
-        expect.stringContaining('title "hero"'),
-        expect.stringContaining('skill "arcane"'),
-      ])
+    expect(res.options[0].blockers).toContain(
+      "race level 0 does not qualify for F (needs 10-24)"
     )
 
-    // Meet every requirement: link the title/skill and raise the race level.
-    dbMock.store.addAssociation({
-      characterId: "chr-1",
-      definitionId: "title-1",
-      kind: "TITLE",
-    })
-    dbMock.store.addAssociation({
-      characterId: "chr-1",
-      definitionId: "skill-1",
-      kind: "SKILL",
-    })
-    const stored = dbMock.store.characters.get("chr-1")!
-    const state = deserializeState(stored.state)
-    stored.state = serializeState({
-      ...state,
-      race: { ...state.race, level: 12 },
-    })
-
-    res = await getEvolutionOptions("chr-1", user)
-    expect(res.options[0].eligible).toBe(true)
-    expect(res.options[0].blockers).toEqual([])
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-elf", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "evolution" })
   })
 
-  it("ignores malformed, archived, wrong-race/grade and missing-destination paths for fallback", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-malformed", "Malformed", {
-      track: "race",
-      fromRaceStableId: "human",
-      toRaceStableId: "elf",
-      fromGrade: "G",
+  it("rejects a POST that would cross raceType with race_type_mismatch and no write", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
     })
-    seedEvolution("evo-archived", "Archived", validPathConfig, {
-      archived: true,
-    })
-    seedEvolution("evo-wrong-grade", "WrongGrade", {
-      ...validPathConfig,
-      fromGrade: "E",
-    })
-    seedEvolution("evo-wrong-race", "WrongRace", {
-      ...validPathConfig,
-      fromRaceStableId: "orc",
-    })
-    seedEvolution("evo-bad-dest", "BadDest", {
-      ...validPathConfig,
-      toRaceStableId: "dragon",
-    })
-    seedEvolution("evo-non-next", "NonNext", {
-      ...validPathConfig,
-      toGrade: "E",
-    })
-    seedCharacter()
-
-    const res = await getEvolutionOptions("chr-1", user)
-    expect(res.options).toHaveLength(0)
-    expect(res.legacyAvailable).toBe(true)
-  })
-
-  it("rejects a legacy grade-only POST with evolution_choice_required even when the path is blocked", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Ascension", {
-      ...validPathConfig,
-      minRaceLevel: 50, // character race level (10) is below this, so blocked
+    seedRace("race-beast", "beast", "Beast", {
+      raceType: "monster",
+      raceDefinitions: {
+        F: { id: "beast:F", perLevel: { strength: 3 }, freePerLevel: 2 },
+      },
     })
     seedCharacter()
 
     await expect(
-      evolveCharacter("chr-1", { grade: "F", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 409, code: "evolution_choice_required" })
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-beast", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "race_type_mismatch" })
 
-    // No evolve event was written; the character is untouched.
     expect(dbMock.store.events).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    const fresh = dbMock.store.characters.get("chr-1")!
+    expect(fresh.raceId).toBe("race-human")
+    expect(fresh.version).toBe(0)
   })
 
-  it("maps a serialization failure (P2034) on evolve to 409 serialization_conflict and rolls back the evolution state/event", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
-    seedCharacter()
-    const before = dbMock.store.characters.get("chr-1")!
-    const beforeState = before.state
-    // A concurrent admin edit to the destination race's config commits while this
-    // evolve is in flight. The SERIALIZABLE transaction detects the conflict and
-    // aborts with P2034, which the service must surface as a 409 rather than a raw
-    // 500, and must not advance the character state or write a stray evolve event.
-    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
-      name: "PrismaClientKnownRequestError",
-      code: "P2034",
+  it("rejects an unknown destination with evolution_destination_missing and no write", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
     })
-    try {
-      await expect(
-        evolveCharacter("chr-1", { optionId: "evo-1", version: 0 }, user)
-      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
-    } finally {
-      spy.mockRestore()
-    }
-    const after = dbMock.store.characters.get("chr-1")!
-    expect(after.state).toBe(beforeState)
-    expect(after.version).toBe(0)
+    seedCharacter()
+
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-nope", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 404,
+      code: "evolution_destination_missing",
+    })
     expect(dbMock.store.events).toHaveLength(0)
   })
 
-  it("evolves along a chosen catalog path to the destination race and grade", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
+  it("rejects an archived destination with catalog_archived and no write", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace(
+      "race-archived",
+      "archived",
+      "Archived",
+      {
+        raceDefinitions: {
+          F: { id: "archived:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+      { archived: true }
+    )
+    seedCharacter()
 
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-archived", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a destination that lacks the next grade's race definition", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-no-f", "no-f", "NoF", {
+      raceDefinitions: {
+        G: { id: "no-f:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedCharacter()
+
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-no-f", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "evolution_destination_definition_missing",
+    })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("evolves a qualifying race to the next grade and preserves class/profession ledgers", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
+    })
     const base = createInitialState("integrated", null, null)
     base.race = { level: 10, grade: "G", mode: "derived", origin: "integrated" }
     base.tracks.class = { level: 20, quarter: 0, definitionId: "" }
@@ -5866,7 +6095,7 @@ describe("race evolution path choices", () => {
 
     const res = await evolveCharacter(
       "chr-1",
-      { optionId: "evo-1", version: 0 },
+      { track: "race", optionId: "race-elf", version: 0 },
       user
     )
     expect(res.character.version).toBe(1)
@@ -5875,7 +6104,6 @@ describe("race evolution path choices", () => {
     const state = deserializeState(res.character.state)
     expect(state.race.grade).toBe("F")
     expect(state.race.definitionId).toBe("elf:F")
-    // Class track, historical awards and allocations are preserved unchanged.
     expect(state.tracks.class.level).toBe(20)
     expect(state.historicalLevelAwards).toHaveLength(1)
     expect(state.historicalLevelAwards[0]).toMatchObject({ track: "class" })
@@ -5883,21 +6111,24 @@ describe("race evolution path choices", () => {
     expect(res.journal).toMatchObject({
       from: "G",
       to: "F",
-      optionId: "evo-1",
+      optionId: "race-elf",
       source: "catalog",
     })
   })
 
   it("uses the destination race definitions for future race awards", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
-    dbMock.store.addCatalog({
-      id: "cls-1",
-      kind: "classes",
-      stableId: "archer",
-      name: "Archer",
-      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
+    })
+    seedClass("cls-1", "archer", "Archer", {
+      F: { fixed: { agility: 2 }, free: 1 },
     })
 
     const state = createInitialState("integrated", null, null)
@@ -5913,7 +6144,7 @@ describe("race evolution path choices", () => {
 
     const evolved = await evolveCharacter(
       "chr-1",
-      { optionId: "evo-1", version: 0 },
+      { track: "race", optionId: "race-elf", version: 0 },
       user
     )
     expect(evolved.character.raceId).toBe("race-elf")
@@ -5933,112 +6164,51 @@ describe("race evolution path choices", () => {
     expect(raceAwards.at(-1)!.definitionId).toBe("elf:F")
   })
 
-  it("does not let a reason bypass a required title/skill", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedTitle("title-1", "hero")
-    seedEvolution("evo-1", "Ascension", {
-      ...validPathConfig,
-      requiredTitleStableIds: ["hero"],
+  it("rolls back a race evolution on a stale version with no event", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
     })
-    seedCharacter()
-
-    await expect(
-      evolveCharacter(
-        "chr-1",
-        { optionId: "evo-1", version: 0, reason: "story" },
-        user
-      )
-    ).rejects.toMatchObject({ status: 400, code: "evolution_prerequisites" })
-  })
-
-  it("bypasses manualRequirementsText only for a nonempty admin reason", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Ascension", {
-      ...validPathConfig,
-      manualRequirementsText: "Requires the blessing of the moon",
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
     })
-    seedCharacter()
-    const admin = { ...user, isAdmin: true }
-
-    // Owner reason does not bypass the narrative gate.
-    await expect(
-      evolveCharacter(
-        "chr-1",
-        { optionId: "evo-1", version: 0, reason: "narrative" },
-        user
-      )
-    ).rejects.toMatchObject({ status: 400, code: "evolution_manual_required" })
-
-    // Admin with no reason does not bypass either.
-    await expect(
-      evolveCharacter("chr-1", { optionId: "evo-1", version: 0 }, admin)
-    ).rejects.toMatchObject({ status: 400, code: "evolution_manual_required" })
-
-    // Admin with a nonempty reason bypasses.
-    const res = await evolveCharacter(
-      "chr-1",
-      { optionId: "evo-1", version: 0, reason: "approved by council" },
-      admin
-    )
-    expect(res.character.raceId).toBe("race-elf")
-    expect(res.journal).toMatchObject({ reason: "approved by council" })
-  })
-
-  it("rolls back a path evolution on a stale version with no event", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Ascension", validPathConfig)
     seedCharacter({ version: 2 })
 
     // An unrelated mutation bumps the version to 3.
     await updateCharacter("chr-1", { name: "Renamed", version: 2 }, user)
 
     await expect(
-      evolveCharacter("chr-1", { optionId: "evo-1", version: 2 }, user)
+      evolveCharacter(
+        "chr-1",
+        { track: "race", optionId: "race-elf", version: 2 },
+        user
+      )
     ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
 
     const fresh = dbMock.store.characters.get("chr-1")!
     expect(fresh.raceId).toBe("race-human")
     expect(fresh.version).toBe(3)
-    // Only the update event was written; the path evolve never committed.
+    // Only the update event was written; the race evolve never committed.
     expect(dbMock.store.events).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("update")
   })
 
-  it("evolves a monster race to a same-type (monster) destination via a catalog path", async () => {
-    dbMock.store.addCatalog({
-      id: "race-wyrm",
-      kind: "races",
-      stableId: "wyrm",
-      name: "Wyrm",
-      config: {
-        raceType: "monster",
-        naturalGrade: "F",
-        raceDefinitions: {
-          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
-        },
+  it("evolves a monster race to a same-type (monster) destination", async () => {
+    seedRace("race-wyrm", "wyrm", "Wyrm", {
+      raceType: "monster",
+      naturalGrade: "F",
+      raceDefinitions: {
+        F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
       },
     })
-    dbMock.store.addCatalog({
-      id: "race-beast",
-      kind: "races",
-      stableId: "beast",
-      name: "Beast",
-      config: {
-        raceType: "monster",
-        raceDefinitions: {
-          E: { id: "beast:E", perLevel: { strength: 3 }, freePerLevel: 2 },
-        },
+    seedRace("race-beast", "beast", "Beast", {
+      raceType: "monster",
+      raceDefinitions: {
+        E: { id: "beast:E", perLevel: { strength: 3 }, freePerLevel: 2 },
       },
-    })
-    seedEvolution("evo-monster", "Wyrm to Beast", {
-      track: "race",
-      fromRaceStableId: "wyrm",
-      toRaceStableId: "beast",
-      fromGrade: "F",
-      toGrade: "E",
     })
 
     const base = createInitialState("born", null, null)
@@ -6054,7 +6224,7 @@ describe("race evolution path choices", () => {
 
     const res = await evolveCharacter(
       "chr-1",
-      { optionId: "evo-monster", version: 0 },
+      { track: "race", optionId: "race-beast", version: 0 },
       user
     )
     expect(res.character.version).toBe(1)
@@ -6067,211 +6237,43 @@ describe("race evolution path choices", () => {
     expect(state.race.definitionId).toBe("beast:E")
   })
 
-  it("rejects a catalog evolution that would cross from enlightened to monster with no write", async () => {
-    seedHumanRace()
-    dbMock.store.addCatalog({
-      id: "race-beast",
-      kind: "races",
-      stableId: "beast",
-      name: "Beast",
-      config: {
-        raceType: "monster",
-        raceDefinitions: {
-          F: { id: "beast:F", perLevel: { strength: 3 }, freePerLevel: 2 },
-        },
+  it("maps a serialization failure (P2034) on evolve to 409 serialization_conflict and rolls back the evolution state/event", async () => {
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
       },
     })
-    seedEvolution("evo-x", "Human to Beast", {
-      track: "race",
-      fromRaceStableId: "human",
-      toRaceStableId: "beast",
-      fromGrade: "G",
-      toGrade: "F",
+    seedRace("race-elf", "elf", "Elf", {
+      raceDefinitions: {
+        F: { id: "elf:F", perLevel: { agility: 2 }, freePerLevel: 2 },
+      },
     })
     seedCharacter()
-
-    await expect(
-      evolveCharacter("chr-1", { optionId: "evo-x", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "race_type_mismatch" })
-
-    // The rejected evolution never committed: no event, no raceId change, no bump.
-    expect(dbMock.store.events).toHaveLength(0)
-    const fresh = dbMock.store.characters.get("chr-1")!
-    expect(fresh.raceId).toBe("race-human")
-    expect(fresh.version).toBe(0)
-  })
-
-  it("rejects a catalog evolution that would cross from monster to enlightened with no write", async () => {
-    dbMock.store.addCatalog({
-      id: "race-wyrm",
-      kind: "races",
-      stableId: "wyrm",
-      name: "Wyrm",
-      config: {
-        raceType: "monster",
-        naturalGrade: "F",
-        raceDefinitions: {
-          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
-        },
-      },
+    const before = dbMock.store.characters.get("chr-1")!
+    const beforeState = before.state
+    // A concurrent admin edit to the destination race's config commits while this
+    // evolve is in flight. The SERIALIZABLE transaction detects the conflict and
+    // aborts with P2034, which the service must surface as a 409 rather than a raw
+    // 500, and must not advance the character state or write a stray evolve event.
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
     })
-    dbMock.store.addCatalog({
-      id: "race-elf-e",
-      kind: "races",
-      stableId: "elf",
-      name: "Elf",
-      config: {
-        raceType: "enlightened",
-        raceDefinitions: {
-          E: { id: "elf:E", perLevel: { agility: 2 }, freePerLevel: 2 },
-        },
-      },
-    })
-    seedEvolution("evo-y", "Wyrm to Elf", {
-      track: "race",
-      fromRaceStableId: "wyrm",
-      toRaceStableId: "elf",
-      fromGrade: "F",
-      toGrade: "E",
-    })
-
-    const base = createInitialState("born", null, null)
-    base.tracks = {}
-    base.race = {
-      level: 30,
-      grade: "F",
-      mode: "independent",
-      origin: "born",
-      quarter: 0,
+    try {
+      await expect(
+        evolveCharacter(
+          "chr-1",
+          { track: "race", optionId: "race-elf", version: 0 },
+          user
+        )
+      ).rejects.toMatchObject({ status: 409, code: "serialization_conflict" })
+    } finally {
+      spy.mockRestore()
     }
-    seedCharacter({ state: serializeState(base), raceId: "race-wyrm" })
-
-    await expect(
-      evolveCharacter("chr-1", { optionId: "evo-y", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "race_type_mismatch" })
-
+    const after = dbMock.store.characters.get("chr-1")!
+    expect(after.state).toBe(beforeState)
+    expect(after.version).toBe(0)
     expect(dbMock.store.events).toHaveLength(0)
-    const fresh = dbMock.store.characters.get("chr-1")!
-    expect(fresh.raceId).toBe("race-wyrm")
-    expect(fresh.version).toBe(0)
-  })
-
-  it("rejects a legacy grade-only evolution to a skip grade even when the race level falls in a higher grade band", async () => {
-    seedHumanRace()
-    // G grade at level 25, which falls in E's published band (entry 25). The only
-    // legitimate target is the NEXT grade (F), so grade-only E must be rejected up
-    // front - the character must never jump a grade.
-    const state = createInitialState("integrated", null, null)
-    state.race = {
-      level: 25,
-      grade: "G",
-      mode: "derived",
-      origin: "integrated",
-    }
-    seedCharacter({ state: serializeState(state) })
-
-    await expect(
-      evolveCharacter("chr-1", { grade: "E", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "invalid_evolution_grade" })
-
-    // No evolve event was written; the character is untouched.
-    expect(dbMock.store.events).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-  })
-
-  it("rejects a catalog path that skips the next grade even when the race level falls in a higher grade band", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-skip", "Human to Elf (skip E)", {
-      ...validPathConfig,
-      toGrade: "E",
-    })
-    const state = createInitialState("integrated", null, null)
-    state.race = {
-      level: 25,
-      grade: "G",
-      mode: "derived",
-      origin: "integrated",
-    }
-    seedCharacter({ state: serializeState(state) })
-
-    await expect(
-      evolveCharacter("chr-1", { optionId: "evo-skip", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "invalid_evolution_grade" })
-
-    // No evolve event was written; the character is untouched.
-    expect(dbMock.store.events).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-  })
-
-  it("still evolves along a path to the NEXT grade when the race level falls in a higher grade band", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
-    // Level 20 keeps the target (F) within its grade band (entry 10, max 24), so
-    // the next-grade path must not be rejected by the new skip-grade guard.
-    const state = createInitialState("integrated", null, null)
-    state.race = {
-      level: 20,
-      grade: "G",
-      mode: "derived",
-      origin: "integrated",
-    }
-    state.tracks.class = { level: 20, quarter: 0, definitionId: "" }
-    seedCharacter({ state: serializeState(state) })
-
-    const res = await evolveCharacter(
-      "chr-1",
-      { optionId: "evo-1", version: 0 },
-      user
-    )
-    expect(res.character.raceId).toBe("race-elf")
-    expect(deserializeState(res.character.state).race.grade).toBe("F")
-  })
-
-  it("blocks a G race at level 0 from a G->F path by the F grade band, yet still surfaces the option", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
-    // Derived race level 0: no class level, no profession track.
-    const state = createInitialState("integrated", null, null)
-    state.race = { level: 0, grade: "G", mode: "derived", origin: "integrated" }
-    state.tracks.class = { level: 0, quarter: 0, definitionId: "" }
-    seedCharacter({ state: serializeState(state) })
-
-    const res = await getEvolutionOptions("chr-1", user)
-    expect(res.options).toHaveLength(1)
-    expect(res.options[0].toGrade).toBe("F")
-    // Level 0 is below F's entry level (10), so GET must not report it eligible.
-    expect(res.options[0].eligible).toBe(false)
-    expect(res.options[0].blockers).toContain(
-      "race level 0 does not qualify for F (needs 10-24)"
-    )
-    // A valid catalog path still exists, so the grade-only fallback is NOT offered.
-    expect(res.legacyAvailable).toBe(false)
-  })
-
-  it("marks a G race at level 10 eligible for a G->F path", async () => {
-    seedHumanRace()
-    seedElfRace()
-    seedEvolution("evo-1", "Human to Elf", validPathConfig)
-    // Derived race level 10 (class 20 / no profession), F's entry level.
-    const state = createInitialState("integrated", null, null)
-    state.race = {
-      level: 10,
-      grade: "G",
-      mode: "derived",
-      origin: "integrated",
-    }
-    state.tracks.class = { level: 20, quarter: 0, definitionId: "" }
-    seedCharacter({ state: serializeState(state) })
-
-    const res = await getEvolutionOptions("chr-1", user)
-    expect(res.options).toHaveLength(1)
-    expect(res.options[0].toGrade).toBe("F")
-    expect(res.options[0].eligible).toBe(true)
-    expect(res.options[0].blockers).toEqual([])
-    expect(res.legacyAvailable).toBe(false)
   })
 
   it("blocks a race option when the target grade's gate is closed", () => {
@@ -6285,7 +6287,7 @@ describe("race evolution path choices", () => {
   })
 })
 
-describe("class/profession track evolution paths", () => {
+describe("class/profession track evolution (next-grade candidates)", () => {
   beforeEach(() => {
     dbMock.store.reset()
   })
@@ -6305,29 +6307,33 @@ describe("class/profession track evolution paths", () => {
     })
   }
 
-  function seedTrackEvolution(
+  function seedProfession(
     id: string,
+    stableId: string,
     name: string,
-    config: Record<string, unknown>,
-    extra: Partial<{ archived: boolean }> = {}
+    grades: Record<string, { fixed: Record<string, number>; free: number }>
   ) {
     dbMock.store.addCatalog({
       id,
-      kind: "evolutions",
-      stableId: id,
+      kind: "professions",
+      stableId,
       name,
-      config,
-      ...extra,
+      config: { grades },
     })
   }
 
-  function seedTitle(id: string, stableId: string) {
+  function seedRace(
+    id: string,
+    stableId: string,
+    name: string,
+    config: Record<string, unknown>
+  ) {
     dbMock.store.addCatalog({
       id,
-      kind: "titles",
+      kind: "races",
       stableId,
-      name: `Title ${id}`,
-      config: { flat: { strength: 1 } },
+      name,
+      config,
     })
   }
 
@@ -6413,38 +6419,32 @@ describe("class/profession track evolution paths", () => {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 3 }, free: 1 },
     })
-    seedTrackEvolution("evo-class-1", "Archer F -> E", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "archer",
-      fromGrade: "F",
-      toGrade: "E",
+    seedClass("cls-lancer", "lancer", "Lancer", {
+      E: { fixed: { strength: 3 }, free: 1 },
+    })
+    // A class with no E grade is never a candidate.
+    seedClass("cls-mage", "mage", "Mage", {
+      F: { fixed: { agility: 2 }, free: 1 },
     })
     seedGradedCharacter({
       classId: "cls-archer",
       classStableId: "archer",
       classGrade: "F",
+      classLevel: 30,
     })
 
     const res = await getEvolutionOptions("chr-1", user, "class")
     expect(res.legacyAvailable).toBe(false)
-    expect(res.options).toHaveLength(1)
-    // The character has no explicit class level (defaults to 0), which is below
-    // the target E grade band's entry level (25). GET must agree with the pure
-    // evolveTrackGrade engine and report the choice as blocked, never eligible.
-    expect(res.options[0]).toMatchObject({
-      id: "evo-class-1",
-      name: "Archer F -> E",
-      fromGrade: "F",
-      toGrade: "E",
-      toTrackName: "Archer",
-      track: "class",
-      eligible: false,
-      manualReview: false,
-    })
-    expect(res.options[0].blockers).toEqual([
-      expect.stringContaining("class level 0 does not qualify for E"),
-    ])
+    expect(res.options.map((o) => o.id)).toEqual(["cls-archer", "cls-lancer"])
+    for (const option of res.options) {
+      expect(option).toMatchObject({
+        fromGrade: "F",
+        toGrade: "E",
+        track: "class",
+        eligible: true,
+        blockers: [],
+      })
+    }
   })
 
   it("gates class evolution by the class grade, independent of the race grade", async () => {
@@ -6452,24 +6452,11 @@ describe("class/profession track evolution paths", () => {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 3 }, free: 1 },
     })
-    dbMock.store.addCatalog({
-      id: "race-human",
-      kind: "races",
-      stableId: "human",
-      name: "Human",
-      config: {
-        raceDefinitions: {
-          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
-          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
-        },
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+        F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
       },
-    })
-    seedTrackEvolution("evo-class-1", "Archer F -> E", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "archer",
-      fromGrade: "F",
-      toGrade: "E",
     })
     // Race grade G, class grade F: the two progression gates are independent.
     seedGradedCharacter({
@@ -6477,6 +6464,7 @@ describe("class/profession track evolution paths", () => {
       classStableId: "archer",
       classGrade: "F",
       raceGrade: "G",
+      classLevel: 30,
     })
 
     // track=class targets the class's next grade (E), not the race's next grade (F).
@@ -6487,21 +6475,49 @@ describe("class/profession track evolution paths", () => {
 
     // track=race targets the race's next grade (F), unaffected by the class grade.
     const raceRes = await getEvolutionOptions("chr-1", user, "race")
-    expect(raceRes.options).toHaveLength(0)
-    expect(raceRes.legacyAvailable).toBe(true)
+    expect(raceRes.options).toHaveLength(1)
+    expect(raceRes.options[0].toGrade).toBe("F")
+    expect(raceRes.legacyAvailable).toBe(false)
+  })
+
+  it("filters profession options the same way and rejects an unknown track destination", async () => {
+    seedProfession("prof-alc", "alchemist", "Alchemist", {
+      F: { fixed: { agility: 2 }, free: 1 },
+      E: { fixed: { agility: 3 }, free: 1 },
+    })
+    seedGradedCharacter({
+      professionId: "prof-alc",
+      professionStableId: "alchemist",
+      professionGrade: "F",
+      professionLevel: 30,
+    })
+
+    const res = await getEvolutionOptions("chr-1", user, "profession")
+    expect(res.legacyAvailable).toBe(false)
+    expect(res.options.map((o) => o.id)).toEqual(["prof-alc"])
+    expect(res.options[0]).toMatchObject({ toGrade: "E", track: "profession" })
+
+    // The evolve POST requires a destination definition of the right kind; a
+    // profession POST pointed at a class row is a missing destination.
+    seedClass("cls-archer", "archer", "Archer", {
+      F: { fixed: { agility: 2 }, free: 1 },
+    })
+    await expect(
+      evolveCharacter(
+        "chr-1",
+        { track: "profession", optionId: "cls-archer", version: 0 },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 404,
+      code: "evolution_destination_missing",
+    })
   })
 
   it("marks a track option blocked below the target band and agrees with the POST rejection", async () => {
     seedClass("cls-archer", "archer", "Archer", {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 3 }, free: 1 },
-    })
-    seedTrackEvolution("evo-class-1", "Archer F -> E", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "archer",
-      fromGrade: "F",
-      toGrade: "E",
     })
     // The class track is F grade but its level (5) is below the E band entry (25),
     // so the next-grade evolve cannot be taken yet.
@@ -6524,13 +6540,13 @@ describe("class/profession track evolution paths", () => {
     await expect(
       evolveCharacter(
         "chr-1",
-        { track: "class", optionId: "evo-class-1", version: 0 },
+        { track: "class", optionId: "cls-archer", version: 0 },
         user
       )
     ).rejects.toMatchObject({ status: 400, code: "evolution" })
   })
 
-  it("filters track options by grade/requirement, marks manual review, and evolves on a qualifying choice", async () => {
+  it("evolves a qualifying class to the destination definition and next grade", async () => {
     seedClass("cls-archer", "archer", "Archer", {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 3 }, free: 1 },
@@ -6539,23 +6555,6 @@ describe("class/profession track evolution paths", () => {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 4 }, free: 1 },
     })
-    seedTitle("title-1", "hero")
-    seedTrackEvolution("evo-class-1", "Archer -> Ranger (manual)", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "ranger",
-      fromGrade: "F",
-      toGrade: "E",
-      requiredTitleStableIds: ["hero"],
-      manualRequirementsText: "Requires a hero's blessing",
-    })
-    seedTrackEvolution("evo-class-2", "Archer -> Ranger (clean)", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "ranger",
-      fromGrade: "F",
-      toGrade: "E",
-    })
     seedGradedCharacter({
       classId: "cls-archer",
       classStableId: "archer",
@@ -6563,89 +6562,31 @@ describe("class/profession track evolution paths", () => {
       classLevel: 30,
     })
 
-    const res = await getEvolutionOptions("chr-1", user, "class")
-    expect(res.options).toHaveLength(2)
-    const manual = res.options.find((o) => o.id === "evo-class-1")!
-    const clean = res.options.find((o) => o.id === "evo-class-2")!
-    expect(manual.manualReview).toBe(true)
-    // Missing the required title blocks the manual path.
-    expect(manual.eligible).toBe(false)
-    expect(clean.eligible).toBe(true)
-
-    // An owner reason cannot bypass mechanical requirements.
-    await expect(
-      evolveCharacter(
-        "chr-1",
-        {
-          track: "class",
-          optionId: "evo-class-1",
-          version: 0,
-          reason: "story",
-        },
-        user
-      )
-    ).rejects.toMatchObject({ status: 400, code: "evolution_prerequisites" })
-
-    // Add the required title: the path becomes mechanically eligible but the
-    // narrative manual gate still blocks a non-admin.
-    dbMock.store.addAssociation({
-      characterId: "chr-1",
-      definitionId: "title-1",
-      kind: "TITLE",
-    })
-    await expect(
-      evolveCharacter(
-        "chr-1",
-        {
-          track: "class",
-          optionId: "evo-class-1",
-          version: 0,
-          reason: "story",
-        },
-        user
-      )
-    ).rejects.toMatchObject({ status: 400, code: "evolution_manual_required" })
-
-    // An admin with a nonempty reason bypasses the narrative gate.
-    const admin = { ...user, isAdmin: true }
-    const res2 = await evolveCharacter(
+    const res = await evolveCharacter(
       "chr-1",
-      {
-        track: "class",
-        optionId: "evo-class-1",
-        version: 0,
-        reason: "approved",
-      },
-      admin
+      { track: "class", optionId: "cls-ranger", version: 0 },
+      user
     )
-    expect(res2.character.classId).toBe("cls-ranger")
-    const state2 = deserializeState(res2.character.state)
-    expect(state2.tracks.class.grade).toBe("E")
-    expect(state2.tracks.class.definitionId).toBe("ranger:E")
+    expect(res.character.classId).toBe("cls-ranger")
+    const state = deserializeState(res.character.state)
+    expect(state.tracks.class.grade).toBe("E")
+    expect(state.tracks.class.definitionId).toBe("ranger:E")
     // Race grade and historical awards are untouched.
-    expect(state2.race.grade).toBe("G")
-    expect(state2.historicalLevelAwards).toHaveLength(0)
-    expect(res2.journal).toMatchObject({
+    expect(state.race.grade).toBe("G")
+    expect(state.historicalLevelAwards).toHaveLength(0)
+    expect(res.journal).toMatchObject({
       track: "class",
       from: "F",
       to: "E",
       source: "track",
-      optionId: "evo-class-1",
-      reason: "approved",
+      optionId: "cls-ranger",
     })
   })
 
-  it("rolls back a class path evolution on a stale version with no event", async () => {
+  it("rolls back a class evolution on a stale version with no event", async () => {
     seedClass("cls-archer", "archer", "Archer", {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 3 }, free: 1 },
-    })
-    seedTrackEvolution("evo-class-1", "Archer F -> E", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "archer",
-      fromGrade: "F",
-      toGrade: "E",
     })
     seedGradedCharacter({
       classId: "cls-archer",
@@ -6660,7 +6601,7 @@ describe("class/profession track evolution paths", () => {
     await expect(
       evolveCharacter(
         "chr-1",
-        { track: "class", optionId: "evo-class-1", version: 2 },
+        { track: "class", optionId: "cls-archer", version: 2 },
         user
       )
     ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
@@ -6668,98 +6609,12 @@ describe("class/profession track evolution paths", () => {
     const fresh = dbMock.store.characters.get("chr-1")!
     expect(fresh.classId).toBe("cls-archer")
     expect(fresh.version).toBe(3)
-    // Only the update event was written; the path evolve never committed.
+    // Only the update event was written; the class evolve never committed.
     expect(dbMock.store.events).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("update")
   })
 
-  it("filters milestone skill offers by the graded track's own grade, not the race grade", async () => {
-    seedClass("cls-archer", "archer", "Archer", {
-      F: { fixed: { agility: 2 }, free: 1 },
-      E: { fixed: { agility: 3 }, free: 1 },
-    })
-    // A race row is required because a derived race level gain needs a race
-    // definition for the current grade when advancing.
-    dbMock.store.addCatalog({
-      id: "race-human",
-      kind: "races",
-      stableId: "human",
-      name: "Human",
-      config: {
-        raceDefinitions: {
-          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
-          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
-          E: { id: "human:E", perLevel: { strength: 1 }, freePerLevel: 1 },
-        },
-      },
-    })
-    // Graded class at F, race grade G.
-    seedGradedCharacter({
-      classId: "cls-archer",
-      classStableId: "archer",
-      classGrade: "F",
-      raceGrade: "G",
-      raceLevel: 10,
-      raceId: "race-human",
-      classLevel: 3,
-    })
-    const stored = dbMock.store.characters.get("chr-1")!
-    const storedState = deserializeState(stored.state)
-    storedState.tracks.class.quarter = 3
-    stored.state = serializeState(storedState)
-
-    dbMock.store.addCatalog({
-      id: "sk-f",
-      kind: "skills",
-      stableId: "sk-f",
-      name: "F skill",
-      grade: "F",
-      config: {
-        track: "class",
-        milestone: 4,
-        effects: [{ phase: "flat", amount: { strength: 1 } }],
-      },
-    })
-    dbMock.store.addCatalog({
-      id: "sk-g",
-      kind: "skills",
-      stableId: "sk-g",
-      name: "G skill",
-      grade: "G",
-      config: {
-        track: "class",
-        milestone: 4,
-        effects: [{ phase: "flat", amount: { strength: 1 } }],
-      },
-    })
-    dbMock.store.addCatalog({
-      id: "sk-u",
-      kind: "skills",
-      stableId: "sk-u",
-      name: "No grade skill",
-      config: {
-        track: "class",
-        milestone: 4,
-        effects: [{ phase: "flat", amount: { strength: 1 } }],
-      },
-    })
-
-    const res = await advanceCharacter(
-      "chr-1",
-      { track: "class", version: 0 },
-      user
-    )
-    const offered = res.character.skillOffers.flatMap((o) =>
-      o.options.map((x) => x.definitionId)
-    )
-    // The graded class at grade F offers the F-graded and ungraded skills; the
-    // G-graded skill (matching the race grade) must NOT be offered.
-    expect(offered).toContain("sk-f")
-    expect(offered).toContain("sk-u")
-    expect(offered).not.toContain("sk-g")
-  })
-
-  it("returns no class options and no fallback, and rejects track evolve, on a legacy ungraded track", async () => {
+  it("returns no class options and rejects track evolve, on a legacy ungraded track", async () => {
     seedClass("cls-archer", "archer", "Archer", {
       F: { fixed: { agility: 2 }, free: 1 },
       E: { fixed: { agility: 3 }, free: 1 },
@@ -6780,17 +6635,10 @@ describe("class/profession track evolution paths", () => {
     expect(res.options).toHaveLength(0)
     expect(res.legacyAvailable).toBe(false)
 
-    seedTrackEvolution("evo-class-1", "Archer F -> E", {
-      track: "class",
-      fromDefinitionStableId: "archer",
-      toDefinitionStableId: "archer",
-      fromGrade: "F",
-      toGrade: "E",
-    })
     await expect(
       evolveCharacter(
         "chr-1",
-        { track: "class", optionId: "evo-class-1", version: 0 },
+        { track: "class", optionId: "cls-archer", version: 0 },
         user
       )
     ).rejects.toMatchObject({ status: 400, code: "track_grade_unknown" })
@@ -6800,15 +6648,9 @@ describe("class/profession track evolution paths", () => {
     seedClass("cls-archer", "archer", "Archer", {
       F: { fixed: { agility: 2 }, free: 1 },
     })
-    dbMock.store.addCatalog({
-      id: "race-human",
-      kind: "races",
-      stableId: "human",
-      name: "Human",
-      config: {
-        raceDefinitions: {
-          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
-        },
+    seedRace("race-human", "human", "Human", {
+      raceDefinitions: {
+        G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
       },
     })
     const classRow = { stableId: "archer" } as Parameters<
@@ -6982,6 +6824,39 @@ describe("importCharacter (trusted backup v3)", () => {
       skillOffers: [],
       ...rest,
     } as ImportV6Document
+  }
+
+  type ImportV7Document = Extract<
+    CharacterImportDocument,
+    { schema: typeof IMPORT_SCHEMA_V7 }
+  >
+
+  type V7DocPartial = Partial<ImportV7Document> & { state?: CharacterState }
+
+  function v7Doc(partial: V7DocPartial = {}): ImportV7Document {
+    const { state: rawState, ...rest } = partial
+    return {
+      schema: IMPORT_SCHEMA_V7,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Imported",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(
+        rawState ?? createInitialState("integrated", null, null)
+      ) as CharacterImportDocument["state"],
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+      ...rest,
+    } as ImportV7Document
   }
 
   it("imports a valid v3 backup as a new imported character owned by the importer", async () => {
@@ -7256,14 +7131,12 @@ describe("importCharacter (trusted backup v3)", () => {
     addImportCatalog(
       "gods",
       "god-1",
-      { pantheon: "Test Pantheon", divineRank: "God" },
+      {
+        pantheon: "Test Pantheon",
+        divineRank: "God",
+        blessingEffects: { Minor: [] },
+      },
       { name: "God One" }
-    )
-    addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [], patronGodStableId: "god-1" },
-      { name: "Bless One" }
     )
     addImportCatalog(
       "bloodlines",
@@ -7271,11 +7144,12 @@ describe("importCharacter (trusted backup v3)", () => {
       { effects: [] },
       { name: "Blood One" }
     )
-    const doc = importDoc({
+    const doc = v7Doc({
       associations: [
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
         {
           kind: "bloodline",
@@ -7390,26 +7264,32 @@ describe("importCharacter (trusted backup v3)", () => {
   it("rejects more than one active blessing on import", async () => {
     seedRaceClass()
     addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [] },
-      { name: "Bless One" }
+      "gods",
+      "god-1",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God One",
+      }
     )
     addImportCatalog(
-      "blessings",
-      "bless-2",
-      { tier: "Minor", effects: [] },
-      { name: "Bless Two" }
+      "gods",
+      "god-2",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God Two",
+      }
     )
-    const doc = importDoc({
+    const doc = v7Doc({
       associations: [
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-2" },
+          definition: { kind: "gods", stableId: "god-2" },
+          tier: "Minor",
         },
       ],
     })
@@ -7422,20 +7302,24 @@ describe("importCharacter (trusted backup v3)", () => {
   it("rejects the SAME blessing catalog definition referenced twice on import as a link collision", async () => {
     seedRaceClass()
     addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [] },
-      { name: "Bless One" }
+      "gods",
+      "god-1",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God One",
+      }
     )
-    const doc = importDoc({
+    const doc = v7Doc({
       associations: [
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
       ],
     })
@@ -7450,26 +7334,33 @@ describe("importCharacter (trusted backup v3)", () => {
   it("rejects an active + archived blessing pair on import as a link collision", async () => {
     seedRaceClass()
     addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [] },
-      { name: "Bless One" }
+      "gods",
+      "god-1",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God One",
+      }
     )
     addImportCatalog(
-      "blessings",
-      "bless-2",
-      { tier: "Minor", effects: [] },
-      { name: "Bless Two", archived: true }
+      "gods",
+      "god-2",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God Two",
+        archived: true,
+      }
     )
-    const doc = importDoc({
+    const doc = v7Doc({
       associations: [
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-2" },
+          definition: { kind: "gods", stableId: "god-2" },
+          tier: "Minor",
         },
       ],
     })
@@ -7517,10 +7408,12 @@ describe("importCharacter (trusted backup v3)", () => {
     seedRaceClass()
     // A single blessing (an archived one would still count toward the singleton).
     addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [] },
-      { name: "Bless One" }
+      "gods",
+      "god-1",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God One",
+      }
     )
     addImportCatalog(
       "titles",
@@ -7534,11 +7427,12 @@ describe("importCharacter (trusted backup v3)", () => {
       { upgradeGroup: "hero", effects: [] },
       { name: "Title Arch", archived: true }
     )
-    const doc = importDoc({
+    const doc = v7Doc({
       associations: [
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
         {
           kind: "title",
@@ -7559,26 +7453,33 @@ describe("importCharacter (trusted backup v3)", () => {
   it("rejects an active plus archived blessing on import (two total blessings)", async () => {
     seedRaceClass()
     addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [] },
-      { name: "Bless One" }
+      "gods",
+      "god-1",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God One",
+      }
     )
     addImportCatalog(
-      "blessings",
-      "bless-arch",
-      { tier: "Minor", effects: [] },
-      { name: "Bless Arch", archived: true }
+      "gods",
+      "god-arch",
+      { blessingEffects: { Minor: [] } },
+      {
+        name: "God Arch",
+        archived: true,
+      }
     )
-    const doc = importDoc({
+    const doc = v7Doc({
       associations: [
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-1" },
+          definition: { kind: "gods", stableId: "god-1" },
+          tier: "Minor",
         },
         {
           kind: "blessing",
-          definition: { kind: "blessings", stableId: "bless-arch" },
+          definition: { kind: "gods", stableId: "god-arch" },
+          tier: "Minor",
         },
       ],
     })
@@ -7595,10 +7496,10 @@ describe("importCharacter (trusted backup v3)", () => {
   it("round-trips blessing and bloodline link kinds through export/import", async () => {
     seedRaceClass()
     addImportCatalog(
-      "blessings",
-      "bless-1",
-      { tier: "Minor", effects: [] },
-      { name: "Bless One" }
+      "gods",
+      "god-1",
+      { blessingEffects: { Minor: [] } },
+      { name: "God One" }
     )
     addImportCatalog(
       "bloodlines",
@@ -7619,7 +7520,8 @@ describe("importCharacter (trusted backup v3)", () => {
       created.id,
       {
         kind: "blessing",
-        definitionId: "bless-1",
+        definitionId: "god-1",
+        tier: "Minor",
         operation: "add",
         version: 0,
       },
@@ -7644,6 +7546,19 @@ describe("importCharacter (trusted backup v3)", () => {
       "blessing",
       "bloodline",
     ])
+    // The v7 export carries the exact blessing tier and re-import preserves it,
+    // so a god + tier link round-trips with nothing dropped to null.
+    const exportedAssocs = (
+      exported as {
+        associations: Array<{ kind: string; tier?: string | null }>
+      }
+    ).associations
+    expect(exportedAssocs.find((a) => a.kind === "blessing")).toMatchObject({
+      tier: "Minor",
+    })
+    expect(
+      imported.associations.find((a) => a.kind === "blessing")
+    ).toMatchObject({ tier: "Minor" })
     const kinds = dbMock.store.associations
       .filter((a) => a.characterId === imported.id)
       .map((a) => a.kind)
@@ -8494,7 +8409,7 @@ describe("importCharacter (trusted backup v3)", () => {
         { name: "Helm" }
       )
       addImportCatalog(
-        "consumables",
+        "items",
         "consum-1",
         { type: "permanent", amount: { strength: 1 } },
         { name: "Ration" }
@@ -8514,7 +8429,7 @@ describe("importCharacter (trusted backup v3)", () => {
             quantity: 2,
           },
           {
-            definition: { kind: "consumables", stableId: "consum-1" },
+            definition: { kind: "items", stableId: "consum-1" },
             quantity: 5,
           },
         ],
@@ -8731,7 +8646,7 @@ describe("importCharacter (trusted backup v3)", () => {
       expect(payload.inventoryCount).toBe(1)
     })
 
-    it("round-trips a v4 backup: equipped stock and consumables survive export and re-import", async () => {
+    it("round-trips a v4 backup: equipped stock and items survive export and re-import", async () => {
       seedRaceClass()
       addImportCatalog(
         "equipment",
@@ -8740,7 +8655,7 @@ describe("importCharacter (trusted backup v3)", () => {
         { name: "Helm" }
       )
       addImportCatalog(
-        "consumables",
+        "items",
         "consum-1",
         { type: "permanent", amount: { strength: 1 } },
         { name: "Ration" }
@@ -8774,7 +8689,7 @@ describe("importCharacter (trusted backup v3)", () => {
         "chr-r",
         user
       )) as CharacterImportDocument
-      expect(portable.schema).toBe("primal-character/6")
+      expect(portable.schema).toBe("primal-character/7")
       const inv = (portable as { inventory: Array<{ quantity: number }> })
         .inventory
       expect(inv).toHaveLength(2)
@@ -9094,7 +9009,7 @@ describe("importCharacter (trusted backup v3)", () => {
       "chr-nr",
       user
     )) as CharacterImportDocument
-    expect(portable.schema).toBe("primal-character/6")
+    expect(portable.schema).toBe("primal-character/7")
 
     // A real wire round-trip. JSON.stringify drops undefined values, which is what
     // used to delete equipmentPosition from a non-ring link and make the strict v5
@@ -9133,477 +9048,6 @@ describe("importCharacter (trusted backup v3)", () => {
     expect(
       imported.inventory.find((i) => i.definitionId === "ring-1")
     ).toBeUndefined()
-  })
-})
-
-describe("consumeCharacter (consumables)", () => {
-  beforeEach(() => {
-    dbMock.store.reset()
-  })
-
-  function bornFState(raceLevel: number, grade: string = "F"): unknown {
-    const state = createInitialState("born", null, null)
-    state.race = { ...state.race, level: raceLevel, grade: grade as Grade }
-    return serializeState(state)
-  }
-
-  function seedConsumable(
-    id: string,
-    config: Record<string, unknown>,
-    extra: Partial<{ name: string; archived: boolean }> = {}
-  ): unknown {
-    const row = dbMock.store.addCatalog({
-      id,
-      kind: "consumables",
-      stableId: id,
-      name: extra.name ?? `Consumable ${id}`,
-      config,
-      ...(extra.archived != null ? { archived: extra.archived } : {}),
-    })
-    // Manual bookkeeping: acquiring stock to consume requires an owned quantity.
-    dbMock.store.addInventoryItem({
-      characterId: "chr-1",
-      definitionId: id,
-      quantity: 5,
-    })
-    return row
-  }
-
-  function seedChar(
-    state: unknown,
-    version = 0,
-    archived = false,
-    origin: "integrated" | "born" = "integrated"
-  ): unknown {
-    return dbMock.store.addCharacter({
-      id: "chr-1",
-      ownerId: user.id,
-      name: "Test",
-      state,
-      version,
-      archived,
-      origin,
-    })
-  }
-
-  function stripOrigin(state: unknown): unknown {
-    delete (state as { race: { origin?: string } }).race.origin
-    return state
-  }
-
-  it("applies a permanent gain and logs a consume event with a definition snapshot", async () => {
-    seedChar(bornFState(10), 0, false, "born")
-    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-1", version: 0 },
-      user
-    )
-    expect(res.character.version).toBe(1)
-    // Applied as a verbatim permanent gain (baseAttributes 0 + gain 3).
-    expect(res.status.attributes.strength).toBe(3)
-    // Authoritative server fields: remaining capacity is now 27 of 30.
-    expect(res.character.permanentConsumableCap).toMatchObject({ strength: 30 })
-    expect(res.character.permanentConsumableRemaining).toMatchObject({
-      strength: 27,
-      agility: 30,
-    })
-    const gains = (
-      res.character.state as {
-        permanentGains: Array<{ kind: string; vector: Record<string, number> }>
-      }
-    ).permanentGains
-    expect(gains).toHaveLength(1)
-    expect(gains[0]).toMatchObject({
-      kind: "consumable",
-      vector: { strength: 3 },
-    })
-
-    expect(dbMock.store.events).toHaveLength(1)
-    const event = dbMock.store.events[0]
-    expect(event.kind).toBe("consume")
-    expect(event.payload).toMatchObject({
-      definitionId: "perm-1",
-      type: "permanent",
-      applied: { strength: 3 },
-      requested: { strength: 3 },
-      capRemainingAfter: { strength: 27 },
-    })
-    const payload = event.payload as {
-      definition: { name: string }
-      appliedAt: string
-    }
-    expect(payload.definition.name).toBe("Consumable perm-1")
-    expect(typeof payload.appliedAt).toBe("string")
-  })
-
-  it("rejects a permanent gain above the cumulative cap (400) and writes no event", async () => {
-    seedChar(bornFState(10), 0, false, "born")
-    seedConsumable("perm-1", { type: "permanent", amount: { strength: 31 } })
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-1", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
-    // No mutation, no event, ledger untouched.
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-    expect(dbMock.store.events).toHaveLength(0)
-  })
-
-  it("adds a unique temporary active effect that expires by duration quarters", async () => {
-    seedChar(bornFState(5), 0, false, "born")
-    seedConsumable("temp-1", {
-      type: "temporary",
-      amount: { strength: 4 },
-      durationQuarters: 3,
-    })
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "temp-1", version: 0 },
-      user
-    )
-    expect(res.character.version).toBe(1)
-    const effects = (
-      res.character.state as {
-        activeEffects: Array<{
-          id: string
-          phase: string
-          source: string
-          expiresAt?: number
-          amount: Record<string, number>
-        }>
-      }
-    ).activeEffects
-    expect(effects).toHaveLength(1)
-    const effect = effects[0]
-    expect(effect.phase).toBe("temporary")
-    expect(effect.source).toBe("consumable")
-    expect(effect.amount.strength).toBe(4)
-    // state.turn is 0, so the effect expires 3 quarters later.
-    expect(effect.expiresAt).toBe(3)
-    // Temporary effects are uncapped: requested === applied, no capUsage.
-    expect(res.status.consumables.applied.strength).toBe(4)
-    expect(res.status.attributes.strength).toBe(4)
-    expect(res.status.consumables.capUsage).toEqual([])
-    // Unique per-application effect id is deterministic but distinct per consumption.
-    expect(effect.id).toContain("temp-1:cons-0-")
-
-    const event = dbMock.store.events[0]
-    expect(event.kind).toBe("consume")
-    expect(event.payload).toMatchObject({
-      definitionId: "temp-1",
-      type: "temporary",
-      applied: { strength: 4 },
-      durationQuarters: 3,
-      expiresAt: 3,
-      capRemainingAfter: {},
-    })
-  })
-
-  it("records the acting user id on a permanent consume event while preserving the snapshot and stock fields", async () => {
-    seedChar(bornFState(10), 0, false, "born")
-    seedConsumable("perm-audit", { type: "permanent", amount: { strength: 3 } })
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-audit", version: 0 },
-      user
-    )
-    expect(res.character.version).toBe(1)
-    expect(res.status.attributes.strength).toBe(3)
-    expect(dbMock.store.events).toHaveLength(1)
-    const event = dbMock.store.events[0]
-    expect(event.kind).toBe("consume")
-    // The acting user is recorded on the consume event.
-    expect(event.payload).toMatchObject({
-      actorId: user.id,
-      definitionId: "perm-audit",
-      type: "permanent",
-      applied: { strength: 3 },
-      requested: { strength: 3 },
-      capRemainingAfter: { strength: 27 },
-      stockPrior: 5,
-      stockAfter: 4,
-    })
-    // History is unchanged: the definition snapshot and timestamp are intact.
-    const payload = event.payload as {
-      definition: {
-        name: string
-        stableId: string
-        kind: string
-        grade: string | null
-      }
-      appliedAt: string
-    }
-    expect(payload.definition.name).toBe("Consumable perm-audit")
-    expect(payload.definition.stableId).toBe("perm-audit")
-    expect(payload.definition.kind).toBe("consumables")
-    expect(typeof payload.appliedAt).toBe("string")
-  })
-
-  it("records the acting user id on a temporary consume event", async () => {
-    seedChar(bornFState(5), 0, false, "born")
-    seedConsumable("temp-audit", {
-      type: "temporary",
-      amount: { strength: 4 },
-      durationQuarters: 3,
-    })
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "temp-audit", version: 0 },
-      user
-    )
-    expect(res.character.version).toBe(1)
-    expect(dbMock.store.events).toHaveLength(1)
-    const event = dbMock.store.events[0]
-    expect(event.kind).toBe("consume")
-    expect(event.payload).toMatchObject({
-      actorId: user.id,
-      definitionId: "temp-audit",
-      type: "temporary",
-      applied: { strength: 4 },
-      requested: { strength: 4 },
-      durationQuarters: 3,
-      expiresAt: 3,
-      capRemainingAfter: {},
-      stockPrior: 5,
-      stockAfter: 4,
-    })
-  })
-
-  it("records the acting admin id when an admin consumes on another owner's character", async () => {
-    const otherOwnerState = bornFState(10)
-    dbMock.store.addCharacter({
-      id: "chr-1",
-      ownerId: "owner-other",
-      name: "Another's character",
-      state: otherOwnerState,
-      version: 0,
-      origin: "born",
-    })
-    seedConsumable("perm-admin", { type: "permanent", amount: { strength: 3 } })
-    const admin = { id: "admin-1", email: "a@example.com", isAdmin: true }
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-admin", version: 0 },
-      admin
-    )
-    expect(res.character.version).toBe(1)
-    expect(res.status.attributes.strength).toBe(3)
-    expect(dbMock.store.events).toHaveLength(1)
-    const event = dbMock.store.events[0]
-    expect(event.kind).toBe("consume")
-    // The admin's id, not the owner's, is the actor on this consume.
-    const payload = event.payload as { actorId: string; definitionId: string }
-    expect(payload.actorId).toBe(admin.id)
-    expect(payload.definitionId).toBe("perm-admin")
-  })
-
-  it("supports repeated permanent applications", async () => {
-    seedChar(bornFState(10), 0, false, "born")
-    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
-    const first = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-1", version: 0 },
-      user
-    )
-    const second = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-1", version: 1 },
-      user
-    )
-    expect(first.character.version).toBe(1)
-    expect(second.character.version).toBe(2)
-    const gains = (
-      second.character.state as {
-        permanentGains: Array<{ kind: string }>
-      }
-    ).permanentGains
-    expect(gains).toHaveLength(2)
-    expect(second.status.attributes.strength).toBe(6)
-    expect(dbMock.store.events).toHaveLength(2)
-  })
-
-  it("rejects a wrong-kind, an archived definition, and an archived character", async () => {
-    seedChar(bornFState(1), 0, false, "born")
-    // Wrong kind: an equipment entry requested as a consumable.
-    dbMock.store.addCatalog({
-      id: "gear-1",
-      kind: "equipment",
-      stableId: "gear-1",
-      name: "Gear",
-      config: { slot: "head", bonus: { strength: 5 } },
-    })
-    // Archived consumable.
-    seedConsumable(
-      "perm-arch",
-      { type: "permanent", amount: { strength: 1 } },
-      {
-        archived: true,
-      }
-    )
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "gear-1", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "wrong_kind" })
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-arch", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
-    // A missing definition 404s.
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "missing", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 404 })
-
-    // An archived character is inert.
-    seedChar(bornFState(1), 0, true, "born")
-    seedConsumable("perm-ok", { type: "permanent", amount: { strength: 1 } })
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-ok", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "character_archived" })
-    expect(dbMock.store.events).toHaveLength(0)
-  })
-
-  it("rejects a stale version (409) and never writes a stale event", async () => {
-    seedChar(bornFState(10), 0, false, "born")
-    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
-    const first = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-1", version: 0 },
-      user
-    )
-    expect(first.character.version).toBe(1)
-    expect(dbMock.store.events).toHaveLength(1)
-
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-1", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
-
-    const fresh = dbMock.store.characters.get("chr-1")!
-    expect(fresh.version).toBe(1)
-    expect(dbMock.store.events).toHaveLength(1)
-  })
-
-  it("rejects a positive permanent gain when the grade has zero capacity", async () => {
-    // An integrated G-origin character in the G band (levels 1..9) has a 0 rate by
-    // default (G is an unknown/unconfigured grade). The cumulative capacity is 0,
-    // so any positive permanent gain is rejected.
-    const state = createInitialState("integrated", null, null)
-    state.race = { ...state.race, level: 5, grade: "G" }
-    seedChar(serializeState(state))
-    seedConsumable("perm-g", { type: "permanent", amount: { strength: 1 } })
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-g", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
-    expect(dbMock.store.events).toHaveLength(0)
-  })
-
-  it("reconstructs a missing state origin from Character.origin (born) and persists it", async () => {
-    // A legacy state predating origin tracking: race.origin absent, but the
-    // authoritative Character.origin column says "born".
-    seedChar(stripOrigin(bornFState(10)), 0, false, "born")
-    seedConsumable("perm-born", { type: "permanent", amount: { strength: 4 } })
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-born", version: 0 },
-      user
-    )
-    // born F level 10 capacity is 30, so the +4 applies in full, not capped to 3.
-    expect(res.status.attributes.strength).toBe(4)
-    expect(res.character.permanentConsumableCap).toMatchObject({ strength: 30 })
-    // The mutation wrote the reconstructed origin into the persisted state.
-    const persisted = res.character.state as { race: { origin?: string } }
-    expect(persisted.race.origin).toBe("born")
-  })
-
-  it("treats a legacy integrated state as conservative integrated (no over-cap grant)", async () => {
-    // Legacy state without race.origin, integrated row, F level 10. The engine
-    // must NOT infer born from the non-G grade: conservative integrated capacity
-    // is 3, so a +4 permanent gain is rejected rather than silently accepted.
-    const state = createInitialState("integrated", null, null)
-    state.race = { ...state.race, level: 10, grade: "F" as Grade }
-    seedChar(serializeState(state))
-    seedConsumable("perm-int", { type: "permanent", amount: { strength: 4 } })
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-int", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
-    expect(dbMock.store.events).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-  })
-
-  it("derives detail capacity from Character.origin, not grade inference (integrated 3 vs born 30)", async () => {
-    // Integrated row, legacy state without origin: F level 10 -> cap 3.
-    let state = createInitialState("integrated", null, null)
-    state.race = { ...state.race, level: 10, grade: "F" as Grade }
-    seedChar(serializeState(state))
-    const detail = await getCharacter("chr-1", user)
-    expect(detail.permanentConsumableCap).toMatchObject({ strength: 3 })
-
-    dbMock.store.reset()
-    // Born row, legacy state without origin: F level 10 -> cap 30.
-    state = createInitialState("born", null, null)
-    state.race = { ...state.race, level: 10, grade: "F" as Grade }
-    seedChar(serializeState(state), 0, false, "born")
-    const bornDetail = await getCharacter("chr-1", user)
-    expect(bornDetail.permanentConsumableCap).toMatchObject({ strength: 30 })
-  })
-
-  it("rejects a legacy consumable config with an actionable 400, not a 500", async () => {
-    seedChar(bornFState(10), 0, false, "born")
-    // A legacy config lacking type/amount must remain visible and reject on
-    // consume with an explicit code, never crash as a 500 or fake a default.
-    seedConsumable("legacy-1", { grade: "F" })
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "legacy-1", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "legacy_consumable_config" })
-    expect(dbMock.store.events).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-  })
-})
-
-describe("catalog consumable config legacy handling", () => {
-  beforeEach(() => {
-    dbMock.store.reset()
-  })
-
-  it("allows a metadata-only PATCH on a legacy consumable entry (config unchanged)", async () => {
-    dbMock.store.addCatalog({
-      id: "legacy-c",
-      kind: "consumables",
-      stableId: "legacy-c",
-      name: "Old Potion",
-      config: { grade: "F" },
-    })
-    const item = await updateCatalogItem("consumables", "legacy-c", {
-      name: "Renamed Potion",
-    })
-    expect(item.name).toBe("Renamed Potion")
-    // The legacy config is preserved untouched, and no default amount is invented.
-    expect((item.config as Record<string, unknown>).grade).toBe("F")
-    expect((item.config as Record<string, unknown>).amount).toBeUndefined()
-  })
-
-  it("requires the modern full shape when a consumable config is changed", async () => {
-    dbMock.store.addCatalog({
-      id: "legacy-c",
-      kind: "consumables",
-      stableId: "legacy-c",
-      name: "Old Potion",
-      config: { grade: "F" },
-    })
-    await expect(
-      updateCatalogItem("consumables", "legacy-c", { config: { grade: "F" } })
-    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
-    // The update never applied - the catalog row is unchanged.
-    expect(
-      (dbMock.store.catalog.get("legacy-c")!.config as Record<string, unknown>)
-        .grade
-    ).toBe("F")
-  })
-
-  it("requires the modern full shape when creating a consumable", async () => {
-    await expect(
-      createCatalogItem("consumables", {
-        name: "New Potion",
-        config: { grade: "F" },
-      })
-    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
-    expect(dbMock.store.catalog.size).toBe(0)
   })
 })
 
@@ -9884,43 +9328,38 @@ describe("catalog blessing / bloodline / god foundations", () => {
     })
   }
 
-  function blessingRow(id: string): {
-    config: Record<string, unknown>
-    patronId: string | null | undefined
-  } {
-    const row = dbMock.store.catalog.get(id)!
-    return { config: row.config, patronId: row.patronId }
-  }
-
-  it("creates a modern blessing and resolves its patron god FK", async () => {
-    seedGod("god-1", "malefic-viper")
-    const item = await createCatalogItem("blessings", {
-      stableId: "bless-1",
-      name: "Malefic Blessing",
+  it("creates a gods entry with blessingEffects at a valid tier", async () => {
+    const item = await createCatalogItem("gods", {
+      stableId: "malefic-viper",
+      name: "Malefic Viper",
       config: {
-        tier: "Major",
-        effects: [{ phase: "flat", amount: { strength: 5 } }],
-        patronGodStableId: "malefic-viper",
+        pantheon: "Void",
+        divineRank: "God",
+        blessingEffects: {
+          Major: [{ phase: "flat", amount: { strength: 5 } }],
+        },
       },
     })
-    expect(item.config).toMatchObject({ tier: "Major" })
-    expect(blessingRow(item.id).patronId).toBe("god-1")
-  })
-
-  it("creates a modern blessing with no patron (and no FK)", async () => {
-    const item = await createCatalogItem("blessings", {
-      stableId: "bless-2",
-      name: "Unbound Blessing",
-      config: {
-        tier: "Lesser",
-        effects: [],
+    expect(item.config).toMatchObject({
+      pantheon: "Void",
+      divineRank: "God",
+      blessingEffects: {
+        Major: [{ phase: "flat", amount: { strength: 5 } }],
       },
     })
-    expect(item.config).toMatchObject({ tier: "Lesser" })
-    expect(blessingRow(item.id).patronId).toBeNull()
   })
 
-  it("maps a serialization failure (P2034) on blessing create to a 409, never a 500", async () => {
+  it("creates a gods entry with no blessingEffects (unbound)", async () => {
+    const item = await createCatalogItem("gods", {
+      stableId: "unbound-god",
+      name: "Unbound God",
+      config: { pantheon: "Void", divineRank: "God" },
+    })
+    expect(item.config).toMatchObject({ pantheon: "Void", divineRank: "God" })
+    expect(item.config).not.toHaveProperty("blessingEffects")
+  })
+
+  it("maps a serialization failure (P2034) on gods create to a 409, never a 500", async () => {
     seedGod("god-serial", "serial-god")
     const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
       name: "PrismaClientKnownRequestError",
@@ -9928,14 +9367,10 @@ describe("catalog blessing / bloodline / god foundations", () => {
     })
     try {
       await expect(
-        createCatalogItem("blessings", {
-          stableId: "serial-bless",
-          name: "Serializable Blessing",
-          config: {
-            tier: "Minor",
-            effects: [],
-            patronGodStableId: "serial-god",
-          },
+        createCatalogItem("gods", {
+          stableId: "serial-god",
+          name: "Serializable God",
+          config: { blessingEffects: { Minor: [] } },
         })
       ).rejects.toMatchObject({
         status: 409,
@@ -9948,52 +9383,80 @@ describe("catalog blessing / bloodline / god foundations", () => {
     expect(dbMock.store.catalog.size).toBe(1) // the seeded god only
   })
 
-  it("rejects a blessing with a missing patron god", async () => {
+  it("rejects a gods entry with an invalid blessingEffects tier key", async () => {
     await expect(
-      createCatalogItem("blessings", {
-        name: "Ghost Blessing",
-        config: { tier: "True", effects: [], patronGodStableId: "no-such-god" },
-      })
-    ).rejects.toMatchObject({ status: 400, code: "patron_god_not_found" })
-    expect(dbMock.store.catalog.size).toBe(0)
-  })
-
-  it("rejects a blessing whose patron god is archived", async () => {
-    seedGod("god-2", "sleeping-god", { archived: true })
-    await expect(
-      createCatalogItem("blessings", {
-        name: "Dormant Blessing",
-        config: {
-          tier: "Divine",
-          effects: [],
-          patronGodStableId: "sleeping-god",
-        },
-      })
-    ).rejects.toMatchObject({ status: 400, code: "patron_god_archived" })
-    expect(dbMock.store.catalog.size).toBe(1)
-  })
-
-  it("rejects a legacy blessing (no tier/effects) on create", async () => {
-    await expect(
-      createCatalogItem("blessings", {
-        name: "Old Blessing",
-        config: { grade: "F", effect: { strength: 3 } },
+      createCatalogItem("gods", {
+        name: "Typo God",
+        config: { blessingEffects: { minor: [] } },
       })
     ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
     expect(dbMock.store.catalog.size).toBe(0)
   })
 
-  it("rejects a blessing effect vector that is not a finite integer", async () => {
+  it("rejects a gods blessingEffects effect vector that is not a finite integer", async () => {
     await expect(
-      createCatalogItem("blessings", {
-        name: "Fractional Blessing",
+      createCatalogItem("gods", {
+        name: "Fractional God",
         config: {
-          tier: "Minor",
-          effects: [{ phase: "flat", amount: { strength: 1.5 } }],
+          blessingEffects: {
+            Minor: [{ phase: "flat", amount: { strength: 1.5 } }],
+          },
         },
       })
     ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("passes through unknown god config keys on create (permissive read)", async () => {
+    const item = await createCatalogItem("gods", {
+      stableId: "legacy-god",
+      name: "Legacy God",
+      config: { grade: "F", effect: { strength: 3 }, pantheon: "Void" },
+    })
+    expect(item.config).toMatchObject({
+      grade: "F",
+      effect: { strength: 3 },
+      pantheon: "Void",
+    })
+  })
+
+  it("allows a metadata-only PATCH on a gods entry (config unchanged)", async () => {
+    dbMock.store.addCatalog({
+      id: "legacy-god",
+      kind: "gods",
+      stableId: "legacy-god",
+      name: "Old God",
+      config: { grade: "F", effect: { strength: 3 } },
+    })
+    const item = await updateCatalogItem("gods", "legacy-god", {
+      name: "Renamed God",
+    })
+    expect(item.name).toBe("Renamed God")
+    expect((item.config as Record<string, unknown>).effect).toMatchObject({
+      strength: 3,
+    })
+  })
+
+  it("allows a config-changing PATCH on a gods entry (passthrough shape kept)", async () => {
+    dbMock.store.addCatalog({
+      id: "legacy-god",
+      kind: "gods",
+      stableId: "legacy-god",
+      name: "Old God",
+      config: { grade: "F", effect: { strength: 3 } },
+    })
+    const item = await updateCatalogItem("gods", "legacy-god", {
+      config: {
+        grade: "F",
+        effect: { strength: 3 },
+        blessingEffects: { Minor: [] },
+      },
+    })
+    expect(item.config).toMatchObject({
+      grade: "F",
+      effect: { strength: 3 },
+      blessingEffects: { Minor: [] },
+    })
   })
 
   it("creates a modern bloodline (narrative-only effects) with no FK", async () => {
@@ -10008,7 +9471,11 @@ describe("catalog blessing / bloodline / god foundations", () => {
       },
     })
     expect(item.config).toMatchObject({ effects: [] })
-    expect(blessingRow(item.id).patronId).toBeNull()
+    expect((item.config as Record<string, unknown>).gradeEffects).toMatchObject(
+      {
+        G: [{ phase: "percent", basisPoints: { perception: 500 } }],
+      }
+    )
   })
 
   it("rejects a legacy bloodline (no effects) on create", async () => {
@@ -10030,109 +9497,20 @@ describe("catalog blessing / bloodline / god foundations", () => {
     expect(item.config).toMatchObject({ pantheon: "Void", divineRank: "God" })
   })
 
-  it("allows a metadata-only PATCH on a legacy blessing (config unchanged)", async () => {
-    dbMock.store.addCatalog({
-      id: "legacy-b",
-      kind: "blessings",
-      stableId: "legacy-b",
-      name: "Old Blessing",
-      config: { grade: "F", effect: { strength: 3 } },
-    })
-    const item = await updateCatalogItem("blessings", "legacy-b", {
-      name: "Renamed Blessing",
-    })
-    expect(item.name).toBe("Renamed Blessing")
-    expect((item.config as Record<string, unknown>).effect).toMatchObject({
-      strength: 3,
-    })
-  })
-
-  it("requires the modern shape when a blessing config is changed", async () => {
-    dbMock.store.addCatalog({
-      id: "legacy-b",
-      kind: "blessings",
-      stableId: "legacy-b",
-      name: "Old Blessing",
-      config: { grade: "F", effect: { strength: 3 } },
-    })
-    await expect(
-      updateCatalogItem("blessings", "legacy-b", {
-        config: { grade: "F", effect: { strength: 3 } },
-      })
-    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
-    // The update never applied.
-    expect(
-      (dbMock.store.catalog.get("legacy-b")!.config as Record<string, unknown>)
-        .effect
-    ).toMatchObject({ strength: 3 })
-  })
-
-  it("repopulates the blessing FK when its patron god changes in the same transaction", async () => {
-    seedGod("god-1", "first-god")
-    seedGod("god-2", "second-god")
-    dbMock.store.addCatalog({
-      id: "bless-1",
-      kind: "blessings",
-      stableId: "bless-1",
-      name: "Switching Blessing",
-      config: {
-        tier: "Greater",
-        effects: [],
-        patronGodStableId: "first-god",
-      },
-      patronId: "god-1",
-    })
-    const item = await updateCatalogItem("blessings", "bless-1", {
-      config: {
-        tier: "Greater",
-        effects: [],
-        patronGodStableId: "second-god",
-      },
-    })
-    expect(item.config).toMatchObject({ patronGodStableId: "second-god" })
-    expect(blessingRow("bless-1").patronId).toBe("god-2")
-  })
-
-  it("clears the blessing FK when the patron god is removed from the config", async () => {
-    seedGod("god-1", "first-god")
-    dbMock.store.addCatalog({
-      id: "bless-1",
-      kind: "blessings",
-      stableId: "bless-1",
-      name: "Removing Blessing",
-      config: {
-        tier: "Greater",
-        effects: [],
-        patronGodStableId: "first-god",
-      },
-      patronId: "god-1",
-    })
-    const item = await updateCatalogItem("blessings", "bless-1", {
-      config: { tier: "Greater", effects: [] },
-    })
-    expect(item.config).toMatchObject({ effects: [] })
-    expect(blessingRow("bless-1").patronId).toBeNull()
-  })
-
-  it("409s a god stableId change while a blessing still references it", async () => {
+  it("allows a god stableId change even while a blessing character link references it", async () => {
     seedGod("god-1", "stable-god")
-    dbMock.store.addCatalog({
-      id: "bless-1",
-      kind: "blessings",
-      stableId: "bless-1",
-      name: "Referencing Blessing",
-      config: {
-        tier: "Minor",
-        effects: [],
-        patronGodStableId: "stable-god",
-      },
-      patronId: "god-1",
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "god-1",
+      kind: "BLESSING",
+      blessingTier: "Minor",
     })
-    await expect(
-      updateCatalogItem("gods", "god-1", { stableId: "renamed-god" })
-    ).rejects.toMatchObject({ status: 409, code: "patron_stable_id_in_use" })
-    // The rejected change never applied.
-    expect(dbMock.store.catalog.get("god-1")!.stableId).toBe("stable-god")
+    // Gods carry no patron FK and are exempt from the link-collision guard, so a
+    // referenced god's stableId can be renamed freely (the link stores definitionId).
+    const item = await updateCatalogItem("gods", "god-1", {
+      stableId: "renamed-god",
+    })
+    expect(item.stableId).toBe("renamed-god")
   })
 
   it("allows a god stableId change when no blessing references it", async () => {
@@ -11894,7 +11272,7 @@ describe("character inventory (owner-managed quantities)", () => {
     config: Record<string, unknown>,
     extra: Partial<{ name: string; archived: boolean }> = {}
   ): unknown {
-    return seedCatalog(id, "consumables", config, extra)
+    return seedCatalog(id, "items", config, extra)
   }
 
   function seedStock(definitionId: string, quantity: number) {
@@ -11903,14 +11281,6 @@ describe("character inventory (owner-managed quantities)", () => {
       definitionId,
       quantity,
     })
-  }
-
-  function setStock(definitionId: string, quantity: number) {
-    const idx = dbMock.store.inventory.findIndex(
-      (i) => i.characterId === "chr-1" && i.definitionId === definitionId
-    )
-    if (idx >= 0) dbMock.store.inventory.splice(idx, 1)
-    return seedStock(definitionId, quantity)
   }
 
   const other = { id: "user-2", email: "x@y", isAdmin: false }
@@ -11978,7 +11348,7 @@ describe("character inventory (owner-managed quantities)", () => {
     expect(inventory[0]).toMatchObject({
       definitionId: "pot-1",
       quantity: 2,
-      kind: "consumables",
+      kind: "items",
     })
     await expect(getCharacterInventory("chr-1", other)).rejects.toMatchObject({
       status: 403,
@@ -12378,108 +11748,6 @@ describe("character inventory (owner-managed quantities)", () => {
     expect(res.character.status?.attributes).toEqual(before.status?.attributes)
     expect(res.character.state).toEqual(before.state)
     expect(res.character.inventory).toHaveLength(1)
-  })
-
-  it("consuming a consumable decrements stock by one and a failed cap/version rolls back stock, state and journal", async () => {
-    const state = createInitialState("born", null, null)
-    state.race = { ...state.race, level: 10, grade: "F" as Grade }
-    dbMock.store.addCharacter({
-      id: "chr-1",
-      ownerId: user.id,
-      name: "Test",
-      state: serializeState(state),
-      version: 0,
-      origin: "born",
-    })
-    seedConsumable("perm-1", { type: "permanent", amount: { strength: 3 } })
-    seedStock("perm-1", 4)
-    const res = await consumeCharacter(
-      "chr-1",
-      { definitionId: "perm-1", version: 0 },
-      user
-    )
-    expect(res.status.attributes.strength).toBe(3)
-    expect(
-      dbMock.store.inventory.find((i) => i.definitionId === "perm-1")!.quantity
-    ).toBe(3)
-    const ev = dbMock.store.events[0]
-    expect(ev.payload).toMatchObject({ stockPrior: 4, stockAfter: 3 })
-
-    // A permanent gain above the cumulative cap rejects and rolls back.
-    const capState = createInitialState("born", null, null)
-    capState.race = { ...capState.race, level: 10, grade: "F" as Grade }
-    dbMock.store.addCharacter({
-      id: "chr-1",
-      ownerId: user.id,
-      name: "Test",
-      state: serializeState(capState),
-      version: 0,
-      origin: "born",
-    })
-    seedConsumable("perm-31", { type: "permanent", amount: { strength: 31 } })
-    seedStock("perm-31", 4)
-    const eventsBefore = dbMock.store.events.length
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "perm-31", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "consumable_cap_exceeded" })
-    expect(
-      dbMock.store.inventory.find((i) => i.definitionId === "perm-31")!.quantity
-    ).toBe(4)
-    expect(dbMock.store.events).toHaveLength(eventsBefore)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-  })
-
-  it("rejects consuming a consumable the character owns none of", async () => {
-    const state = createInitialState("born", null, null)
-    state.race = { ...state.race, level: 1, grade: "F" as Grade }
-    dbMock.store.addCharacter({
-      id: "chr-1",
-      ownerId: user.id,
-      name: "Test",
-      state: serializeState(state),
-      version: 0,
-      origin: "born",
-    })
-    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
-    // No owned stock -> insufficient.
-    await expect(
-      consumeCharacter("chr-1", { definitionId: "pot-1", version: 0 }, user)
-    ).rejects.toMatchObject({ status: 400, code: "inventory_insufficient" })
-    expect(dbMock.store.events).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
-  })
-
-  it("concurrent consumes of the final stock unit let exactly one succeed", async () => {
-    const state = createInitialState("born", null, null)
-    state.race = { ...state.race, level: 1, grade: "F" as Grade }
-    dbMock.store.addCharacter({
-      id: "chr-1",
-      ownerId: user.id,
-      name: "Test",
-      state: serializeState(state),
-      version: 0,
-      origin: "born",
-    })
-    seedConsumable("temp-1", {
-      type: "temporary",
-      amount: { strength: 4 },
-      durationQuarters: 3,
-    })
-    setStock("temp-1", 1)
-    const results = await Promise.allSettled([
-      consumeCharacter("chr-1", { definitionId: "temp-1", version: 0 }, user),
-      consumeCharacter("chr-1", { definitionId: "temp-1", version: 0 }, user),
-    ])
-    const fulfilled = results.filter((r) => r.status === "fulfilled")
-    const rejected = results.filter((r) => r.status === "rejected")
-    expect(fulfilled).toHaveLength(1)
-    expect(rejected).toHaveLength(1)
-    const reason = (rejected[0] as PromiseRejectedResult).reason as {
-      status: number
-    }
-    expect(reason.status).toBeGreaterThanOrEqual(400)
-    expect(dbMock.store.inventory).toHaveLength(0)
-    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
   })
 })
 
@@ -12961,13 +12229,14 @@ describe("equipment requirements / rarity / soulbound metadata", () => {
     expect(items).toHaveLength(1)
     expect(items[0].applied.strength).toBe(30)
 
-    // Edit in a minRaceLevel the character (level 1) does not currently meet.
+    // Edit in a minimumLevel the character (level 1) does not currently meet.
     await updateCatalogItem("equipment", "sword", {
       config: {
         slot: "Weapon",
         rarity: "Common",
         bonus: { strength: 30 },
-        minRaceLevel: 5,
+        minimumLevel: 5,
+        requiredLevelType: "humanoidRace",
       },
     })
 
@@ -13277,6 +12546,1322 @@ describe("equipment requirements / rarity / soulbound metadata", () => {
       requiredRaceType: "enlightened",
     })
     expect(item?.equipmentEligibility).toMatchObject({ eligible: false })
+  })
+
+  function seedGod(id: string, archived = false): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "gods",
+      stableId: id,
+      name: `God ${id}`,
+      config: { blessingEffects: {} },
+      ...(archived ? { archived: true } : {}),
+    })
+  }
+
+  function putCharacter(state: CharacterState, version = 0): void {
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version,
+    })
+  }
+
+  it("rejects a new equipment config that still uses the legacy requirement keys", async () => {
+    await expect(
+      createCatalogItem("equipment", {
+        name: "LegacyReq",
+        config: { slot: "Head", rarity: "Common", minRaceLevel: 5 },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    await expect(
+      createCatalogItem("equipment", {
+        name: "LegacyReq2",
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          requiredRaceType: "monster",
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    const item = await createCatalogItem("equipment", {
+      name: "CanonReq",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        minimumLevel: 5,
+        requiredLevelType: "humanoidRace",
+      },
+    })
+    expect(item.config).toMatchObject({
+      minimumLevel: 5,
+      requiredLevelType: "humanoidRace",
+    })
+  })
+
+  it("still reads and enforces a legacy minRaceLevel / requiredRaceType config", async () => {
+    seedCharacter(1)
+    seedEquipment("gear-legacy", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      minRaceLevel: 5,
+      requiredRaceType: "enlightened",
+    })
+    seedStock("gear-legacy")
+    // The add gate still rejects an unmet legacy requirement.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-legacy",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("race level 5"),
+    })
+    // Bypass the gate and confirm the read view still surfaces the legacy keys.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-legacy",
+      kind: "EQUIPMENT",
+    })
+    const detail = await getCharacter("chr-1", user)
+    const assoc = detail.associations.find((a) => a.kind === "equipment")
+    expect(assoc?.requirements).toMatchObject({
+      minRaceLevel: 5,
+      requiredRaceType: "enlightened",
+    })
+    expect(assoc?.equipmentEligibility).toMatchObject({ eligible: false })
+  })
+
+  it("gates eligibility on the Class track level and on class-track existence", async () => {
+    const state = createInitialState("integrated", null, null)
+    state.tracks["class"] = { level: 3, quarter: 0, definitionId: "" }
+    state.baseAttributes = { ...state.baseAttributes, strength: 1000 }
+    putCharacter(state)
+    seedEquipment("gear-class", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      minimumLevel: 5,
+      requiredLevelType: "class",
+    })
+    seedStock("gear-class")
+    // Class level 3 < 5 -> the add gate rejects with a precise reason.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-class",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("Class level 5"),
+    })
+    // Raise the class level past the requirement -> eligible.
+    const state2 = createInitialState("integrated", null, null)
+    state2.tracks["class"] = { level: 6, quarter: 0, definitionId: "" }
+    state2.baseAttributes = { ...state2.baseAttributes, strength: 1000 }
+    putCharacter(state2, 1)
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-class",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    const items = res.character.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    expect(items[0].applied.strength).toBe(10)
+  })
+
+  it("rejects an item requiring a Class track when no class track exists", async () => {
+    const state = createInitialState("integrated", null, null)
+    delete state.tracks["class"]
+    state.baseAttributes = { ...state.baseAttributes, strength: 1000 }
+    putCharacter(state)
+    seedEquipment("gear-no-class", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredLevelType: "class",
+    })
+    seedStock("gear-no-class")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-no-class",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("Class track"),
+    })
+  })
+
+  it("gates eligibility on the Profession track level and on profession-track existence", async () => {
+    const state = createInitialState("integrated", null, null)
+    state.tracks["profession"] = { level: 2, quarter: 0, definitionId: "" }
+    state.baseAttributes = { ...state.baseAttributes, strength: 1000 }
+    putCharacter(state)
+    seedEquipment("gear-prof", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      minimumLevel: 4,
+      requiredLevelType: "profession",
+    })
+    seedStock("gear-prof")
+    // Profession level 2 < 4 -> reject with a precise reason.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-prof",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("Profession level 4"),
+    })
+    // A profession-requiring item with no profession track is also rejected.
+    const noProf = createInitialState("integrated", null, null)
+    noProf.baseAttributes = { ...noProf.baseAttributes, strength: 1000 }
+    putCharacter(noProf)
+    seedEquipment("gear-no-prof", {
+      slot: "Chest",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredLevelType: "profession",
+    })
+    seedStock("gear-no-prof")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-no-prof",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("Profession track"),
+    })
+  })
+
+  it("gates humanoidRace eligibility on race type and race level", async () => {
+    seedRace("race-monster", {
+      raceType: "monster",
+      naturalGrade: "F",
+      raceDefinitions: {
+        F: { id: "race-monster:F", perLevel: allEqual(1), freePerLevel: 5 },
+      },
+    })
+    seedCharacter(1, { raceId: "race-monster", raceMode: "independent" })
+    seedEquipment("gear-hu", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      minimumLevel: 5,
+      requiredLevelType: "humanoidRace",
+    })
+    seedStock("gear-hu")
+    // A monster-raced character does NOT satisfy the humanoid requirement.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-hu",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("humanoid"),
+    })
+    // A humanoid character at race level 1 (< 5) is type-eligible but level-ineligible.
+    seedCharacter(1)
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-hu",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("humanoid race level 5"),
+    })
+    // Raise the race level past the requirement -> eligible.
+    seedCharacter(6)
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-hu",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.status?.equipment.items?.[0]?.applied.strength).toBe(
+      10
+    )
+  })
+
+  it("gates monstrousRace eligibility on race type and race level", async () => {
+    // A humanoid character does NOT satisfy the monstrous requirement.
+    seedCharacter(1)
+    seedEquipment("gear-mst", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      minimumLevel: 3,
+      requiredLevelType: "monstrousRace",
+    })
+    seedStock("gear-mst")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-mst",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("monstrous"),
+    })
+    // A monster at race level 4 (>= 3) satisfies the requirement.
+    seedRace("race-monster", {
+      raceType: "monster",
+      naturalGrade: "F",
+      raceDefinitions: {
+        F: { id: "race-monster:F", perLevel: allEqual(1), freePerLevel: 5 },
+      },
+    })
+    seedCharacter(4, { raceId: "race-monster", raceMode: "independent" })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-mst",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.status?.equipment.items?.[0]?.applied.strength).toBe(
+      10
+    )
+  })
+
+  it("gates divine-patron eligibility on exact god stableId (other god fails)", async () => {
+    seedCharacter(1)
+    seedGod("god-a")
+    seedGod("god-b")
+    // The character has a Minor blessing from God A only.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "god-a",
+      kind: "BLESSING",
+      blessingTier: "Minor",
+    })
+    seedEquipment("gear-god", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-a",
+      minimumBlessingTier: "Minor",
+    })
+    seedEquipment("gear-god-other", {
+      slot: "Chest",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-b",
+      minimumBlessingTier: "Minor",
+    })
+    seedStock("gear-god")
+    seedStock("gear-god-other")
+    // Matching god + equal tier -> eligible.
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-god",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.status?.equipment.items?.[0]?.applied.strength).toBe(
+      10
+    )
+    // A different god is required -> ineligible, reason names the god.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-god-other",
+          operation: "add",
+          version: 1,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("god-b"),
+    })
+  })
+
+  it("enforces the minimum blessing tier (below fails, equal/above pass)", async () => {
+    seedCharacter(1)
+    seedGod("god-c")
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "god-c",
+      kind: "BLESSING",
+      blessingTier: "Minor",
+    })
+    // Below the current tier -> rejected, reason states the required tier.
+    seedEquipment("gear-tier-hi", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-c",
+      minimumBlessingTier: "Greater",
+    })
+    seedStock("gear-tier-hi")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-tier-hi",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("Greater"),
+    })
+    // Equal tier -> eligible.
+    seedEquipment("gear-tier-eq", {
+      slot: "Chest",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-c",
+      minimumBlessingTier: "Minor",
+    })
+    seedStock("gear-tier-eq")
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-tier-eq",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(res.character.status?.equipment.items).toHaveLength(1)
+    // A lower tier (Baptism) than the current (Minor) -> eligible.
+    seedEquipment("gear-tier-lo", {
+      slot: "Hands",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-c",
+      minimumBlessingTier: "Baptism",
+    })
+    seedStock("gear-tier-lo")
+    const res2 = await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-tier-lo",
+        operation: "add",
+        version: 1,
+      },
+      user
+    )
+    expect(res2.character.status?.equipment.items).toHaveLength(2)
+  })
+
+  it("renders an item ineligible when the required patron is archived or not linked", async () => {
+    seedCharacter(1)
+    seedGod("god-arch", true)
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "god-arch",
+      kind: "BLESSING",
+      blessingTier: "Minor",
+    })
+    seedEquipment("gear-god-arch", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-arch",
+    })
+    seedStock("gear-god-arch")
+    // An archived patron (even though linked) is ineligible.
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-god-arch",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("archived"),
+    })
+    // No link at all to a required god is ineligible.
+    seedGod("god-none")
+    seedEquipment("gear-god-none", {
+      slot: "Chest",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-none",
+    })
+    seedStock("gear-god-none")
+    await expect(
+      associateCharacter(
+        "chr-1",
+        {
+          kind: "equipment",
+          definitionId: "gear-god-none",
+          operation: "add",
+          version: 0,
+        },
+        user
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "equipment_requirements_unmet",
+      message: expect.stringContaining("god-none"),
+    })
+  })
+
+  it("loses eligibility when a track level declines and suppresses the live bonus", async () => {
+    const state = createInitialState("integrated", null, null)
+    state.tracks["class"] = { level: 6, quarter: 0, definitionId: "" }
+    state.baseAttributes = { ...state.baseAttributes, strength: 1000 }
+    putCharacter(state)
+    seedEquipment("gear-decline", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 30 },
+      minimumLevel: 5,
+      requiredLevelType: "class",
+    })
+    seedStock("gear-decline")
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "equipment",
+        definitionId: "gear-decline",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const d1 = await getCharacter("chr-1", user)
+    expect(d1.status?.equipment.items?.[0]?.applied.strength).toBe(30)
+    // Decline the class track below the requirement.
+    const lowered = createInitialState("integrated", null, null)
+    lowered.tracks["class"] = { level: 2, quarter: 0, definitionId: "" }
+    lowered.baseAttributes = { ...lowered.baseAttributes, strength: 1000 }
+    putCharacter(lowered, 1)
+    const d2 = await getCharacter("chr-1", user)
+    const item = d2.status?.equipment.items?.[0]
+    expect(item).toBeDefined()
+    expect(item?.requested.strength).toBe(0)
+    expect(item?.applied.strength).toBe(0)
+  })
+
+  it("suppresses both attribute and derived bonuses when eligibility is lost", async () => {
+    const state = createInitialState("integrated", null, null)
+    state.tracks["class"] = { level: 2, quarter: 0, definitionId: "" }
+    state.baseAttributes = {
+      ...state.baseAttributes,
+      strength: 1000,
+      vitality: 100,
+      wisdom: 100,
+    }
+    putCharacter(state)
+    seedEquipment("gear-derived-inel", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      derivedFlat: { hp: 50 },
+      derivedPercentBasisPoints: { hp: 1000 },
+      minimumLevel: 5,
+      requiredLevelType: "class",
+    })
+    seedStock("gear-derived-inel")
+    // Link directly (bypassing the add gate) so the ineligible link can be read.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-derived-inel",
+      kind: "EQUIPMENT",
+    })
+    const detail = await getCharacter("chr-1", user)
+    const items = detail.status?.equipment.items ?? []
+    expect(items).toHaveLength(1)
+    expect(items[0].requested.strength).toBe(0)
+    expect(items[0].applied.strength).toBe(0)
+    // The derived HP bonus is inert: HP stays at its vitality-derived base (1000).
+    expect(detail.status?.derivedStats?.hp).toBe(1000)
+  })
+
+  it("rejects a new equipment entry referencing a missing or archived divine patron", async () => {
+    await expect(
+      createCatalogItem("equipment", {
+        name: "GearMissing",
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          requiredGodStableId: "no-such-god",
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("no-such-god"),
+    })
+    seedGod("god-arch", true)
+    await expect(
+      createCatalogItem("equipment", {
+        name: "GearArch",
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          requiredGodStableId: "god-arch",
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("god-arch"),
+    })
+    seedGod("god-ok")
+    const item = await createCatalogItem("equipment", {
+      name: "GearOK",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        requiredGodStableId: "god-ok",
+        minimumBlessingTier: "Minor",
+      },
+    })
+    expect(item.config).toMatchObject({
+      requiredGodStableId: "god-ok",
+      minimumBlessingTier: "Minor",
+    })
+  })
+
+  it("blocks a god stableId rename while equipment references the old id", async () => {
+    seedGod("god-r")
+    seedEquipment("gear-ref", {
+      slot: "Weapon",
+      rarity: "Common",
+      bonus: { strength: 10 },
+      requiredGodStableId: "god-r",
+    })
+    await expect(
+      updateCatalogItem("gods", "god-r", { stableId: "god-r2" })
+    ).rejects.toMatchObject({ status: 409, code: "god_stable_id_in_use" })
+  })
+
+  it("allows a god stableId rename when no equipment references it", async () => {
+    seedGod("god-free")
+    const item = await updateCatalogItem("gods", "god-free", {
+      stableId: "god-free-2",
+    })
+    expect(item.stableId).toBe("god-free-2")
+  })
+
+  it("runs an equipment create under SERIALIZABLE isolation (against a concurrent god/skill rename)", async () => {
+    seedGod("god-serial")
+    seedSkill("sk-serial", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    const spy = vi.spyOn(prisma, "$transaction")
+    try {
+      await createCatalogItem("equipment", {
+        name: "GearSerial",
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          requiredGodStableId: "god-serial",
+          grantedSkillStableIds: ["sk-serial"],
+        },
+      })
+      // The equipment create transaction MUST request SERIALIZABLE isolation so a
+      // concurrent god/skill stableId rename cannot slip between the live-ref read
+      // and the equipment write (which would leave a dangling reference).
+      expect(spy.mock.calls[spy.mock.calls.length - 1][1]).toEqual(
+        expect.objectContaining({ isolationLevel: "Serializable" })
+      )
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("runs an equipment config-changing update under SERIALIZABLE isolation", async () => {
+    seedEquipment("gear-upd", {
+      slot: "Head",
+      rarity: "Common",
+      bonus: { strength: 1 },
+    })
+    const spy = vi.spyOn(prisma, "$transaction")
+    try {
+      await updateCatalogItem("equipment", "gear-upd", {
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          bonus: { strength: 2 },
+        },
+      })
+      // A config-changing equipment PATCH re-validates requiredGodStableId /
+      // grantedSkillStableIds inside the transaction, so it must run SERIALIZABLE.
+      expect(spy.mock.calls[spy.mock.calls.length - 1][1]).toEqual(
+        expect.objectContaining({ isolationLevel: "Serializable" })
+      )
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("maps a serialization failure (P2034) on equipment create to a 409, never a 500", async () => {
+    seedGod("god-serial-map")
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        createCatalogItem("equipment", {
+          name: "GearMap",
+          config: {
+            slot: "Head",
+            rarity: "Common",
+            requiredGodStableId: "god-serial-map",
+          },
+        })
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "catalog_serialization_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    // The rejected create left no equipment row behind (only the seeded god).
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  function seedSkill(id: string, config: Record<string, unknown>): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: `Skill ${id}`,
+      config,
+    })
+  }
+
+  it("blocks a skill stableId rename while any equipment grants the old id", async () => {
+    seedSkill("sk-r", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedEquipment("gear-ref", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-r"],
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-r", { stableId: "sk-r2" })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "skill_stable_id_in_use",
+      message: expect.stringContaining("sk-r"),
+    })
+  })
+
+  it("blocks a skill stableId rename even when the referencing equipment is archived", async () => {
+    seedSkill("sk-arch", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    dbMock.store.addCatalog({
+      id: "gear-arch",
+      kind: "equipment",
+      stableId: "gear-arch",
+      name: "Gear Arch",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        grantedSkillStableIds: ["sk-arch"],
+      },
+      archived: true,
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-arch", { stableId: "sk-arch2" })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "skill_stable_id_in_use",
+      message: expect.stringContaining("sk-arch"),
+    })
+  })
+
+  it("allows a skill stableId rename when no equipment grants it", async () => {
+    seedSkill("sk-free", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    const item = await updateCatalogItem("skills", "sk-free", {
+      stableId: "sk-free-2",
+    })
+    expect(item.stableId).toBe("sk-free-2")
+  })
+
+  it("still allows metadata / effects edits on a granted skill (rename is the only blocked change)", async () => {
+    seedSkill("sk-meta", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedEquipment("gear-meta", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-meta"],
+    })
+    const item = await updateCatalogItem("skills", "sk-meta", {
+      name: "Renamed Skill",
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 7 } }],
+      },
+    })
+    expect(item.name).toBe("Renamed Skill")
+    expect(item.config).toMatchObject({
+      effects: [{ phase: "flat", amount: { strength: 7 } }],
+    })
+  })
+})
+
+describe("equipment-granted passive skills (live synthesis, dedup, inert states)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharacter(baseStrength = 100): void {
+    const state = createInitialState("integrated", null, null)
+    state.baseAttributes = {
+      ...state.baseAttributes,
+      strength: baseStrength,
+    }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedSkill(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: `Skill ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedEquipment(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "equipment",
+      stableId: id,
+      name: extra.name ?? `Gear ${id}`,
+      config,
+    })
+  }
+
+  function equipWithoutGate(definitionId: string): void {
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId,
+      kind: "EQUIPMENT",
+    })
+  }
+
+  function strengthFlatDelta(status: unknown): number {
+    const traces = (
+      status as {
+        traces: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces
+    const strength = traces.find((t) => t.attribute === "strength")
+    if (!strength) return 0
+    const flat = strength.phases.find((p) => p.phase === "flat")
+    return flat?.delta ?? 0
+  }
+
+  it("synthesizes the granted skill's passive stat while the item is equipped and eligible", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    equipWithoutGate("gear-1")
+    const detail = await getCharacter("chr-1", user)
+    // The granted passive is synthesized live (flat +5 sourced to item+skill).
+    expect(strengthFlatDelta(detail.status)).toBe(5)
+    // It is never persisted as a SKILL association and never written into state.
+    expect(detail.associations).toHaveLength(1)
+    expect(detail.associations[0]).toMatchObject({ kind: "equipment" })
+    expect(
+      (detail.state as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+  })
+
+  it("keeps the granted passive inert while the item is ineligible", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    // Race level 0 is below minRaceLevel 5 => ineligible.
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+      minRaceLevel: 5,
+    })
+    equipWithoutGate("gear-1")
+    const detail = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(detail.status)).toBe(0)
+    // Requalifying (raising the race level) turns the grant back on.
+    const state = deserializeState(
+      (await dbMock.store.characters.get("chr-1")!).state
+    )
+    state.race = { ...state.race, level: 6 }
+    dbMock.store.characters.get("chr-1")!.state = serializeState(state)
+    const requalified = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(requalified.status)).toBe(5)
+  })
+
+  it("treats an archived skill as inert even while the granting item is eligible", async () => {
+    seedCharacter(100)
+    seedSkill(
+      "sk-1",
+      {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+      { archived: true }
+    )
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    equipWithoutGate("gear-1")
+    const detail = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(detail.status)).toBe(0)
+  })
+
+  it("does not double count: a linked SKILL association wins, and duplicate equipment grants apply once", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    // Link the same skill as a SKILL association (the linked association wins).
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-1",
+      kind: "SKILL",
+    })
+    // Two equipment items both grant sk-1.
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    seedEquipment("gear-2", {
+      slot: "Chest",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    equipWithoutGate("gear-1")
+    equipWithoutGate("gear-2")
+    const detail = await getCharacter("chr-1", user)
+    // Applied once (via the linked skill), never counted three times.
+    expect(strengthFlatDelta(detail.status)).toBe(5)
+  })
+
+  it("applies a duplicate equipment grant only once (first equipped wins)", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    seedEquipment("gear-2", {
+      slot: "Chest",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    equipWithoutGate("gear-1")
+    equipWithoutGate("gear-2")
+    const detail = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(detail.status)).toBe(5)
+  })
+
+  it("rejects a new equipment config that grants a missing skill", async () => {
+    await expect(
+      createCatalogItem("equipment", {
+        name: "GearMissing",
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          grantedSkillStableIds: ["no-such-skill"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("no-such-skill"),
+    })
+  })
+
+  it("rejects a new equipment config that grants an archived skill", async () => {
+    seedSkill(
+      "sk-arch",
+      {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+      { archived: true }
+    )
+    await expect(
+      createCatalogItem("equipment", {
+        name: "GearArch",
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          grantedSkillStableIds: ["sk-arch"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("sk-arch"),
+    })
+  })
+
+  it("accepts a new equipment config that grants an existing unarchived skill", async () => {
+    seedSkill("sk-ok", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    const item = await createCatalogItem("equipment", {
+      name: "GearOK",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        grantedSkillStableIds: ["sk-ok"],
+      },
+    })
+    expect(item.config).toMatchObject({ grantedSkillStableIds: ["sk-ok"] })
+  })
+
+  it("rejects a config-changing update that grants a missing / archived skill", async () => {
+    seedSkill(
+      "sk-arch",
+      {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+      { archived: true }
+    )
+    seedEquipment("gear-1", { slot: "Head", rarity: "Common" })
+    await expect(
+      updateCatalogItem("equipment", "gear-1", {
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          grantedSkillStableIds: ["missing-skill"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("missing-skill"),
+    })
+    await expect(
+      updateCatalogItem("equipment", "gear-1", {
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          grantedSkillStableIds: ["sk-arch"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("sk-arch"),
+    })
+    // The rejected update never applied; the row keeps its original config.
+    expect(
+      (dbMock.store.catalog.get("gear-1")!.config as Record<string, unknown>)
+        .grantedSkillStableIds
+    ).toBeUndefined()
+  })
+})
+
+describe("equipment-granted skill lookup is transaction-scoped", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharacter(): void {
+    const state = createInitialState("integrated", null, null)
+    state.baseAttributes = { ...state.baseAttributes, strength: 100 }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedSkill(id: string, config: Record<string, unknown>): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: `Skill ${id}`,
+      config,
+    })
+  }
+
+  function seedEquipment(id: string, config: Record<string, unknown>): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "equipment",
+      stableId: id,
+      name: `Gear ${id}`,
+      config,
+    })
+  }
+
+  function equip(definitionId: string): void {
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId,
+      kind: "EQUIPMENT",
+    })
+  }
+
+  function strengthFlatDelta(status: unknown): number {
+    const traces = (
+      status as {
+        traces: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces
+    const strength = traces.find((t) => t.attribute === "strength")
+    if (!strength) return 0
+    const flat = strength.phases.find((p) => p.phase === "flat")
+    return flat?.delta ?? 0
+  }
+
+  it("reads the equipment-granted skill through the transaction client, never the global client", async () => {
+    seedCharacter()
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    equip("gear-1")
+    // The GLOBAL client is primed to resolve no skills (an empty map), so if the
+    // mutation fell back to a global skill lookup the granted passive would go inert.
+    const spy = vi
+      .spyOn(prisma.catalogDefinition, "findMany")
+      .mockResolvedValue([])
+    try {
+      const detail = await updateCharacter("chr-1", { name: "Renamed" }, user)
+      expect(strengthFlatDelta(detail.status)).toBe(5)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("snapshots the recently edited skill config inside the transaction, not a stale global read", async () => {
+    seedCharacter()
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    equip("gear-1")
+    // A skill config edit lands in the transaction's view, but the GLOBAL client
+    // still returns the OLD +5 config. A mutation that resolves the skill map
+    // through global prisma would synthesize the stale +5; using the transaction
+    // client it must see the edited +7 snapshot.
+    const storedSkill = dbMock.store.catalog.get("sk-1")!
+    ;(storedSkill.config as Record<string, unknown>).effects = [
+      { phase: "flat", amount: { strength: 7 } },
+    ]
+    const spy = vi
+      .spyOn(prisma.catalogDefinition, "findMany")
+      .mockResolvedValue([
+        {
+          id: "sk-1",
+          kind: "skills",
+          stableId: "sk-1",
+          name: "Skill sk-1",
+          config: {
+            track: "class",
+            milestone: 4,
+            rarity: "Common",
+            effects: [{ phase: "flat", amount: { strength: 5 } }],
+          },
+          archived: false,
+        } as never,
+      ])
+    try {
+      const detail = await updateCharacter("chr-1", { name: "Renamed" }, user)
+      expect(strengthFlatDelta(detail.status)).toBe(7)
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 
@@ -13777,6 +14362,7 @@ describe("character list-item race grade / level / configured band", () => {
       associations: [],
       inventory: [],
       skillOffers: [],
+      assets: [],
     } as Parameters<typeof toListItem>[0]
   }
 
@@ -13821,7 +14407,7 @@ describe("character list-item race grade / level / configured band", () => {
     expect(withStatus[0].raceGradeBand).toEqual({ min: 25, max: 99 })
   })
 
-  it("maps a custom configured grade-table band for the grade", () => {
+  it("maps a custom configured grade-table band for the grade", async () => {
     const config = defaultRulesConfig()
     config.gradeTable = [
       { grade: "G", min: 0, max: 9, entryLevel: 0 },
@@ -13833,13 +14419,13 @@ describe("character list-item race grade / level / configured band", () => {
       tracks: {},
       race: { level: 0, grade: "B", mode: "derived" },
     })
-    const item = toListItem(charFixture(state), false, config, 7, state)
+    const item = await toListItem(charFixture(state), false, config, 7, state)
     expect(item.raceGrade).toBe("B")
     expect(item.raceLevel).toBe(0)
     expect(item.raceGradeBand).toEqual({ min: 300, max: 449 })
   })
 
-  it("reads a null grade band when the grade has no configured band", () => {
+  it("reads a null grade band when the grade has no configured band", async () => {
     const config = defaultRulesConfig()
     config.gradeTable = [
       { grade: "G", min: 0, max: 9, entryLevel: 0 },
@@ -13850,10 +14436,235 @@ describe("character list-item race grade / level / configured band", () => {
       tracks: {},
       race: { level: 0, grade: "B", mode: "derived" },
     })
-    const item = toListItem(charFixture(state), false, config, 7, state)
+    const item = await toListItem(charFixture(state), false, config, 7, state)
     expect(item.raceGrade).toBe("B")
     expect(item.raceLevel).toBe(0)
     expect(item.raceGradeBand).toBeNull()
+  })
+})
+
+describe("character list-item portrait (authenticated dashboard URL)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function baseState(): CharacterState {
+    return createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+    })
+  }
+
+  function seedState(overrides: Record<string, unknown> = {}): string {
+    return dbMock.store.addCharacter({
+      id: "chr-portrait",
+      ownerId: user.id,
+      name: "Portrait",
+      description: null,
+      state: serializeState(baseState()),
+      version: 0,
+      ...(overrides as Record<string, unknown>),
+    }).id
+  }
+
+  function seedOtherOwnerState(): void {
+    dbMock.store.addCharacter({
+      id: "chr-other",
+      ownerId: "user-2",
+      name: "Other",
+      description: null,
+      state: serializeState(baseState()),
+      version: 0,
+    })
+    dbMock.store.addAsset({
+      id: "asset-other",
+      characterId: "chr-other",
+    })
+  }
+
+  it("exposes the canonical authenticated portrait URL for a character with a portrait", async () => {
+    seedState()
+    dbMock.store.addAsset({
+      id: "asset-portrait",
+      kind: "character-avatar",
+      characterId: "chr-portrait",
+      url: "/api/assets/asset-portrait",
+      updatedAt: new Date("2026-01-02"),
+    })
+    const items = await listCharacters(user)
+    expect(items).toHaveLength(1)
+    expect(items[0].portrait).toEqual({
+      assetId: "asset-portrait",
+      url: "/api/assets/asset-portrait",
+    })
+  })
+
+  it("returns a null portrait for a character without one", async () => {
+    seedState()
+    const items = await listCharacters(user)
+    expect(items).toHaveLength(1)
+    expect(items[0].portrait).toBeNull()
+  })
+
+  it("keeps a portrait on an archived character in the list", async () => {
+    seedState({ archived: true })
+    dbMock.store.addAsset({
+      id: "asset-portrait",
+      characterId: "chr-portrait",
+    })
+    const items = await listCharacters(user, { includeArchived: true })
+    expect(items).toHaveLength(1)
+    expect(items[0].archived).toBe(true)
+    expect(items[0].portrait).toEqual({
+      assetId: "asset-portrait",
+      url: "/api/assets/asset-portrait",
+    })
+  })
+
+  it("derives the URL from the asset id via the canonical route, never a stored path", async () => {
+    seedState()
+    // Even if the persisted `url` column were a filesystem path, the public DTO
+    // must use the canonical authenticated `/api/assets/{id}` route.
+    dbMock.store.addAsset({
+      id: "asset-portrait",
+      characterId: "chr-portrait",
+      url: "/data/uploads/portrait.webp",
+    })
+    const items = await listCharacters(user)
+    expect(items[0].portrait).toEqual({
+      assetId: "asset-portrait",
+      url: "/api/assets/asset-portrait",
+    })
+  })
+
+  it("scopes the list (and its portrait) to the owning user for a non-admin", async () => {
+    seedState()
+    seedOtherOwnerState()
+    const items = await listCharacters(user)
+    expect(items).toHaveLength(1)
+    expect(items[0].id).toBe("chr-portrait")
+    expect(items[0].portrait).toBeNull()
+  })
+
+  it("carries derivedStats in the typed status DTO when withStatus is set", async () => {
+    seedState()
+    const items = await listCharacters(user, { withStatus: true })
+    expect(items).toHaveLength(1)
+    const status = items[0].status!
+    expect(status.derivedStats).toBeDefined()
+    expect(typeof status.derivedStats.hp).toBe("number")
+    expect(typeof status.derivedStats.mp).toBe("number")
+    expect(typeof status.derivedStats.sp).toBe("number")
+  })
+})
+
+describe("listCharacters shares the unarchived-skill map across items", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharWithGrant(id: string): void {
+    const state = createInitialState("integrated", null, null)
+    state.baseAttributes = { ...state.baseAttributes, strength: 100 }
+    dbMock.store.addCharacter({
+      id,
+      ownerId: user.id,
+      name: `Test ${id}`,
+      state: serializeState(state),
+      version: 0,
+    })
+    dbMock.store.addAssociation({
+      characterId: id,
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+    })
+  }
+
+  function seedGrantSkill(): void {
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Skill sk-1",
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+    })
+  }
+
+  function seedGrantGear(): void {
+    dbMock.store.addCatalog({
+      id: "gear-1",
+      kind: "equipment",
+      stableId: "gear-1",
+      name: "Gear 1",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        grantedSkillStableIds: ["sk-1"],
+      },
+    })
+  }
+
+  function strengthFlatDelta(status: unknown): number {
+    const traces = (
+      status as {
+        traces: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces
+    const strength = traces.find((t) => t.attribute === "strength")
+    if (!strength) return 0
+    const flat = strength.phases.find((p) => p.phase === "flat")
+    return flat?.delta ?? 0
+  }
+
+  it("loads the unarchived-skill map ONCE for a withStatus list of 3 granted characters", async () => {
+    seedGrantSkill()
+    seedGrantGear()
+    seedCharWithGrant("chr-1")
+    seedCharWithGrant("chr-2")
+    seedCharWithGrant("chr-3")
+    const spy = vi.spyOn(prisma.catalogDefinition, "findMany")
+    try {
+      const items = await listCharacters(user, { withStatus: true })
+      expect(items).toHaveLength(3)
+      for (const item of items) {
+        expect(strengthFlatDelta(item.status)).toBe(5)
+      }
+      // A single unarchived-skill query for the whole request, never one per item.
+      expect(spy).toHaveBeenCalledTimes(1)
+      expect(spy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { kind: "skills", archived: false },
+        })
+      )
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("does not load the unarchived-skill map for a status-less list", async () => {
+    seedGrantSkill()
+    seedGrantGear()
+    seedCharWithGrant("chr-1")
+    seedCharWithGrant("chr-2")
+    seedCharWithGrant("chr-3")
+    const spy = vi.spyOn(prisma.catalogDefinition, "findMany")
+    try {
+      const items = await listCharacters(user)
+      expect(items).toHaveLength(3)
+      for (const item of items) expect(item.status).toBeUndefined()
+      expect(spy).not.toHaveBeenCalled()
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 
@@ -15157,5 +15968,86 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
         user
       )
     ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+})
+
+describe("grade ceiling level-up blockers (service read)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedDerived(
+    opts: {
+      classLevel?: number
+      professionLevel?: number
+      raceGrade?: Grade
+    } = {}
+  ): unknown {
+    const classLevel = opts.classLevel ?? 27
+    const professionLevel = opts.professionLevel ?? 24
+    const state = createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks: {
+        class: { level: classLevel, quarter: 0, definitionId: "class-def" },
+        profession: {
+          level: professionLevel,
+          quarter: 0,
+          definitionId: "prof-def",
+        },
+      },
+      race: {
+        level: Math.floor((classLevel + professionLevel) / 2),
+        grade: opts.raceGrade ?? "F",
+        mode: "derived",
+        origin: "integrated",
+      },
+    })
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "GradeGate",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedMonster(level: number, grade: Grade): unknown {
+    const state = createCharacterState({
+      baseAttributes: makeVector({}),
+      tracks: {},
+      race: { level, grade, mode: "independent", quarter: 0 },
+    })
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Monster",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  it("exposes class/profession level-up blockers for a derived race at the grade ceiling", async () => {
+    seedDerived()
+    const detail = await getCharacter("chr-1", user)
+    // The derived race level is the symmetric average of class + profession, so a
+    // class and a profession level-up project the SAME race level and are both
+    // blocked when that projection crosses the F->E ceiling.
+    expect(detail.levelUpBlocked?.class).toContain("F->E")
+    expect(detail.levelUpBlocked?.profession).toContain("F->E")
+    expect(detail.levelUpBlocked?.race).toBeUndefined()
+  })
+
+  it("exposes a race level-up blocker for a monster (independent) race", async () => {
+    seedMonster(25, "F")
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.levelUpBlocked?.race).toContain("F->E")
+    expect(detail.levelUpBlocked?.class).toBeUndefined()
+    expect(detail.levelUpBlocked?.profession).toBeUndefined()
+  })
+
+  it("leaves levelUpBlocked empty when no track crosses the grade ceiling", async () => {
+    seedDerived({ classLevel: 25, professionLevel: 24 })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.levelUpBlocked ?? {}).toEqual({})
   })
 })

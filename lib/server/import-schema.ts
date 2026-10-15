@@ -1,8 +1,8 @@
 /**
- * Zod schema for the trusted-backup character import document (v3, v4, v5 and v6).
+ * Zod schema for the trusted-backup character import document (v3 through v7).
  *
- * The v6 document is the output of `exportCharacter` (schema
- * `primal-character/6`) plus `skillOffers`. It is a *trusted backup*, NOT
+ * The v7 document is the output of `exportCharacter` (schema
+ * `primal-character/7`) plus `skillOffers`. It is a *trusted backup*, NOT
  * authoritative server-verified state: the `state` is validated against the
  * engine `characterStateSchema`, but `liveState` and `status` are advisory and
  * are recomputed server-side on import. Catalog references (identity race/class/
@@ -10,16 +10,34 @@
  * skill-offer option) are resolved by `kind` + `stableId` to EXISTING catalog
  * definitions - no catalog content is ever auto-created, and a
  * missing/mismatched/archived required definition is rejected with an actionable
- * error. Every v5/v6 equipment association carries the ring `equipmentPosition` so
- * a Ring-slot character round-trips its two physical ring positions.
+ * error. Every v5/v6/v7 equipment association carries the ring
+ * `equipmentPosition` so a Ring-slot character round-trips its two physical ring
+ * positions.
  *
- * A v6 backup additionally carries the append-only skill-offer cancellation model:
- * every exported skill offer includes a REQUIRED non-negative `generation` and a
- * REQUIRED-but-nullable `canceledAt` timestamp. A canceled offer is never dropped,
- * so a restore preserves the full historical offer identity; the importer
+ * A v6/v7 backup additionally carries the append-only skill-offer cancellation
+ * model: every exported skill offer includes a REQUIRED non-negative `generation`
+ * and a REQUIRED-but-nullable `canceledAt` timestamp. A canceled offer is never
+ * dropped, so a restore preserves the full historical offer identity; the importer
  * re-validates the offer invariants (unique per track/level/choiceGroup/generation,
  * at most one active offer per base key, no selected+canceled row) before any
  * write. A legacy v3/v4/v5 backup omits both fields; they default to 0/null.
+ *
+ * The v7 document changes the BLESSING association model (the legacy `blessings`
+ * catalog kind was retired): a blessing association references a `gods`
+ * definition by `definition.kind: "gods"` and carries a REQUIRED `tier` (the
+ * eight-tier blessing hierarchy). The importer persists that tier on the
+ * association link so the live effect is synthesized from the god's
+ * `blessingEffects[tier]`. A v7 document NEVER carries a `blessings` inventory or
+ * association kind; its inventory `definition.kind` is `"equipment"` or `"items"`
+ * only (the legacy `consumables` alias is rejected, not normalized).
+ *
+ * The v4/v5/v6 documents (schemas `primal-character/4`/`/5`/`/6`) still parse, but
+ * the SERVICE LAYER rejects any document carrying a legacy `blessing` association
+ * with an actionable 400 migration notice - even when that association would
+ * otherwise resolve - because the `blessings` catalog rows no longer exist. A
+ * legacy v4/v5/v6 inventory `consumables` kind is normalized to `items` (see
+ * `inventoryRefSchema`), never persisted. Legacy v3/v4/v5 documents omit the
+ * skill-offer generation/cancellation fields; they default to 0/null.
  *
  * The v4 document (schema `primal-character/4`) adds the `inventory` array and the
  * `legacyUnowned` equipment marker and is still accepted on import; it carries no
@@ -44,14 +62,15 @@
  */
 
 import { z } from "zod"
-import { characterStateSchema } from "@/lib/server/schemas"
+import { blessingTierSchema, characterStateSchema } from "@/lib/server/schemas"
 
 export const IMPORT_SCHEMA_V3 = "primal-character/3" as const
 export const IMPORT_SCHEMA_V4 = "primal-character/4" as const
 export const IMPORT_SCHEMA_V5 = "primal-character/5" as const
 export const IMPORT_SCHEMA_V6 = "primal-character/6" as const
+export const IMPORT_SCHEMA_V7 = "primal-character/7" as const
 /** The current trusted-backup schema (what `exportCharacter` emits). */
-export const IMPORT_SCHEMA = IMPORT_SCHEMA_V6
+export const IMPORT_SCHEMA = IMPORT_SCHEMA_V7
 
 export const IMPORT_RULESET_VERSION = "house-2026-10-12-v1" as const
 
@@ -176,12 +195,20 @@ const v5AssociationSchema = z.discriminatedUnion("kind", [
 
 /**
  * A single exported inventory entry. `definition.kind` is always `"equipment"` or
- * `"consumables"` (the only kinds that can be inventoried); `quantity` is bounded
- * 1..999999 (the same bound the migration's CHECK constraint enforces).
+ * `"items"` (the only kinds that can be inventoried - `items` replaces the legacy
+ * `consumables` kind); `quantity` is bounded 1..999999 (the same bound the
+ * migration's CHECK constraint enforces).
+ *
+ * A legacy backup (v4/v5/v6) that predates the rename may still carry
+ * `definition.kind: "consumables"`. It is ACCEPTED and normalized to `"items"`
+ * here, before any resolver runs, so an old backup never references a catalog
+ * kind the enum no longer holds. The legacy value is never persisted.
  */
 const inventoryRefSchema = z.object({
   definition: z.object({
-    kind: z.enum(["equipment", "consumables"]),
+    kind: z
+      .enum(["equipment", "consumables", "items"])
+      .transform((kind) => (kind === "consumables" ? "items" : kind)),
     stableId: z.string().min(1),
   }),
   quantity: z.number().int().min(1).max(999999),
@@ -332,7 +359,73 @@ const v6DocumentSchema = z.object({
 })
 
 /**
- * The full trusted-backup document: the current v6 shape, or a legacy v5/v4/v3
+ * v7 blessing association. The legacy `blessings` catalog kind was retired, so a
+ * blessing now references a `gods` definition by `definition.kind: "gods"` and
+ * carries a REQUIRED `tier` (the eight-tier blessing hierarchy). The importer
+ * persists that tier verbatim on the association link, so the live effect is
+ * synthesized from the god's `blessingEffects[tier]` at read time. A non-gods
+ * definition (e.g. a stale `blessings` kind) is rejected at the schema boundary.
+ */
+const v7BlessingAssociationSchema = z
+  .object({
+    kind: z.literal("blessing"),
+    tier: blessingTierSchema,
+    definition: definitionRefSchema,
+    legacyUnowned: z.literal(false).optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.definition.kind !== "gods") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `A blessing association must reference a gods definition (got "${data.definition.kind}")`,
+        path: ["definition", "kind"],
+      })
+    }
+  })
+
+/**
+ * v7 association references. Non-blessing kinds keep the v5 shape (ring position
+ * on equipment); a blessing is the god + tier form above. Blessing links carry no
+ * `legacyUnowned` marker beyond the v5 non-equipment allowance.
+ */
+const v7AssociationSchema = z.discriminatedUnion("kind", [
+  equipmentAssociationSchemaV5,
+  ...NON_EQUIPMENT_KINDS.filter((k) => k !== "blessing").map((kind) =>
+    nonEquipmentAssociationSchema.extend({ kind: z.literal(kind) })
+  ),
+  v7BlessingAssociationSchema,
+])
+
+/**
+ * v7 inventory entry. The legacy `consumables` alias is REJECTED (not normalized):
+ * a v7 document names the kind `"equipment"` or `"items"` only.
+ */
+const inventoryRefSchemaV7 = z.object({
+  definition: z.object({
+    kind: z.enum(["equipment", "items"]),
+    stableId: z.string().min(1),
+  }),
+  quantity: z.number().int().min(1).max(999999),
+})
+
+/**
+ * The current v7 trusted-backup document. Everything v6 carries (the strict v6
+ * skill-offer shape, inventory, ring positions) plus the god + tier blessing
+ * model: a blessing association references a `gods` definition and carries a
+ * REQUIRED `tier`. This is the ONLY schema `exportCharacter` emits; legacy v3-v6
+ * documents still parse and are accepted unless they carry a blessing association
+ * (the service layer rejects those with a migration notice).
+ */
+const v7DocumentSchema = z.object({
+  schema: z.literal(IMPORT_SCHEMA_V7),
+  ...documentBase,
+  associations: z.array(v7AssociationSchema).max(MAX_IMPORT_ASSOCIATIONS),
+  inventory: z.array(inventoryRefSchemaV7).max(MAX_IMPORT_INVENTORY),
+  skillOffers: z.array(skillOfferSchemaV6).max(MAX_IMPORT_SKILL_OFFERS),
+})
+
+/**
+ * The full trusted-backup document: the current v7 shape, or a legacy v6/v5/v4/v3
  * shape. `state` is the only authoritative field used to build the new character;
  * `liveState` / `status` are advisory and are validated loosely (they are ignored
  * on import, status is recomputed). The arrays are bounded so a pathological
@@ -343,9 +436,10 @@ export const characterImportDocumentSchema = z.discriminatedUnion("schema", [
   v4DocumentSchema,
   v5DocumentSchema,
   v6DocumentSchema,
+  v7DocumentSchema,
 ])
 
-/** The validated import document type (v3, v4, v5 or v6). */
+/** The validated import document type (v3, v4, v5, v6 or v7). */
 export type CharacterImportDocument = z.infer<
   typeof characterImportDocumentSchema
 >

@@ -13,17 +13,16 @@ const KIND_LABELS: Record<string, string> = {
   titles: "Titles",
   equipment: "Equipment",
   skills: "Skills",
-  blessings: "Blessings",
   bloodlines: "Bloodlines",
-  consumables: "Consumables",
-  evolutions: "Evolutions",
-  gods: "Gods & Patrons",
+  items: "Items",
+  gods: "Gods",
   transcendent_skills: "Transcendent Skills",
 }
 
 export default function CatalogPage() {
   const params = useParams<{ kind: string }>()
-  const kind = params.kind
+  // Blessings is retired as a catalog kind; legacy links now land on Gods.
+  const kind = params.kind === "blessings" ? "gods" : params.kind
   const label = KIND_LABELS[kind] ?? kind
 
   return (

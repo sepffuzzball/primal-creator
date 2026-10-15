@@ -3,10 +3,10 @@
  *
  * Exercises the importer against a live database: applying a manifest creates the
  * six curated entries, a repeat apply is idempotent (skips every existing row), a
- * pre-existing house row with a conflicting stableId is retained unchanged, and a
- * mid-transaction patron failure rolls back the whole import (no partial rows).
- * Runs ONLY when explicitly opted in (see `resolveDbIntegration`); a normal
- * `pnpm test` skips this file.
+ * pre-existing house row with a conflicting stableId is retained unchanged, and an
+ * invalid `gods` config rejects the whole import before any row is written (no
+ * partial rows). Runs ONLY when explicitly opted in (see `resolveDbIntegration`);
+ * a normal `pnpm test` skips this file.
  *
  * These tests never delete pre-existing catalog rows. Every stableId this suite
  * uses is run-suffixed with a fresh `randomUUID`, and cleanup deletes only the
@@ -147,13 +147,13 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
     expect(row?.config).toEqual({ houseStub: true })
   })
 
-  it("rolls back a mid-transaction patron failure with no partial rows", async () => {
-    // The first entry is valid and would be created; the second is a blessing
-    // naming a missing patron god, which fails inside the transaction. Every
-    // creation must roll back, leaving no row behind. Run-specific ids mean no
-    // pre-delete is needed and a non-empty DB is safe.
+  it("rejects an invalid gods config with no partial rows", async () => {
+    // The first entry is valid and would be created; the second is a `gods` entry
+    // whose `blessingEffects` names an unrecognized tier ("minor"), which fails
+    // config validation BEFORE any write. No row is created, so the valid first
+    // entry does not leak a partial write. Run-specific ids mean no pre-delete is
+    // needed and a non-empty DB is safe.
     const preSkillId = `pg-pre-skill__${runSuffix}`
-    const missingGod = `pg-no-such-god__${runSuffix}`
     const bad: WikiReviewedEntry[] = [
       {
         kind: "skills",
@@ -164,21 +164,17 @@ describe.skipIf(!gate.run)("wiki-reviewed catalog import (real PG)", () => {
         config: { effects: [], rarity: "Common" },
       },
       {
-        kind: "blessings",
-        stableId: `pg-ghost-bless__${runSuffix}`,
+        kind: "gods",
+        stableId: `pg-ghost-god__${runSuffix}`,
         name: "Ghost",
         description: "d",
         sourceUrl: "https://example.com/ghost",
-        config: {
-          tier: "Minor",
-          effects: [],
-          patronGodStableId: missingGod,
-        },
+        config: { blessingEffects: { minor: [] } },
       },
     ]
     await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
       status: 400,
-      code: "patron_god_not_found",
+      code: "invalid_config",
     })
     const pre = await prisma.catalogDefinition.findUnique({
       where: { kind_stableId: { kind: "skills", stableId: preSkillId } },

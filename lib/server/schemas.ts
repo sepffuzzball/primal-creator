@@ -107,6 +107,31 @@ export const integerPartialVectorSchema = z.object({
   willpower: z.number().int().optional(),
 })
 
+/**
+ * Sparse derived-resource patch over the HP/MP/SP maxima whose values are finite
+ * integers (signed, matching `Partial<Record<DerivedResource, number>>` in the
+ * engine type). Used for the engine CharacterState equipment bonus: a stored
+ * state's `derivedFlat` / `derivedPercentBasisPoints` round-trip through JSON and
+ * stay plain declarative integers. Zod `.int()` rejects NaN / Infinity, so a
+ * parsed value is always finite.
+ */
+export const derivedResourceIntegerSchema = z.object({
+  hp: z.number().int().optional(),
+  mp: z.number().int().optional(),
+  sp: z.number().int().optional(),
+})
+
+/**
+ * Sparse derived-resource patch whose values are nonnegative integers. Used for
+ * the catalog-level `equipmentConfigSchema` derived HP/MP/SP bonuses: the editor
+ * only accepts nonnegative whole-number additions to the resource maxima.
+ */
+export const nonnegativeDerivedResourceSchema = z.object({
+  hp: z.number().int().nonnegative().optional(),
+  mp: z.number().int().nonnegative().optional(),
+  sp: z.number().int().nonnegative().optional(),
+})
+
 // ------------------------------------------------------------------ //
 // Engine CharacterState (mirrors lib/rules/types.ts)
 // ------------------------------------------------------------------ //
@@ -244,6 +269,16 @@ const equipmentBonusSchema = z.object({
   // integer basis points (10000 = 100%). Absent on legacy states; the engine treats
   // a missing field as no percentage contribution.
   percentBasisPoints: nonnegativePartialVectorSchema.optional(),
+  // Optional per-resource flat bonuses applied directly to the derived HP/MP/SP
+  // maxima. Unlike the attribute `bonus`, these do NOT consume the per-attribute
+  // aggregate or overall equipment cap budgets, never compound, and only sum
+  // across items. Absent on legacy states; the engine treats a missing field as 0.
+  derivedFlat: derivedResourceIntegerSchema.optional(),
+  // Optional per-resource percentage bonuses (nonnegative basis points,
+  // 10000 = 100%) applied once to the positive (base + flat) derived value. They
+  // are summed across items and never compound, and they do not share the
+  // attribute equipment cap budgets. Absent on legacy states; contributes 0.
+  derivedPercentBasisPoints: derivedResourceIntegerSchema.optional(),
 })
 
 export const characterStateSchema = z.object({
@@ -323,7 +358,10 @@ export const adminUserPatchSchema = z
  *
  * Every field is optional so an omitted/empty selection is valid; the server
  * never infers a special ability or auto-selects one. Bounds:
- *   - `blessingId` is a single optional `string | null` (at most one blessing).
+ *   - `blessing` is a single optional `{ godId, tier }` object (at most one
+ *     blessing, selected as a god + exact tier). The god definition must be an
+ *     unarchived `gods` catalog entry; the link stores the tier verbatim and its
+ *     live effect is synthesized from the god's `blessingEffects[tier]`.
  *   - `bloodlineIds` is an optional array of at most one nonempty id (a
  *     character may carry at most one bloodline link, enforced server-side and
  *     by a partial unique index; see docs/rules/bloodlines.md).
@@ -335,7 +373,12 @@ export const adminUserPatchSchema = z
  */
 export const specialAbilitiesSchema = z
   .object({
-    blessingId: z.string().min(1).nullable().optional(),
+    blessing: z
+      .object({
+        godId: z.string().min(1),
+        tier: blessingTierSchema,
+      })
+      .optional(),
     bloodlineIds: z.array(z.string().min(1)).max(1).optional(),
     transcendentSkillIds: z.array(z.string().min(1)).max(8).optional(),
   })
@@ -360,7 +403,7 @@ export const specialAbilitiesSchema = z
     for (const id of data.bloodlineIds ?? []) register(id, "bloodlineIds")
     for (const id of data.transcendentSkillIds ?? [])
       register(id, "transcendentSkillIds")
-    if (data.blessingId != null) register(data.blessingId, "blessingId")
+    if (data.blessing != null) register(data.blessing.godId, "blessing")
   })
 
 export const characterCreateSchema = z.object({
@@ -483,11 +526,6 @@ export const allocateSchema = z.object({
   version: z.number().int().nonnegative(),
 })
 
-export const consumeSchema = z.object({
-  definitionId: z.string().min(1),
-  version: z.number().int().nonnegative(),
-})
-
 /**
  * Set-once profession after creation. The client supplies the id of an active
  * `professions` catalog entry (graded exactly at the character's current race
@@ -518,57 +556,18 @@ export const inventoryPostSchema = z.object({
 })
 
 /**
- * A RACE evolution path choice. The client must supply the id of an unarchived
- * `evolutions` catalog entry that declares a valid race path config. `reason` is
- * optional and is only ever recorded (or, for an admin, used to override the
- * narrative `manualRequirementsText` hard gate). A user-provided reason never
- * bypasses a mechanical requirement.
- *
- * `track` is a LITERAL optional `"race"` - never a free string. This is what
- * keeps a class/profession track path (`track: "class"` / `track: "profession"`)
- * from being matched (and silently stripped) here: when Zod reaches this branch
- * with `track: "class"`, the value fails the literal and the union moves on to
- * `evolveTrackPathSchema`, which preserves the track. Old clients that omit
- * `track` entirely (the legacy race shape) still parse here unchanged.
+ * A single evolution choice. Every track (race, class, profession) must be named
+ * explicitly and must point at a DESTINATION catalog definition id - there is no
+ * legacy grade-only path and no `evolutions` catalog kind anymore, so the client
+ * always chooses a real destination definition. `reason` is optional and is only
+ * ever recorded in the journal (it never gates anything).
  */
-export const evolvePathSchema = z.object({
-  optionId: z.string().min(1),
-  version: z.number().int().nonnegative(),
-  reason: z.string().optional(),
-  track: z.literal("race").optional(),
-})
-
-/**
- * Legacy grade-only evolution. Retained as the house fallback that is only
- * accepted when NO valid catalog race path to the requested grade exists; when a
- * path exists the server 409s `evolution_choice_required`.
- */
-export const evolveGradeSchema = z.object({
-  grade: gradeSchema,
-  version: z.number().int().nonnegative(),
-})
-
-/**
- * A CLASS/PROFESSION track evolution path choice. The client supplies the id of
- * an unarchived `evolutions` catalog entry that declares a valid
- * `track: "class"` / `track: "profession"` path config, plus the target `track`.
- * `reason` is optional and is only ever recorded (or, for an admin, used to
- * override the narrative `manualRequirementsText` hard gate). A user-provided
- * reason never bypasses a mechanical requirement. The selected track is only
- * that track's `grade`/`definitionId`; the race grade is never touched.
- */
-export const evolveTrackPathSchema = z.object({
-  track: z.enum(["class", "profession"]),
+export const evolveSchema = z.object({
+  track: z.enum(["race", "class", "profession"]),
   optionId: z.string().min(1),
   version: z.number().int().nonnegative(),
   reason: z.string().optional(),
 })
-
-export const evolveSchema = z.union([
-  evolvePathSchema,
-  evolveGradeSchema,
-  evolveTrackPathSchema,
-])
 
 /**
  * A ring's physical position on the character. Ring is a SINGLE catalog slot
@@ -581,22 +580,55 @@ export const equipmentPositionSchema = z.enum(["Ring 1", "Ring 2"])
 
 export type EquipmentPosition = z.infer<typeof equipmentPositionSchema>
 
-export const associationSchema = z.object({
-  kind: z.enum(["title", "equipment", "blessing", "bloodline", "transcendent"]),
-  definitionId: z.string().min(1),
-  operation: z.enum(["add", "remove"]),
-  version: z.number().int().nonnegative(),
-  // A self-reported qualifying reason, recorded on the associate event. Required
-  // for a RANKED title add (<=500 chars, trimmed nonempty enforced by the service
-  // which knows whether the target title is ranked); optional and ignored
-  // otherwise. Never a proof claim - just the player's account.
-  reason: z.string().max(500).optional(),
-  // The physical ring position, REQUIRED for an `add` of a Ring-slot equipment
-  // item (a single catalog `Ring` slot but two wearable positions). Forbidden on
-  // any non-Ring equipment add and ignored on a remove. Never required on a
-  // non-equipment kind.
-  equipmentPosition: equipmentPositionSchema.optional(),
-})
+export const associationSchema = z
+  .object({
+    kind: z.enum([
+      "title",
+      "equipment",
+      "blessing",
+      "bloodline",
+      "transcendent",
+    ]),
+    definitionId: z.string().min(1),
+    operation: z.enum(["add", "remove"]),
+    version: z.number().int().nonnegative(),
+    // A self-reported qualifying reason, recorded on the associate event. Required
+    // for a RANKED title add (<=500 chars, trimmed nonempty enforced by the service
+    // which knows whether the target title is ranked); optional and ignored
+    // otherwise. Never a proof claim - just the player's account.
+    reason: z.string().max(500).optional(),
+    // The physical ring position, REQUIRED for an `add` of a Ring-slot equipment
+    // item (a single catalog `Ring` slot but two wearable positions). Forbidden on
+    // any non-Ring equipment add and ignored on a remove. Never required on a
+    // non-equipment kind.
+    equipmentPosition: equipmentPositionSchema.optional(),
+    // The exact blessing tier, meaningful ONLY on a `blessing` add (a blessing
+    // link stores the tier it was granted at, and the live effect is synthesized
+    // from the god's `blessingEffects[tier]`). REQUIRED on a blessing add - the
+    // service never writes a null tier (the DB CHECK rejects one) - and ignored on
+    // a remove or any non-blessing kind, where it may be omitted or supplied as
+    // metadata only. When supplied on a blessing add it is persisted verbatim on
+    // the link; the god's definition `definitionId` is the god that granted it.
+    tier: blessingTierSchema.optional(),
+  })
+  .superRefine((data, ctx) => {
+    // A blessing ADD must carry an exact tier (one of the eight). A missing tier
+    // is rejected at the API boundary before reaching the service, so a blessing
+    // link can never be created with a null tier. A remove / non-blessing kind
+    // never requires a tier.
+    if (
+      data.kind === "blessing" &&
+      data.operation === "add" &&
+      data.tier == null
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "a blessing add requires an exact tier (one of the eight blessing tiers)",
+        path: ["tier"],
+      })
+    }
+  })
 
 export const skillSelectSchema = z.object({
   operation: z.literal("select"),
@@ -642,13 +674,22 @@ export const catalogKindSchema = z.enum([
   "titles",
   "equipment",
   "skills",
-  "blessings",
   "bloodlines",
-  "consumables",
-  "evolutions",
+  "items",
   "gods",
   "transcendent_skills",
 ])
+
+/**
+ * Normalize a catalog-kind string to its canonical value, mapping the legacy
+ * `consumables` alias to `items`. Anything else is returned unchanged. Used at
+ * catalog import boundaries so a pre-existing manifest/upload (and the not-yet-
+ * migrated UI) that still says `consumables` resolves against the `items` catalog
+ * rows; the legacy value is never persisted.
+ */
+export function normalizeCatalogKind(kind: string): string {
+  return kind === "consumables" ? "items" : kind
+}
 
 /**
  * Grade-specific prose descriptions for a catalog entry, keyed by the grade
@@ -939,6 +980,43 @@ export function isIncompleteEquipmentConfig(
   return !equipmentRaritySchema.safeParse(config.rarity).success
 }
 
+/**
+ * Detect an equipment config that still carries the LEGACY requirement keys
+ * (`minRaceLevel` / `requiredRaceType`) instead of the canonical
+ * `minimumLevel` / `requiredLevelType` pair. A NEW or config-changing write must
+ * never persist the legacy keys (the editor migrates them to canonical), while an
+ * existing row that still carries them stays readable and enforced by the
+ * eligibility engine. Only `minRaceLevel` / `requiredRaceType` are considered
+ * legacy; `soulbound` is not (it has no canonical replacement).
+ */
+export function hasLegacyEquipmentRequirements(
+  config: Record<string, unknown>
+): boolean {
+  return (
+    config.minRaceLevel !== undefined || config.requiredRaceType !== undefined
+  )
+}
+
+/**
+ * The ordered blessing-tier ladder, lowest to highest. Driven by
+ * `blessingTierSchema` so the enumeration order can never drift from the schema.
+ */
+export const BLESSING_TIER_ORDER = blessingTierSchema.options
+
+/**
+ * Whether a stored blessing tier is at or above a required minimum tier, using the
+ * authoritative ordered ladder (Baptism < Minor < Lesser < Intermediate < Major <
+ * Greater < Divine < True). Both must be valid `BlessingTier` values; the caller is
+ * responsible for validating them (the schema already does).
+ */
+export function blessingTierAtLeast(
+  tier: BlessingTier,
+  required: BlessingTier
+): boolean {
+  const index = (t: BlessingTier) => BLESSING_TIER_ORDER.indexOf(t)
+  return index(tier) >= index(required)
+}
+
 export const equipmentConfigSchema = z
   .object({
     slot: z.string().min(1).optional(),
@@ -947,12 +1025,78 @@ export const equipmentConfigSchema = z
     // integer basis points (10000 = 100%). The flat `bonus` is unchanged; a percent
     // bonus shares the capped flat equipment budget. Absent on legacy entries.
     percentBasisPoints: nonnegativePartialVectorSchema.optional(),
+    // Optional per-resource flat bonuses applied directly to the derived HP/MP/SP
+    // maxima. Unlike the attribute `bonus`, these do NOT consume the per-attribute
+    // aggregate or overall equipment cap budgets. The editor accepts only
+    // nonnegative integers; absent on legacy entries.
+    derivedFlat: nonnegativeDerivedResourceSchema.optional(),
+    // Optional per-resource percentage bonuses (nonnegative integer basis points,
+    // 10000 = 100%) applied to the derived HP/MP/SP maxima, likewise independent of
+    // the attribute equipment cap budgets. Absent on legacy entries.
+    derivedPercentBasisPoints: nonnegativeDerivedResourceSchema.optional(),
     rarity: equipmentRaritySchema.optional(),
     soulbound: z.boolean().optional(),
+    // Legacy race-only eligibility keys. Still readable and enforced, but never
+    // authoritative on a NEW or config-changing write (see
+    // `hasLegacyEquipmentRequirements`); the editor migrates them to the canonical
+    // `minimumLevel` / `requiredLevelType` pair.
     minRaceLevel: z.number().int().nonnegative().optional(),
     requiredRaceType: z.enum(["enlightened", "monster"]).optional(),
+    // Canonical eligibility: a nonnegative minimum level on a declared track/race
+    // type. `minimumLevel` requires `requiredLevelType`; `requiredLevelType` alone
+    // (no level) means a type restriction at level 0 (the track/race must exist and
+    // be of the requested type, but the level is not gated).
+    minimumLevel: z.number().int().nonnegative().optional(),
+    requiredLevelType: z
+      .enum(["class", "profession", "humanoidRace", "monstrousRace"])
+      .optional(),
+    // Optional divine patron eligibility. `requiredGodStableId` names the god's
+    // catalog `stableId`; `minimumBlessingTier` (default Baptism when absent) is the
+    // lowest blessing tier that satisfies the requirement. A config that sets a
+    // minimum tier MUST also name a god.
+    requiredGodStableId: z.string().min(1).optional(),
+    minimumBlessingTier: blessingTierSchema.optional(),
+    // Optional equipment-granted passive skills. Each entry is the catalog
+    // `stableId` of a `skills` definition whose current `config.effects` are
+    // synthesized live while the item is worn and eligible (`[]` is allowed: an
+    // item grants no passive). Every id must be nonempty and internally unique;
+    // the service layer resolves each id to an unarchived skill on a new /
+    // config-changing write and rejects a missing or archived reference.
+    grantedSkillStableIds: z.array(z.string().min(1)).optional(),
   })
   .passthrough()
+  .superRefine((data, ctx) => {
+    if (data.minimumLevel != null && data.requiredLevelType == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'a "requiredLevelType" ("class"/"profession"/"humanoidRace"/"monstrousRace") is required when "minimumLevel" is set',
+        path: ["requiredLevelType"],
+      })
+    }
+    if (data.minimumBlessingTier != null && data.requiredGodStableId == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'a "requiredGodStableId" is required when "minimumBlessingTier" is set',
+        path: ["requiredGodStableId"],
+      })
+    }
+    if (data.grantedSkillStableIds != null) {
+      const seen = new Set<string>()
+      for (const id of data.grantedSkillStableIds) {
+        if (seen.has(id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `"${id}" is granted more than once in "grantedSkillStableIds"`,
+            path: ["grantedSkillStableIds"],
+          })
+          break
+        }
+        seen.add(id)
+      }
+    }
+  })
 
 /**
  * A single declarative passive effect carried by a skill's catalog config.
@@ -1120,49 +1264,6 @@ export const titleConfigSchema = z
   })
 
 /**
- * Catalog config for a `blessings` entry.
- *
- * Modern shape (required on NEW or CONFIG-CHANGED writes):
- *   - `tier` is the eight-level blessing hierarchy (Baptism plus Minor..True).
- *   - `effects` is the typed flat/percent declarative effect list. A blessing
- *     with purely narrative benefits (no numeric effect) may use `effects: []`.
- *   - `patronGodStableId` (optional) names the unarchived `gods` entry that is
- *     the blessing's patron; when provided the service stores the resolved FK
- *     `patronId` in the same transaction.
- *   - `compatibleBlessingStableIds` (optional) and `upgradeGroup` (optional) are
- *     forwarded as-is.
- *
- * The schema reads permissively (passthrough) so a LEGACY `{grade, effect}`
- * config stays readable and metadata-only-PATCHable: it carries no `tier` /
- * `effects`, and `isLegacyBlessingConfig` returns true so the service layer
- * rejects only NEW/CONFIG-CHANGED writes (never a read).
- */
-export const blessingConfigSchema = z
-  .object({
-    grade: gradeSchema.optional(),
-    // Legacy single-effect object; readable, not part of the modern shape.
-    effect: z.record(z.string(), z.unknown()).optional(),
-    tier: blessingTierSchema.optional(),
-    patronGodStableId: z.string().min(1).optional(),
-    effects: z.array(catalogEffectSchema).optional(),
-    compatibleBlessingStableIds: z.array(z.string()).optional(),
-    upgradeGroup: z.string().optional(),
-  })
-  .passthrough()
-
-/**
- * Detects a `blessings` config that lacks the modern `tier`/`effects` shape.
- * Such a config is permitted for reads and metadata-only PATCHes (see
- * `blessingConfigSchema`), but the service layer requires the modern shape
- * whenever a blessing is created or its config is changed.
- */
-export function isLegacyBlessingConfig(
-  config: Record<string, unknown>
-): boolean {
-  return config.tier == null || config.effects == null
-}
-
-/**
  * Catalog config for a `bloodlines` entry.
  *
  * Modern shape (required on NEW or CONFIG-CHANGED writes):
@@ -1264,269 +1365,52 @@ export function isLegacyTranscendentSkillConfig(
 }
 
 /**
- * Catalog config for a `gods` entry (the Gods & Patrons catalog kind). The god
- * config is intentionally metadata-only in this phase: `pantheon` and
- * `divineRank` are free-text descriptors the UI may surface, and a `gods` entry
- * is never granted numeric effects to characters (phase 2 wires blessing/bloodline
- * associations). It reads permissively so a future shape cannot break a read.
+ * Catalog config for a `gods` entry (the Gods & Patrons catalog kind).
+ *
+ * `pantheon` and `divineRank` are free-text descriptors the UI may surface. A
+ * god may ALSO carry a `blessingEffects` map: a partial record of blessing tier
+ * -> declarative effect list, so a god's blessing at a given tier synthesizes
+ * those effects live when a character links that god+tier as a blessing. A
+ * missing tier (or a god with no `blessingEffects` entry for that tier)
+ * contributes no effects (the link is still valid and shown, just without a
+ * synthesized numeric bonus - no invented value). A god is never auto-linked
+ * solely because it exists in the catalog; a character only receives a blessing
+ * when an explicit `{godId, tier}` selection is linked.
+ *
+ * The schema reads permissively (passthrough) so a future shape cannot break a
+ * read. `blessingEffects` keys are STRICT - only the eight blessing tiers are
+ * accepted, so a typo (e.g. "minor") is rejected rather than silently dropped.
  */
 export const godConfigSchema = z
   .object({
     pantheon: z.string().optional(),
     divineRank: z.string().optional(),
+    blessingEffects: z
+      .partialRecord(blessingTierSchema, z.array(catalogEffectSchema))
+      .optional(),
   })
   .passthrough()
 
 /**
- * Catalog config for a `consumables` entry.
+ * Catalog config for an `items` entry (the inventory-only catalog kind that
+ * replaces the legacy `consumables` kind).
  *
- * A consumable is exactly one of two kinds:
- *   - `permanent`: grants a permanent external stat gain, capped by the grade-based
- *     race-level capacity (F3/E5/D15/C45). It must NOT carry `durationQuarters`.
- *   - `temporary`: produces a temporary effect that lasts `durationQuarters` quarters
- *     and is NOT capped by the grade rates. It MUST carry a positive `durationQuarters`.
- *
- * `amount` is a non-negative integer partial vector that must request at least one
- * positive attribute (an all-zero amount is rejected as empty).
- *
- * Legacy entries created before the `type`/`amount` shape was hardened may omit
- * either field. Such a config is accepted here (metadata-only, so the catalog
- * stays readable/editable) and is rejected only at consume time with an
- * actionable `legacy_consumable_config` error - never granted a fabricated
- * default amount. New POSTs and config-changing PATCHes are required by the
- * service layer to carry the modern full shape (see `isLegacyConsumableConfig`).
+ * ITEM metadata-only in this phase: it carries NO mandatory mechanical fields -
+ * no required `type`/`amount`/`durationQuarters`, and no consume path. An item
+ * is owned inventory bookkeeping; any permanent/temporary effects it may have
+ * already live immutably in Character.state. The config accepts `{}` (an empty
+ * object is a valid item config, as is an omitted config) and any optional
+ * narrative keys; unknown keys pass through so a legacy `consumables` config
+ * (which may still carry `type`/`amount`/`durationQuarters`) reads without
+ * breakage. Mechanical application of item effects is a later stage.
  */
-export const consumableConfigSchema = z
+export const itemConfigSchema = z
   .object({
-    type: z.enum(["permanent", "temporary"]).optional(),
-    amount: nonnegativePartialVectorSchema.optional(),
-    durationQuarters: z.number().int().positive().optional(),
-    group: z.string().optional(),
+    narrative: z.string().optional(),
+    description: z.string().optional(),
     grade: gradeSchema.optional(),
   })
   .passthrough()
-  .superRefine((config, ctx) => {
-    const { type, amount, durationQuarters } = config
-    // A legacy consumable config (missing `type` or `amount`) is metadata-only
-    // and is skipped here; consume rejects it explicitly rather than inventing a
-    // default amount.
-    if (type == null || amount == null) return
-    const hasPositive = Object.values(amount).some(
-      (v) => typeof v === "number" && Number.isFinite(v) && v > 0
-    )
-    if (!hasPositive) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "consumable amount must request at least one positive attribute",
-        path: ["amount"],
-      })
-    }
-    if (type === "temporary" && durationQuarters == null) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "temporary consumable requires durationQuarters (a positive integer)",
-        path: ["durationQuarters"],
-      })
-    }
-    if (type === "permanent" && durationQuarters != null) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "permanent consumable forbids durationQuarters",
-        path: ["durationQuarters"],
-      })
-    }
-  })
-
-/**
- * Detect a `consumables` config that lacks the modern `type`/`amount` shape.
- * Such a config is permitted for reads and metadata-only PATCHes (see
- * `consumableConfigSchema`), but the service layer requires the modern full
- * shape whenever a consumable is created or its config is changed, and rejects
- * it with an actionable error at consume time. This avoids accepting a
- * fabricated default amount.
- */
-export function isLegacyConsumableConfig(
-  config: Record<string, unknown>
-): boolean {
-  return config.type == null || config.amount == null
-}
-
-function isGradeValue(value: unknown): boolean {
-  return gradeSchema.safeParse(value).success
-}
-
-/**
- * Catalog config for an `evolutions` entry.
- *
- * Two shapes are supported:
- *   - A **legacy metadata-only** config (`{from, to, titleId}`) remains readable
- *     and editable (metadata PATCH) but is NOT a usable race evolution path.
- *   - An **active race evolution path**: `track: "race"` plus the required
- *     `fromRaceStableId`, `toRaceStableId`, `fromGrade`, `toGrade`, and optional
- *     `minRaceLevel`, `requiredTitleStableIds`, `requiredSkillStableIds` and
- *     `manualRequirementsText`. Only this shape can be selected by
- *     `POST /api/characters/[id]/evolve` with `optionId`.
- *
- * The schema reads permissively (passthrough) so a legacy or partial config never
- * breaks a catalog read; the service layer rejects a NEW or CONFIG-CHANGED
- * evolutions entry whose config is not a valid full race path (see
- * `isValidRaceEvolutionConfig`), mirroring the consumables/skills hardening.
- */
-export const evolutionConfigSchema = z
-  .object({
-    from: gradeSchema.optional(),
-    to: gradeSchema.optional(),
-    titleId: z.string().optional(),
-    track: z.string().optional(),
-    fromRaceStableId: z.string().optional(),
-    toRaceStableId: z.string().optional(),
-    fromGrade: gradeSchema.optional(),
-    toGrade: gradeSchema.optional(),
-    minRaceLevel: z.number().int().nonnegative().optional(),
-    minTrackLevel: z.number().int().nonnegative().optional(),
-    requiredTitleStableIds: z.array(z.string()).optional(),
-    requiredSkillStableIds: z.array(z.string()).optional(),
-    manualRequirementsText: z.string().optional(),
-    // Class/profession path fields (a fully-formed track evolution path).
-    fromDefinitionStableId: z.string().optional(),
-    toDefinitionStableId: z.string().optional(),
-  })
-  .passthrough()
-
-/**
- * Whether an `evolutions` config is a fully-formed, active race evolution path.
- *
- * A legacy metadata-only config (the old `{from,to,titleId}` shape) is readable
- * and editable, but is NOT a full path, so this returns false and it can never be
- * used as an `optionId` choice. The service layer rejects NEW or CONFIG-CHANGED
- * evolutions entries whose config fails this check, same as consumables/skills.
- */
-export function isValidRaceEvolutionConfig(
-  config: Record<string, unknown>
-): boolean {
-  if (config.track !== "race") return false
-  if (
-    typeof config.fromRaceStableId !== "string" ||
-    config.fromRaceStableId.length === 0
-  ) {
-    return false
-  }
-  if (
-    typeof config.toRaceStableId !== "string" ||
-    config.toRaceStableId.length === 0
-  ) {
-    return false
-  }
-  if (!isGradeValue(config.fromGrade)) return false
-  if (!isGradeValue(config.toGrade)) return false
-  if (
-    config.minRaceLevel != null &&
-    (typeof config.minRaceLevel !== "number" ||
-      !Number.isInteger(config.minRaceLevel) ||
-      config.minRaceLevel < 0)
-  ) {
-    return false
-  }
-  if (
-    config.requiredTitleStableIds != null &&
-    (!Array.isArray(config.requiredTitleStableIds) ||
-      config.requiredTitleStableIds.some((s) => typeof s !== "string"))
-  ) {
-    return false
-  }
-  if (
-    config.requiredSkillStableIds != null &&
-    (!Array.isArray(config.requiredSkillStableIds) ||
-      config.requiredSkillStableIds.some((s) => typeof s !== "string"))
-  ) {
-    return false
-  }
-  if (
-    config.manualRequirementsText != null &&
-    typeof config.manualRequirementsText !== "string"
-  ) {
-    return false
-  }
-  return true
-}
-
-/**
- * Whether an `evolutions` config is a fully-formed, active class/profession
- * (track) evolution path.
- *
- * A track path declares `track: "class"` or `track: "profession"` plus the
- * required `fromDefinitionStableId`, `toDefinitionStableId`, `fromGrade` and
- * `toGrade`. The optional `minTrackLevel`, `requiredTitleStableIds`,
- * `requiredSkillStableIds` and `manualRequirementsText` are validated the same
- * way as a race path. A legacy metadata-only config (the old `{from,to,titleId}`
- * shape) is readable and editable, but is NOT a full track path, so this returns
- * false. The service layer rejects NEW or CONFIG-CHANGED evolutions entries whose
- * config is neither a complete race path nor a complete class/profession path.
- */
-export function isValidTrackEvolutionConfig(
-  config: Record<string, unknown>
-): boolean {
-  if (config.track !== "class" && config.track !== "profession") return false
-  if (
-    typeof config.fromDefinitionStableId !== "string" ||
-    config.fromDefinitionStableId.length === 0
-  ) {
-    return false
-  }
-  if (
-    typeof config.toDefinitionStableId !== "string" ||
-    config.toDefinitionStableId.length === 0
-  ) {
-    return false
-  }
-  if (!isGradeValue(config.fromGrade)) return false
-  if (!isGradeValue(config.toGrade)) return false
-  if (
-    config.minTrackLevel != null &&
-    (typeof config.minTrackLevel !== "number" ||
-      !Number.isInteger(config.minTrackLevel) ||
-      config.minTrackLevel < 0)
-  ) {
-    return false
-  }
-  if (
-    config.requiredTitleStableIds != null &&
-    (!Array.isArray(config.requiredTitleStableIds) ||
-      config.requiredTitleStableIds.some((s) => typeof s !== "string"))
-  ) {
-    return false
-  }
-  if (
-    config.requiredSkillStableIds != null &&
-    (!Array.isArray(config.requiredSkillStableIds) ||
-      config.requiredSkillStableIds.some((s) => typeof s !== "string"))
-  ) {
-    return false
-  }
-  if (
-    config.manualRequirementsText != null &&
-    typeof config.manualRequirementsText !== "string"
-  ) {
-    return false
-  }
-  return true
-}
-
-/**
- * Whether an `evolutions` config is a fully-formed path: either a complete race
- * path OR a complete class/profession path. A legacy metadata-only config (the
- * old `{from,to,titleId}` shape) is readable/editable but not a usable path, so
- * this returns false and it can never be selected by `optionId`.
- */
-export function isValidEvolutionConfig(
-  config: Record<string, unknown>
-): boolean {
-  return (
-    isValidRaceEvolutionConfig(config) || isValidTrackEvolutionConfig(config)
-  )
-}
 
 const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   races: raceConfigSchema,
@@ -1535,10 +1419,8 @@ const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   titles: titleConfigSchema,
   equipment: equipmentConfigSchema,
   skills: skillConfigSchema,
-  blessings: blessingConfigSchema,
   bloodlines: bloodlineConfigSchema,
-  consumables: consumableConfigSchema,
-  evolutions: evolutionConfigSchema,
+  items: itemConfigSchema,
   gods: godConfigSchema,
   transcendent_skills: transcendentSkillConfigSchema,
 }

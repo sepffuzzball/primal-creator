@@ -10,8 +10,9 @@
 ## Verified
 
 - Blessings are an investment of **records** by a god into a mortal. They raise the
-  mortal's potential toward godhood and tie their Path to that god's. Upon issuing
-  a blessing, the issuing god becomes the mortal's **patron**.
+  mortal's potential toward godhood and tie their Path to that god's. (The legacy
+  "patron" model was retired: a god's identity now lives on the character
+  association, not on a catalog `patronId` FK.)
 - There are **eight** levels in the blessing hierarchy, from lowest to highest:
   **Baptism, Minor, Lesser, Intermediate, Major, Greater, Divine, True**.
   **Baptism** is the lowest entry tier - a ritual marking a follower as an
@@ -50,68 +51,115 @@ rarity tied to the blessing level, and possibly class/profession unlock
 (clerical). Levels and values should be **configurable data**, since no source
 table pins the magnitudes. No invented formula should be used to derive them.
 
-## Catalog config (modern shape)
+## Model (god + tier on a character association)
 
-A `blessings` catalog entry must declare the modern shape on create or any
-config-changing update:
+A blessing is **not** a catalog kind. The legacy `blessings` catalog kind was
+retired: a blessing is a `BLESSING` `CharacterAssociation` whose `definitionId`
+points to a **`gods`** catalog entry, with the exact blessing **tier** stored on
+the association link itself (`blessingTier`). Each link carries a nullable
+`blessingTier` (`Baptism` | `Minor` | `Lesser` | `Intermediate` | `Major` |
+`Greater` | `Divine` | `True`); null means no tier was persisted and the link
+synthesizes no effect.
+
+A `gods` catalog entry may optionally declare a `blessingEffects` map in its
+config:
 
 ```ts
 {
-  // Required: the blessed tier (lowest to highest). Baptism is an entry tier with
-  // no invented numeric effect (use `effects: []`); Minor..True are the seven
-  // substantive blessing levels.
-  tier: "Baptism" | "Minor" | "Lesser" | "Intermediate" | "Major" | "Greater" | "Divine" | "True",
-  // Optional: the stableId of the unarchived `gods` entry that is this blessing's
-  // patron. When present the server resolves it to the FK `patronId`. A
-  // `gods` entry with no blessing may have no `patronId` (it is not a patron).
-  patronGodStableId?: string,
-  // Required: the typed flat/percent declarative effects. Every vector value must
-  // be a finite integer (never a float, NaN or Infinity). A purely narrative
-  // blessing (no numeric effect) uses [].
-  effects: SkillEffect[],
-  // Optional: stableIds of blessings this one is compatible with (no numeric
-  // application yet - phase 2).
-  compatibleBlessingStableIds?: string[],
-  // Optional: forwarded as-is (used only to remove superseded linked benefits).
-  upgradeGroup?: string,
+  pantheon?: string,
+  divineRank?: string,
+  // Optional partial record: tier -> declarative effect list. A missing tier (or a
+  // god with no entry for that tier) contributes NO effects - the link is still
+  // valid and shown, just without a synthesized numeric bonus (no invented value).
+  blessingEffects?: {
+    Baptism?: SkillEffect[],
+    Minor?: SkillEffect[],
+    Lesser?: SkillEffect[],
+    Intermediate?: SkillEffect[],
+    Major?: SkillEffect[],
+    Greater?: SkillEffect[],
+    Divine?: SkillEffect[],
+    True?: SkillEffect[],
+  },
 }
 ```
 
 `SkillEffect` is the shared flat/percent discriminated union used by skills,
 blessings and bloodlines: `{ phase: "flat", amount }` or
 `{ phase: "percent", basisPoints }`, each optionally carrying `condition`,
-`stacking`, and `group`. The server validates that every effect vector is a
-finite integer so the stored config is a plain JSON-safe data object.
+`stacking`, and `group`. The server validates that every effect vector is a finite
+integer so the stored config is a plain JSON-safe data object. `blessingEffects`
+keys are STRICT: only the eight blessing tiers are accepted, so a typo (e.g.
+`minor`) is rejected rather than silently dropped, while the rest of the config
+reads permissively (passthrough) so a future shape cannot break a read.
 
-Legacy entries carrying the old `{ grade, effect }` shape remain readable and
-metadata-only-PATCHable; a create or config-changing update is rejected unless
-both `tier` and `effects` are present. A blessing that names an archived or
-missing god is rejected with `patron_god_not_found` / `patron_god_archived`; a
-`gods` entry's `stableId` cannot change while any blessing still references it
-as patron (409 `patron_stable_id_in_use`), so the JSON `patronGodStableId` and
-the stored FK `patronId` never diverge.
+A god is never auto-linked solely because it exists in the catalog; a character
+receives a blessing only when an explicit `{ godId, tier }` selection is linked.
+No catalog create/import grants or resolves a blessing and no `patronId` row,
+column or index is written (the FK, index and column were dropped). Blessings are
+created only through the association flows below.
 
 ## Character associations (wired)
 
-Blessings can be attached to a character as an association. The server
-synthesizes the declared `effects` into the character's live `status` without
+A blessing is linked as an association: `associateCharacter` (or create) accepts a
+`blessing` selection of `{ godId, tier }`. The god definition must be an
+unarchived `gods` entry; the tier is persisted verbatim on the link (never
+inferred from the god config), and the `associate` event journal snapshot records
+the god's identity (`{ id, name, stableId }`) plus the exact `tier`.
+
+At read time the server synthesizes the declared effects from the god's **current**
+catalog config `blessingEffects[tier]` into the character's live `status` without
 rewriting the stored state, so catalog edits recalculate live effects and never
-mutate historical awards. The `tier` is forwarded as metadata on the event
-snapshot. Archived blessings are inert: a linked but archived definition
-contributes no effect.
+mutate historical awards. A link without a tier (or a god with no `blessingEffects`
+entry for that tier) contributes no effect; an archived god link is inert. The
+`tier` is forwarded as metadata on the event snapshot and exposed on the read view
+as `{ kind: "blessing", definition: { kind: "gods", ... }, tier }`.
 
 A character holds **at most one blessing link** - archived or active - at any
 time. Adding a blessing atomically replaces every existing BLESSING link on that
-character, including archived ones; an archived blessing, though inert, still
-occupies the single blessing slot until it is replaced (by adding a new blessing)
-or removed. The invariant is enforced at the database layer by a partial unique
-index (one BLESSING row per character); `associateCharacter` runs the add/remove
-under SERIALIZABLE with CAS and maps a concurrent singleton-race `P2002` to a 409
-`blessing_singleton_conflict`, while an `updateCatalogItem`/import that would
-leave a character with more than one blessing link is rejected with 409
-`link_collision`. Upgrades are explicit: choose the newer catalog blessing - the
-old link is displaced and journaled in the `removed` array of the `associate`
-event. `compatibleBlessingStableIds` is stored as metadata but does not yet gate
-coexistence (phase 2). An import backup that carries more than one total blessing
-link (active + archived) is rejected with 400 `import_link_collision` before any
-write.
+character; an archived blessing, though inert, still occupies the single slot until
+replaced or removed. The invariant is enforced at the database layer by a partial
+unique index (one BLESSING row per character); `associateCharacter` runs the
+add/remove under SERIALIZABLE with CAS and maps a concurrent singleton-race
+`P2002` to a 409 `blessing_singleton_conflict`.
+
+## Import / export (backup schema v7)
+
+`exportCharacter` emits `primal-character/7`. A v7 `blessing` association
+references a `gods` definition (`definition.kind: "gods"`) and carries a REQUIRED
+`tier`; the importer persists that tier verbatim on the association link. A
+non-gods definition (e.g. a stale `blessings` kind) is rejected at the schema
+boundary. A v7 inventory `definition.kind` is `equipment` or `items` only (the
+legacy `consumables` alias is rejected, not normalized).
+
+Legacy `primal-character/3` through `/6` documents still parse, but the service
+rejects any carrying a `blessing` association with an actionable 400 migration
+notice - even when it would otherwise resolve - because the `blessings` catalog
+rows no longer exist. The notice does not recommend a post-migration re-export
+(re-exporting cannot recover a link whose catalog row and tier live only in the
+pre-migration database); it tells the caller to **take a PostgreSQL backup BEFORE
+applying migration 0019** and recreate the god + tier links manually afterward,
+and to remove the links from the old file only if that is intentional. A legacy
+v4/v5/v6 inventory `consumables` kind is normalized to `items`. An import backup
+carrying more than one total blessing link (active + archived) is rejected with
+400 `import_link_collision` before any write.
+
+## Migration (0019)
+
+Migration `0019_god_blessing_tiers` is **destructive** and **irreversible**: it
+deletes every existing `BLESSING` association, preflights and deletes all
+`catalog_definitions WHERE kind='blessings'`, adds the nullable `blessingTier`
+column, and drops the `patronId` FK/index/column. The deleted blessing links are
+**not** recoverable from the post-migration database (the `blessings` catalog rows
+are gone), so **take a full PostgreSQL backup BEFORE applying migrations
+0017-0019** (the whole destructive chain) and recreate god + tier links manually
+afterward if the backup's blessing links must be preserved. The
+`CatalogKind.blessings` enum value is left dormant (no new write uses it).
+
+The migration also adds a database CHECK constraint
+(`character_associations_blessing_tier_check`) on `character_associations`: a
+`BLESSING` link must carry a non-null `blessingTier` and every other kind must
+carry a null `blessingTier`. The check is added AFTER the legacy BLESSING links
+are deleted, so a pre-existing null-tier row can never violate it; from here on
+the application (schema + service) and the database agree that a blessing link is
+never created with a null tier.

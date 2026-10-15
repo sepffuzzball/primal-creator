@@ -340,9 +340,28 @@ export interface EquipmentBonus {
    * field contribute no percentage.
    */
   percentBasisPoints?: PartialVector
+  /**
+   * Optional per-resource flat bonuses applied directly to the derived HP/MP/SP
+   * maxima. Unlike the attribute `bonus`, these do NOT consume the per-attribute
+   * aggregate or overall equipment cap budgets, never compound, and only sum
+   * across items. Backward compatible: legacy stored states without this field
+   * contribute 0.
+   */
+  derivedFlat?: Partial<Record<DerivedResource, number>>
+  /**
+   * Optional per-resource percentage bonuses expressed as nonnegative integer
+   * basis points (10000 = 100%). These are SUMMED across all items and applied
+   * ONCE to the positive (base + flat) value, never compounded onto another
+   * item, and they do not share the attribute equipment cap budgets. Backward
+   * compatible: legacy items without this field contribute 0.
+   */
+  derivedPercentBasisPoints?: Partial<Record<DerivedResource, number>>
 }
 
 export type ResourceId = string
+
+/** The three core derived resource pools (HP / MP / SP). */
+export type DerivedResource = "hp" | "mp" | "sp"
 
 /* ------------------------------------------------------------------ *
  * Effects
@@ -559,6 +578,60 @@ export interface ResourceStatus {
   provenance: string
 }
 
+/**
+ * Per-resource breakdown of an authoritative derived HP/MP/SP maximum. Exposed
+ * so a consumer can distinguish the attribute-derived base from the flat and
+ * percentage equipment contributions, and so tests can assert the formula.
+ */
+export interface DerivedStatBreakdown {
+  /** The attribute that drives this resource's base value. */
+  attribute: Attribute
+  /** Base value: finalAttributes[attribute] * 10 (may be negative). */
+  base: number
+  /** Sum of equipment `derivedFlat` contributions for this resource. */
+  flat: number
+  /** Sum of equipment `derivedPercentBasisPoints` contributions. */
+  percentBasisPoints: number
+  /** Floored percentage of the positive (base + flat) (0 when base + flat <= 0). */
+  percentApplied: number
+  /** Clamped final maximum. */
+  max: number
+}
+
+/**
+ * Authoritative maxima for the three core derived resource pools, always
+ * present and never `null` (unlike the legacy configurable `resources` engine).
+ * Derived from the FINAL attributes after every phase, including temporary
+ * effects, independent of the equipment cap budgets.
+ */
+export interface DerivedStats {
+  hp: number
+  mp: number
+  sp: number
+  /**
+   * Optional per-resource breakdown, useful for provenance and tests. Always
+   * computed by the engine; optional only so the type degrades to the literal
+   * `{ hp; mp; sp }` shape for consumers that do not need it.
+   */
+  breakdown?: Record<DerivedResource, DerivedStatBreakdown>
+}
+
+/**
+ * Source of the historical fixed attribute points, split per track
+ * (race / class / profession). Each vector is the SUM of the `fixed` vectors
+ * from `state.historicalLevelAwards` attributable to that track. Known track
+ * literals (`"race"` / `"class"` / `"profession"`) map directly; genuinely
+ * unknown legacy track strings are split evenly among the applicable tracks in
+ * deterministic Race, Class, Profession order. The three vectors sum, per
+ * attribute, exactly to the `historical-fixed` trace delta (the engine never
+ * reclassifies free points into fixed, and never mutates stored awards).
+ */
+export interface HistoricalFixedByTrack {
+  race: AttributeVector
+  class: AttributeVector
+  profession: AttributeVector
+}
+
 export interface StatusResult {
   attributes: AttributeVector
   traces: AttributeTrace[]
@@ -566,9 +639,15 @@ export interface StatusResult {
   totalFreePoints: number
   allocatedPoints: number
   resources: ResourceStatus[]
+  derivedStats: DerivedStats
   equipment: EquipmentStatus
   consumables: ConsumableStatus
   capUsage: CapUsage[]
+  /**
+   * Historical fixed award points, sourced per track (race / class / profession).
+   * See {@link HistoricalFixedByTrack} for the splitting contract.
+   */
+  historicalFixedByTrack: HistoricalFixedByTrack
 }
 
 export interface ConsumableStatus {

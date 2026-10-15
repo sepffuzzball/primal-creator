@@ -686,3 +686,329 @@ describe("resources", () => {
     expect(result.resources[0].provenance).toContain("assumption")
   })
 })
+
+describe("derived stats (HP / MP / SP maxima)", () => {
+  it("reflects temporary attribute effects in derived stats", () => {
+    const state = character()
+    state.activeEffects.push({
+      id: "tmp1",
+      source: "buff",
+      provenance: "assumption",
+      phase: "temporary",
+      amount: { vitality: 5, wisdom: 3, endurance: 2 },
+      stacking: "stack",
+    })
+    const result = calculateStatus(state, config())
+    expect(result.attributes.vitality).toBe(15)
+    expect(result.attributes.wisdom).toBe(13)
+    expect(result.attributes.endurance).toBe(12)
+    expect(result.derivedStats.hp).toBe(150)
+    expect(result.derivedStats.mp).toBe(130)
+    expect(result.derivedStats.sp).toBe(120)
+  })
+
+  it("stacks derived flat and percent contributions without compounding", () => {
+    const state = character()
+    state.equipment.push(
+      {
+        id: "d1",
+        name: "Vital Charm",
+        slot: "trinket",
+        source: "assumption",
+        bonus: {},
+        derivedFlat: { hp: 20 },
+      },
+      {
+        id: "d2",
+        name: "Warding Sigil",
+        slot: "trinket",
+        source: "assumption",
+        bonus: {},
+        derivedPercentBasisPoints: { hp: 1000 },
+      },
+      {
+        id: "d3",
+        name: "Vital Rune",
+        slot: "trinket",
+        source: "assumption",
+        bonus: {},
+        derivedPercentBasisPoints: { hp: 2000 },
+      }
+    )
+    const result = calculateStatus(state, config())
+    // base = 10vitality * 10 = 100; flat = 20; pct = 1000 + 2000 = 3000 (summed,
+    // never compounded). max = max(0, 120 + floor(120 * 3000 / 10000)) = 120 + 36.
+    expect(result.derivedStats.hp).toBe(156)
+    expect(result.derivedStats.breakdown!.hp.base).toBe(100)
+    expect(result.derivedStats.breakdown!.hp.flat).toBe(20)
+    expect(result.derivedStats.breakdown!.hp.percentBasisPoints).toBe(3000)
+    expect(result.derivedStats.breakdown!.hp.percentApplied).toBe(36)
+    expect(result.derivedStats.breakdown!.hp.max).toBe(156)
+    // A sequential (compounding) application would give floor(132 * 1.2) = 158.
+    expect(result.derivedStats.hp).not.toBe(158)
+  })
+
+  it("does not consume attribute equipment cap budgets for derived bonuses", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100, vitality: 50 })
+    state.equipment.push({
+      id: "sword",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 100 },
+      derivedFlat: { hp: 30 },
+    })
+    const result = calculateStatus(state, config())
+    // strength flat 100 is clamped: individual 20% cap is 20, and the overall
+    // sum cap (floor(150 * 0.15) = 22) does not bind below it, so 20 applies.
+    expect(result.equipment.applied.strength).toBe(20)
+    expect(result.attributes.strength).toBe(120)
+    // The derived hp flat applies in full, unaffected by the strength cap.
+    expect(result.derivedStats.hp).toBe(530)
+  })
+
+  it("leaves the legacy configurable resources untouched", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ vitality: 50 })
+    state.currentResources = { hp: 42 }
+    const result = calculateStatus(state, config())
+    // Legacy configurable path is unchanged: no formula -> null max, current kept.
+    expect(result.resources[0].id).toBe("hp")
+    expect(result.resources[0].current).toBe(42)
+    expect(result.resources[0].max).toBeNull()
+    // Derived values are computed independently of the legacy path.
+    expect(result.derivedStats.hp).toBe(500)
+  })
+
+  it("clamps a negative derived resource at zero", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ vitality: 1 })
+    state.activeEffects.push({
+      id: "negFlat",
+      source: "buff",
+      provenance: "assumption",
+      phase: "flat",
+      amount: { vitality: -20 },
+      stacking: "stack",
+    })
+    const result = calculateStatus(state, config())
+    expect(result.attributes.vitality).toBe(-19)
+    expect(result.derivedStats.hp).toBe(0)
+    expect(result.derivedStats.breakdown!.hp.base).toBe(-190)
+    expect(result.derivedStats.breakdown!.hp.percentApplied).toBe(0)
+    expect(result.derivedStats.breakdown!.hp.max).toBe(0)
+  })
+
+  it("keeps legacy equipment without derived fields contributing nothing (no regression)", () => {
+    const state = character()
+    state.baseAttributes = makeVector({ strength: 100, vitality: 50 })
+    state.equipment.push({
+      id: "sword",
+      name: "Sword",
+      slot: "weapon",
+      source: "assumption",
+      bonus: { strength: 30 },
+    })
+    const result = calculateStatus(state, config())
+    // Legacy item contributes no derived flat/percent.
+    expect(result.derivedStats.hp).toBe(500)
+    expect(result.derivedStats.mp).toBe(0)
+    // The attribute equipment path is unchanged.
+    expect(result.equipment.requested.strength).toBe(30)
+    expect(result.attributes.strength).toBe(120)
+  })
+})
+
+describe("historicalFixedByTrack (source of historical fixed points per track)", () => {
+  it("maps known track literals directly and preserves exact totals", () => {
+    const state = character()
+    state.historicalLevelAwards.push(
+      {
+        track: "race",
+        level: 1,
+        definitionId: "d",
+        fixed: vec({ strength: 3, agility: 1 }),
+        free: 2,
+      },
+      {
+        track: "class",
+        level: 2,
+        definitionId: "d",
+        fixed: vec({ strength: 5 }),
+        free: 3,
+      },
+      {
+        track: "profession",
+        level: 3,
+        definitionId: "d",
+        fixed: vec({ strength: 7, endurance: 4 }),
+        free: 4,
+      }
+    )
+    const result = calculateStatus(state, config())
+    // Known track literals map directly to their own bucket.
+    expect(result.historicalFixedByTrack.race.strength).toBe(3)
+    expect(result.historicalFixedByTrack.race.agility).toBe(1)
+    expect(result.historicalFixedByTrack.class.strength).toBe(5)
+    expect(result.historicalFixedByTrack.profession.strength).toBe(7)
+    expect(result.historicalFixedByTrack.profession.endurance).toBe(4)
+    // The three vectors sum, per attribute, to the historical-fixed trace delta.
+    const trace = result.traces.find((t) => t.attribute === "strength")!
+    const histPhase = trace.phases.find((p) => p.phase === "historical-fixed")!
+    expect(histPhase.delta).toBe(3 + 5 + 7)
+    const sum =
+      result.historicalFixedByTrack.race.strength +
+      result.historicalFixedByTrack.class.strength +
+      result.historicalFixedByTrack.profession.strength
+    expect(sum).toBe(histPhase.delta)
+    // Status totals and final attributes are unchanged by the new field.
+    expect(result.totalFreePoints).toBe(2 + 3 + 4)
+    expect(result.attributes.strength).toBe(10 + 3 + 5 + 7)
+    expect(result.attributes.agility).toBe(10 + 1)
+    expect(result.attributes.endurance).toBe(10 + 4)
+  })
+
+  it("splits an unknown imported track evenly in Race, Class, Profession order", () => {
+    const state = character() // derived (enlightened) mode, class + profession present
+    state.historicalLevelAwards.push({
+      track: "mystic-path", // genuinely unknown legacy literal
+      level: 1,
+      definitionId: "legacy:award",
+      fixed: vec({ strength: 5 }),
+      free: 1,
+    })
+    const result = calculateStatus(state, config())
+    // Applicable = [race, class, profession]; 5 split 2/2/1 in that order.
+    expect(result.historicalFixedByTrack.race.strength).toBe(2)
+    expect(result.historicalFixedByTrack.class.strength).toBe(2)
+    expect(result.historicalFixedByTrack.profession.strength).toBe(1)
+    const histPhase = result.traces
+      .find((t) => t.attribute === "strength")!
+      .phases.find((p) => p.phase === "historical-fixed")!
+    const sum =
+      result.historicalFixedByTrack.race.strength +
+      result.historicalFixedByTrack.class.strength +
+      result.historicalFixedByTrack.profession.strength
+    expect(sum).toBe(5)
+    expect(histPhase.delta).toBe(5)
+    // The fixed amount is counted exactly once in the final attribute.
+    expect(result.attributes.strength).toBe(10 + 5)
+    // Free points are not grouped into the fixed split.
+    expect(result.totalFreePoints).toBe(1)
+  })
+
+  it("splits an unknown track to race only when profession is absent", () => {
+    const state = character()
+    delete state.tracks["profession"]
+    state.historicalLevelAwards.push({
+      track: "mystic-path",
+      level: 1,
+      definitionId: "legacy:award",
+      fixed: vec({ strength: 3 }),
+      free: 0,
+    })
+    const result = calculateStatus(state, config())
+    // Applicable = [race, class]; 3 split 2/1 in order, profession omitted.
+    expect(result.historicalFixedByTrack.race.strength).toBe(2)
+    expect(result.historicalFixedByTrack.class.strength).toBe(1)
+    expect(result.historicalFixedByTrack.profession.strength).toBe(0)
+    const sum =
+      result.historicalFixedByTrack.race.strength +
+      result.historicalFixedByTrack.class.strength +
+      result.historicalFixedByTrack.profession.strength
+    expect(sum).toBe(3)
+  })
+
+  it("splits an unknown track to race only for a monster", () => {
+    const state = character({ raceMode: "independent", raceLevel: 10 })
+    state.historicalLevelAwards.push({
+      track: "beast", // unknown legacy literal on a monster
+      level: 1,
+      definitionId: "legacy:award",
+      fixed: vec({ strength: 8, agility: 2 }),
+      free: 0,
+    })
+    const result = calculateStatus(state, config())
+    // A monster is race-only: the whole amount lands in the race bucket.
+    expect(result.historicalFixedByTrack.race.strength).toBe(8)
+    expect(result.historicalFixedByTrack.race.agility).toBe(2)
+    expect(result.historicalFixedByTrack.class.strength).toBe(0)
+    expect(result.historicalFixedByTrack.profession.strength).toBe(0)
+    const histPhase = result.traces
+      .find((t) => t.attribute === "strength")!
+      .phases.find((p) => p.phase === "historical-fixed")!
+    expect(histPhase.delta).toBe(8)
+    expect(result.attributes.strength).toBe(10 + 8)
+  })
+
+  it("splits a negative fixed vector with signed remainder preserving the exact total", () => {
+    const state = character()
+    state.historicalLevelAwards.push({
+      track: "mystic-path", // unknown literal carrying a negative vector
+      level: 1,
+      definitionId: "legacy:award",
+      fixed: vec({ strength: -5 }),
+      free: 0,
+    })
+    const result = calculateStatus(state, config())
+    // -5 / 3 -> base -1 per bucket, remainder -2 applied to the first two buckets.
+    expect(result.historicalFixedByTrack.race.strength).toBe(-2)
+    expect(result.historicalFixedByTrack.class.strength).toBe(-2)
+    expect(result.historicalFixedByTrack.profession.strength).toBe(-1)
+    const sum =
+      result.historicalFixedByTrack.race.strength +
+      result.historicalFixedByTrack.class.strength +
+      result.historicalFixedByTrack.profession.strength
+    expect(sum).toBe(-5)
+    const histPhase = result.traces
+      .find((t) => t.attribute === "strength")!
+      .phases.find((p) => p.phase === "historical-fixed")!
+    expect(histPhase.delta).toBe(-5)
+    expect(result.attributes.strength).toBe(10 - 5)
+  })
+
+  it("does not mutate stored awards and keeps historical-fixed trace totals unchanged", () => {
+    const state = character()
+    const awards = [
+      {
+        track: "class",
+        level: 1,
+        definitionId: "d",
+        fixed: vec({ strength: 2, wisdom: 1 }),
+        free: 5,
+      },
+      {
+        track: "mystic-path",
+        level: 1,
+        definitionId: "legacy:award",
+        fixed: vec({ strength: 6 }),
+        free: 2,
+      },
+    ]
+    state.historicalLevelAwards.push(...awards)
+    const before = JSON.parse(JSON.stringify(state.historicalLevelAwards))
+    const result = calculateStatus(state, config())
+    // Stored awards are not mutated.
+    expect(JSON.parse(JSON.stringify(state.historicalLevelAwards))).toEqual(
+      before
+    )
+    // strength: class 2 + unknown split (6 among race/class/prof = 2/2/2).
+    expect(result.historicalFixedByTrack.class.strength).toBe(2 + 2)
+    expect(result.historicalFixedByTrack.race.strength).toBe(2)
+    expect(result.historicalFixedByTrack.profession.strength).toBe(2)
+    const histPhase = result.traces
+      .find((t) => t.attribute === "strength")!
+      .phases.find((p) => p.phase === "historical-fixed")!
+    expect(histPhase.delta).toBe(2 + 6)
+    const sum =
+      result.historicalFixedByTrack.race.strength +
+      result.historicalFixedByTrack.class.strength +
+      result.historicalFixedByTrack.profession.strength
+    expect(sum).toBe(histPhase.delta)
+    // Available/free/allocated point totals are unaffected by the fixed split.
+    expect(result.totalFreePoints).toBe(5 + 2)
+    expect(result.allocatedPoints).toBe(0)
+    expect(result.availablePoints).toBe(7)
+  })
+})

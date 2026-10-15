@@ -24,6 +24,9 @@ import {
   type Attribute,
   type AttributeVector,
   type CharacterState,
+  type DerivedResource,
+  type DerivedStatBreakdown,
+  type DerivedStats,
   type EffectCondition,
   type EquipmentBonus,
   type GameEffect,
@@ -705,6 +708,155 @@ export function computeResources(
 }
 
 /* ------------------------------------------------------------------ *
+ * Derived HP / MP / SP maxima
+ *
+ * Authoritative maxima for the three core pools, derived from the FINAL
+ * attributes after every phase (including temporary effects). Always present
+ * and never null, unlike the legacy configurable `resources` engine. These are
+ * deliberately independent of the equipment 20%/15% attribute cap budgets and
+ * never compound across items: the percentage basis points are summed across
+ * all equipment and applied once to the positive (base + flat) value.
+ * ------------------------------------------------------------------ */
+
+/** Which canonical attribute drives each derived resource's base value. */
+const DERIVED_RESOURCE_ATTRIBUTE: Record<DerivedResource, Attribute> = {
+  hp: "vitality",
+  mp: "wisdom",
+  sp: "endurance",
+}
+
+function deriveOneResource(
+  finalAttributes: AttributeVector,
+  equipment: EquipmentBonus[],
+  resource: DerivedResource
+): DerivedStatBreakdown {
+  const attribute = DERIVED_RESOURCE_ATTRIBUTE[resource]
+  const base = finalAttributes[attribute] * 10
+  let flat = 0
+  let percentBasisPoints = 0
+  for (const item of equipment) {
+    flat += item.derivedFlat?.[resource] ?? 0
+    percentBasisPoints += item.derivedPercentBasisPoints?.[resource] ?? 0
+  }
+  const effectiveBase = Math.max(0, base + flat)
+  const percentApplied = Math.floor(
+    (effectiveBase * percentBasisPoints) / 10000
+  )
+  const max = Math.max(0, base + flat + percentApplied)
+  return { attribute, base, flat, percentBasisPoints, percentApplied, max }
+}
+
+export function computeDerivedStats(
+  finalAttributes: AttributeVector,
+  equipment: EquipmentBonus[]
+): DerivedStats {
+  const hp = deriveOneResource(finalAttributes, equipment, "hp")
+  const mp = deriveOneResource(finalAttributes, equipment, "mp")
+  const sp = deriveOneResource(finalAttributes, equipment, "sp")
+  return { hp: hp.max, mp: mp.max, sp: sp.max, breakdown: { hp, mp, sp } }
+}
+
+/* ------------------------------------------------------------------ *
+ * Historical fixed source per track (race / class / profession)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The applicable tracks for splitting a genuinely unknown legacy award track,
+ * in deterministic Race, Class, Profession order. A monster (independent race
+ * mode) is race-only; an enlightened (derived) character always includes race
+ * and adds any present class / profession tracks, omitting absent ones.
+ */
+function applicableTracksForSplit(
+  state: CharacterState
+): Array<"race" | "class" | "profession"> {
+  const list: Array<"race" | "class" | "profession"> = ["race"]
+  if (state.race.mode === "independent") return list
+  if (state.tracks["class"]) list.push("class")
+  if (state.tracks["profession"]) list.push("profession")
+  return list
+}
+
+/**
+ * Split a signed integer `total` as evenly as possible across `n` buckets, in
+ * order, preserving the exact total. The base uses truncation toward zero; the
+ * signed remainder is spread one unit per bucket starting from the first, so a
+ * negative total distributes its remainder as `-1` to the earliest buckets.
+ */
+function splitSignedEvenly(total: number, n: number): number[] {
+  if (n <= 0) return []
+  const base = Math.trunc(total / n)
+  const remainder = total - base * n
+  const out = new Array<number>(n).fill(base)
+  const step = remainder > 0 ? 1 : remainder < 0 ? -1 : 0
+  const count = Math.min(Math.abs(remainder), n)
+  for (let i = 0; i < count; i++) out[i] += step
+  return out
+}
+
+function addFixedInto(dest: AttributeVector, src: AttributeVector): void {
+  for (const attr of ATTRIBUTES) dest[attr] += src[attr]
+}
+
+/**
+ * Compute the source of the historical fixed attribute points per track
+ * (race / class / profession) from `state.historicalLevelAwards[].fixed`.
+ *
+ * Known track literals map directly; genuinely unknown legacy track strings are
+ * split EACH stat value evenly among the applicable tracks in deterministic
+ * Race, Class, Profession order (a monster is race-only; an enlightened
+ * character uses race plus any present class/profession tracks, omitting absent
+ * ones) using signed-integer remainder apportionment that keeps the exact total.
+ * Stored awards are never mutated and free points are never grouped into fixed.
+ */
+function computeHistoricalFixedByTrack(state: CharacterState): {
+  race: AttributeVector
+  class: AttributeVector
+  profession: AttributeVector
+} {
+  const race = zeroVector()
+  const clazz = zeroVector()
+  const profession = zeroVector()
+  const buckets: Record<"race" | "class" | "profession", AttributeVector> = {
+    race,
+    class: clazz,
+    profession,
+  }
+
+  const targets = applicableTracksForSplit(state)
+  const n = targets.length
+
+  for (const award of state.historicalLevelAwards) {
+    const track = award.track
+    if (track === "race") {
+      addFixedInto(buckets.race, award.fixed)
+      continue
+    }
+    if (track === "class") {
+      addFixedInto(buckets.class, award.fixed)
+      continue
+    }
+    if (track === "profession") {
+      addFixedInto(buckets.profession, award.fixed)
+      continue
+    }
+    // Genuinely unknown legacy track literal: split each stat evenly.
+    if (n === 0) continue
+    for (const attr of ATTRIBUTES) {
+      const split = splitSignedEvenly(award.fixed[attr], n)
+      for (let i = 0; i < n; i++) {
+        buckets[targets[i]][attr] += split[i]
+      }
+    }
+  }
+
+  return {
+    race: buckets.race,
+    class: buckets.class,
+    profession: buckets.profession,
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Main status calculation
  * ------------------------------------------------------------------ */
 
@@ -836,6 +988,8 @@ export function calculateStatus(
   const availablePoints = totalFreePoints - allocatedPoints
 
   const resources = computeResources(state, config, attributes)
+  const derivedStats = computeDerivedStats(attributes, state.equipment)
+  const historicalFixedByTrack = computeHistoricalFixedByTrack(state)
 
   return {
     attributes,
@@ -844,8 +998,10 @@ export function calculateStatus(
     totalFreePoints,
     allocatedPoints,
     resources,
+    derivedStats,
     equipment: equipment.status,
     consumables,
     capUsage,
+    historicalFixedByTrack,
   }
 }

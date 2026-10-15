@@ -32,8 +32,7 @@
  *
  * Every entry is validated against `catalogCreateSchema` plus the per-kind config
  * schema (`parseCatalogConfig`) and the same modern-shape checks the service layer
- * enforces on a create (blessing tier/effects, bloodline effects, skill
- * track/milestone pairs, etc). Every `sourceUrl` must be an `https:` URL naming a
+ * enforces on a create (bloodline effects, skill track/milestone pairs, etc). Every `sourceUrl` must be an `https:` URL naming a
  * host. A malformed manifest fails with a 400 BEFORE any write, and a duplicate
  * (kind, stableId) within the manifest also fails early.
  */
@@ -46,15 +45,14 @@ import {
   catalogCreateSchema,
   catalogKindSchema,
   hasInvalidSkillTrack,
+  hasLegacyEquipmentRequirements,
   isIncompleteEquipmentConfig,
   isIncompleteRaceConfig,
   isIncompleteSkillConfig,
   isIncompleteSkillRarity,
-  isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
-  isLegacyConsumableConfig,
   isLegacyTranscendentSkillConfig,
-  isValidEvolutionConfig,
+  normalizeCatalogKind,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
 import type { Grade } from "@/lib/rules"
@@ -192,7 +190,10 @@ function assertHttpsSourceUrl(sourceUrl: string, stableId: string): void {
 }
 
 function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
-  if (!catalogKindSchema.safeParse(entry.kind).success) {
+  // Accept the legacy `consumables` kind as an alias for `items`; the legacy value
+  // is never persisted (create/write always uses the canonical kind).
+  const kind = normalizeCatalogKind(entry.kind) as CatalogKind
+  if (!catalogKindSchema.safeParse(kind).success) {
     throw badRequest("invalid_kind", `Unknown catalog kind "${entry.kind}"`)
   }
   assertHttpsSourceUrl(entry.sourceUrl, entry.stableId)
@@ -208,23 +209,23 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
   if (!parsed.success) {
     throw badRequest(
       "validation",
-      `Invalid catalog manifest entry "${entry.stableId}" (${entry.kind})`
+      `Invalid catalog manifest entry "${entry.stableId}" (${kind})`
     )
   }
   let config: Record<string, unknown>
   try {
-    config = parseCatalogConfig(entry.kind, entry.config)
+    config = parseCatalogConfig(kind, entry.config)
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Invalid catalog config"
     throw badRequest(
       "invalid_config",
-      `Invalid config for "${entry.stableId}" (${entry.kind}): ${message}`
+      `Invalid config for "${entry.stableId}" (${kind}): ${message}`
     )
   }
-  assertModernConfig(entry.kind, config)
+  assertModernConfig(kind, config)
   return {
-    kind: entry.kind,
+    kind,
     stableId: entry.stableId,
     name: entry.name,
     description: entry.description,
@@ -244,12 +245,6 @@ export function assertModernConfig(
   kind: string,
   config: Record<string, unknown>
 ): void {
-  if (kind === "consumables" && isLegacyConsumableConfig(config)) {
-    throw badRequest(
-      "invalid_config",
-      'Consumable config is missing required "type" and "amount" fields'
-    )
-  }
   if (kind === "skills" && isIncompleteSkillConfig(config)) {
     throw badRequest(
       "invalid_config",
@@ -275,18 +270,6 @@ export function assertModernConfig(
       'Race config must declare a valid "raceType": expected "enlightened" or "monster"'
     )
   }
-  if (kind === "evolutions" && !isValidEvolutionConfig(config)) {
-    throw badRequest(
-      "invalid_config",
-      "Evolution config is not a valid path: it must be a complete race path OR a complete class/profession path"
-    )
-  }
-  if (kind === "blessings" && isLegacyBlessingConfig(config)) {
-    throw badRequest(
-      "invalid_config",
-      'Blessing config is missing required "tier" and "effects" fields'
-    )
-  }
   if (kind === "bloodlines" && isLegacyBloodlineConfig(config)) {
     throw badRequest(
       "invalid_config",
@@ -308,6 +291,15 @@ export function assertModernConfig(
     throw badRequest(
       "invalid_config",
       'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring/Weapon, or a documented legacy alias) and a valid "rarity"'
+    )
+  }
+  // A NEW equipment manifest entry must persist the CANONICAL requirement keys,
+  // never the legacy `minRaceLevel` / `requiredRaceType` (the editor migrates
+  // them); an existing row that carries them stays readable and enforced.
+  if (kind === "equipment" && hasLegacyEquipmentRequirements(config)) {
+    throw badRequest(
+      "invalid_config",
+      'Equipment config uses the legacy "minRaceLevel"/"requiredRaceType"; use the canonical "minimumLevel"/"requiredLevelType"'
     )
   }
 }
@@ -358,40 +350,6 @@ function toPreviewEntry(
   }
 }
 
-/**
- * Resolve the `patronId` FK for a `blessings` entry, mirroring the service's
- * `resolveBlessingPatronId`. Runs inside the SAME transaction as the create so an
- * invalid/archived patron fails the whole import and never leaves a dangling FK.
- * A non-blessing entry returns no patron data.
- */
-async function blessingPatronData(
-  db: Prisma.TransactionClient,
-  entry: ValidatedEntry
-): Promise<{ patronId?: string | null }> {
-  if (entry.kind !== "blessings") return {}
-  const config = entry.config as Record<string, unknown>
-  const stableId = config.patronGodStableId
-  if (typeof stableId !== "string" || stableId.length === 0) {
-    return { patronId: null }
-  }
-  const god = await db.catalogDefinition.findUnique({
-    where: { kind_stableId: { kind: "gods", stableId } },
-  })
-  if (!god) {
-    throw badRequest(
-      "patron_god_not_found",
-      `Patron god "${stableId}" is not in the catalog`
-    )
-  }
-  if (god.archived) {
-    throw badRequest(
-      "patron_god_archived",
-      `Patron god "${god.name}" is archived; unarchive it before granting its blessing`
-    )
-  }
-  return { patronId: god.id }
-}
-
 function isUniqueViolation(err: unknown): boolean {
   if (
     err instanceof Prisma.PrismaClientKnownRequestError &&
@@ -419,6 +377,60 @@ function isSerializationFailure(err: unknown): boolean {
 // ------------------------------------------------------------------ //
 
 /**
+ * Verify that every equipment manifest entry's divine-patron reference
+ * (`requiredGodStableId`) resolves to a god that will exist unarchived after the
+ * import: either an existing unarchived god row, or a god created by this same
+ * manifest (import always creates rows with `archived: false`). A dangling patron
+ * would render the item permanently ineligible, so it is rejected up front before
+ * any write.
+ */
+function assertManifestEquipmentGodRefs(
+  entries: readonly Pick<WikiReviewedEntry, "kind" | "stableId" | "config">[],
+  unarchivedGodStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (entry.kind !== "equipment") continue
+    const godStableId = entry.config.requiredGodStableId
+    if (typeof godStableId !== "string" || godStableId.length === 0) continue
+    if (!unarchivedGodStableIds.has(godStableId)) {
+      throw badRequest(
+        "invalid_config",
+        `Equipment manifest entry "${entry.stableId}" requires divine patron "${godStableId}" which is neither an unarchived catalog god nor a god created by this manifest`
+      )
+    }
+  }
+}
+
+/**
+ * Verify that every equipment manifest entry's granted-passive-skill reference
+ * (`grantedSkillStableIds`) resolves to a skill that will exist unarchived after
+ * the import: either an existing unarchived skill row, or a skill created by this
+ * same manifest (import always creates rows with `archived: false`). A dangling
+ * or archived skill would render the granted passive permanently inert, so it is
+ * rejected up front before any write. No-op when the entry is not equipment or
+ * grants no skill.
+ */
+function assertManifestEquipmentSkillRefs(
+  entries: readonly Pick<WikiReviewedEntry, "kind" | "stableId" | "config">[],
+  unarchivedSkillStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (entry.kind !== "equipment") continue
+    const granted = entry.config.grantedSkillStableIds
+    if (!Array.isArray(granted) || granted.length === 0) continue
+    for (const stableId of granted) {
+      if (typeof stableId !== "string" || stableId.length === 0) continue
+      if (!unarchivedSkillStableIds.has(stableId)) {
+        throw badRequest(
+          "invalid_config",
+          `Equipment manifest entry "${entry.stableId}" grants skill "${stableId}" which is neither an unarchived catalog skill nor a skill created by this manifest`
+        )
+      }
+    }
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row with that (kind, stableId) yet)
  * or `skip_existing` (a row already occupies the key, so it is never overwritten).
@@ -429,6 +441,38 @@ export async function previewWikiReviewedImport(
   const validated = validateEntries(entries)
   const rows = await prisma.catalogDefinition.findMany({})
   const byKey = new Map(rows.map((row) => [keyOf(row.kind, row.stableId), row]))
+  const unarchivedGods = new Set(
+    rows.filter((r) => r.kind === "gods" && !r.archived).map((r) => r.stableId)
+  )
+  // A manifest god only becomes newly unarchived when its (kind, stableId) key is
+  // ABSENT from the existing catalog. If a god row already exists - even archived -
+  // the manifest entry is skipped (existing rows are never overwritten), so the god
+  // keeps its current archived state and must NOT satisfy an equipment patron ref.
+  for (const entry of validated) {
+    if (entry.kind === "gods" && !byKey.has(keyOf("gods", entry.stableId))) {
+      unarchivedGods.add(entry.stableId)
+    }
+  }
+  // A manifest skill only becomes newly unarchived when its (kind, stableId) key is
+  // ABSENT from the existing catalog. If a skill row already exists - even
+  // archived - the manifest entry is skipped (existing rows are never
+  // overwritten), so the skill keeps its current archived state and must NOT
+  // satisfy an equipment granted-skill reference.
+  const unarchivedSkillStableIds = new Set(
+    rows
+      .filter((r) => r.kind === "skills" && !r.archived)
+      .map((r) => r.stableId)
+  )
+  for (const entry of validated) {
+    if (
+      entry.kind === "skills" &&
+      !byKey.has(keyOf("skills", entry.stableId))
+    ) {
+      unarchivedSkillStableIds.add(entry.stableId)
+    }
+  }
+  assertManifestEquipmentGodRefs(validated, unarchivedGods)
+  assertManifestEquipmentSkillRefs(validated, unarchivedSkillStableIds)
   let createCount = 0
   let skipCount = 0
   const resultEntries = validated.map((entry) => {
@@ -469,6 +513,44 @@ export async function applyWikiReviewedImport(
         const byKey = new Map(
           rows.map((row) => [keyOf(row.kind, row.stableId), row])
         )
+        const unarchivedGods = new Set(
+          rows
+            .filter((r) => r.kind === "gods" && !r.archived)
+            .map((r) => r.stableId)
+        )
+        // Only a manifest god whose (kind, stableId) key is ABSENT from the
+        // existing catalog is treated as newly unarchived. A god that already
+        // exists - even archived - is skipped (existing rows are never
+        // overwritten), so it keeps its current archived state and must NOT
+        // satisfy an equipment patron reference.
+        for (const entry of validated) {
+          if (
+            entry.kind === "gods" &&
+            !byKey.has(keyOf("gods", entry.stableId))
+          ) {
+            unarchivedGods.add(entry.stableId)
+          }
+        }
+        // Only a manifest skill whose (kind, stableId) key is ABSENT from the
+        // existing catalog is treated as newly unarchived. A skill that already
+        // exists - even archived - is skipped (existing rows are never
+        // overwritten), so it keeps its current archived state and must NOT
+        // satisfy an equipment granted-skill reference.
+        const unarchivedSkillStableIds = new Set(
+          rows
+            .filter((r) => r.kind === "skills" && !r.archived)
+            .map((r) => r.stableId)
+        )
+        for (const entry of validated) {
+          if (
+            entry.kind === "skills" &&
+            !byKey.has(keyOf("skills", entry.stableId))
+          ) {
+            unarchivedSkillStableIds.add(entry.stableId)
+          }
+        }
+        assertManifestEquipmentGodRefs(validated, unarchivedGods)
+        assertManifestEquipmentSkillRefs(validated, unarchivedSkillStableIds)
         const createdIds: string[] = []
         let skipCount = 0
         const resultEntries: CatalogImportEntryPreview[] = []
@@ -493,7 +575,6 @@ export async function applyWikiReviewedImport(
               config: entry.config as Prisma.InputJsonValue,
               gradeDescriptions:
                 entry.gradeDescriptions as Prisma.InputJsonValue,
-              ...(await blessingPatronData(tx, entry)),
             },
           })
           createdIds.push(row.id)

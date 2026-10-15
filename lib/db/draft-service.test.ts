@@ -194,7 +194,12 @@ describe("draft data schema (whitelist / bounds)", () => {
     // enough to push the serialized total beyond the whole-payload cap.
     const parsed = draftDataSchema.safeParse({
       ...nearLimitData(),
-      specialAbilities: { blessingId: "b".repeat(DRAFT_DATA_MAX_BYTES) },
+      specialAbilities: {
+        blessing: {
+          godId: "b".repeat(DRAFT_DATA_MAX_BYTES),
+          tier: "Minor",
+        },
+      },
     })
     expect(parsed.success).toBe(false)
   })
@@ -219,7 +224,7 @@ describe("draft data schema (whitelist / bounds)", () => {
       name: "Kael",
       special: true,
       specialAbilities: {
-        blessingId: "bless-1",
+        blessing: { godId: "bless-1", tier: "Minor" },
         bloodlineIds: ["blood-1"],
         transcendentSkillIds: ["trans-1"],
       },
@@ -250,7 +255,7 @@ describe("draft data schema (whitelist / bounds)", () => {
     const parsed = draftDataSchema.safeParse({
       step: 4,
       specialAbilities: {
-        blessingId: "bless-1",
+        blessing: { godId: "bless-1", tier: "Minor" },
         bloodlineIds: ["bless-1"],
       },
     })

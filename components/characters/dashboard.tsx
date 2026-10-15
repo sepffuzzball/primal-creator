@@ -21,6 +21,7 @@ import {
 } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -71,6 +72,27 @@ const gradeBadgeClasses = {
 type LevelTier = "Early" | "Mid" | "Developing" | "Late" | "Pinnacle"
 
 const E_GRADE_BAND = { min: 25, max: 99 }
+
+export function CharacterPortrait({ item }: { item: CharacterListItem }) {
+  const [failed, setFailed] = React.useState(false)
+  return (
+    <Avatar size="lg" className="size-12 shrink-0">
+      {item.portrait?.url && !failed ? (
+        // Private asset URLs require the authenticated browser request; bypass Next's optimizer.
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={item.portrait.url}
+          alt={`${item.name} portrait`}
+          className="aspect-square size-full rounded-full object-cover"
+          onError={() => setFailed(true)}
+        />
+      ) : null}
+      <AvatarFallback className="text-sm">
+        {item.name.charAt(0).toUpperCase() || <UserIcon aria-hidden="true" />}
+      </AvatarFallback>
+    </Avatar>
+  )
+}
 
 export function getRaceLevelTier(
   level: number,
@@ -472,24 +494,29 @@ export function CharactersDashboard() {
             return (
               <Card key={item.id}>
                 <CardHeader>
-                  <div className="flex items-start justify-between gap-2">
-                    <CardTitle>
-                      <Link
-                        href={`/characters/${item.id}`}
-                        className="hover:underline"
-                      >
-                        {item.name}
-                      </Link>
-                    </CardTitle>
-                    {item.archived ? (
-                      <Badge variant="outline">Archived</Badge>
-                    ) : null}
+                  <div className="flex min-w-0 items-start gap-3">
+                    <CharacterPortrait item={item} />
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <CardTitle className="min-w-0 break-words">
+                          <Link
+                            href={`/characters/${item.id}`}
+                            className="hover:underline"
+                          >
+                            {item.name}
+                          </Link>
+                        </CardTitle>
+                        {item.archived ? (
+                          <Badge variant="outline">Archived</Badge>
+                        ) : null}
+                      </div>
+                      <CardDescription>
+                        {[item.raceName, item.className, item.professionName]
+                          .filter(Boolean)
+                          .join(" / ") || "No choices yet"}
+                      </CardDescription>
+                    </div>
                   </div>
-                  <CardDescription>
-                    {[item.raceName, item.className, item.professionName]
-                      .filter(Boolean)
-                      .join(" / ") || "No choices yet"}
-                  </CardDescription>
                   <RaceBadges item={item} />
                 </CardHeader>
                 <CardContent>

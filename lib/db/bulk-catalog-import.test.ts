@@ -55,24 +55,15 @@ function god(stableId: string) {
   }
 }
 
-function blessing(
-  stableId: string,
-  patronGodStableId?: string,
-  extra: Record<string, unknown> = {}
-) {
+function equipment(stableId: string, extra: Record<string, unknown> = {}) {
   return {
-    kind: "blessings",
+    kind: "equipment",
     stableId,
-    name: `Blessing ${stableId}`,
-    description: `A blessing named ${stableId}`,
+    name: `Equipment ${stableId}`,
+    description: `Equipment of ${stableId}`,
     provenance: "house",
-    sourceUrl: "https://example.com/bless/" + stableId,
-    config: {
-      tier: "Minor",
-      effects: [],
-      ...(patronGodStableId ? { patronGodStableId } : {}),
-    },
-    ...extra,
+    sourceUrl: "https://example.com/equipment/" + stableId,
+    config: { slot: "Ring", rarity: "Common", ...extra },
   }
 }
 
@@ -212,23 +203,23 @@ describe("bulk JSON parsing and validation", () => {
     ).toThrowError(expect.objectContaining({ status: 400, code: "validation" }))
   })
 
-  it("rejects a legacy blessing config missing tier/effects", () => {
+  it("rejects a god whose blessingEffects references an unknown tier", () => {
     const bad = {
-      ...blessing("legacy-bless"),
-      config: { grade: "F", effect: {} },
+      ...god("bad-god"),
+      config: { blessingEffects: { minor: [] } },
     }
     expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
       expect.objectContaining({ status: 400, code: "invalid_config" })
     )
   })
 
-  it("reports the row number for a modern-config failure", () => {
+  it("reports the row number for an invalid god config", () => {
     const bad = {
-      ...blessing("legacy-bless"),
-      config: { grade: "F", effect: {} },
+      ...god("bad-god"),
+      config: { blessingEffects: { minor: [] } },
     }
     expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
-      /Bulk row 1: Blessing config is missing required "tier" and "effects" fields/
+      /Bulk row 1: invalid config/i
     )
   })
 
@@ -590,105 +581,34 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
     expect(dbMock.store.catalog.size).toBe(2)
   })
 
-  it("inserts gods first, so a blessing may name a god created later in the upload", async () => {
-    // Blessing references the god BEFORE the god appears in the upload.
-    const entries = parseBulkEntries(
-      "json",
-      jsonContent([blessing("bless-one", "odin"), god("odin")])
-    )
+  it("applies a gods entry and preserves its blessingEffects config", async () => {
+    const godEntry = {
+      ...god("odin"),
+      config: { blessingEffects: { True: [], Minor: [] } },
+    }
+    const entries = parseBulkEntries("json", jsonContent([godEntry]))
     const result = await applyBulkImport(entries, "digest")
-    expect(result.createCount).toBe(2)
-    expect(result.createdIds).toHaveLength(2)
-    const blessingRow = [...dbMock.store.catalog.values()].find(
-      (r) => r.stableId === "bless-one"
-    )!
+    expect(result.createCount).toBe(1)
+    expect(result.createdIds).toHaveLength(1)
     const godRow = [...dbMock.store.catalog.values()].find(
       (r) => r.stableId === "odin"
     )!
-    expect(blessingRow.patronId).toBe(godRow.id)
+    expect(godRow.kind).toBe("gods")
+    expect(godRow.config).toEqual({ blessingEffects: { True: [], Minor: [] } })
   })
 
-  it("rolls back the whole import when a would-create blessing names a missing god", async () => {
+  it("creates gods and non-god entries in any row order (no patron resolution)", async () => {
+    // Order is irrelevant now that blessings live on character associations, not as
+    // a patron FK; both rows exist and are created independently.
     const entries = parseBulkEntries(
       "json",
-      jsonContent([skill("skills", "pre"), blessing("ghost", "no-such-god")])
-    )
-    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
-      status: 400,
-      code: "patron_god_not_found",
-    })
-    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
-      status: 400,
-      code: "patron_god_not_found",
-    })
-    expect(dbMock.store.catalog.size).toBe(0)
-  })
-
-  it("rejects a would-create blessing whose patron god exists but is archived", async () => {
-    dbMock.store.addCatalog({
-      id: "archived-god",
-      kind: "gods",
-      stableId: "odin",
-      name: "Odin",
-      config: {},
-
-      archived: true,
-    })
-    const entries = parseBulkEntries(
-      "json",
-      jsonContent([blessing("bless-one", "odin")])
-    )
-    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
-      status: 400,
-      code: "patron_god_archived",
-    })
-    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
-      status: 400,
-      code: "patron_god_archived",
-    })
-    expect(dbMock.store.catalog.size).toBe(1)
-  })
-
-  it("allows a would-create blessing whose patron is an existing unarchived god", async () => {
-    dbMock.store.addCatalog({
-      id: "live-god",
-      kind: "gods",
-      stableId: "odin",
-      name: "Odin",
-      config: {},
-
-      archived: false,
-    })
-    const entries = parseBulkEntries(
-      "json",
-      jsonContent([blessing("bless-one", "odin")])
+      jsonContent([god("odin"), skill("skills", "a")])
     )
     const result = await applyBulkImport(entries, "digest")
-    expect(result.createCount).toBe(1)
-    const blessingRow = [...dbMock.store.catalog.values()].find(
-      (r) => r.stableId === "bless-one"
-    )!
-    expect(blessingRow.patronId).toBe("live-god")
-  })
-
-  it("does not revalidate a skip-existing blessing's patron", async () => {
-    // The blessing already exists, so its (missing) patron is not re-checked.
-    dbMock.store.addCatalog({
-      id: "bless-existing",
-      kind: "blessings",
-      stableId: "bless-one",
-      name: "Existing Blessing",
-      config: { tier: "Minor", effects: [], patronGodStableId: "no-such-god" },
-
-      archived: false,
-    })
-    const entries = parseBulkEntries(
-      "json",
-      jsonContent([blessing("bless-one", "no-such-god")])
-    )
-    const result = await applyBulkImport(entries, "digest")
-    expect(result.createCount).toBe(0)
-    expect(result.skipCount).toBe(1)
+    expect(result.createCount).toBe(2)
+    const ids = [...dbMock.store.catalog.values()].map((r) => r.stableId)
+    expect(ids).toContain("odin")
+    expect(ids).toContain("a")
   })
 
   it("maps a P2034 serialization conflict to 409 without partial writes", async () => {
@@ -790,5 +710,316 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       (r) => r.stableId === "csv-gd"
     )!
     expect(row.gradeDescriptions).toEqual({ B: "A B-grade blurb" })
+  })
+
+  it("accepts an equipment entry whose required god exists unarchived already", async () => {
+    dbMock.store.addCatalog({
+      id: "god-viper",
+      kind: "gods",
+      stableId: "the-malefic-viper",
+      name: "The Malefic Viper",
+      config: { blessingEffects: {} },
+      archived: false,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("viper-ring", { requiredGodStableId: "the-malefic-viper" }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(1)
+    expect(preview.entries[0].status).toBe("create")
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(1)
+    const ring = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "viper-ring"
+    )!
+    expect(ring.config).toMatchObject({
+      requiredGodStableId: "the-malefic-viper",
+    })
+  })
+
+  it("rejects an equipment entry with a dangling god reference and writes nothing", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("dangling-ring", { requiredGodStableId: "no-such-god" }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects an equipment entry whose required god is archived", async () => {
+    dbMock.store.addCatalog({
+      id: "archived-god",
+      kind: "gods",
+      stableId: "a-sleeping-god",
+      name: "A Sleeping God",
+      config: { blessingEffects: {} },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("sleeping-god-ring", {
+          requiredGodStableId: "a-sleeping-god",
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    // The pre-existing archived god is left untouched.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("accepts an equipment entry whose required god is created by the same upload", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        god("manifest-god"),
+        equipment("manifest-god-ring", {
+          requiredGodStableId: "manifest-god",
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(2)
+    expect(preview.skipCount).toBe(0)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(2)
+    expect(applied.skipCount).toBe(0)
+    const ring = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "manifest-god-ring"
+    )!
+    expect(ring.config).toMatchObject({ requiredGodStableId: "manifest-god" })
+    const patron = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "manifest-god"
+    )!
+    expect(patron.archived).toBe(false)
+  })
+
+  it("rejects an equipment ref to a god that is archived even when the upload also lists that god (the upload god entry is skipped)", async () => {
+    // A god row already exists archived, AND the upload also lists that same god.
+    // Because existing rows are never overwritten, the upload god entry is
+    // skipped (status skip_existing), so the god stays archived. The import must
+    // NOT treat the merely-included upload god as unarchived, so an equipment
+    // entry requiring it is rejected in BOTH preview and apply, with no write.
+    dbMock.store.addCatalog({
+      id: "dual-god",
+      kind: "gods",
+      stableId: "dual-god",
+      name: "Dual God",
+      config: { blessingEffects: {} },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        god("dual-god"),
+        equipment("dual-god-relic", { requiredGodStableId: "dual-god" }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    // The pre-existing archived god is left untouched; nothing else was written.
+    expect(dbMock.store.catalog.size).toBe(1)
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "dual-god"
+    )!
+    expect(row.archived).toBe(true)
+  })
+
+  it("apply rechecks the god ref inside the transaction and rejects when a god is archived concurrently after a passing preview", async () => {
+    dbMock.store.addCatalog({
+      id: "god-ok",
+      kind: "gods",
+      stableId: "god-ok",
+      name: "God Ok",
+      config: { blessingEffects: {} },
+      archived: false,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("ok-ring", { requiredGodStableId: "god-ok" }),
+        skill("skills", "ok-skill"),
+      ])
+    )
+    // Preview reads the god as active and would create both rows.
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(2)
+
+    // A concurrent write archives the god between preview and apply, so the
+    // apply SERIALIZABLE transaction re-reads the god's archived state and must
+    // reject rather than trust the stale preview result.
+    dbMock.store.catalog.get("god-ok")!.archived = true
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    // Nothing was written: neither the equipment nor the skill row, and the god
+    // itself was never touched by apply (it pre-existed and is not overwritten).
+    expect(dbMock.store.catalog.size).toBe(1)
+    expect(dbMock.store.catalog.get("god-ok")!.archived).toBe(true)
+  })
+
+  it("writes nothing when a valid row precedes an equipment entry with a dangling god reference", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "valid-skill"),
+        equipment("bad-ring", { requiredGodStableId: "no-such-god" }),
+      ])
+    )
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("accepts an equipment entry that grants an existing unarchived skill", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: false,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("existing-skill-ring", {
+          grantedSkillStableIds: ["existing-skill"],
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(1)
+    expect(preview.entries[0].status).toBe("create")
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(1)
+    const ring = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "existing-skill-ring"
+    )!
+    expect(ring.config).toMatchObject({
+      grantedSkillStableIds: ["existing-skill"],
+    })
+  })
+
+  it("rejects an equipment entry that grants a missing skill and writes nothing", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("missing-skill-ring", {
+          grantedSkillStableIds: ["no-such-skill"],
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects an equipment entry that grants an archived skill and writes nothing", async () => {
+    dbMock.store.addCatalog({
+      id: "archived-skill",
+      kind: "skills",
+      stableId: "archived-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        equipment("archived-skill-ring", {
+          grantedSkillStableIds: ["archived-skill"],
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    // The pre-existing archived skill is left untouched.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("accepts an equipment entry that grants a skill created by the same upload", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "manifest-skill"),
+        equipment("manifest-skill-ring", {
+          grantedSkillStableIds: ["manifest-skill"],
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(2)
+    expect(preview.skipCount).toBe(0)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(2)
+    expect(applied.skipCount).toBe(0)
+    const ring = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "manifest-skill-ring"
+    )!
+    expect(ring.config).toMatchObject({
+      grantedSkillStableIds: ["manifest-skill"],
+    })
+    const skillRow = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "manifest-skill"
+    )!
+    expect(skillRow.archived).toBe(false)
+  })
+
+  it("writes nothing when a valid row precedes an equipment entry with a dangling skill grant", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "valid-skill"),
+        equipment("bad-ring", { grantedSkillStableIds: ["no-such-skill"] }),
+      ])
+    )
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
   })
 })

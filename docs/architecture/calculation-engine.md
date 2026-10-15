@@ -279,7 +279,8 @@ deliberately **not** authoritative character state. The contract is:
   Each string is bounded and the whole payload is capped at 256KiB. It never stores
   uploaded binaries and never stores stat vectors, awards or effects - those
   belong to the engine, not the draft. It does not derive any numbers.
-  `specialAbilities` carries the explicit blessing `blessingId` and
+  `specialAbilities` carries the explicit blessing selection - a single optional
+  `{ godId, tier }` object under `blessing` - and the
   `bloodlineIds`/`transcendentSkillIds` arrays (`bloodlineIds` at most 1 unique
   nonempty id, `transcendentSkillIds` at most 8 unique nonempty ids - the
   transport/request bound, not the effective cap; the per-character limit is the
@@ -315,9 +316,9 @@ deliberately **not** authoritative character state. The contract is:
   the create proceeds as before.
 - **Explicit special-ability selections are part of atomic create.** `POST
 /api/characters` (and the resumable draft `data`) accept an optional
-  `specialAbilities` object (`blessingId`, `bloodlineIds`,
+  `specialAbilities` object (`blessing` as `{ godId, tier }`, `bloodlineIds`,
   `transcendentSkillIds`). When supplied, `createCharacter` resolves each id by
-  its corresponding catalog kind (`blessings` / `bloodlines` /
+  its corresponding catalog kind (`gods` / `bloodlines` /
   `transcendent_skills`), requires the definition to be unarchived, enforces the
   invariants (at most one blessing; at most one bloodline; at most
   `maxTranscendentSkills` transcendent skills - the admin-configurable HouseRules
@@ -433,7 +434,7 @@ importer defaults them to `0`/`null`.
   user-supplied history from server-verified progression.
 - **v4 inventory + grandfathered markers (v4 only).** The current document adds an
   `inventory` array (each entry a `definition` reference by `kind` +
-  `stableId`, only `equipment` / `consumables`, with a `quantity` bounded
+  `stableId`, only `equipment` / `items`, with a `quantity` bounded
   1..999999) and a `legacyUnowned` boolean on equipment associations. On import
   the inventory array is bounded at 500 distinct definitions, must resolve to
   EXISTING catalog definitions (archived stock is imported inert), must be unique

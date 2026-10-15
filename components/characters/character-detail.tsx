@@ -27,10 +27,7 @@ import {
   type CharacterResponse,
   type AllocateResponse,
   type AssociationResponse,
-  type ConsumeResponse,
   type ExportResponse,
-  type EvolveResponse,
-  type EvolutionOptionsResult,
   type Grade,
   type JournalDelta,
   type PortraitResponse,
@@ -49,6 +46,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Progress,
   ProgressTrack,
@@ -134,47 +132,6 @@ function rarityRank(rarity: string | undefined): number {
     : SKILL_RARITY_ORDER.indexOf(rarity as (typeof SKILL_RARITY_ORDER)[number])
 }
 
-// House rule entry level required to evolve INTO each grade (source-verified).
-const GRADE_ENTRY_LEVEL: Record<Grade, number> = {
-  G: 0,
-  F: 10,
-  E: 25,
-  D: 100,
-  C: 200,
-  B: 350,
-  A: 500,
-  S: 750,
-}
-
-// Inclusive upper level bound of each grade band (next entry - 1; S is open).
-const GRADE_MAX_LEVEL: Record<Grade, number> = {
-  G: 9,
-  F: 24,
-  E: 99,
-  D: 199,
-  C: 349,
-  B: 499,
-  A: 749,
-  S: 999,
-}
-
-/**
- * The highest grade strictly above `current` whose level band contains `level`.
- * A grade qualifies only when the race level is within its published band and
- * has reached the band's entry level. Returns null when no higher grade is
- * reachable from the current level (e.g. already at S).
- */
-function evolutionTarget(level: number, current: Grade): Grade | null {
-  let best: Grade | null = null
-  for (const grade of GRADE_ORDER) {
-    if (GRADE_ORDER.indexOf(grade) <= GRADE_ORDER.indexOf(current)) continue
-    if (level >= GRADE_ENTRY_LEVEL[grade] && level <= GRADE_MAX_LEVEL[grade]) {
-      best = grade
-    }
-  }
-  return best
-}
-
 function JournalPanel({ journal }: { journal: JournalDelta }) {
   const experienceJournal = journal as JournalDelta & {
     percentBefore?: number
@@ -255,6 +212,7 @@ function ExperienceControl({
   level,
   editable,
   busy,
+  levelUpBlocked,
   draft,
   onDraft,
   onCommit,
@@ -265,6 +223,7 @@ function ExperienceControl({
   level: number
   editable: boolean
   busy: boolean
+  levelUpBlocked?: string
   draft: number | undefined
   onDraft: (value: number) => void
   onCommit: (value: number) => void
@@ -325,7 +284,8 @@ function ExperienceControl({
               aria-label={`Increase ${track} level`}
               variant="outline"
               size="sm"
-              disabled={busy}
+              disabled={busy || Boolean(levelUpBlocked)}
+              title={levelUpBlocked}
               onClick={() => onLevel("levelUp")}
             >
               + Level
@@ -337,6 +297,11 @@ function ExperienceControl({
           </p>
         )}
       </div>
+      {editable && levelUpBlocked ? (
+        <p className="text-xs text-muted-foreground" role="status">
+          {levelUpBlocked}
+        </p>
+      ) : null}
       <div className="flex justify-between text-xs text-muted-foreground">
         <span>Level {level}</span>
         <span className="tabular-nums">{value}%</span>
@@ -457,21 +422,6 @@ function upgradeGroupFor(item: CatalogItem): string | undefined {
   return typeof group === "string" && group.length > 0 ? group : undefined
 }
 
-function consumableTypeFor(item: CatalogItem): "permanent" | "temporary" {
-  return item.config?.type === "temporary" ? "temporary" : "permanent"
-}
-
-function consumableAmountFor(item: CatalogItem): string {
-  return formatVector(
-    item.config?.amount as Partial<Record<AttributeKey, number>> | undefined
-  )
-}
-
-function consumableDurationFor(item: CatalogItem): number | undefined {
-  const d = item.config?.durationQuarters
-  return typeof d === "number" && Number.isFinite(d) ? d : undefined
-}
-
 /**
  * Right-hand panel for attaching/removing titles and equipment. It lists the
  * real catalog entries and calls the associations endpoint with the current
@@ -486,7 +436,6 @@ function AssociationSheet({
   character,
   titles,
   equipment,
-  consumables,
   blessings,
   bloodlines,
   transcendentSkills,
@@ -495,10 +444,8 @@ function AssociationSheet({
   onRetryCreationRules,
   loading,
   busy,
-  consumeBusy,
   onAdd,
   onRemove,
-  onConsume,
   onPowerAdd,
   onPowerRemove,
 }: {
@@ -507,7 +454,6 @@ function AssociationSheet({
   character: CharacterDetail
   titles: CatalogItem[]
   equipment: CatalogItem[]
-  consumables: CatalogItem[]
   blessings: CatalogItem[]
   bloodlines: CatalogItem[]
   transcendentSkills: CatalogItem[]
@@ -516,7 +462,6 @@ function AssociationSheet({
   onRetryCreationRules: () => void
   loading: boolean
   busy: boolean
-  consumeBusy: boolean
   onAdd: (
     kind: "title" | "equipment",
     definitionId: string,
@@ -524,16 +469,17 @@ function AssociationSheet({
     equipmentPosition?: "Ring 1" | "Ring 2"
   ) => void
   onRemove: (kind: "title" | "equipment", definitionId: string) => void
-  onConsume: (definitionId: string) => void
   onPowerAdd: (
     kind: "blessing" | "bloodline" | "transcendent",
-    definitionId: string
+    definitionId: string,
+    tier?: string
   ) => void
   onPowerRemove: (
     kind: "blessing" | "bloodline" | "transcendent",
     definitionId: string
   ) => void
 }) {
+  const [blessingTier, setBlessingTier] = React.useState("Minor")
   const [rankedClaim, setRankedClaim] = React.useState<CatalogItem | null>(null)
   const [rankedReason, setRankedReason] = React.useState("")
   const [ringPositions, setRingPositions] = React.useState<
@@ -971,465 +917,351 @@ function AssociationSheet({
     )
   }
 
-  function consumableRow(item: CatalogItem) {
-    const permanent = consumableTypeFor(item) === "permanent"
-    return (
-      <div
-        key={item.id}
-        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
-      >
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5">
-            <span className="truncate font-medium">{item.name}</span>
-            <Badge variant={permanent ? "default" : "outline"}>
-              {permanent ? "Permanent" : "Temporary"}
-            </Badge>
-          </div>
-          <div className="text-[0.6875rem] text-muted-foreground">
-            Amount: {consumableAmountFor(item) || "0"}
-            {permanent
-              ? null
-              : ` - Duration: ${consumableDurationFor(item) ?? "?"} quarter(s)`}
-          </div>
-          {permanent &&
-          character.permanentConsumableCap &&
-          character.permanentConsumableRemaining ? (
-            <div className="text-[0.6875rem] text-muted-foreground">
-              Cap: {formatVector(character.permanentConsumableCap)} - Remaining:{" "}
-              {formatVector(character.permanentConsumableRemaining)}
-            </div>
-          ) : null}
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={
-            consumeBusy ||
-            !character.inventory?.some(
-              (row) =>
-                row.definitionId === item.id &&
-                row.quantity > 0 &&
-                !row.archived
-            )
-          }
-          onClick={() => onConsume(item.id)}
-        >
-          Consume
-        </Button>
-      </div>
-    )
-  }
-
-  const permanentHistory = (character.state.permanentGains ?? []).filter(
-    (g) => (g as { kind?: string }).kind === "consumable"
-  ) as Array<{
-    id: string
-    source: string
-    vector?: Partial<Record<AttributeKey, number>>
-    requested?: Partial<Record<AttributeKey, number>>
-    capRemainingAfter?: Partial<Record<AttributeKey, number>>
-    gradeAtApplication?: string
-    raceLevelAtApplication?: number
-    appliedAt?: string | number
-  }>
-
-  // Only show temporary consumable effects that are still active: an effect with
-  // a recorded `expiresAt` is active while it is strictly greater than the
-  // current turn; effects without an expiry stay active indefinitely.
-  const currentTurn = character.state.turn
-  const activeTempEffects = (character.state.activeEffects ?? []).filter(
-    (e) =>
-      (e as { phase?: string }).phase === "temporary" &&
-      (e as { source?: string }).source === "consumable" &&
-      ((e as { expiresAt?: number }).expiresAt == null ||
-        (e as { expiresAt?: number }).expiresAt! > currentTurn)
-  ) as Array<{
-    id: string
-    source: string
-    provenance: string
-    expiresAt?: number
-    amount?: Partial<Record<AttributeKey, number>>
-  }>
-
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="flex flex-col gap-4">
+      <SheetContent className="flex max-h-dvh flex-col gap-4 overflow-hidden">
         <SheetHeader>
           <SheetTitle>Character associations</SheetTitle>
           <SheetDescription>
-            Manage titles, equipment, consumables, blessings, and bloodlines
-            directly onto this character. This is direct application, not an
-            Equipment and consumables require owned stock. Use the Inventory tab
-            to record manual bookkeeping before equipping or consuming. Source
-            notes are not verified loot or crafting records.
+            Manage titles, equipment, blessings, and bloodlines directly onto
+            this character. Items are inventory stock, not character
+            associations. Source notes are not verified loot or crafting
+            records.
           </SheetDescription>
         </SheetHeader>
 
-        <Tabs defaultValue="titles">
+        <Tabs defaultValue="titles" className="flex min-h-0 flex-1 flex-col">
           <TabsList variant="line">
             <TabsTrigger value="titles">Titles</TabsTrigger>
             <TabsTrigger value="equipment">Equipment</TabsTrigger>
-            <TabsTrigger value="consumables">Consumables</TabsTrigger>
             <TabsTrigger value="blessings">Blessings</TabsTrigger>
             <TabsTrigger value="bloodlines">Bloodlines</TabsTrigger>
             <TabsTrigger value="transcendent">Transcendent skills</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="titles" className="pt-3">
-            {loading ? (
-              <p className="text-xs text-muted-foreground">Loading titles...</p>
-            ) : titles.length === 0 && archivedLinkedTitles.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No titles in the catalog yet.
-              </p>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {titles.map(titleRow)}
-                {archivedLinkedTitles.map(archivedLinkedRow)}
-              </div>
-            )}
-          </TabsContent>
-
-          <TabsContent value="equipment" className="pt-3">
-            {loading ? (
-              <p className="text-xs text-muted-foreground">
-                Loading equipment...
-              </p>
-            ) : equipment.length === 0 &&
-              archivedLinkedEquipment.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No equipment in the catalog yet.
-              </p>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {equipment.map(equipmentRow)}
-                {archivedLinkedEquipment.map(archivedLinkedRow)}
-              </div>
-            )}
-            <p className="mt-3 text-[0.6875rem] text-muted-foreground">
-              Equipment bonuses are capped (house assumption): 20% of the
-              pre-equipment value per attribute (aggregate, not per item) and
-              15% of the total across all attributes. Suppressed values above
-              are what these caps reject.
-            </p>
-          </TabsContent>
-
-          <TabsContent value="consumables" className="pt-3">
-            {loading ? (
-              <p className="text-xs text-muted-foreground">
-                Loading consumables...
-              </p>
-            ) : consumables.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No consumables in the catalog yet.
-              </p>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {consumables.map(consumableRow)}
-              </div>
-            )}
-
-            <Separator className="my-3" />
-
-            <div className="flex flex-col gap-2">
-              <h4 className="text-xs font-medium">Active temporary effects</h4>
-              {activeTempEffects.length === 0 ? (
-                <p className="text-[0.6875rem] text-muted-foreground">
-                  No active temporary consumable effects.
+          <ScrollArea className="min-h-0 flex-1">
+            <TabsContent value="titles" className="pt-3">
+              {loading ? (
+                <p className="text-xs text-muted-foreground">
+                  Loading titles...
+                </p>
+              ) : titles.length === 0 && archivedLinkedTitles.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No titles in the catalog yet.
                 </p>
               ) : (
-                activeTempEffects.map((effect) => (
-                  <div
-                    key={effect.id}
-                    className="rounded-lg border bg-input/20 p-2 text-xs/relaxed"
-                  >
-                    <div className="font-medium">
-                      {formatVector(effect.amount) || "0"}
-                    </div>
-                    <div className="text-[0.6875rem] text-muted-foreground">
-                      Expires at turn {effect.expiresAt ?? "?"} (
-                      {effect.provenance})
-                    </div>
-                  </div>
-                ))
+                <div className="flex flex-col gap-2">
+                  {titles.map(titleRow)}
+                  {archivedLinkedTitles.map(archivedLinkedRow)}
+                </div>
               )}
-            </div>
+            </TabsContent>
 
-            <div className="mt-3 flex flex-col gap-2">
-              <h4 className="text-xs font-medium">Permanent gains applied</h4>
-              {permanentHistory.length === 0 ? (
-                <p className="text-[0.6875rem] text-muted-foreground">
-                  No permanent consumable gains recorded yet.
+            <TabsContent value="equipment" className="pt-3">
+              {loading ? (
+                <p className="text-xs text-muted-foreground">
+                  Loading equipment...
+                </p>
+              ) : equipment.length === 0 &&
+                archivedLinkedEquipment.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No equipment in the catalog yet.
                 </p>
               ) : (
-                permanentHistory.map((gain) => (
-                  <div
-                    key={gain.id}
-                    className="rounded-lg border bg-input/20 p-2 text-xs/relaxed"
-                  >
-                    <div className="font-medium">{gain.source}</div>
-                    <div className="text-[0.6875rem] text-muted-foreground">
-                      Applied: {formatVector(gain.vector)} - Requested:{" "}
-                      {formatVector(gain.requested)}
-                      {gain.gradeAtApplication
-                        ? ` - Grade at application: ${gain.gradeAtApplication}`
-                        : ""}
-                      {typeof gain.raceLevelAtApplication === "number"
-                        ? ` - Race level: ${gain.raceLevelAtApplication}`
-                        : ""}
-                    </div>
-                    <div className="text-[0.6875rem] text-muted-foreground">
-                      Cap remaining after:{" "}
-                      {formatVector(gain.capRemainingAfter)}
-                    </div>
-                  </div>
-                ))
+                <div className="flex flex-col gap-2">
+                  {equipment.map(equipmentRow)}
+                  {archivedLinkedEquipment.map(archivedLinkedRow)}
+                </div>
               )}
-            </div>
-          </TabsContent>
-          {(["blessing", "bloodline"] as const).map((kind) => {
-            const catalog = kind === "blessing" ? blessings : bloodlines
-            const linkedPower = character.associations.filter(
-              (a) => a.kind === kind
-            )
-            const options = [
-              ...catalog,
-              ...linkedPower
-                .filter(
-                  (a) =>
-                    a.definitionArchived &&
-                    !catalog.some((c) => c.id === a.definitionId)
-                )
-                .map(
-                  (a) =>
-                    ({
-                      id: a.definitionId,
-                      name: a.name,
-                      description: null,
-                      grade: a.grade ?? null,
-                      archived: true,
-                      config: {},
-                    }) as CatalogItem
-                ),
-            ]
-            return (
-              <TabsContent
-                key={kind}
-                value={kind === "blessing" ? "blessings" : "bloodlines"}
-                className="pt-3"
-              >
-                {loading ? (
-                  <p className="text-xs text-muted-foreground">
-                    Loading {kind}s...
-                  </p>
-                ) : options.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    No {kind}s in the catalog yet.
-                  </p>
-                ) : (
-                  <div className="flex flex-col gap-2">
-                    {options.map((item) => {
-                      const association = linkedPower.find(
-                        (a) => a.definitionId === item.id
-                      )
-                      const patron = item.config?.patronGodStableId
-                      const tier = item.config?.tier
-                      return (
-                        <div
-                          key={item.id}
-                          className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+              <p className="mt-3 text-[0.6875rem] text-muted-foreground">
+                Equipment bonuses are capped (house assumption): 20% of the
+                pre-equipment value per attribute (aggregate, not per item) and
+                15% of the total across all attributes. Suppressed values above
+                are what these caps reject.
+              </p>
+            </TabsContent>
+
+            {(["blessing", "bloodline"] as const).map((kind) => {
+              const catalog = kind === "blessing" ? blessings : bloodlines
+              const linkedPower = character.associations.filter(
+                (a) => a.kind === kind
+              )
+              const options = [
+                ...catalog,
+                ...linkedPower
+                  .filter(
+                    (a) =>
+                      a.definitionArchived &&
+                      !catalog.some((c) => c.id === a.definitionId)
+                  )
+                  .map(
+                    (a) =>
+                      ({
+                        id: a.definitionId,
+                        name: a.name,
+                        description: null,
+                        grade: a.grade ?? null,
+                        archived: true,
+                        config: {},
+                      }) as CatalogItem
+                  ),
+              ]
+              return (
+                <TabsContent
+                  key={kind}
+                  value={kind === "blessing" ? "blessings" : "bloodlines"}
+                  className="pt-3"
+                >
+                  {kind === "blessing" ? (
+                    <div className="mb-3 flex flex-col gap-2">
+                      <Label htmlFor="association-blessing-tier">
+                        Blessing tier
+                      </Label>
+                      <Select
+                        value={blessingTier}
+                        onValueChange={(value) => {
+                          if (value) setBlessingTier(value)
+                        }}
+                      >
+                        <SelectTrigger
+                          id="association-blessing-tier"
+                          aria-label="Blessing tier"
                         >
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="font-medium">{item.name}</span>
-                              {item.grade ? (
-                                <Badge variant="outline">{item.grade}</Badge>
-                              ) : null}
-                              {item.archived ? (
-                                <Badge variant="outline">
-                                  Archived - inert
-                                </Badge>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            {(
+                              [
+                                "Baptism",
+                                "Minor",
+                                "Lesser",
+                                "Intermediate",
+                                "Major",
+                                "Greater",
+                                "Divine",
+                                "True",
+                              ] as const
+                            ).map((tier) => (
+                              <SelectItem key={tier} value={tier}>
+                                {tier}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ) : null}
+                  {loading ? (
+                    <p className="text-xs text-muted-foreground">
+                      Loading {kind}s...
+                    </p>
+                  ) : options.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No {kind}s in the catalog yet.
+                    </p>
+                  ) : (
+                    <div className="flex flex-col gap-2">
+                      {options.map((item) => {
+                        const association = linkedPower.find(
+                          (a) => a.definitionId === item.id
+                        )
+                        return (
+                          <div
+                            key={item.id}
+                            className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                          >
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="font-medium">
+                                  {kind === "blessing" && association?.tier
+                                    ? `${association.tier} Blessing of ${item.name}`
+                                    : item.name}
+                                </span>
+                                {item.grade ? (
+                                  <Badge variant="outline">{item.grade}</Badge>
+                                ) : null}
+                                {item.archived ? (
+                                  <Badge variant="outline">
+                                    Archived - inert
+                                  </Badge>
+                                ) : null}
+                              </div>
+                              <p className="text-xs whitespace-pre-wrap text-muted-foreground">
+                                {association?.grade
+                                  ? (association.gradeDescription ??
+                                    "No description for this grade")
+                                  : null}
+                              </p>
+                              {item.description ? (
+                                <p className="text-xs text-muted-foreground">
+                                  {item.description}
+                                </p>
                               ) : null}
                             </div>
-                            <p className="text-xs whitespace-pre-wrap text-muted-foreground">
-                              {association?.grade
-                                ? (association.gradeDescription ??
-                                  "No description for this grade")
-                                : null}
-                            </p>
-                            {typeof tier === "string" ||
-                            typeof patron === "string" ? (
-                              <div className="text-[0.6875rem] text-muted-foreground">
-                                {typeof tier === "string"
-                                  ? `Tier: ${tier}`
-                                  : ""}
-                                {typeof tier === "string" &&
-                                typeof patron === "string"
-                                  ? " - "
-                                  : ""}
-                                {typeof patron === "string"
-                                  ? `Patron: ${patron}`
-                                  : ""}
-                              </div>
-                            ) : null}
-                            {item.description ? (
-                              <p className="text-xs text-muted-foreground">
-                                {item.description}
-                              </p>
-                            ) : null}
+                            {association ? (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={busy}
+                                onClick={() => onPowerRemove(kind, item.id)}
+                              >
+                                Remove
+                              </Button>
+                            ) : item.archived ? null : (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={busy}
+                                onClick={() =>
+                                  onPowerAdd(
+                                    kind,
+                                    item.id,
+                                    kind === "blessing"
+                                      ? blessingTier
+                                      : undefined
+                                  )
+                                }
+                              >
+                                Add
+                              </Button>
+                            )}
                           </div>
-                          {association ? (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={busy}
-                              onClick={() => onPowerRemove(kind, item.id)}
-                            >
-                              Remove
-                            </Button>
-                          ) : item.archived ? null : (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={busy}
-                              onClick={() => onPowerAdd(kind, item.id)}
-                            >
-                              Add
-                            </Button>
-                          )}
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-              </TabsContent>
-            )
-          })}
-          <TabsContent value="transcendent" className="pt-3">
-            <div className="mb-3 flex flex-col gap-2">
-              <p className="text-xs text-muted-foreground">
-                Selected{" "}
-                {
-                  character.associations.filter(
-                    (a) => a.kind === "transcendent"
-                  ).length
-                }{" "}
-                / maximum {maxTranscendentSkills ?? "unavailable"}
-              </p>
-              {creationRulesError ? (
-                <Alert variant="destructive">
-                  <div className="flex flex-col gap-2">
-                    <span>{creationRulesError}</span>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={onRetryCreationRules}
-                    >
-                      Retry rules
-                    </Button>
-                  </div>
-                </Alert>
-              ) : null}
-            </div>
-            {loading ? (
-              <p className="text-xs text-muted-foreground">
-                Loading transcendent skills...
-              </p>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {transcendentOptions.map((item) => {
-                  const association = character.associations.find(
-                    (a) =>
-                      a.kind === "transcendent" && a.definitionId === item.id
-                  )
-                  const cost = item.config?.costDescription
-                  const acquisition = item.config?.acquisitionNotes
-                  return (
-                    <div
-                      key={item.id}
-                      className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
-                    >
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-1.5 font-medium">
-                          {item.name}
-                          {item.grade ? (
-                            <Badge variant="outline">{item.grade}</Badge>
-                          ) : null}
-                          {item.archived ? (
-                            <Badge variant="outline">Archived</Badge>
-                          ) : null}
-                        </div>
-                        <p className="text-xs whitespace-pre-wrap text-muted-foreground">
-                          {association?.grade
-                            ? (association.gradeDescription ??
-                              "No description for this grade")
-                            : null}
-                        </p>
-                        {item.sourceUrl ? (
-                          <p className="text-[0.6875rem] text-muted-foreground">
-                            <a
-                              className="underline"
-                              href={item.sourceUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              Source
-                            </a>
-                          </p>
-                        ) : null}
-                        {item.description ? (
-                          <p className="text-xs text-muted-foreground">
-                            {item.description}
-                          </p>
-                        ) : null}
-                        {typeof cost === "string" ? (
-                          <p className="text-xs text-muted-foreground">
-                            Cost description (reference only): {cost}
-                          </p>
-                        ) : null}
-                        {typeof acquisition === "string" ? (
-                          <p className="text-xs text-muted-foreground">
-                            Acquisition notes: {acquisition}
-                          </p>
-                        ) : null}
-                      </div>
-                      {association ? (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={busy}
-                          onClick={() => onPowerRemove("transcendent", item.id)}
-                        >
-                          Remove
-                        </Button>
-                      ) : item.archived ? null : (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={
-                            busy ||
-                            maxTranscendentSkills == null ||
-                            character.associations.filter(
-                              (a) => a.kind === "transcendent"
-                            ).length >= maxTranscendentSkills
-                          }
-                          onClick={() => onPowerAdd("transcendent", item.id)}
-                        >
-                          Attach
-                        </Button>
-                      )}
+                        )
+                      })}
                     </div>
-                  )
-                })}
-                {transcendentOptions.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    No transcendent skills in the catalog.
-                  </p>
+                  )}
+                </TabsContent>
+              )
+            })}
+            <TabsContent value="transcendent" className="pt-3">
+              <div className="mb-3 flex flex-col gap-2">
+                <p className="text-xs text-muted-foreground">
+                  Selected{" "}
+                  {
+                    character.associations.filter(
+                      (a) => a.kind === "transcendent"
+                    ).length
+                  }{" "}
+                  / maximum {maxTranscendentSkills ?? "unavailable"}
+                </p>
+                {creationRulesError ? (
+                  <Alert variant="destructive">
+                    <div className="flex flex-col gap-2">
+                      <span>{creationRulesError}</span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={onRetryCreationRules}
+                      >
+                        Retry rules
+                      </Button>
+                    </div>
+                  </Alert>
                 ) : null}
               </div>
-            )}
-          </TabsContent>
+              {loading ? (
+                <p className="text-xs text-muted-foreground">
+                  Loading transcendent skills...
+                </p>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {transcendentOptions.map((item) => {
+                    const association = character.associations.find(
+                      (a) =>
+                        a.kind === "transcendent" && a.definitionId === item.id
+                    )
+                    const cost = item.config?.costDescription
+                    const acquisition = item.config?.acquisitionNotes
+                    return (
+                      <div
+                        key={item.id}
+                        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                            {item.name}
+                            {item.grade ? (
+                              <Badge variant="outline">{item.grade}</Badge>
+                            ) : null}
+                            {item.archived ? (
+                              <Badge variant="outline">Archived</Badge>
+                            ) : null}
+                          </div>
+                          <p className="text-xs whitespace-pre-wrap text-muted-foreground">
+                            {association?.grade
+                              ? (association.gradeDescription ??
+                                "No description for this grade")
+                              : null}
+                          </p>
+                          {item.sourceUrl ? (
+                            <p className="text-[0.6875rem] text-muted-foreground">
+                              <a
+                                className="underline"
+                                href={item.sourceUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Source
+                              </a>
+                            </p>
+                          ) : null}
+                          {item.description ? (
+                            <p className="text-xs text-muted-foreground">
+                              {item.description}
+                            </p>
+                          ) : null}
+                          {typeof cost === "string" ? (
+                            <p className="text-xs text-muted-foreground">
+                              Cost description (reference only): {cost}
+                            </p>
+                          ) : null}
+                          {typeof acquisition === "string" ? (
+                            <p className="text-xs text-muted-foreground">
+                              Acquisition notes: {acquisition}
+                            </p>
+                          ) : null}
+                        </div>
+                        {association ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={busy}
+                            onClick={() =>
+                              onPowerRemove("transcendent", item.id)
+                            }
+                          >
+                            Remove
+                          </Button>
+                        ) : item.archived ? null : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={
+                              busy ||
+                              maxTranscendentSkills == null ||
+                              character.associations.filter(
+                                (a) => a.kind === "transcendent"
+                              ).length >= maxTranscendentSkills
+                            }
+                            onClick={() => onPowerAdd("transcendent", item.id)}
+                          >
+                            Attach
+                          </Button>
+                        )}
+                      </div>
+                    )
+                  })}
+                  {transcendentOptions.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No transcendent skills in the catalog.
+                    </p>
+                  ) : null}
+                </div>
+              )}
+            </TabsContent>
+          </ScrollArea>
         </Tabs>
         <Dialog
           open={rankedClaim !== null}
@@ -1523,28 +1355,15 @@ export function CharacterDetail({
     notes: "",
   })
   const [savingNotes, setSavingNotes] = React.useState(false)
-  const [evolveOpen, setEvolveOpen] = React.useState(false)
-  const [evolveBusy, setEvolveBusy] = React.useState(false)
-  const [evolveError, setEvolveError] = React.useState<string | null>(null)
-  const [evolutionOptions, setEvolutionOptions] =
-    React.useState<EvolutionOptionsResult | null>(null)
-  const [evolutionLoading, setEvolutionLoading] = React.useState(false)
-  const [selectedOptionId, setSelectedOptionId] = React.useState("")
-  const [evolutionOptionMode, setEvolutionOptionMode] = React.useState<
-    "option" | "legacy"
-  >("option")
-  const [evolveReason, setEvolveReason] = React.useState("")
   const [trackEvolveTrack, setTrackEvolveTrack] = React.useState<
-    "class" | "profession" | null
+    "race" | "class" | "profession" | null
   >(null)
   const [associationsOpen, setAssociationsOpen] = React.useState(false)
   const [titlesCatalog, setTitlesCatalog] = React.useState<CatalogItem[]>([])
   const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
     []
   )
-  const [consumablesCatalog, setConsumablesCatalog] = React.useState<
-    CatalogItem[]
-  >([])
+  const [itemsCatalog, setItemsCatalog] = React.useState<CatalogItem[]>([])
   const [blessingsCatalog, setBlessingsCatalog] = React.useState<CatalogItem[]>(
     []
   )
@@ -1562,9 +1381,6 @@ export function CharacterDetail({
   >(null)
   const [catalogLoading, setCatalogLoading] = React.useState(false)
   const [assocBusy, setAssocBusy] = React.useState(false)
-  const [consumeBusy, setConsumeBusy] = React.useState(false)
-  const [consumeConfirm, setConsumeConfirm] =
-    React.useState<CatalogItem | null>(null)
   const [skillsCatalog, setSkillsCatalog] = React.useState<CatalogItem[]>([])
   const [skillBusy, setSkillBusy] = React.useState(false)
   const [upgradeSource, setUpgradeSource] =
@@ -1968,94 +1784,6 @@ export function CharacterDetail({
     [character, reload]
   )
 
-  const loadEvolutionOptions = React.useCallback(async () => {
-    if (!character) return
-    setEvolutionLoading(true)
-    setEvolveError(null)
-    try {
-      const res = await apiFetch<EvolutionOptionsResult>(
-        `/api/characters/${character.id}/evolutions`
-      )
-      setEvolutionOptions(res)
-      // Default to the first option a user could take (no manual review gate);
-      // otherwise prefer the first mechanically-eligible option. The client can
-      // still change the selection; the server re-validates on submit.
-      const firstSelectable = res.options.find(
-        (o) => o.eligible && (isAdmin ? true : !o.manualReview)
-      )
-      if (firstSelectable) {
-        setSelectedOptionId(firstSelectable.id)
-        setEvolutionOptionMode("option")
-      } else if (res.legacyAvailable) {
-        setEvolutionOptionMode("legacy")
-      } else {
-        setSelectedOptionId(res.options[0]?.id ?? "")
-        setEvolutionOptionMode("option")
-      }
-    } catch (err) {
-      setEvolveError(
-        err instanceof Error ? err.message : "Failed to load evolution options."
-      )
-      // Leave options UNKNOWN (null) rather than claiming a legacy fallback is
-      // available: on a failed fetch no option list is trustworthy, so the UI
-      // must not show the grade-only fallback or enable the action.
-      setEvolutionOptions(null)
-    } finally {
-      setEvolutionLoading(false)
-    }
-  }, [character, isAdmin])
-
-  const submitEvolution = React.useCallback(async () => {
-    if (!character) return
-    setEvolveBusy(true)
-    setEvolveError(null)
-    try {
-      let body: {
-        version: number
-        grade?: Grade
-        optionId?: string
-        reason?: string
-      }
-      if (evolutionOptionMode === "legacy") {
-        const fallbackGrade = evolutionTarget(
-          character.state.race.level,
-          character.state.race.grade
-        )
-        if (!fallbackGrade) {
-          setEvolveError("No higher race grade reached at this level yet.")
-          setEvolveBusy(false)
-          return
-        }
-        body = { grade: fallbackGrade, version: character.version }
-      } else {
-        body = {
-          optionId: selectedOptionId,
-          version: character.version,
-          ...(evolveReason.trim() ? { reason: evolveReason.trim() } : {}),
-        }
-      }
-      const res = await apiFetch<EvolveResponse>(
-        `/api/characters/${character.id}/evolve`,
-        { ...jsonInit("POST", body) }
-      )
-      setEvolveOpen(false)
-      toast.success(`Evolved race grade to ${res.journal.to}.`)
-      await reload()
-      void refreshEvents()
-    } catch (err) {
-      setEvolveError(err instanceof Error ? err.message : "Evolution failed.")
-    } finally {
-      setEvolveBusy(false)
-    }
-  }, [
-    character,
-    evolutionOptionMode,
-    selectedOptionId,
-    evolveReason,
-    reload,
-    refreshEvents,
-  ])
-
   const archive = React.useCallback(async () => {
     if (!character) return
     setBusy(true)
@@ -2145,8 +1873,8 @@ export function CharacterDetail({
       kind:
         | "titles"
         | "equipment"
-        | "consumables"
-        | "blessings"
+        | "items"
+        | "gods"
         | "bloodlines"
         | "transcendent_skills"
     ) => {
@@ -2155,8 +1883,8 @@ export function CharacterDetail({
         const res = await apiFetch<CatalogListResponse>(`/api/catalog/${kind}`)
         if (kind === "titles") setTitlesCatalog(res.items)
         else if (kind === "equipment") setEquipmentCatalog(res.items)
-        else if (kind === "consumables") setConsumablesCatalog(res.items)
-        else if (kind === "blessings") setBlessingsCatalog(res.items)
+        else if (kind === "items") setItemsCatalog(res.items)
+        else if (kind === "gods") setBlessingsCatalog(res.items)
         else if (kind === "bloodlines") setBloodlinesCatalog(res.items)
         else setTranscendentCatalog(res.items)
       } catch (err) {
@@ -2196,15 +1924,15 @@ export function CharacterDetail({
     void loadCreationRules()
     if (titlesCatalog.length === 0) void loadCatalog("titles")
     if (equipmentCatalog.length === 0) void loadCatalog("equipment")
-    if (consumablesCatalog.length === 0) void loadCatalog("consumables")
-    if (blessingsCatalog.length === 0) void loadCatalog("blessings")
+    if (itemsCatalog.length === 0) void loadCatalog("items")
+    if (blessingsCatalog.length === 0) void loadCatalog("gods")
     if (bloodlinesCatalog.length === 0) void loadCatalog("bloodlines")
     if (transcendentCatalog.length === 0)
       void loadCatalog("transcendent_skills")
   }, [
     titlesCatalog.length,
     equipmentCatalog.length,
-    consumablesCatalog.length,
+    itemsCatalog.length,
     blessingsCatalog.length,
     bloodlinesCatalog.length,
     transcendentCatalog.length,
@@ -2217,7 +1945,8 @@ export function CharacterDetail({
       kind: "title" | "equipment" | "blessing" | "bloodline" | "transcendent",
       definitionId: string,
       reason?: string,
-      equipmentPosition?: "Ring 1" | "Ring 2"
+      equipmentPosition?: "Ring 1" | "Ring 2",
+      tier?: string
     ) => {
       if (!character) return
       setAssocBusy(true)
@@ -2235,6 +1964,7 @@ export function CharacterDetail({
                 ? { equipmentPosition }
                 : {}),
               ...(kind === "title" && reason ? { reason } : {}),
+              ...(kind === "blessing" && tier ? { tier } : {}),
             }),
           }
         )
@@ -2277,52 +2007,6 @@ export function CharacterDetail({
     },
     [character, reload]
   )
-
-  const doConsume = React.useCallback(
-    async (definitionId: string, name?: string) => {
-      if (!character) return
-      setConsumeBusy(true)
-      setError(null)
-      try {
-        await apiFetch<ConsumeResponse>(
-          `/api/characters/${character.id}/consume`,
-          {
-            ...jsonInit("POST", {
-              definitionId,
-              version: character.version,
-            }),
-          }
-        )
-        toast.success(`Consumed "${name ?? "consumable"}".`)
-        await reload()
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Consume failed.")
-      } finally {
-        setConsumeBusy(false)
-      }
-    },
-    [character, reload]
-  )
-
-  const requestConsume = React.useCallback(
-    (item: CatalogItem) => {
-      // Temporary effects are immediate; permanent gains cannot be undone, so
-      // they first require confirmation.
-      if (consumableTypeFor(item) === "permanent") {
-        setConsumeConfirm(item)
-      } else {
-        void doConsume(item.id, item.name)
-      }
-    },
-    [doConsume]
-  )
-
-  const confirmConsume = React.useCallback(async () => {
-    if (!consumeConfirm) return
-    const item = consumeConfirm
-    setConsumeConfirm(null)
-    await doConsume(item.id, item.name)
-  }, [consumeConfirm, doConsume])
 
   const selectSkill = React.useCallback(
     async (offerId: string, definitionId: string) => {
@@ -2467,7 +2151,11 @@ export function CharacterDetail({
   const professionTrack = state.tracks["profession"]
   const status = character.status
   const raceGrade = state.race.grade
-  const evolveTarget = evolutionTarget(state.race.level, raceGrade)
+  const raceHasNextGrade =
+    GRADE_ORDER.indexOf(raceGrade) < GRADE_ORDER.length - 1
+  const raceNextGrade: Grade | null = raceHasNextGrade
+    ? (GRADE_ORDER[GRADE_ORDER.indexOf(raceGrade) + 1] ?? null)
+    : null
   const classPercent = Math.min(
     100,
     Math.max(
@@ -2521,18 +2209,6 @@ export function CharacterDetail({
   const skillAssociations = character.associations.filter(
     (a) => a.kind === "skill"
   )
-
-  const evolutionOptionList = evolutionOptions?.options ?? []
-  const legacyAvailable = evolutionOptions?.legacyAvailable ?? false
-  const selectedOption = evolutionOptionList.find(
-    (o) => o.id === selectedOptionId
-  )
-  const canConfirm =
-    evolutionOptionMode === "legacy"
-      ? legacyAvailable && evolveTarget != null
-      : selectedOption?.eligible === true &&
-        (!selectedOption.manualReview ||
-          (isAdmin && evolveReason.trim().length > 0))
 
   const trackHistory = (track: "race" | "class" | "profession") => {
     const matching = events ? eventsForTrack(events, track) : null
@@ -2697,28 +2373,22 @@ export function CharacterDetail({
               variant="outline"
               size="sm"
               className="gap-1"
-              onClick={() => {
-                setEvolveError(null)
-                setSelectedOptionId("")
-                setEvolutionOptionMode("option")
-                setEvolveReason("")
-                setEvolveOpen(true)
-                void loadEvolutionOptions()
-              }}
-              disabled={busy || evolveBusy || !evolveTarget}
+              onClick={() => setTrackEvolveTrack("race")}
+              disabled={busy || !raceHasNextGrade}
               title={
-                evolveTarget
-                  ? `Evolve race grade to ${evolveTarget}`
-                  : "No higher race grade reached at this level yet"
+                raceHasNextGrade
+                  ? `Evolve race grade to ${raceNextGrade}`
+                  : "This race is already at the highest grade"
               }
               aria-label={
-                evolveTarget
-                  ? `Evolve race grade to ${evolveTarget}`
+                raceHasNextGrade
+                  ? `Evolve race grade to ${raceNextGrade}`
                   : "Evolve race grade"
               }
             >
               <SparklesIcon />
-              Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
+              Evolve grade
+              {raceNextGrade ? ` (to ${raceNextGrade})` : ""}
             </Button>
           </>
         ) : (
@@ -2762,28 +2432,22 @@ export function CharacterDetail({
               variant="outline"
               size="sm"
               className="gap-1"
-              onClick={() => {
-                setEvolveError(null)
-                setSelectedOptionId("")
-                setEvolutionOptionMode("option")
-                setEvolveReason("")
-                setEvolveOpen(true)
-                void loadEvolutionOptions()
-              }}
-              disabled={busy || evolveBusy || !evolveTarget}
+              onClick={() => setTrackEvolveTrack("race")}
+              disabled={busy || !raceHasNextGrade}
               title={
-                evolveTarget
-                  ? `Evolve race grade to ${evolveTarget}`
-                  : "No higher race grade reached at this level yet"
+                raceHasNextGrade
+                  ? `Evolve race grade to ${raceNextGrade}`
+                  : "This race is already at the highest grade"
               }
               aria-label={
-                evolveTarget
-                  ? `Evolve race grade to ${evolveTarget}`
+                raceHasNextGrade
+                  ? `Evolve race grade to ${raceNextGrade}`
                   : "Evolve race grade"
               }
             >
               <SparklesIcon />
-              Evolve grade{evolveTarget ? ` (to ${evolveTarget})` : ""}
+              Evolve grade
+              {raceNextGrade ? ` (to ${raceNextGrade})` : ""}
             </Button>
           </>
         )}
@@ -2796,13 +2460,13 @@ export function CharacterDetail({
           setActiveTab(v)
           if (v === "inventory") {
             if (equipmentCatalog.length === 0) void loadCatalog("equipment")
-            if (consumablesCatalog.length === 0) void loadCatalog("consumables")
+            if (itemsCatalog.length === 0) void loadCatalog("items")
           }
         }}
       >
         <TabsList variant="line">
           <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="attributes">Attributes</TabsTrigger>
+          <TabsTrigger value="attributes">Stats</TabsTrigger>
           <TabsTrigger value="race">Race</TabsTrigger>
           {state.race.mode !== "independent" ? (
             <TabsTrigger value="class">Class</TabsTrigger>
@@ -2814,8 +2478,8 @@ export function CharacterDetail({
           <TabsTrigger value="powers">Powers</TabsTrigger>
           <TabsTrigger value="titles">Titles</TabsTrigger>
           <TabsTrigger value="equipment">Equipment</TabsTrigger>
-          <TabsTrigger value="consumables">Consumables</TabsTrigger>
           <TabsTrigger value="inventory">Inventory</TabsTrigger>
+          <TabsTrigger value="consumables">Historical gains</TabsTrigger>
           <TabsTrigger value="history">History</TabsTrigger>
           <TabsTrigger value="notes">Notes</TabsTrigger>
         </TabsList>
@@ -2831,7 +2495,7 @@ export function CharacterDetail({
                     or crafting records.
                   </p>
                 </div>
-                {(["equipment", "consumables"] as const).map((kind) => {
+                {(["equipment", "items"] as const).map((kind) => {
                   const rows = (character.inventory ?? []).filter(
                     (item) => item.kind === kind
                   )
@@ -2839,9 +2503,7 @@ export function CharacterDetail({
                     <section
                       key={kind}
                       aria-label={
-                        kind === "equipment"
-                          ? "Owned equipment"
-                          : "Owned consumables"
+                        kind === "equipment" ? "Owned equipment" : "Owned items"
                       }
                     >
                       <h4 className="mb-2 text-sm font-medium capitalize">
@@ -3022,28 +2684,7 @@ export function CharacterDetail({
                                         </Button>
                                       </div>
                                     )
-                                  ) : (
-                                    <Button
-                                      size="sm"
-                                      variant="outline"
-                                      disabled={
-                                        consumeBusy ||
-                                        item.archived ||
-                                        item.quantity < 1
-                                      }
-                                      onClick={() => {
-                                        const catalogItem =
-                                          consumablesCatalog.find(
-                                            (entry) =>
-                                              entry.id === item.definitionId
-                                          )
-                                        if (catalogItem)
-                                          requestConsume(catalogItem)
-                                      }}
-                                    >
-                                      Consume
-                                    </Button>
-                                  )}
+                                  ) : null}
                                   <Button
                                     size="sm"
                                     variant="outline"
@@ -3127,8 +2768,8 @@ export function CharacterDetail({
                         ))}
                     </SelectGroup>
                     <SelectGroup>
-                      <SelectLabel>Consumables</SelectLabel>
-                      {consumablesCatalog
+                      <SelectLabel>Items</SelectLabel>
+                      {itemsCatalog
                         .filter((item) => !item.archived)
                         .map((item) => (
                           <SelectItem key={item.id} value={item.id}>
@@ -3428,6 +3069,52 @@ export function CharacterDetail({
             </section>
 
             <section
+              aria-labelledby="character-derived-stats-heading"
+              className="flex flex-col gap-2"
+            >
+              <h2
+                id="character-derived-stats-heading"
+                className="font-heading text-sm font-semibold"
+              >
+                Derived Stats
+              </h2>
+              {status?.derivedStats ? (
+                <div className="grid grid-cols-3 gap-2">
+                  {(
+                    [
+                      ["hp", "Health"],
+                      ["mp", "Mana"],
+                      ["sp", "Stamina"],
+                    ] as const
+                  ).map(([resource, name]) => {
+                    const value = status.derivedStats[resource]
+                    return (
+                      <Card key={resource}>
+                        <CardContent className="flex flex-col items-center gap-1 text-center">
+                          <span className="text-[0.6875rem] font-medium text-muted-foreground uppercase">
+                            {resource}
+                          </span>
+                          <span
+                            className="text-2xl font-semibold tabular-nums"
+                            aria-label={`${name} (${resource.toUpperCase()}) ${value}`}
+                          >
+                            {value}
+                          </span>
+                        </CardContent>
+                      </Card>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p
+                  className="rounded-lg border p-4 text-sm text-muted-foreground"
+                  role="status"
+                >
+                  Derived stats are unavailable right now.
+                </p>
+              )}
+            </section>
+            <section
               aria-labelledby="character-attributes-heading"
               className="flex flex-col gap-2"
             >
@@ -3436,11 +3123,8 @@ export function CharacterDetail({
                   id="character-attributes-heading"
                   className="font-heading text-sm font-semibold"
                 >
-                  Current attributes
+                  Stats
                 </h2>
-                <p className="text-xs text-muted-foreground">
-                  Calculated values from the character status.
-                </p>
               </div>
               {status?.attributes ? (
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-9">
@@ -3518,7 +3202,9 @@ export function CharacterDetail({
                               className="rounded-lg border bg-input/20 p-2"
                             >
                               <div className="flex flex-wrap items-center gap-1.5 font-medium">
-                                {a.name}
+                                {kind === "blessing" && a.tier
+                                  ? `${a.tier} Blessing of ${a.name}`
+                                  : a.name}
                                 {a.grade ? (
                                   <Badge variant="outline">{a.grade}</Badge>
                                 ) : null}
@@ -3672,17 +3358,52 @@ export function CharacterDetail({
                         <TableCell>
                           <div className="flex flex-col gap-0.5">
                             {trace.phases.map((phase) => (
-                              <span
-                                key={phase.phase}
-                                className="flex justify-between text-[0.6875rem] text-muted-foreground"
-                              >
-                                <span>{phase.phase}</span>
-                                <span className="tabular-nums">
-                                  {phase.value}
-                                  {phase.delta >= 0 ? " (+" : " ("}
-                                  {phase.delta}){" "}
+                              <div key={phase.phase}>
+                                <span className="flex justify-between text-[0.6875rem] text-muted-foreground">
+                                  <span>{phase.phase}</span>
+                                  <span className="tabular-nums">
+                                    {phase.value}
+                                    {phase.delta >= 0 ? " (+" : " ("}
+                                    {phase.delta}){" "}
+                                  </span>
                                 </span>
-                              </span>
+                                {phase.phase === "historical-fixed"
+                                  ? (
+                                      [
+                                        ["Race", "race"],
+                                        ["Class", "class"],
+                                        ["Profession", "profession"],
+                                      ] as const
+                                    ).map(([source, track]) => {
+                                      const fixed =
+                                        (
+                                          status as typeof status & {
+                                            historicalFixedByTrack?: Partial<
+                                              Record<
+                                                "race" | "class" | "profession",
+                                                Partial<
+                                                  Record<AttributeKey, number>
+                                                >
+                                              >
+                                            >
+                                          }
+                                        ).historicalFixedByTrack?.[track]?.[
+                                          trace.attribute as AttributeKey
+                                        ] ?? 0
+                                      return (
+                                        <span
+                                          key={track}
+                                          className="flex justify-between pl-3 text-[0.6875rem] text-muted-foreground"
+                                        >
+                                          <span>{source} fixed</span>
+                                          <span className="tabular-nums">
+                                            {fixed}
+                                          </span>
+                                        </span>
+                                      )
+                                    })
+                                  : null}
+                              </div>
                             ))}
                           </div>
                         </TableCell>
@@ -3717,6 +3438,7 @@ export function CharacterDetail({
             <CardContent>
               <ExperienceControl
                 track="race"
+                levelUpBlocked={character.levelUpBlocked?.race}
                 percent={racePercent}
                 level={state.race.level}
                 editable={state.race.mode === "independent"}
@@ -3755,6 +3477,7 @@ export function CharacterDetail({
                 {classTrack ? (
                   <ExperienceControl
                     track="class"
+                    levelUpBlocked={character.levelUpBlocked?.class}
                     percent={classPercent}
                     level={classTrack.level}
                     editable={state.race.mode !== "independent"}
@@ -3807,6 +3530,7 @@ export function CharacterDetail({
                 {professionTrack ? (
                   <ExperienceControl
                     track="profession"
+                    levelUpBlocked={character.levelUpBlocked?.profession}
                     percent={professionPercent}
                     level={professionTrack.level}
                     editable={state.race.mode !== "independent"}
@@ -4419,14 +4143,9 @@ export function CharacterDetail({
         <TabsContent value="consumables" className="pt-3">
           <div className="flex items-start justify-between gap-3">
             <p className="text-xs text-muted-foreground">
-              Consumables grant either a permanent stat gain (capped by the
-              grade-based race-level capacity) or a temporary effect that
-              expires after a number of quarters. Permanent gains are recorded
-              in the immutable journal and cannot be undone.
+              Historical item-related gains and effects remain visible here; new
+              stock is managed in Inventory.
             </p>
-            <Button variant="outline" size="sm" onClick={openAssociations}>
-              Manage consumables
-            </Button>
           </div>
 
           {status && status.consumables ? (
@@ -4456,7 +4175,7 @@ export function CharacterDetail({
             </div>
           ) : (
             <p className="mt-3 text-xs text-muted-foreground">
-              No active temporary consumable effects.
+              No active temporary item effects.
             </p>
           )}
 
@@ -4622,214 +4341,10 @@ export function CharacterDetail({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={evolveOpen} onOpenChange={setEvolveOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Evolve race grade</DialogTitle>
-            <DialogDescription>
-              This progresses race grade only. Class/profession evolution is not
-              selected yet, so the system will not auto-choose a path for you.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-col gap-1 text-xs/relaxed text-muted-foreground">
-            <span>
-              Current grade: <span className="font-medium">{raceGrade}</span>
-            </span>
-            <span>
-              Target grade:{" "}
-              <span className="font-medium">{evolveTarget ?? "-"}</span>
-            </span>
-            <span>
-              Race level:{" "}
-              <span className="font-medium">{state.race.level}</span>
-            </span>
-          </div>
-
-          {evolutionLoading ? (
-            <p className="text-xs text-muted-foreground">
-              Loading evolution options...
-            </p>
-          ) : evolutionOptions == null ? (
-            <div className="flex flex-col gap-2">
-              <p className="text-xs text-muted-foreground">
-                Could not load evolution options.
-              </p>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void loadEvolutionOptions()}
-              >
-                Retry
-              </Button>
-            </div>
-          ) : evolutionOptions && evolutionOptionList.length > 0 ? (
-            <div className="flex flex-col gap-2">
-              {evolutionOptionList.map((option) => {
-                const selected = option.id === selectedOptionId
-                const selectable = option.eligible
-                return (
-                  <button
-                    key={option.id}
-                    type="button"
-                    onClick={() => {
-                      if (!selectable) return
-                      setSelectedOptionId(option.id)
-                      setEvolutionOptionMode("option")
-                    }}
-                    disabled={!selectable}
-                    className={cn(
-                      "flex w-full flex-col gap-1 rounded-lg border p-2 text-left text-xs/relaxed",
-                      selected ? "border-ring bg-input/20" : "border",
-                      !selectable ? "cursor-not-allowed opacity-70" : ""
-                    )}
-                  >
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-medium">{option.name}</span>
-                      <Badge variant="outline">
-                        {option.fromGrade} {"->"} {option.toGrade}
-                      </Badge>
-                      <Badge variant="outline">
-                        {option.track === "race"
-                          ? "Race"
-                          : option.track === "class"
-                            ? "Class"
-                            : "Profession"}
-                        : {option.toTrackName}
-                      </Badge>
-                      {option.manualReview ? (
-                        <Badge variant="outline">Manual review</Badge>
-                      ) : null}
-                      {!selectable ? (
-                        <Badge variant="outline">Blocked</Badge>
-                      ) : null}
-                    </div>
-                    {option.description ? (
-                      <span className="text-muted-foreground">
-                        {option.description}
-                      </span>
-                    ) : null}
-                    {option.sourceUrl ? (
-                      <span className="text-muted-foreground">
-                        Source: {option.sourceUrl}
-                      </span>
-                    ) : null}
-                    {option.blockers.length > 0 ? (
-                      <ul className="list-disc pl-5 text-muted-foreground">
-                        {option.blockers.map((blocker, i) => (
-                          <li key={i}>{blocker}</li>
-                        ))}
-                      </ul>
-                    ) : null}
-                    {option.manualReview && !isAdmin ? (
-                      <span className="text-muted-foreground">
-                        An admin must provide a reason to override the manual
-                        requirements for this path.
-                      </span>
-                    ) : null}
-                  </button>
-                )
-              })}
-              {legacyAvailable ? (
-                <button
-                  type="button"
-                  onClick={() => setEvolutionOptionMode("legacy")}
-                  className={cn(
-                    "flex w-full flex-col gap-1 rounded-lg border p-2 text-left text-xs/relaxed",
-                    evolutionOptionMode === "legacy"
-                      ? "border-ring bg-input/20"
-                      : "border"
-                  )}
-                >
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="font-medium">
-                      Grade-only ({evolveTarget ?? "-"})
-                    </span>
-                    <Badge variant="outline">House fallback</Badge>
-                  </div>
-                  <span className="text-muted-foreground">
-                    No contextual race path targets this grade, so the same-race
-                    grade evolution is offered.
-                  </span>
-                </button>
-              ) : null}
-            </div>
-          ) : evolutionOptions && evolutionOptions.legacyAvailable ? (
-            <p className="text-xs text-muted-foreground">
-              No contextual race evolution path is configured for this grade.
-              The system applies the grade-only house fallback to{" "}
-              {evolveTarget ?? "-"}.
-            </p>
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              No evolution options are available yet.
-            </p>
-          )}
-
-          {evolutionOptionMode === "option" &&
-          selectedOption?.manualReview &&
-          isAdmin ? (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="evolve-reason">
-                Reason (required to override manual requirements)
-              </Label>
-              <Input
-                id="evolve-reason"
-                value={evolveReason}
-                onChange={(e) => setEvolveReason(e.target.value)}
-              />
-            </div>
-          ) : evolutionOptionMode === "legacy" && isAdmin ? (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="evolve-reason">Reason (optional)</Label>
-              <Input
-                id="evolve-reason"
-                value={evolveReason}
-                onChange={(e) => setEvolveReason(e.target.value)}
-              />
-            </div>
-          ) : null}
-
-          {evolveError ? (
-            <p role="alert" className="text-xs/relaxed text-destructive">
-              {evolveError}
-            </p>
-          ) : null}
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setEvolveOpen(false)}
-              disabled={evolveBusy}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={() => void submitEvolution()}
-              disabled={!canConfirm || evolveBusy}
-            >
-              {evolveBusy ? "Evolving..." : `Evolve to ${evolveTarget ?? "-"}`}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {trackEvolveTrack === "class" ? (
+      {trackEvolveTrack ? (
         <TrackEvolutionDialog
-          track="class"
+          track={trackEvolveTrack}
           character={character}
-          isAdmin={isAdmin}
-          onClose={() => setTrackEvolveTrack(null)}
-          onEvolved={() => {
-            void reload()
-            void refreshEvents()
-          }}
-        />
-      ) : null}
-
-      {trackEvolveTrack === "profession" ? (
-        <TrackEvolutionDialog
-          track="profession"
-          character={character}
-          isAdmin={isAdmin}
           onClose={() => setTrackEvolveTrack(null)}
           onEvolved={() => {
             void reload()
@@ -4844,7 +4359,6 @@ export function CharacterDetail({
         character={character}
         titles={titlesCatalog}
         equipment={equipmentCatalog}
-        consumables={consumablesCatalog}
         blessings={blessingsCatalog}
         bloodlines={bloodlinesCatalog}
         transcendentSkills={transcendentCatalog}
@@ -4853,18 +4367,13 @@ export function CharacterDetail({
         onRetryCreationRules={() => void loadCreationRules()}
         loading={catalogLoading}
         busy={assocBusy}
-        consumeBusy={consumeBusy}
         onAdd={(kind, definitionId, reason, equipmentPosition) =>
           void addAssociation(kind, definitionId, reason, equipmentPosition)
         }
         onRemove={(kind, definitionId) =>
           void removeAssociation(kind, definitionId)
         }
-        onConsume={(definitionId) => {
-          const item = consumablesCatalog.find((c) => c.id === definitionId)
-          if (item) requestConsume(item)
-        }}
-        onPowerAdd={(kind, definitionId) => {
+        onPowerAdd={(kind, definitionId, tier) => {
           if (kind === "transcendent") {
             const item = transcendentCatalog.find(
               (entry) => entry.id === definitionId
@@ -4898,7 +4407,7 @@ export function CharacterDetail({
             )
           )
             return
-          void addAssociation(kind, definitionId)
+          void addAssociation(kind, definitionId, undefined, undefined, tier)
         }}
         onPowerRemove={(kind, definitionId) => {
           const name =
@@ -4931,40 +4440,6 @@ export function CharacterDetail({
               disabled={portraitBusy}
             >
               {portraitBusy ? "Removing..." : "Remove"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={!!consumeConfirm}
-        onOpenChange={(open) => {
-          if (!open) setConsumeConfirm(null)
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Consume permanent consumable</DialogTitle>
-            <DialogDescription>
-              Applying &quot;{consumeConfirm?.name ?? ""}&quot; grants a
-              permanent attribute gain that cannot be undone by simply
-              unequipping. It is capped by the grade-based permanent-consumable
-              capacity (a house assumption, F3/E5/D15/C45).
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setConsumeConfirm(null)}
-              disabled={consumeBusy}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={() => void confirmConsume()}
-              disabled={consumeBusy}
-            >
-              {consumeBusy ? "Consuming..." : "Consume"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -418,7 +418,7 @@ let bloodlinesCatalog: import("@/lib/api").CatalogItem[] = []
 let transcendentCatalog: import("@/lib/api").CatalogItem[] = []
 let equipmentCatalog: import("@/lib/api").CatalogItem[] = []
 let titlesCatalog: import("@/lib/api").CatalogItem[] = []
-let consumablesCatalog: import("@/lib/api").CatalogItem[] = []
+let itemsCatalog: import("@/lib/api").CatalogItem[] = []
 let inventoryError: unknown = null
 let inventoryPosts: Array<{
   operation: "add" | "remove"
@@ -501,11 +501,14 @@ function association(
 
 /** Build an owned inventory row with documented defaults. */
 function inventoryItem(
-  overrides: Partial<import("@/lib/api").CharacterInventoryItem> & {
+  overrides: Omit<
+    Partial<import("@/lib/api").CharacterInventoryItem>,
+    "kind"
+  > & {
     id: string
     definitionId: string
     name: string
-    kind: "equipment" | "consumables"
+    kind: "equipment" | "items"
     quantity: number
   }
 ): import("@/lib/api").CharacterInventoryItem {
@@ -573,11 +576,11 @@ function applyAssociation(
   }
 }
 
-/** Find a definition in the test catalogs by id (equipment or consumables). */
+/** Find a definition in the test catalogs by id (equipment or items). */
 function inventoryCatalogFind(
   definitionId: string
 ): import("@/lib/api").CatalogItem | undefined {
-  return [...equipmentCatalog, ...consumablesCatalog].find(
+  return [...equipmentCatalog, ...itemsCatalog].find(
     (c) => c.id === definitionId
   )
 }
@@ -618,7 +621,7 @@ function applyInventory(
           id: `inv-${body.definitionId}`,
           definitionId: body.definitionId,
           name: source?.name ?? body.definitionId,
-          kind: source?.kind === "consumables" ? "consumables" : "equipment",
+          kind: source?.kind === "items" ? "items" : "equipment",
           quantity: next,
           archived: source?.archived ?? false,
           ...(typeof source?.config?.slot === "string" &&
@@ -667,7 +670,7 @@ function setupMock(options?: {
   transcendentSkills?: import("@/lib/api").CatalogItem[]
   equipmentCatalog?: import("@/lib/api").CatalogItem[]
   titles?: import("@/lib/api").CatalogItem[]
-  consumablesCatalog?: import("@/lib/api").CatalogItem[]
+  itemsCatalog?: import("@/lib/api").CatalogItem[]
   inventoryError?: unknown
   /** Thrown when PATCH /api/characters/chr-1 is called (a failed profile save). */
   profileSaveError?: unknown
@@ -704,7 +707,7 @@ function setupMock(options?: {
   transcendentCatalog = options?.transcendentSkills ?? []
   equipmentCatalog = options?.equipmentCatalog ?? []
   titlesCatalog = options?.titles ?? []
-  consumablesCatalog = options?.consumablesCatalog ?? []
+  itemsCatalog = options?.itemsCatalog ?? []
   inventoryError = options?.inventoryError ?? null
   profileSaveError = options?.profileSaveError ?? null
   creationRulesError = options?.creationRulesError ?? null
@@ -794,11 +797,11 @@ function setupMock(options?: {
       }
       return { character: activeCharacter, journal: experienceJournal }
     }
-    if (url === "/api/characters/chr-1/evolutions") {
+    if (url.startsWith("/api/characters/chr-1/evolutions")) {
       if (evolutionsError) throw evolutionsError
-      return { options: [], legacyAvailable: true }
+      return { options: [], legacyAvailable: false }
     }
-    if (url === "/api/catalog/blessings") {
+    if (url === "/api/catalog/gods") {
       return { kind: "catalog", items: blessingsCatalog }
     }
     if (url === "/api/catalog/bloodlines") {
@@ -813,8 +816,8 @@ function setupMock(options?: {
     if (url === "/api/catalog/equipment") {
       return { kind: "catalog", items: equipmentCatalog }
     }
-    if (url === "/api/catalog/consumables") {
-      return { kind: "catalog", items: consumablesCatalog }
+    if (url === "/api/catalog/items") {
+      return { kind: "catalog", items: itemsCatalog }
     }
     if (url === "/api/catalog/skills")
       return { kind: "catalog", items: skillsCatalogForTest }
@@ -942,6 +945,7 @@ describe("CharacterDetail overview summary", () => {
             perception: 88,
             willpower: 99,
           },
+          derivedStats: { hp: 101, mp: 202, sp: 303 },
           traces: [],
           availablePoints: 0,
           totalFreePoints: 0,
@@ -967,6 +971,26 @@ describe("CharacterDetail overview summary", () => {
     await renderDetail()
 
     expect(screen.getByRole("heading", { name: "Longshot" })).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "Derived Stats" })).toBeTruthy()
+    const overviewHeadings = screen
+      .getAllByRole("heading")
+      .map((heading) => heading.textContent)
+    expect(overviewHeadings.indexOf("Progression")).toBeLessThan(
+      overviewHeadings.indexOf("Derived Stats")
+    )
+    expect(overviewHeadings.indexOf("Derived Stats")).toBeLessThan(
+      overviewHeadings.indexOf("Stats")
+    )
+    expect(screen.getByRole("heading", { name: "Stats" })).toBeTruthy()
+    expect(screen.getByLabelText("Health (HP) 101")).toBeTruthy()
+    expect(screen.getByLabelText("Mana (MP) 202")).toBeTruthy()
+    expect(screen.getByLabelText("Stamina (SP) 303")).toBeTruthy()
+    expect(screen.getByText("101")).toBeTruthy()
+    expect(screen.getByText("202")).toBeTruthy()
+    expect(screen.getByText("303")).toBeTruthy()
+    expect(
+      screen.queryByText("Calculated values from the character status.")
+    ).toBeNull()
     for (const [label, value] of [
       ["Strength", "11"],
       ["Agility", "22"],
@@ -1007,9 +1031,110 @@ describe("CharacterDetail overview summary", () => {
         "Current calculated attributes are unavailable right now."
       )
     ).toBeTruthy()
+    expect(
+      screen.getByText("Derived stats are unavailable right now.")
+    ).toBeTruthy()
     expect(screen.getByLabelText("Race level 25")).toBeTruthy()
     expect(screen.queryByLabelText(/Class level/)).toBeNull()
     expect(screen.queryByLabelText(/Profession level/)).toBeNull()
+  })
+})
+
+describe("grade ceiling and historical stat provenance", () => {
+  it("disables only the monster race + Level when the server blocks it", async () => {
+    const monster = {
+      ...character,
+      classId: null,
+      className: null,
+      state: {
+        ...character.state,
+        race: { ...character.state.race, mode: "independent" },
+      },
+      levelUpBlocked: { race: "Race grade ceiling reached." },
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({ character: monster })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Race" }))
+    expect(
+      screen
+        .getByRole("button", { name: "Increase race level" })
+        .hasAttribute("disabled")
+    ).toBe(true)
+    expect(screen.getByText("Race grade ceiling reached.")).toBeTruthy()
+    expect(screen.getByRole("slider").hasAttribute("disabled")).toBe(false)
+  })
+
+  it("blocks class + Level from server reason and leaves it enabled when unblocked", async () => {
+    setupMock({
+      character: {
+        ...character,
+        levelUpBlocked: { class: "Class grade ceiling reached." },
+      },
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Class" }))
+    expect(
+      screen
+        .getByRole("button", { name: "Increase class level" })
+        .hasAttribute("disabled")
+    ).toBe(true)
+    expect(screen.getByText("Class grade ceiling reached.")).toBeTruthy()
+    cleanup()
+    setupMock({ character })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Class" }))
+    expect(
+      screen
+        .getByRole("button", { name: "Increase class level" })
+        .hasAttribute("disabled")
+    ).toBe(false)
+  })
+
+  it("shows server-supplied fixed points by track without changing historical total", async () => {
+    const status = {
+      attributes: { strength: 8 },
+      derivedStats: { hp: 1, mp: 2, sp: 3 },
+      traces: [
+        {
+          attribute: "strength",
+          final: 8,
+          phases: [{ phase: "historical-fixed", value: 6, delta: 6 }],
+        },
+      ],
+      historicalFixedByTrack: {
+        race: { strength: 1 },
+        class: { strength: 2 },
+        profession: { strength: 3 },
+      },
+      availablePoints: 0,
+      totalFreePoints: 0,
+      allocatedPoints: 0,
+      resources: [],
+      equipment: {
+        requested: {},
+        applied: {},
+        suppressed: {},
+        items: [],
+        capUsage: [],
+      },
+      consumables: { requested: {}, applied: {}, suppressed: {}, capUsage: [] },
+      capUsage: [],
+    }
+    setupMock({
+      character: {
+        ...character,
+        status,
+      } as unknown as import("@/lib/api").CharacterDetail,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Stats" }))
+    expect(screen.getByRole("tab", { name: "Stats" })).toBeTruthy()
+    expect(screen.getByText("historical-fixed")).toBeTruthy()
+    expect(screen.getByText("Race fixed")).toBeTruthy()
+    expect(screen.getByText("Class fixed")).toBeTruthy()
+    expect(screen.getByText("Profession fixed")).toBeTruthy()
+    expect(screen.getByText("6 (+6)")).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "Derived Stats" })).toBeTruthy()
   })
 })
 
@@ -1472,9 +1597,9 @@ describe("CharacterDetail race-only progression", () => {
     ).toBeNull()
     // Race grade evolution is a race action and stays available. The button
     // carries an aria-label, so match the accessible name, not the visible text
-    // ("Evolve grade (to E)").
+    // ("Evolve grade (to F)").
     expect(
-      screen.getByRole("button", { name: /Evolve race grade to E/ })
+      screen.getByRole("button", { name: /Evolve race grade to F/ })
     ).toBeTruthy()
     // No class/profession advance or evolution actions.
     expect(screen.queryByRole("button", { name: /Evolve class/ })).toBeNull()
@@ -1946,23 +2071,22 @@ describe("CharacterDetail evolution options error state", () => {
 
     await renderDetail()
 
-    // Open the evolve dialog. At grade G / level 25 the client target is E, so the
-    // button is enabled.
+    // Open the evolve dialog. At grade G the client targets the next grade (F), so
+    // the button is enabled.
     fireEvent.click(screen.getByText(/Evolve grade/))
     await flush()
 
-    // No false availability claim: the failed options fetch must NOT be shown as
-    // a legacy fallback. Instead the user is told options could not load and gets
-    // a retry.
-    expect(screen.getByText("Could not load evolution options.")).toBeTruthy()
+    // No false availability claim: the failed options fetch surfaces the raw error
+    // and a retry, with no legacy grade-only fallback.
+    expect(screen.getByText("network down")).toBeTruthy()
     expect(screen.getByText("Retry")).toBeTruthy()
     expect(screen.queryByText(/Grade-only/)).toBeNull()
     expect(
-      screen.queryByText("No evolution options are available yet.")
+      screen.queryByText("No race evolution options are available yet.")
     ).toBeNull()
 
     // The action is withheld: the submit button is disabled.
-    const submitBtn = screen.getByText(/Evolve to E/).closest("button")
+    const submitBtn = screen.getByText(/Evolve to -/).closest("button")
     expect(submitBtn?.disabled).toBe(true)
   })
 
@@ -1976,22 +2100,46 @@ describe("CharacterDetail evolution options error state", () => {
 
     expect(screen.getByText("Retry")).toBeTruthy()
 
-    // The network recovers; the retry fetch now succeeds with the legacy fallback
-    // available (no catalog path targets the next grade F).
+    // The network recovers; the retry fetch now succeeds with no options (there
+    // is no grade-only path anymore).
     evolutionsError = null
     fireEvent.click(screen.getByText("Retry"))
     await flush()
 
-    // The error/retry UI is gone and the legacy fallback is now honestly reported.
-    expect(screen.queryByText("Could not load evolution options.")).toBeNull()
-    expect(screen.getByText(/No contextual race evolution path/)).toBeTruthy()
+    // The error/retry UI is gone and the empty candidate set is honestly reported.
+    expect(
+      screen.queryByText("Could not load race evolution options.")
+    ).toBeNull()
+    expect(
+      screen.getByText("No race evolution options are available yet.")
+    ).toBeTruthy()
 
-    const submitBtn = screen.getByText(/Evolve to E/).closest("button")
-    expect(submitBtn?.disabled).toBe(false)
+    const submitBtn = screen.getByText(/Evolve to -/).closest("button")
+    expect(submitBtn?.disabled).toBe(true)
   })
 })
 
 describe("CharacterDetail power associations", () => {
+  it("formats an existing blessing link from its god name and persisted tier", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "assoc-viper",
+            kind: "blessing",
+            definitionId: "god-viper",
+            name: "The Malefic Viper",
+            tier: "True",
+          }),
+        ],
+      },
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Powers" }))
+    expect(screen.getByText("True Blessing of The Malefic Viper")).toBeTruthy()
+  })
+
   it("confirms replacing the sole bloodline and names archived displaced links", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true)
     setupMock({
@@ -2171,12 +2319,14 @@ describe("CharacterDetail power associations", () => {
       definitionId: string
       operation: string
       version: number
+      tier?: string
     }
     expect(body).toEqual({
       kind: "blessing",
       definitionId: "bless-monster",
       operation: "add",
       version: 3,
+      tier: "Minor",
     })
 
     // The reload reflects the newly linked blessing on the powers tab.
@@ -2184,7 +2334,7 @@ describe("CharacterDetail power associations", () => {
     expect(blessingSection.getByText("Monster Blessing")).toBeTruthy()
   })
 
-  it("AssociationSheet blessing option surfaces the patronGodStableId", async () => {
+  it("loads blessing choices from the Gods catalog and exposes a tier selector", async () => {
     setupMock({
       blessings: [
         catalogItem({
@@ -2199,7 +2349,12 @@ describe("CharacterDetail power associations", () => {
     fireEvent.click(screen.getByText("Manage powers"))
     await flush()
 
-    expect(screen.getByText(/Patron: god-dawn/)).toBeTruthy()
+    expect(screen.getByLabelText("Blessing tier")).toBeTruthy()
+    expect(
+      (apiFetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some(
+        ([url]) => url === "/api/catalog/gods"
+      )
+    ).toBe(true)
   })
 
   it("adding a blessing with linked blessings opens a replacement confirmation listing every displaced link with an archived marker before POST", async () => {
@@ -2261,12 +2416,14 @@ describe("CharacterDetail power associations", () => {
       definitionId: string
       operation: string
       version: number
+      tier?: string
     }
     expect(body).toEqual({
       kind: "blessing",
       definitionId: "bless-new",
       operation: "add",
       version: 3,
+      tier: "Minor",
     })
 
     // The successful reload reflects the newly linked blessing.
@@ -2703,26 +2860,26 @@ describe("CharacterDetail inventory", () => {
     expect(screen.getByText("Qty 2")).toBeTruthy()
   })
 
-  it("an archived consumable inventory row is visible and inert: Discard works but Consume is disabled", async () => {
+  it("an archived item inventory row shows stock quantity without consume controls", async () => {
     setupMock({
       character: {
         ...character,
         inventory: [
           inventoryItem({
             id: "inv-potion",
-            definitionId: "cons-potion",
-            name: "Old Potion",
-            kind: "consumables",
+            definitionId: "item-token",
+            name: "Old Token",
+            kind: "items",
             quantity: 1,
             archived: true,
           }),
         ],
       },
-      consumablesCatalog: [
+      itemsCatalog: [
         catalogItem({
-          id: "cons-potion",
-          name: "Old Potion",
-          kind: "consumables",
+          id: "item-token",
+          name: "Old Token",
+          kind: "items",
           archived: true,
         }),
       ],
@@ -2732,21 +2889,14 @@ describe("CharacterDetail inventory", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
 
-    const ownedConsumables = within(screen.getByLabelText("Owned consumables"))
+    const ownedItems = within(screen.getByLabelText("Owned items"))
     // Archived stock stays visible and is honestly marked inert.
-    expect(ownedConsumables.getByText("Old Potion")).toBeTruthy()
-    expect(ownedConsumables.getByText("Qty 1")).toBeTruthy()
-    expect(ownedConsumables.getByText("Archived - inert")).toBeTruthy()
-    // An archived definition cannot be newly consumed.
-    expect(
-      (
-        ownedConsumables.getByRole("button", {
-          name: "Consume",
-        }) as HTMLButtonElement
-      ).disabled
-    ).toBe(true)
+    expect(ownedItems.getByText("Old Token")).toBeTruthy()
+    expect(ownedItems.getByText("Qty 1")).toBeTruthy()
+    expect(ownedItems.getByText("Archived - inert")).toBeTruthy()
+    expect(ownedItems.queryByRole("button", { name: "Consume" })).toBeNull()
     // But owned archived stock can still be discarded.
-    const discard = ownedConsumables.getByRole("button", {
+    const discard = ownedItems.getByRole("button", {
       name: "Discard",
     }) as HTMLButtonElement
     expect(discard.disabled).toBe(false)
@@ -2772,7 +2922,7 @@ describe("CharacterDetail inventory", () => {
     expect(inventoryPosts).toEqual([
       {
         operation: "remove",
-        definitionId: "cons-potion",
+        definitionId: "item-token",
         quantity: 1,
         version: 3,
         sourceNote: "used it up",
@@ -2781,8 +2931,8 @@ describe("CharacterDetail inventory", () => {
 
     // The row disappears on reload; the archived catalog entry remains visible
     // only via the management sheet, not as owned stock.
-    const after = within(screen.getByLabelText("Owned consumables"))
-    expect(after.queryByText("Old Potion")).toBeNull()
+    const after = within(screen.getByLabelText("Owned items"))
+    expect(after.queryByText("Old Token")).toBeNull()
     expect(after.queryByText("Qty 1")).toBeNull()
   })
 

@@ -8,6 +8,8 @@ import {
   evolveGrade,
   evolveTrackGrade,
   experiencePercentFor,
+  gradeLevelUpBlockReason,
+  gradeLevelUpBlockers,
   levelUpFromExperience,
   setExperiencePercent,
 } from "./progression"
@@ -1182,5 +1184,147 @@ describe("levelUpFromExperience", () => {
     expect(result.state.historicalLevelAwards).toHaveLength(1)
     // The journal merges the final engine step's award snapshot.
     expect(result.journal.award?.definitionId).toBe("class-def")
+  })
+})
+
+describe("grade ceiling level-up blockers", () => {
+  const blockerConfig = config({
+    raceDefinitions: {
+      F: { id: "race-f", perLevel: { strength: 1 }, freePerLevel: 1 },
+    },
+  })
+
+  function monsterState(
+    overrides: { level?: number; grade?: Grade } = {}
+  ): CharacterState {
+    return createCharacterState({
+      baseAttributes: zeroVector(),
+      tracks: {},
+      race: {
+        level: overrides.level ?? 0,
+        grade: overrides.grade ?? "F",
+        mode: "independent",
+        quarter: 0,
+      },
+    })
+  }
+
+  it("allows a monster race level-up exactly at the next grade threshold (F24->25)", () => {
+    const state = monsterState({ level: 24, grade: "F" })
+    expect(gradeLevelUpBlockReason(state, "race", blockerConfig)).toBeNull()
+    expect(gradeLevelUpBlockers(state, blockerConfig)).toEqual({})
+  })
+
+  it("blocks a monster race level-up one above the next grade threshold", () => {
+    const state = monsterState({ level: 25, grade: "F" })
+    const reason = gradeLevelUpBlockReason(state, "race", blockerConfig)
+    expect(reason).toContain("F->E")
+    expect(reason).toContain("26")
+    expect(gradeLevelUpBlockers(state, blockerConfig)).toEqual({
+      race: expect.stringContaining("race"),
+    })
+  })
+
+  it("exposes only the race key for a monster and only class/profession for a derived race", () => {
+    const monster = monsterState({ level: 25, grade: "F" })
+    expect(Object.keys(gradeLevelUpBlockers(monster, blockerConfig))).toEqual([
+      "race",
+    ])
+    // An enlightened race at the F->E threshold (class 25 -> 26 gives derived race
+    // 25, not past E entry 25) blocks nothing, so the map carries no keys.
+    const enlightened = character({ classLevel: 25, professionLevel: 24 })
+    expect(Object.keys(gradeLevelUpBlockers(enlightened, config()))).toEqual([])
+  })
+
+  it("blocks an enlightened class when the derived race gate crosses the threshold", () => {
+    const state = character({ classLevel: 27, professionLevel: 24 })
+    state.race.grade = "F"
+    // derived race floor((27+24)/2)=25; class 27 -> 28 gives floor((28+24)/2)=26 > 25.
+    const reason = gradeLevelUpBlockReason(state, "class", blockerConfig)
+    expect(reason).toContain("F->E")
+    expect(reason).toContain("26")
+    // The derived race level is the symmetric average of both tracks, so a class
+    // and a profession level-up project the SAME race level and both are blocked
+    // when that projection crosses the ceiling.
+    expect(gradeLevelUpBlockers(state, blockerConfig)).toEqual({
+      class: expect.stringContaining("race"),
+      profession: expect.stringContaining("race"),
+    })
+  })
+
+  it("does not block when the derived race reaches the threshold exactly", () => {
+    const state = character({ classLevel: 25, professionLevel: 24 })
+    state.race.grade = "F"
+    // class 25 -> 26 gives floor((26+24)/2)=25, exactly E's entry level (25).
+    expect(gradeLevelUpBlockReason(state, "class", blockerConfig)).toBeNull()
+  })
+
+  it("reports the derived race gate before the track gate when both would block", () => {
+    const state = character({ classLevel: 25, professionLevel: 100 })
+    state.race.grade = "F"
+    state.tracks["class"].grade = "F"
+    // class 25 -> 26: the track gate (F->E entry 25) blocks AND the derived race
+    // gate blocks (floor((26+100)/2)=63 > 25). The derived race gate must be
+    // reported before the track gate.
+    const reason = gradeLevelUpBlockReason(state, "class", blockerConfig)
+    expect(reason).toContain("race")
+    expect(gradeLevelUpBlockers(state, blockerConfig).class).toContain("race")
+  })
+
+  it("unblocks a class level-up after the race grade is evolved", () => {
+    const state = character({ classLevel: 27, professionLevel: 24 })
+    state.race.grade = "E"
+    // class 27 -> 28 gives derived race 26, well inside E (next D entry 100).
+    expect(gradeLevelUpBlockReason(state, "class", blockerConfig)).toBeNull()
+  })
+
+  it("never caps a track at grade S (no next band)", () => {
+    const state = monsterState({ level: 1000, grade: "S" })
+    expect(gradeLevelUpBlockReason(state, "race", config())).toBeNull()
+    expect(gradeLevelUpBlockers(state, config())).toEqual({})
+  })
+
+  it("caps a graded track independently and leaves an ungraded track uncapped", () => {
+    // Graded class at F, level 25 -> 26, past E's entry (25).
+    const graded = character({ classLevel: 25, professionLevel: 0 })
+    graded.tracks["class"].grade = "F"
+    graded.race.grade = "F"
+    const reason = gradeLevelUpBlockReason(graded, "class", blockerConfig)
+    expect(reason).toContain("class")
+    // An ungraded class at the same level carries no track gate.
+    const ungraded = character({ classLevel: 25, professionLevel: 0 })
+    ungraded.race.grade = "F"
+    expect(gradeLevelUpBlockReason(ungraded, "class", blockerConfig)).toBeNull()
+  })
+
+  it("honors a custom grade table", () => {
+    const custom = config({
+      gradeTable: [
+        { grade: "G", min: 0, max: 9, entryLevel: 0 },
+        { grade: "F", min: 0, max: 24, entryLevel: 10 },
+        { grade: "E", min: 20, max: 99, entryLevel: 20 },
+        { grade: "D", min: 100, max: 199, entryLevel: 100 },
+        { grade: "C", min: 200, max: 349, entryLevel: 200 },
+        { grade: "B", min: 350, max: 499, entryLevel: 350 },
+        { grade: "A", min: 500, max: 749, entryLevel: 500 },
+        { grade: "S", min: 750, max: 999, entryLevel: 750 },
+      ],
+    })
+    // Monster at F level 19: 19 -> 20 reaches the custom E entry (20), allowed.
+    expect(
+      gradeLevelUpBlockReason(
+        monsterState({ level: 19, grade: "F" }),
+        "race",
+        custom
+      )
+    ).toBeNull()
+    // Monster at F level 20: 20 -> 21 pushes past the custom E entry (20), blocked.
+    const reason = gradeLevelUpBlockReason(
+      monsterState({ level: 20, grade: "F" }),
+      "race",
+      custom
+    )
+    expect(reason).toContain("21")
+    expect(reason).toContain("F->E")
   })
 })

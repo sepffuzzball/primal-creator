@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest"
 import {
   advanceSchema,
-  blessingConfigSchema,
+  associationSchema,
+  BLESSING_TIER_ORDER,
+  blessingTierAtLeast,
   bloodlineConfigSchema,
   characterCreateSchema,
   characterStateSchema,
@@ -18,15 +20,17 @@ import {
   gradeDescriptionsSchema,
   hasInvalidNaturalGradeConfig,
   hasInvalidRaceTypeConfig,
+  hasLegacyEquipmentRequirements,
   inventoryPostSchema,
   isCanonicalEquipmentSlot,
   isIncompleteEquipmentConfig,
   isIncompleteRaceConfig,
   isIncompleteSkillRarity,
-  isLegacyBlessingConfig,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
+  itemConfigSchema,
   legacyRingPositionForConfig,
+  normalizeCatalogKind,
   normalizeEquipmentSlot,
   professionSetSchema,
   raceConfigSchema,
@@ -40,21 +44,11 @@ import {
   transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
-describe("evolveSchema (evolution union)", () => {
-  it("parses a legacy race path with no track key", () => {
-    const parsed = evolveSchema.safeParse({ optionId: "evo-1", version: 0 })
-    expect(parsed.success).toBe(true)
-    if (parsed.success) {
-      // No `track` is injected by the schema; the legacy race shape is preserved.
-      expect(parsed.data).toEqual({ optionId: "evo-1", version: 0 })
-      expect((parsed.data as { track?: string }).track).toBeUndefined()
-    }
-  })
-
-  it("parses an explicit race path with track: 'race'", () => {
+describe("evolveSchema (single evolution choice)", () => {
+  it("parses a race choice with track: 'race'", () => {
     const parsed = evolveSchema.safeParse({
       track: "race",
-      optionId: "evo-1",
+      optionId: "dest-race-1",
       version: 0,
       reason: "story",
     })
@@ -62,36 +56,34 @@ describe("evolveSchema (evolution union)", () => {
     if (parsed.success) {
       expect(parsed.data).toEqual({
         track: "race",
-        optionId: "evo-1",
+        optionId: "dest-race-1",
         version: 0,
         reason: "story",
       })
     }
   })
 
-  it("preserves track on a class path instead of stripping it into a race path", () => {
+  it("preserves track on a class choice", () => {
     const parsed = evolveSchema.safeParse({
       track: "class",
-      optionId: "evo-c",
+      optionId: "dest-class-1",
       version: 0,
     })
     expect(parsed.success).toBe(true)
     if (parsed.success) {
-      // The bug: with a race schema that omitted `track`, a class/profession path
-      // was matched and `track` silently stripped, so this parsed as a race path.
       expect(parsed.data).toEqual({
         track: "class",
-        optionId: "evo-c",
+        optionId: "dest-class-1",
         version: 0,
       })
-      expect((parsed.data as { track?: string }).track).toBe("class")
+      expect(parsed.data.track).toBe("class")
     }
   })
 
-  it("preserves track on a profession path", () => {
+  it("preserves track on a profession choice", () => {
     const parsed = evolveSchema.safeParse({
       track: "profession",
-      optionId: "evo-p",
+      optionId: "dest-prof-1",
       version: 0,
       reason: "story",
     })
@@ -99,80 +91,37 @@ describe("evolveSchema (evolution union)", () => {
     if (parsed.success) {
       expect(parsed.data).toEqual({
         track: "profession",
-        optionId: "evo-p",
+        optionId: "dest-prof-1",
         version: 0,
         reason: "story",
       })
     }
   })
 
-  it("parses a legacy grade-only path", () => {
-    const parsed = evolveSchema.safeParse({ grade: "F", version: 0 })
-    expect(parsed.success).toBe(true)
-    if (parsed.success) {
-      expect(parsed.data).toEqual({ grade: "F", version: 0 })
-    }
+  it("requires an explicit track (no legacy grade-only path)", () => {
+    // The retired grade-only shape `{grade, version}` no longer parses.
+    const gradeOnly = evolveSchema.safeParse({ grade: "F", version: 0 })
+    expect(gradeOnly.success).toBe(false)
+    const noTrack = evolveSchema.safeParse({ optionId: "dest-1", version: 0 })
+    expect(noTrack.success).toBe(false)
   })
 
   it("rejects a payload with no recognized evolution shape", () => {
     const parsed = evolveSchema.safeParse({})
     expect(parsed.success).toBe(false)
   })
-})
 
-describe("blessing / bloodline / god catalog config", () => {
-  it("parses a modern blessing config and preserves its typed effects", () => {
-    const parsed = blessingConfigSchema.safeParse({
-      tier: "Major",
-      effects: [{ phase: "flat", amount: { strength: 5 } }],
-      compatibleBlessingStableIds: ["bless-2"],
-      upgradeGroup: "viper",
-      patronGodStableId: "malefic-viper",
-    })
-    expect(parsed.success).toBe(true)
-    if (parsed.success) {
-      expect(parsed.data.tier).toBe("Major")
-      expect(parsed.data.effects).toHaveLength(1)
-    }
-  })
-
-  it("accepts the Baptism tier (below Minor) with no invented numeric effect", () => {
-    // Baptism is the lowest entry tier; a baptism blessing carries no fabricated
-    // numeric bonus, so `effects` is empty.
-    const parsed = blessingConfigSchema.safeParse({
-      tier: "Baptism",
-      effects: [],
-    })
-    expect(parsed.success).toBe(true)
-    if (parsed.success) {
-      expect(parsed.data.tier).toBe("Baptism")
-      expect(parsed.data.effects).toEqual([])
-    }
-  })
-
-  it("reads a legacy blessing config (grade/effect) without tier/effects", () => {
-    const parsed = blessingConfigSchema.safeParse({
-      grade: "F",
-      effect: { strength: 3 },
-    })
-    expect(parsed.success).toBe(true)
-  })
-
-  it("detects a legacy blessing vs modern blessing config", () => {
-    expect(
-      isLegacyBlessingConfig({ grade: "F", effect: { strength: 3 } })
-    ).toBe(true)
-    expect(isLegacyBlessingConfig({ tier: "Minor", effects: [] })).toBe(false)
-  })
-
-  it("rejects a blessing effect vector that is not a finite integer", () => {
-    const parsed = blessingConfigSchema.safeParse({
-      tier: "Minor",
-      effects: [{ phase: "flat", amount: { strength: 1.5 } }],
+  it("rejects an unknown track value", () => {
+    const parsed = evolveSchema.safeParse({
+      track: "gods",
+      optionId: "dest-1",
+      version: 0,
     })
     expect(parsed.success).toBe(false)
   })
+})
 
+describe("bloodline / god catalog config", () => {
   it("parses a modern bloodline config with narrative-only effects", () => {
     const parsed = bloodlineConfigSchema.safeParse({
       effects: [],
@@ -225,6 +174,45 @@ describe("blessing / bloodline / god catalog config", () => {
   it("reads a god config that only carries unknown fields", () => {
     const parsed = godConfigSchema.safeParse({ realm: "the void" })
     expect(parsed.success).toBe(true)
+  })
+
+  it("parses a god blessingEffects map keyed by the eight blessing tiers", () => {
+    const parsed = godConfigSchema.safeParse({
+      blessingEffects: {
+        True: [{ phase: "flat", amount: { strength: 5 } }],
+        Minor: [],
+      },
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.blessingEffects?.True).toHaveLength(1)
+      expect(parsed.data.blessingEffects?.Minor).toEqual([])
+    }
+  })
+
+  it("rejects a blessingEffects key outside the eight-tier vocabulary", () => {
+    // "minor" is a typo for "Minor"; the tier keys are strict.
+    expect(
+      godConfigSchema.safeParse({ blessingEffects: { minor: [] } }).success
+    ).toBe(false)
+  })
+
+  it("rejects a non-integer blessing effect amount in a god blessingEffects entry", () => {
+    expect(
+      godConfigSchema.safeParse({
+        blessingEffects: {
+          Major: [{ phase: "flat", amount: { strength: 1.5 } }],
+        },
+      }).success
+    ).toBe(false)
+  })
+
+  it("accepts a god with no blessingEffects (a tiered link synthesizes no bonus)", () => {
+    const parsed = godConfigSchema.safeParse({ divineRank: "God" })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.blessingEffects).toBeUndefined()
+    }
   })
 })
 
@@ -520,7 +508,7 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
       raceId: "race-1",
       classId: "cls-1",
       specialAbilities: {
-        blessingId: "bless-1",
+        blessing: { godId: "god-1", tier: "Major" },
         bloodlineIds: ["blood-1"],
         transcendentSkillIds: ["trans-1"],
       },
@@ -528,10 +516,20 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
     expect(parsed.success).toBe(true)
   })
 
-  it("rejects an empty blessingId", () => {
-    expect(specialAbilitiesSchema.safeParse({ blessingId: "" }).success).toBe(
-      false
-    )
+  it("rejects a blessing with an empty godId", () => {
+    expect(
+      specialAbilitiesSchema.safeParse({
+        blessing: { godId: "", tier: "True" },
+      }).success
+    ).toBe(false)
+  })
+
+  it("rejects a blessing with an invalid tier", () => {
+    expect(
+      specialAbilitiesSchema.safeParse({
+        blessing: { godId: "god-1", tier: "minor" },
+      }).success
+    ).toBe(false)
   })
 
   it("rejects a bloodline array with more than 1 id", () => {
@@ -543,7 +541,7 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
 
   it("rejects an id selected in more than one field (cross-field overlap)", () => {
     const parsed = specialAbilitiesSchema.safeParse({
-      blessingId: "bless-1",
+      blessing: { godId: "bless-1", tier: "Minor" },
       bloodlineIds: ["bless-1"],
     })
     expect(parsed.success).toBe(false)
@@ -988,6 +986,179 @@ describe("equipment metadata (rarity / slot / soulbound / requirements)", () => 
     ).toBe(false)
   })
 
+  it("equipmentConfigSchema reads and preserves the canonical minimumLevel / requiredLevelType", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Common",
+      minimumLevel: 45,
+      requiredLevelType: "humanoidRace",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({
+        minimumLevel: 45,
+        requiredLevelType: "humanoidRace",
+      })
+    }
+  })
+
+  it("equipmentConfigSchema requires requiredLevelType when minimumLevel is set", () => {
+    expect(
+      equipmentConfigSchema.safeParse({ slot: "Head", minimumLevel: 5 }).success
+    ).toBe(false)
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        minimumLevel: 5,
+        requiredLevelType: "class",
+      }).success
+    ).toBe(true)
+  })
+
+  it("equipmentConfigSchema allows requiredLevelType alone (type restriction at level 0)", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      requiredLevelType: "monstrousRace",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.requiredLevelType).toBe("monstrousRace")
+      expect(parsed.data.minimumLevel).toBeUndefined()
+    }
+  })
+
+  it("equipmentConfigSchema rejects an invalid requiredLevelType / negative minimumLevel", () => {
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        requiredLevelType: "race",
+      }).success
+    ).toBe(false)
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        minimumLevel: -1,
+        requiredLevelType: "class",
+      }).success
+    ).toBe(false)
+  })
+
+  it("equipmentConfigSchema requires requiredGodStableId when minimumBlessingTier is set", () => {
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        minimumBlessingTier: "Minor",
+      }).success
+    ).toBe(false)
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        minimumBlessingTier: "Minor",
+        requiredGodStableId: "odin",
+      }).success
+    ).toBe(true)
+  })
+
+  it("equipmentConfigSchema allows requiredGodStableId alone (tier defaults to Baptism at runtime)", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      requiredGodStableId: "odin",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({ requiredGodStableId: "odin" })
+      expect(parsed.data.minimumBlessingTier).toBeUndefined()
+    }
+  })
+
+  it("equipmentConfigSchema accepts grantedSkillStableIds (empty, nonempty, unique)", () => {
+    const empty = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: [],
+    })
+    expect(empty.success).toBe(true)
+
+    const nonempty = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["skill-a", "skill-b"],
+    })
+    expect(nonempty.success).toBe(true)
+    if (nonempty.success) {
+      expect(nonempty.data.grantedSkillStableIds).toEqual([
+        "skill-a",
+        "skill-b",
+      ])
+    }
+
+    // Absent (legacy config) reads back as undefined, never a fabricated list.
+    const absent = equipmentConfigSchema.safeParse({ slot: "Head" })
+    expect(absent.success).toBe(true)
+    if (absent.success) {
+      expect(absent.data.grantedSkillStableIds).toBeUndefined()
+    }
+  })
+
+  it("equipmentConfigSchema rejects a duplicate grantedSkillStableIds entry", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["skill-a", "skill-a"],
+    })
+    expect(parsed.success).toBe(false)
+    if (!parsed.success) {
+      expect(
+        parsed.error.issues.some((i) => i.path[0] === "grantedSkillStableIds")
+      ).toBe(true)
+    }
+  })
+
+  it("equipmentConfigSchema rejects a blank grantedSkillStableIds entry", () => {
+    expect(
+      equipmentConfigSchema.safeParse({
+        slot: "Head",
+        rarity: "Common",
+        grantedSkillStableIds: [""],
+      }).success
+    ).toBe(false)
+  })
+
+  it("hasLegacyEquipmentRequirements detects legacy keys and not canonical ones", () => {
+    expect(hasLegacyEquipmentRequirements({ minRaceLevel: 5 })).toBe(true)
+    expect(
+      hasLegacyEquipmentRequirements({ requiredRaceType: "enlightened" })
+    ).toBe(true)
+    expect(
+      hasLegacyEquipmentRequirements({
+        minimumLevel: 5,
+        requiredLevelType: "class",
+      })
+    ).toBe(false)
+    expect(hasLegacyEquipmentRequirements({ slot: "Head" })).toBe(false)
+  })
+
+  it("BLESSING_TIER_ORDER is the canonical tier ladder", () => {
+    expect(BLESSING_TIER_ORDER).toEqual([
+      "Baptism",
+      "Minor",
+      "Lesser",
+      "Intermediate",
+      "Major",
+      "Greater",
+      "Divine",
+      "True",
+    ])
+  })
+
+  it("blessingTierAtLeast orders tiers by the canonical ladder", () => {
+    expect(blessingTierAtLeast("Baptism", "Baptism")).toBe(true)
+    expect(blessingTierAtLeast("Minor", "Baptism")).toBe(true)
+    expect(blessingTierAtLeast("Baptism", "Minor")).toBe(false)
+    expect(blessingTierAtLeast("Lesser", "Minor")).toBe(true)
+    expect(blessingTierAtLeast("True", "Divine")).toBe(true)
+  })
+
   it("EQUIPMENT_SLOTS lists exactly the canonical slots (Ring is a single slot)", () => {
     expect(EQUIPMENT_SLOTS).toEqual([
       "Head",
@@ -1164,6 +1335,131 @@ describe("equipment percent basis points", () => {
   })
 
   it("characterStateSchema accepts a legacy equipment bonus without percentBasisPoints", () => {
+    const state = {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [
+        {
+          id: "gear-1",
+          name: "Sword",
+          slot: "Weapon",
+          source: "s",
+          bonus: { strength: 10 },
+        },
+      ],
+      currentResources: {},
+      turn: 0,
+    }
+    const parsed = characterStateSchema.safeParse(state)
+    expect(parsed.success).toBe(true)
+  })
+})
+
+describe("equipment derived resource bonuses (HP/MP/SP maxima)", () => {
+  it("equipmentConfigSchema accepts valid nonnegative-integer derivedFlat / derivedPercentBasisPoints", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      bonus: { strength: 10 },
+      derivedFlat: { hp: 50, mp: 25, sp: 0 },
+      derivedPercentBasisPoints: { hp: 1000, mp: 2000 },
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toMatchObject({
+        derivedFlat: { hp: 50, mp: 25, sp: 0 },
+        derivedPercentBasisPoints: { hp: 1000, mp: 2000 },
+      })
+    }
+  })
+
+  it("equipmentConfigSchema rejects a negative derivedFlat value", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      derivedFlat: { hp: -5 },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("equipmentConfigSchema rejects a fractional derivedPercentBasisPoints value", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Ancient",
+      derivedPercentBasisPoints: { mp: 10.5 },
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("equipmentConfigSchema accepts a config with no derived fields (legacy readable)", () => {
+    const parsed = equipmentConfigSchema.safeParse({
+      slot: "Head",
+      rarity: "Common",
+      bonus: { strength: 5 },
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("characterStateSchema round-trips an equipment bonus carrying derivedFlat / derivedPercentBasisPoints", () => {
+    const state = {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [
+        {
+          id: "gear-1",
+          name: "Sword",
+          slot: "Weapon",
+          source: "s",
+          bonus: { strength: 10 },
+          derivedFlat: { hp: 50, mp: 25 },
+          derivedPercentBasisPoints: { hp: 1000, mp: 2000 },
+        },
+      ],
+      currentResources: {},
+      turn: 0,
+    }
+    const parsed = characterStateSchema.safeParse(state)
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.equipment[0].derivedFlat).toEqual({ hp: 50, mp: 25 })
+      expect(parsed.data.equipment[0].derivedPercentBasisPoints).toEqual({
+        hp: 1000,
+        mp: 2000,
+      })
+    }
+  })
+
+  it("characterStateSchema accepts a legacy equipment bonus without derived fields", () => {
     const state = {
       baseAttributes: {
         strength: 0,
@@ -1430,5 +1726,197 @@ describe("characterStateSchema experiencePercent validation", () => {
       const state = baseState({ tracks: { class: track } })
       expect(characterStateSchema.safeParse(state).success).toBe(false)
     }
+  })
+})
+
+describe("historicalLevelAwards track literals (legacy permissiveness)", () => {
+  it("accepts a known track literal and preserves it verbatim", () => {
+    const state = {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [
+        {
+          track: "race",
+          level: 1,
+          definitionId: "d",
+          fixed: {
+            strength: 1,
+            agility: 0,
+            endurance: 0,
+            vitality: 0,
+            toughness: 0,
+            wisdom: 0,
+            intelligence: 0,
+            perception: 0,
+            willpower: 0,
+          },
+          free: 0,
+        },
+      ],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [],
+      currentResources: {},
+      turn: 0,
+    }
+    const parsed = characterStateSchema.safeParse(state)
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.historicalLevelAwards[0].track).toBe("race")
+    }
+  })
+
+  it("accepts a genuinely unknown legacy track literal (no parser restriction)", () => {
+    // The engine splits unknown track literals evenly across applicable tracks;
+    // the state schema must not reject such a literal on read.
+    const state = {
+      baseAttributes: {
+        strength: 0,
+        agility: 0,
+        endurance: 0,
+        vitality: 0,
+        toughness: 0,
+        wisdom: 0,
+        intelligence: 0,
+        perception: 0,
+        willpower: 0,
+      },
+      tracks: {},
+      race: { level: 0, grade: "F", mode: "derived" },
+      historicalLevelAwards: [
+        {
+          track: "mystic-path",
+          level: 1,
+          definitionId: "d",
+          fixed: {
+            strength: 1,
+            agility: 0,
+            endurance: 0,
+            vitality: 0,
+            toughness: 0,
+            wisdom: 0,
+            intelligence: 0,
+            perception: 0,
+            willpower: 0,
+          },
+          free: 0,
+        },
+      ],
+      allocations: [],
+      permanentGains: [],
+      activeEffects: [],
+      equipment: [],
+      currentResources: {},
+      turn: 0,
+    }
+    const parsed = characterStateSchema.safeParse(state)
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.historicalLevelAwards[0].track).toBe("mystic-path")
+    }
+  })
+})
+
+describe("itemConfigSchema / normalizeCatalogKind (items catalog kind)", () => {
+  it("accepts an empty item config", () => {
+    expect(itemConfigSchema.safeParse({}).success).toBe(true)
+  })
+
+  it("accepts an item config with optional narrative keys and passes unknown keys through", () => {
+    const parsed = itemConfigSchema.parse({
+      narrative: "A field ration.",
+      description: "Keeps hunger at bay.",
+      grade: "D",
+      // Unknown/legacy keys pass through unchanged (no mandatory mechanical fields).
+      type: "permanent",
+      amount: { strength: 1 },
+      durationQuarters: 3,
+    })
+    expect(parsed).toEqual({
+      narrative: "A field ration.",
+      description: "Keeps hunger at bay.",
+      grade: "D",
+      type: "permanent",
+      amount: { strength: 1 },
+      durationQuarters: 3,
+    })
+  })
+
+  it("rejects a non-object item config", () => {
+    expect(itemConfigSchema.safeParse("not-an-object").success).toBe(false)
+  })
+
+  it("normalizes the legacy `consumables` kind to `items`", () => {
+    expect(normalizeCatalogKind("consumables")).toBe("items")
+    expect(normalizeCatalogKind("items")).toBe("items")
+    expect(normalizeCatalogKind("equipment")).toBe("equipment")
+    expect(normalizeCatalogKind("races")).toBe("races")
+  })
+})
+
+describe("associationSchema (blessing tier requirement)", () => {
+  it("accepts a blessing add with an explicit valid tier", () => {
+    const parsed = associationSchema.safeParse({
+      kind: "blessing",
+      definitionId: "god-1",
+      operation: "add",
+      version: 0,
+      tier: "Minor",
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data).toMatchObject({ kind: "blessing", tier: "Minor" })
+  })
+
+  it("rejects a blessing add that omits the tier", () => {
+    const parsed = associationSchema.safeParse({
+      kind: "blessing",
+      definitionId: "god-1",
+      operation: "add",
+      version: 0,
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a blessing add with an invalid tier value", () => {
+    const parsed = associationSchema.safeParse({
+      kind: "blessing",
+      definitionId: "god-1",
+      operation: "add",
+      version: 0,
+      tier: "minor",
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("accepts a blessing remove without a tier", () => {
+    const parsed = associationSchema.safeParse({
+      kind: "blessing",
+      definitionId: "god-1",
+      operation: "remove",
+      version: 0,
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a non-blessing add without a tier", () => {
+    const parsed = associationSchema.safeParse({
+      kind: "bloodline",
+      definitionId: "blood-1",
+      operation: "add",
+      version: 0,
+    })
+    expect(parsed.success).toBe(true)
   })
 })

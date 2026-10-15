@@ -226,7 +226,7 @@ type CatalogKind =
   | "races"
   | "classes"
   | "professions"
-  | "blessings"
+  | "gods"
   | "bloodlines"
   | "transcendentSkills"
 
@@ -258,7 +258,7 @@ const BASE_CATALOG_URLS = new Set([
   "/api/catalog/professions",
 ])
 const ABILITY_CATALOG_URLS = new Set([
-  "/api/catalog/blessings",
+  "/api/catalog/gods",
   "/api/catalog/bloodlines",
   "/api/catalog/transcendent_skills",
 ])
@@ -267,7 +267,7 @@ const CATALOG_URL_TO_KIND: Record<string, CatalogKind> = {
   "/api/catalog/races": "races",
   "/api/catalog/classes": "classes",
   "/api/catalog/professions": "professions",
-  "/api/catalog/blessings": "blessings",
+  "/api/catalog/gods": "gods",
   "/api/catalog/bloodlines": "bloodlines",
   "/api/catalog/transcendent_skills": "transcendentSkills",
 }
@@ -282,7 +282,7 @@ let catalog: Record<CatalogKind, CatalogItem[]> = {
   races: [],
   classes: [],
   professions: [],
-  blessings: [],
+  gods: [],
   bloodlines: [],
   transcendentSkills: [],
 }
@@ -302,7 +302,7 @@ function setupMock(options: Options) {
     races: options.catalog?.races ?? [],
     classes: options.catalog?.classes ?? [],
     professions: options.catalog?.professions ?? [],
-    blessings: options.catalog?.blessings ?? [],
+    gods: options.catalog?.gods ?? [],
     bloodlines: options.catalog?.bloodlines ?? [],
     transcendentSkills: options.catalog?.transcendentSkills ?? [],
   }
@@ -380,7 +380,7 @@ function putCalls(): string[] {
 function createPostBodies(): Array<{
   name: string
   specialAbilities?: {
-    blessingId?: string | null
+    blessing?: { godId: string; tier: string } | null
     bloodlineIds?: string[]
     transcendentSkillIds?: string[]
   }
@@ -1409,7 +1409,6 @@ describe("CreateCharacterForm special abilities", () => {
     expect(body.data?.special).toBe(false)
     // A legacy boolean never implies a power: the explicit selection is empty.
     expect(body.data?.specialAbilities).toEqual({
-      blessingId: null,
       bloodlineIds: [],
       transcendentSkillIds: [],
     })
@@ -1419,7 +1418,7 @@ describe("CreateCharacterForm special abilities", () => {
     setupMock({
       serverDraft: null,
       catalog: {
-        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        gods: [makeItem("bless-1", { name: "Blessing One" })],
         bloodlines: [
           makeItem("blood-1", { name: "Bloodline One" }),
           makeItem("blood-2", { name: "Bloodline Two" }),
@@ -1443,7 +1442,6 @@ describe("CreateCharacterForm special abilities", () => {
 
     const body = lastDraftPutBody()[0]
     expect(body.data?.specialAbilities).toEqual({
-      blessingId: null,
       bloodlineIds: ["blood-1"],
       transcendentSkillIds: ["trans-1"],
     })
@@ -1455,7 +1453,7 @@ describe("CreateCharacterForm special abilities", () => {
         data: serverData({
           name: "Kael",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: ["blood-1"],
             transcendentSkillIds: ["trans-1"],
           },
@@ -1463,7 +1461,7 @@ describe("CreateCharacterForm special abilities", () => {
         version: 5,
       },
       catalog: {
-        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        gods: [makeItem("bless-1", { name: "Blessing One" })],
         bloodlines: [makeItem("blood-1", { name: "Bloodline One" })],
         transcendentSkills: [makeItem("trans-1", { name: "Transcendent One" })],
       },
@@ -1494,7 +1492,7 @@ describe("CreateCharacterForm special abilities", () => {
           name: "Kael",
           origin: "integrated",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: ["blood-1", "blood-2"],
             transcendentSkillIds: ["trans-1"],
           },
@@ -1504,7 +1502,7 @@ describe("CreateCharacterForm special abilities", () => {
     setupMock({
       serverDraft: null,
       catalog: {
-        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        gods: [makeItem("bless-1", { name: "Blessing One" })],
         bloodlines: [
           makeItem("blood-1", { name: "Bloodline One" }),
           makeItem("blood-2", { name: "Bloodline Two" }),
@@ -1526,7 +1524,7 @@ describe("CreateCharacterForm special abilities", () => {
     expect(createCalls).toBe(1)
     const post = createPostBodies()[0]
     expect(post.specialAbilities).toEqual({
-      blessingId: "bless-1",
+      blessing: { godId: "bless-1", tier: "Minor" },
       bloodlineIds: ["blood-1"],
       transcendentSkillIds: ["trans-1"],
     })
@@ -1539,7 +1537,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: [],
             transcendentSkillIds: [],
           },
@@ -1549,9 +1547,7 @@ describe("CreateCharacterForm special abilities", () => {
     setupMock({
       serverDraft: null,
       catalog: {
-        blessings: [
-          makeItem("bless-1", { name: "Blessing One", archived: true }),
-        ],
+        gods: [makeItem("bless-1", { name: "Blessing One", archived: true })],
       },
       putResult: { data: serverData({ name: "Kael" }), version: 1 },
     })
@@ -1578,7 +1574,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: ["blood-1", "blood-2"],
             transcendentSkillIds: [],
           },
@@ -1622,7 +1618,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: ["orphan-1"],
             transcendentSkillIds: [],
           },
@@ -1675,7 +1671,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: selected,
             transcendentSkillIds: [],
           },
@@ -1710,7 +1706,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: [],
             transcendentSkillIds: [],
           },
@@ -1720,7 +1716,7 @@ describe("CreateCharacterForm special abilities", () => {
     setupMock({
       serverDraft: null,
       catalog: {
-        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        gods: [makeItem("bless-1", { name: "Blessing One" })],
       },
       abilityCatalogError: new Error("network down"),
       putResult: { data: serverData({ name: "Kael" }), version: 1 },
@@ -1774,7 +1770,7 @@ describe("CreateCharacterForm special abilities", () => {
           localDraft({
             name: "Cap test",
             specialAbilities: {
-              blessingId: null,
+              blessing: null,
               bloodlineIds: [],
               transcendentSkillIds: selectedIds,
             },
@@ -1812,7 +1808,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Cap test",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: [],
             transcendentSkillIds: ["trans-1"],
           },
@@ -1854,7 +1850,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Over cap",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: [],
             transcendentSkillIds: ["t1", "t2", "t3", "t4"],
           },
@@ -1946,7 +1942,6 @@ describe("CreateCharacterForm special abilities", () => {
     expect(createCalls).toBe(1)
     const post = createPostBodies()[0]
     expect(post.specialAbilities).toEqual({
-      blessingId: null,
       bloodlineIds: [],
       transcendentSkillIds: [],
     })
@@ -1959,7 +1954,7 @@ describe("CreateCharacterForm special abilities", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: [],
             transcendentSkillIds: [],
           },
@@ -1971,7 +1966,7 @@ describe("CreateCharacterForm special abilities", () => {
         data: serverData({
           name: "Kael",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: [],
             transcendentSkillIds: [],
           },
@@ -1988,8 +1983,11 @@ describe("CreateCharacterForm special abilities", () => {
     expect(screen.getByText(/Use device draft/)).toBeTruthy()
     const raw = window.localStorage.getItem(RECOVERY_KEY)
     expect(raw).not.toBeNull()
-    expect(JSON.parse(raw as string).specialAbilities.blessingId).toBe(
+    expect(JSON.parse(raw as string).specialAbilities.blessing.godId).toBe(
       "bless-1"
+    )
+    expect(JSON.parse(raw as string).specialAbilities.blessing.tier).toBe(
+      "Minor"
     )
   })
 })
@@ -2003,7 +2001,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
           name: "Kael",
           nickname: "Kit",
           specialAbilities: {
-            blessingId: null,
+            blessing: null,
             bloodlineIds: "not-an-array",
             transcendentSkillIds: null,
           },
@@ -2031,7 +2029,6 @@ describe("CreateCharacterForm legacy draft normalization", () => {
 
     expect(createCalls).toBe(1)
     expect(createPostBodies()[0].specialAbilities).toEqual({
-      blessingId: null,
       bloodlineIds: [],
       transcendentSkillIds: [],
     })
@@ -2048,7 +2045,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
         localDraft({
           name: "Kael",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: ["blood-1", 42, null],
             transcendentSkillIds: null,
           },
@@ -2058,7 +2055,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
     setupMock({
       serverDraft: null,
       catalog: {
-        blessings: [makeItem("bless-1")],
+        gods: [makeItem("bless-1")],
         bloodlines: [makeItem("blood-1")],
       },
       putResult: { data: serverData({ name: "Kael" }), version: 1 },
@@ -2084,7 +2081,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
     expect(putCalls()).toEqual(["/api/drafts"])
     const putBody = lastDraftPutBody()[0]
     expect(putBody.data?.specialAbilities).toEqual({
-      blessingId: "bless-1",
+      blessing: { godId: "bless-1", tier: "Minor" },
       bloodlineIds: ["blood-1"],
       transcendentSkillIds: [],
     })
@@ -2101,7 +2098,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
         localDraft({
           name: "RecoverMe",
           specialAbilities: {
-            blessingId: "bless-1",
+            blessing: { godId: "bless-1", tier: "Minor" },
             bloodlineIds: [],
             transcendentSkillIds: [],
           },
@@ -2112,7 +2109,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
       serverDraft: null,
       catalog: {
         races: [makeItem("r1")],
-        blessings: [makeItem("bless-1", { name: "Blessing One" })],
+        gods: [makeItem("bless-1", { name: "Blessing One" })],
       },
       putResult: { data: serverData({ name: "RecoverMe" }), version: 2 },
     })
@@ -2135,7 +2132,7 @@ describe("CreateCharacterForm legacy draft normalization", () => {
     const bodies = lastDraftPutBody()
     const putBody = bodies[bodies.length - 1]
     expect(putBody.data?.specialAbilities).toEqual({
-      blessingId: "bless-1",
+      blessing: { godId: "bless-1", tier: "Minor" },
       bloodlineIds: [],
       transcendentSkillIds: [],
     })
@@ -2146,6 +2143,45 @@ describe("CreateCharacterForm legacy draft normalization", () => {
 })
 
 describe("CreateCharacterForm special step None choice", () => {
+  it("allows changing the selected god's tier and clearing the selection", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        localDraft({
+          step: "special",
+          name: "Kael",
+          origin: "integrated",
+          specialAbilities: {
+            blessing: { godId: "god-viper", tier: "Minor" },
+            bloodlineIds: [],
+            transcendentSkillIds: [],
+          },
+        })
+      )
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        gods: [makeItem("god-viper", { name: "The Malefic Viper" })],
+      },
+    })
+
+    await renderForm()
+    await flush()
+
+    const tier = screen.getByLabelText("Blessing tier") as HTMLSelectElement
+    fireEvent.change(tier, { target: { value: "True" } })
+    expect(tier.value).toBe("True")
+
+    fireEvent.click(
+      within(screen.getByRole("region", { name: "Blessings" })).getByRole(
+        "radio",
+        { name: "None" }
+      )
+    )
+    expect(screen.queryByLabelText("Blessing tier")).toBeNull()
+  })
+
   it("renders the blessing None choice even when the ability catalogs fail", async () => {
     setupMock({
       serverDraft: null,

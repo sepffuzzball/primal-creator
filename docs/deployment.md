@@ -91,6 +91,24 @@ Run these **before** `docker compose up -d` if you want the first boot to be
 immediately usable, or after once; the app serves regardless because it never
 auto-migrates.
 
+#### Destructive migrations (backup first)
+
+Migrations **0017, 0018 and 0019** form an irreversible destructive chain. In
+particular, `0019_god_blessing_tiers` **deletes every existing BLESSING
+association** and all `blessings` catalog rows (and drops the `patronId`
+column), then adds a database CHECK constraint that forbids a null-tier BLESSING
+link. The deleted blessing links cannot be recovered from the post-migration
+database, so before running `pnpm db:migrate` on a database that already has
+characters, **take a full PostgreSQL backup**:
+
+```bash
+docker compose exec postgres pg_dump -U postgres primal_creator > backup-before-0017.sql
+```
+
+If a character's blessing links must be preserved, restore from that backup
+recreates the `blessings` catalog rows and the old BLESSING links, and someone
+must re-link each god + tier manually afterward. See `docs/rules/blessings.md`.
+
 ## 2. Health checks
 
 - The **app** image has a container `HEALTHCHECK` (and a Compose override) that

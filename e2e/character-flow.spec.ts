@@ -51,6 +51,26 @@ async function choose(page: Page, label: RegExp): Promise<void> {
 }
 
 /**
+ * Wait for a dynamically-loaded questionnaire radio (a catalog option) to be
+ * visible.
+ *
+ * The race/class/blessing/bloodline choices are fetched from the API only after
+ * the wizard step renders. On a cold `next dev --webpack` compile the route can
+ * spend tens of seconds compiling before the option ever exists (the first run
+ * of this suite failed at the default 10s expect timeout waiting for the Human
+ * radio after Born, while a warm run passed instantly). The global expect
+ * timeout (10s) is therefore too short here: give these catalog options the
+ * same generous 45s budget as the hydration wait. This is a targeted
+ * per-assertion timeout, not a global expect-timeout change, and it still fails
+ * loudly (hard assertion) if the catalog never loads.
+ */
+async function waitForCatalogOption(page: Page, label: RegExp): Promise<void> {
+  await expect(page.getByRole("radio", { name: label })).toBeVisible({
+    timeout: 45_000,
+  })
+}
+
+/**
  * Wait until React has hydrated the current page. `next dev` is slow to
  * compile/hydrate on a cold start (and does so after the `load` event), so
  * interacting before hydration causes browsers to submit the login form with
@@ -76,6 +96,13 @@ async function waitForHydrated(page: Page): Promise<void> {
 
 test.describe("character lifecycle", () => {
   test("login, create, progress, allocate, archive", async ({ page }) => {
+    // A cold `next dev --webpack` compile can take tens of seconds per route on
+    // the first hit, and the catalogue/hydration waits below budget up to 45s
+    // each. The global 120s test timeout is only intended for warm runs, so
+    // extend it for THIS lifecycle test only (not globally) to absorb a cold
+    // compile. See waitForCatalogOption/waitForHydrated.
+    test.setTimeout(180_000)
+
     // ------------------------------------------------------------------ //
     // QuestionnairePrimitive registry guard.
     //
@@ -184,7 +211,7 @@ test.describe("character lifecycle", () => {
     // the entries and a second run observes createCount=0 and takes the
     // idempotent skip path.
     // ------------------------------------------------------------------ //
-    await page.goto("/catalog/blessings")
+    await page.goto("/catalog/gods")
     await waitForHydrated(page)
 
     // Preview to decide whether to apply. The preview endpoint is admin-only
@@ -247,17 +274,15 @@ test.describe("character lifecycle", () => {
       page.getByRole("button", { name: "Import reviewed wiki entries" })
     ).toBeVisible()
 
-    const blessingCatalog = await page.request.get("/api/catalog/blessings")
+    const blessingCatalog = await page.request.get("/api/catalog/gods")
     expect(blessingCatalog.ok()).toBeTruthy()
     const blessings = (await blessingCatalog.json()) as {
       kind: string
-      items: Array<{ name: string }>
+      items: Array<{ id: string; name: string }>
     }
-    expect(blessings.kind).toBe("blessings")
+    expect(blessings.kind).toBe("gods")
     expect(
-      blessings.items.some(
-        (b) => b.name === "True Blessing of the Malefic Viper"
-      )
+      blessings.items.some((b) => b.name === "The Malefic Viper")
     ).toBeTruthy()
 
     const bloodlineCatalog = await page.request.get("/api/catalog/bloodlines")
@@ -331,12 +356,16 @@ test.describe("character lifecycle", () => {
     await next(page)
 
     // Step 4 - race: Human. Wait for the catalog to load so the choice exists.
-    await expect(page.getByRole("radio", { name: /^Human\b/i })).toBeVisible()
+    // The race catalog is fetched dynamically, so a cold compile may take tens of
+    // seconds before the radio exists - wait with the same 45s budget as the
+    // hydration wait rather than the 10s global expect timeout.
+    await waitForCatalogOption(page, /^Human\b/i)
     await choose(page, /^Human\b/i)
     await next(page)
 
-    // Step 5 - class: Archer.
-    await expect(page.getByRole("radio", { name: /^Archer\b/i })).toBeVisible()
+    // Step 5 - class: Archer. Dynamically loaded from the class catalog; see the
+    // race step above for why this needs the generous 45s catalog wait.
+    await waitForCatalogOption(page, /^Archer\b/i)
     await choose(page, /^Archer\b/i)
     await next(page)
 
@@ -344,20 +373,20 @@ test.describe("character lifecycle", () => {
     await choose(page, /^None\b/i)
     await next(page)
 
-    // Step 7 - special abilities. The curated wiki manifest ships a blessing
-    // (True Blessing of the Malefic Viper) and a bloodline (Bloodline of the
+    // Step 7 - special abilities. The gods catalog offers The Malefic Viper and
+    // the bloodline catalog offers Bloodline of the
     // Primal Hunter) but no transcendent skill, so select the blessing +
     // bloodline and leave the transcendent section unselected. The wizard's
     // bloodline picker is a single-select radio group (a character may carry at
     // most one bloodline link), so it is chosen with the same `choose` radio
     // helper as the race/class/profession steps, never checked as a checkbox.
-    await expect(
-      page.getByRole("radio", { name: /True Blessing of the Malefic Viper/ })
-    ).toBeVisible()
-    await choose(page, /True Blessing of the Malefic Viper/)
-    await expect(
-      page.getByRole("radio", { name: /Bloodline of the Primal Hunter/ })
-    ).toBeVisible()
+    // These blessing/bloodline options are dynamically loaded from the gods and
+    // bloodline catalogs, so they need the same generous 45s catalog wait as the
+    // race/class steps.
+    await waitForCatalogOption(page, /The Malefic Viper/)
+    await choose(page, /The Malefic Viper/)
+    await page.getByLabel("Blessing tier").selectOption("True")
+    await waitForCatalogOption(page, /Bloodline of the Primal Hunter/)
     await choose(page, /Bloodline of the Primal Hunter/)
     await next(page)
 
@@ -417,13 +446,16 @@ ${missingItemWarnings.join("\n")}`
     expect(detailRes.ok()).toBeTruthy()
     const detail = (await detailRes.json()) as {
       character: {
-        associations: Array<{ kind: string; name: string }>
+        associations: Array<{ kind: string; name: string; tier?: string }>
       }
     }
     const assocKeys = detail.character.associations.map(
       (a) => `${a.kind}:${a.name}`
     )
-    expect(assocKeys).toContain("blessing:True Blessing of the Malefic Viper")
+    expect(assocKeys).toContain("blessing:The Malefic Viper")
+    expect(
+      detail.character.associations.find((a) => a.kind === "blessing")?.tier
+    ).toBe("True")
     expect(assocKeys).toContain("bloodline:Bloodline of the Primal Hunter")
 
     // The wizard's final create step atomically consumes the resumable draft,
@@ -446,12 +478,15 @@ ${missingItemWarnings.join("\n")}`
     expect(createEvent).toBeTruthy()
     const special = createEvent?.payload.specialAbilities as
       | {
-          blessing: { name: string } | null
+          blessing: { name: string; tier: string } | null
           bloodlines: Array<{ name: string }>
         }
       | undefined
     expect(special).toBeTruthy()
-    expect(special?.blessing?.name).toBe("True Blessing of the Malefic Viper")
+    expect(special?.blessing).toMatchObject({
+      name: "The Malefic Viper",
+      tier: "True",
+    })
     expect(
       special?.bloodlines.some(
         (b) => b.name === "Bloodline of the Primal Hunter"
@@ -518,7 +553,7 @@ ${missingItemWarnings.join("\n")}`
     // ------------------------------------------------------------------ //
     // Allocate one attribute point.
     // ------------------------------------------------------------------ //
-    await page.getByRole("tab", { name: "Attributes" }).click()
+    await page.getByRole("tab", { name: "Stats" }).click()
 
     // Level-up awarded the class free point (Archer F gives 1 free point).
     await expect(page.getByText("Available points: 1").first()).toBeVisible()

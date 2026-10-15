@@ -30,15 +30,15 @@
  *   - `sourceUrl` is optional but, when supplied, must be an https URL that names
  *     a host (an `http:` or hostless value is rejected).
  *   - No automatic granting to characters: the importer only creates catalog rows;
- *     it never touches character associations.
- *
- * Patron-god rules (blessings only, only for entries that would be CREATED; a
- * skip-existing blessing needs no revalidation):
- *   - A would-create blessing's `config.patronGodStableId` must resolve to a valid
- *     UNARCHIVED existing god OR to a god that would be created by the SAME upload
- *     (regardless of row order).
- *   - If a god stableId exists archived and the batch does not recreate it, the
- *     referencing blessing is rejected.
+ *     it never touches character associations. Blessings are no longer a catalog
+ *     kind (a god + tier now lives on character associations), so no patron-god
+ *     resolution is needed and row order is irrelevant.
+ *   - An equipment config that names a divine patron (`requiredGodStableId`)
+ *     must reference a god that will exist unarchived after the upload: either an
+ *     existing unarchived god row, or a god created by this same upload. A
+ *     dangling or archived patron (including a god that the upload lists but that
+ *     already exists archived, so it is skipped) is rejected with a 400
+ *     `invalid_config` on both preview and apply, before any write.
  *
  * Validation uses `catalogCreateSchema` + `parseCatalogConfig` +
  * `assertModernConfig` (the same modern-shape guards the service layer applies on
@@ -62,6 +62,7 @@ import {
   catalogKindSchema,
   gradeDescriptionsSchema,
   gradeSchema,
+  normalizeCatalogKind,
   parseCatalogConfig,
 } from "@/lib/server/schemas"
 import { assertModernConfig, type CatalogKind } from "@/lib/db/catalog-import"
@@ -375,7 +376,9 @@ function requireRecord(value: unknown, row: number): Record<string, unknown> {
 
 function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
   const row = raw.row
-  const kind = requireString(raw.kind, row, "kind")
+  // Accept the legacy `consumables` kind as an alias for `items`; the legacy value
+  // is never persisted (create/write always uses the canonical `items` kind).
+  const kind = normalizeCatalogKind(requireString(raw.kind, row, "kind"))
   if (!catalogKindSchema.safeParse(kind).success) {
     throw badRequest(
       "invalid_kind",
@@ -869,62 +872,6 @@ function toExistingRow(row: ExistingCatalogRowSource): BulkImportExistingRow {
 }
 
 // ------------------------------------------------------------------ //
-// Patron-god validation
-// ------------------------------------------------------------------ //
-
-/**
- * Assert that a would-create blessing's patron god is acceptable. A god already
- * created by the SAME upload is always acceptable (it will be unarchived when
- * created). Otherwise the god must exist in the live catalog, be unarchived, and
- * NOT be skipped by the batch (a batch-skipped archived god is rejected).
- */
-function assertBulkPatronGod(
-  byKey: Map<string, BulkImportExistingRow>,
-  wouldCreateGodKeys: Set<string>,
-  stableId: string,
-  row: number
-): void {
-  if (wouldCreateGodKeys.has(keyOf("gods", stableId))) return
-  const god = byKey.get(keyOf("gods", stableId))
-  if (!god) {
-    throw badRequest(
-      "patron_god_not_found",
-      `Bulk row ${row}: patron god "${stableId}" is not in the catalog`
-    )
-  }
-  if (god.archived) {
-    throw badRequest(
-      "patron_god_archived",
-      `Bulk row ${row}: patron god "${god.name}" is archived; unarchive it before granting its blessing`
-    )
-  }
-}
-
-/**
- * Resolve the `patronId` FK for a would-create blessing, after gods have been
- * inserted first. A batch-created patron god resolves through `createdByKey`;
- * an existing unarchived patron god resolves through `byKey`.
- */
-async function blessingPatronData(
-  tx: Prisma.TransactionClient,
-  entry: BulkCatalogEntry,
-  createdByKey: Map<string, string>,
-  byKey: Map<string, BulkImportExistingRow>
-): Promise<{ patronId?: string | null }> {
-  if (entry.kind !== "blessings") return {}
-  const config = entry.config as Record<string, unknown>
-  const stableId = config.patronGodStableId
-  if (typeof stableId !== "string" || stableId.length === 0) {
-    return { patronId: null }
-  }
-  const key = keyOf("gods", stableId)
-  const createdId = createdByKey.get(key)
-  if (createdId != null) return { patronId: createdId }
-  const god = byKey.get(key)
-  return { patronId: god ? god.id : null }
-}
-
-// ------------------------------------------------------------------ //
 // Preview / apply
 // ------------------------------------------------------------------ //
 
@@ -937,39 +884,66 @@ function computeStatuses(
   )
 }
 
-function collectWouldCreateGodKeys(
+/**
+ * Verify that every equipment entry's divine-patron reference
+ * (`requiredGodStableId`) resolves to a god that will exist unarchived after the
+ * upload: either an existing unarchived god row, or a god created by this same
+ * upload (import always creates rows with `archived: false`). A dangling or
+ * archived patron would render the item permanently ineligible, so it is
+ * rejected up front before any write. No-op when the entry is not equipment or
+ * names no patron.
+ */
+function assertBulkEquipmentGodRefs(
   entries: readonly BulkCatalogEntry[],
-  statuses: ReadonlyArray<"create" | "skip_existing">
-): Set<string> {
-  const keys = new Set<string>()
-  entries.forEach((entry, i) => {
-    if (entry.kind === "gods" && statuses[i] === "create") {
-      keys.add(keyOf("gods", entry.stableId))
+  unarchivedGodStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (entry.kind !== "equipment") continue
+    const godStableId = entry.config.requiredGodStableId
+    if (typeof godStableId !== "string" || godStableId.length === 0) continue
+    if (!unarchivedGodStableIds.has(godStableId)) {
+      throw badRequest(
+        "invalid_config",
+        `Bulk row ${entry.row}: equipment entry requires divine patron "${godStableId}" which is neither an unarchived catalog god nor a god created by this upload`
+      )
     }
-  })
-  return keys
+  }
 }
 
-function validateCreateBlessingPatrons(
+/**
+ * Verify that every equipment entry's granted-passive-skill reference
+ * (`grantedSkillStableIds`) resolves to a skill that will exist unarchived after
+ * the upload: either an existing unarchived skill row, or a skill created by this
+ * same upload (import always creates rows with `archived: false`). A dangling or
+ * archived skill would render the granted passive permanently inert, so it is
+ * rejected up front before any write. No-op when the entry is not equipment or
+ * grants no skill.
+ */
+function assertBulkEquipmentSkillRefs(
   entries: readonly BulkCatalogEntry[],
-  statuses: ReadonlyArray<"create" | "skip_existing">,
-  byKey: Map<string, BulkImportExistingRow>,
-  wouldCreateGodKeys: Set<string>
+  unarchivedSkillStableIds: ReadonlySet<string>
 ): void {
-  entries.forEach((entry, i) => {
-    if (entry.kind !== "blessings" || statuses[i] !== "create") return
-    const config = entry.config as Record<string, unknown>
-    const godStableId = config.patronGodStableId
-    if (typeof godStableId !== "string" || godStableId.length === 0) return
-    assertBulkPatronGod(byKey, wouldCreateGodKeys, godStableId, entry.row)
-  })
+  for (const entry of entries) {
+    if (entry.kind !== "equipment") continue
+    const granted = entry.config.grantedSkillStableIds
+    if (!Array.isArray(granted) || granted.length === 0) continue
+    for (const stableId of granted) {
+      if (typeof stableId !== "string" || stableId.length === 0) continue
+      if (!unarchivedSkillStableIds.has(stableId)) {
+        throw badRequest(
+          "invalid_config",
+          `Bulk row ${entry.row}: equipment entry grants skill "${stableId}" which is neither an unarchived catalog skill nor a skill created by this upload`
+        )
+      }
+    }
+  }
 }
 
 /**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row occupies that (kind, stableId)
  * yet) or `skip_existing` (a row already occupies the key, so it is never
- * overwritten). Would-create blessings' patron gods are validated here.
+ * overwritten).
  */
 export async function previewBulkImport(
   entries: readonly BulkCatalogEntry[],
@@ -979,9 +953,38 @@ export async function previewBulkImport(
   const byKey = new Map<string, BulkImportExistingRow>(
     rows.map((row) => [keyOf(row.kind, row.stableId), toExistingRow(row)])
   )
-  const statuses = computeStatuses(entries, byKey)
-  const wouldCreateGodKeys = collectWouldCreateGodKeys(entries, statuses)
-  validateCreateBlessingPatrons(entries, statuses, byKey, wouldCreateGodKeys)
+  const unarchivedGods = new Set(
+    rows.filter((r) => r.kind === "gods" && !r.archived).map((r) => r.stableId)
+  )
+  // Only an upload god whose (kind, stableId) key is ABSENT from the existing
+  // catalog is treated as newly unarchived. A god that already exists - even
+  // archived - is skipped (existing rows are never overwritten), so it keeps its
+  // current archived state and must NOT satisfy an equipment patron reference.
+  for (const entry of entries) {
+    if (entry.kind === "gods" && !byKey.has(keyOf("gods", entry.stableId))) {
+      unarchivedGods.add(entry.stableId)
+    }
+  }
+  // Only an upload skill whose (kind, stableId) key is ABSENT from the existing
+  // catalog is treated as newly unarchived. A skill that already exists - even
+  // archived - is skipped (existing rows are never overwritten), so it keeps its
+  // current archived state and must NOT satisfy an equipment granted-skill
+  // reference.
+  const unarchivedSkillStableIds = new Set(
+    rows
+      .filter((r) => r.kind === "skills" && !r.archived)
+      .map((r) => r.stableId)
+  )
+  for (const entry of entries) {
+    if (
+      entry.kind === "skills" &&
+      !byKey.has(keyOf("skills", entry.stableId))
+    ) {
+      unarchivedSkillStableIds.add(entry.stableId)
+    }
+  }
+  assertBulkEquipmentGodRefs(entries, unarchivedGods)
+  assertBulkEquipmentSkillRefs(entries, unarchivedSkillStableIds)
 
   let createCount = 0
   let skipCount = 0
@@ -1014,9 +1017,7 @@ export async function previewBulkImport(
 
 /**
  * Apply the upload: validate every entry, then create every MISSING row in ONE
- * SERIALIZABLE transaction, re-checking existence inside the transaction. Gods
- * are created first, then all other kinds, so a blessing that names a god created
- * by the same upload can resolve its patron FK regardless of row order. Existing
+ * SERIALIZABLE transaction, re-checking existence inside the transaction. Existing
  * rows are never touched. On a P2002 / P2034 conflict from a concurrent import
  * the whole transaction is rolled back and a 409 is returned; the next retry is
  * idempotent.
@@ -1033,27 +1034,51 @@ export async function applyBulkImport(
           rows.map((row) => [keyOf(row.kind, row.stableId), toExistingRow(row)])
         )
         const statuses = computeStatuses(entries, byKey)
-        const wouldCreateGodKeys = collectWouldCreateGodKeys(entries, statuses)
-        // Revalidate patrons before any write so a failure rolls back nothing.
-        validateCreateBlessingPatrons(
-          entries,
-          statuses,
-          byKey,
-          wouldCreateGodKeys
+        const unarchivedGods = new Set(
+          rows
+            .filter((r) => r.kind === "gods" && !r.archived)
+            .map((r) => r.stableId)
         )
+        // Only an upload god whose (kind, stableId) key is ABSENT from the
+        // existing catalog is treated as newly unarchived. A god that already
+        // exists - even archived - is skipped (existing rows are never
+        // overwritten), so it keeps its current archived state and must NOT
+        // satisfy an equipment patron reference. Recomputed INSIDE the
+        // serializable transaction so an apply never trusts a stale preview.
+        for (const entry of entries) {
+          if (
+            entry.kind === "gods" &&
+            !byKey.has(keyOf("gods", entry.stableId))
+          ) {
+            unarchivedGods.add(entry.stableId)
+          }
+        }
+        // Only an upload skill whose (kind, stableId) key is ABSENT from the
+        // existing catalog is treated as newly unarchived. A skill that already
+        // exists - even archived - is skipped (existing rows are never
+        // overwritten), so it keeps its current archived state and must NOT
+        // satisfy an equipment granted-skill reference. Recomputed INSIDE the
+        // serializable transaction so an apply never trusts a stale preview.
+        const unarchivedSkillStableIds = new Set(
+          rows
+            .filter((r) => r.kind === "skills" && !r.archived)
+            .map((r) => r.stableId)
+        )
+        for (const entry of entries) {
+          if (
+            entry.kind === "skills" &&
+            !byKey.has(keyOf("skills", entry.stableId))
+          ) {
+            unarchivedSkillStableIds.add(entry.stableId)
+          }
+        }
+        assertBulkEquipmentGodRefs(entries, unarchivedGods)
+        assertBulkEquipmentSkillRefs(entries, unarchivedSkillStableIds)
 
         const creationOrder = entries
           .map((entry, index) => ({ entry, index }))
           .filter((item) => statuses[item.index] === "create")
-        // Gods first (so a blessing patron FK can resolve against a batch-created
-        // god), then every other kind.
-        creationOrder.sort((a, b) => {
-          const ag = a.entry.kind === "gods" ? 0 : 1
-          const bg = b.entry.kind === "gods" ? 0 : 1
-          return ag - bg
-        })
 
-        const createdByKey = new Map<string, string>()
         const createdIds: string[] = []
         for (const { entry } of creationOrder) {
           const row = await tx.catalogDefinition.create({
@@ -1068,10 +1093,8 @@ export async function applyBulkImport(
               config: entry.config as Prisma.InputJsonValue,
               gradeDescriptions:
                 entry.gradeDescriptions as Prisma.InputJsonValue,
-              ...(await blessingPatronData(tx, entry, createdByKey, byKey)),
             },
           })
-          createdByKey.set(keyOf(entry.kind, entry.stableId), row.id)
           createdIds.push(row.id)
         }
 

@@ -108,6 +108,33 @@ the way a class/profession quarter is consumed:
 See `docs/rules/races.md` for the `raceType` split that decides which path a race
 takes.
 
+## Grade ceiling level-up blockers (read-only)
+
+The progression engine never mutates state on a read, and neither do the read-only
+blocker helpers `gradeLevelUpBlockReason(state, track, config)` and
+`gradeLevelUpBlockers(state, config)` exported from `lib/rules/progression.ts`.
+They mirror the engine's actual grade gates exactly - a level-up may reach exactly
+the entry level of the NEXT grade but may not push past it until the caller evolves
+the grade - so a client can show which `+Level` buttons are disabled by the
+authoritative current grade ceiling without re-deriving the rule.
+
+- A **monster** (independent race) exposes only the `race` key, gated by the race's
+  own level against the next race grade band's entry level.
+- An **enlightened** (derived) race exposes only `class` and `profession`. The
+  derived race gate is evaluated FIRST using the projected race level after the
+  hypothetical track level-up (the same `raceDerivationStrategy` the engine uses),
+  and is reported before any per-track ceiling. A track carries a track-grade
+  ceiling only when it is explicitly graded; a legacy ungraded track never does. A
+  derived race's level is the symmetric average of its tracks, so a class and a
+  profession level-up no longer block independently - they project the same race
+  level and are both blocked when it crosses the ceiling.
+
+The service exposes this on `CharacterDetail.levelUpBlocked` (a
+`Partial<Record<"race" | "class" | "profession", string>>`, present only for a
+track a level-up actually blocks). It is computed in the detail read from the
+stored state and current rules config - no second query and no mutation - so it is
+always authoritative against the same grade table the progression engine runs.
+
 ## Authoritative EXP percentage (quarter cadence replaced)
 
 The quarter index is no longer the primary progression input for new/modernized

@@ -3,7 +3,10 @@ import {
   characterImportDocumentSchema,
   IMPORT_RULESET_VERSION,
   IMPORT_SCHEMA_V3,
+  IMPORT_SCHEMA_V4,
+  IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
+  IMPORT_SCHEMA_V7,
 } from "@/lib/server/import-schema"
 
 /**
@@ -46,7 +49,10 @@ const identity = {
 }
 
 function baseDoc(
-  schema: typeof IMPORT_SCHEMA_V3 | typeof IMPORT_SCHEMA_V6,
+  schema:
+    | typeof IMPORT_SCHEMA_V3
+    | typeof IMPORT_SCHEMA_V6
+    | typeof IMPORT_SCHEMA_V7,
   skillOffers: unknown[]
 ): Record<string, unknown> {
   const doc: Record<string, unknown> = {
@@ -60,7 +66,8 @@ function baseDoc(
     associations: [],
     skillOffers,
   }
-  if (schema === IMPORT_SCHEMA_V6) doc.inventory = []
+  if (schema === IMPORT_SCHEMA_V6 || schema === IMPORT_SCHEMA_V7)
+    doc.inventory = []
   return doc
 }
 
@@ -224,4 +231,230 @@ describe("import document skill-offer canceledAt validation", () => {
       expect(parsed.success).toBe(false)
     }
   )
+})
+
+describe("import document inventory kind normalization", () => {
+  it.each([IMPORT_SCHEMA_V4, IMPORT_SCHEMA_V5, IMPORT_SCHEMA_V6])(
+    "normalizes a legacy inventory `consumables` kind to `items` (schema %s)",
+    (schema) => {
+      const parsed = characterImportDocumentSchema.safeParse({
+        schema,
+        rulesetVersion: IMPORT_RULESET_VERSION,
+        identity,
+        state,
+        liveState: {},
+        status: {},
+        events: [],
+        associations: [],
+        skillOffers: [],
+        inventory: [
+          {
+            definition: { kind: "consumables", stableId: "ration-1" },
+            quantity: 3,
+          },
+        ],
+      })
+      expect(parsed.success).toBe(true)
+      if (parsed.success) {
+        const doc = parsed.data as {
+          schema:
+            | typeof IMPORT_SCHEMA_V4
+            | typeof IMPORT_SCHEMA_V5
+            | typeof IMPORT_SCHEMA_V6
+          inventory: Array<{
+            definition: { kind: string; stableId: string }
+            quantity: number
+          }>
+        }
+        expect(doc.inventory[0].definition.kind).toBe("items")
+      }
+    }
+  )
+
+  it("keeps an `items` inventory kind unchanged", () => {
+    const parsed = characterImportDocumentSchema.safeParse({
+      schema: IMPORT_SCHEMA_V6,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity,
+      state,
+      liveState: {},
+      status: {},
+      events: [],
+      associations: [],
+      skillOffers: [],
+      inventory: [
+        {
+          definition: { kind: "items", stableId: "ration-1" },
+          quantity: 3,
+        },
+      ],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      const doc = parsed.data as {
+        schema: typeof IMPORT_SCHEMA_V6
+        inventory: Array<{
+          definition: { kind: string; stableId: string }
+          quantity: number
+        }>
+      }
+      expect(doc.inventory[0].definition.kind).toBe("items")
+    }
+  })
+})
+
+describe("import document v7 blessing association / inventory", () => {
+  function v7Doc(overrides: {
+    associations?: unknown[]
+    inventory?: unknown[]
+  }): Record<string, unknown> {
+    return {
+      schema: IMPORT_SCHEMA_V7,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity,
+      state,
+      liveState: {},
+      status: {},
+      events: [],
+      associations: overrides.associations ?? [],
+      skillOffers: [],
+      inventory: overrides.inventory ?? [],
+    }
+  }
+
+  it("accepts a v7 blessing association referencing a gods definition with a valid tier", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v7Doc({
+        associations: [
+          {
+            kind: "blessing",
+            definition: { kind: "gods", stableId: "the-malefic-viper" },
+            tier: "True",
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects a v7 blessing association whose definition is not a gods kind", () => {
+    // A stale legacy `blessings` kind is rejected at the schema boundary.
+    const parsed = characterImportDocumentSchema.safeParse(
+      v7Doc({
+        associations: [
+          {
+            kind: "blessing",
+            definition: { kind: "blessings", stableId: "true-blessing" },
+            tier: "Minor",
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a v7 blessing association with a missing tier", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v7Doc({
+        associations: [
+          {
+            kind: "blessing",
+            definition: { kind: "gods", stableId: "the-malefic-viper" },
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a v7 blessing association with an invalid tier", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v7Doc({
+        associations: [
+          {
+            kind: "blessing",
+            definition: { kind: "gods", stableId: "the-malefic-viper" },
+            tier: "minor",
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a v7 inventory `consumables` kind (not normalized)", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v7Doc({
+        inventory: [
+          {
+            definition: { kind: "consumables", stableId: "ration-1" },
+            quantity: 3,
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("accepts a v7 inventory with equipment/items kinds only", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v7Doc({
+        inventory: [
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 1,
+          },
+          {
+            definition: { kind: "items", stableId: "ration-1" },
+            quantity: 3,
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(true)
+  })
+})
+
+describe("import document state equipment derived bonuses", () => {
+  it("round-trips an equipment bonus carrying derivedFlat / derivedPercentBasisPoints", () => {
+    const withEquipment = {
+      ...state,
+      equipment: [
+        {
+          id: "gear-1",
+          name: "Sword",
+          slot: "Weapon",
+          source: "s",
+          bonus: { strength: 10 },
+          derivedFlat: { hp: 50, mp: 25 },
+          derivedPercentBasisPoints: { hp: 1000, mp: 2000 },
+        },
+      ],
+    }
+    const doc = {
+      schema: IMPORT_SCHEMA_V6,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity,
+      state: withEquipment,
+      liveState: {},
+      status: {},
+      events: [],
+      associations: [],
+      skillOffers: [],
+      inventory: [],
+    }
+    const parsed = characterImportDocumentSchema.safeParse(doc)
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      const equipment = parsed.data.state.equipment as Array<{
+        derivedFlat?: Record<string, number>
+        derivedPercentBasisPoints?: Record<string, number>
+      }>
+      expect(equipment[0].derivedFlat).toEqual({ hp: 50, mp: 25 })
+      expect(equipment[0].derivedPercentBasisPoints).toEqual({
+        hp: 1000,
+        mp: 2000,
+      })
+    }
+  })
 })

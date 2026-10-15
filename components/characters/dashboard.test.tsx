@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest"
-import { render, screen } from "@testing-library/react"
+import { cleanup, render, screen } from "@testing-library/react"
+import { afterEach } from "vitest"
 import type { CharacterListItem, Grade } from "@/lib/api"
-import { getRaceLevelTier, RaceBadges } from "./dashboard"
+import { CharacterPortrait, getRaceLevelTier, RaceBadges } from "./dashboard"
 
 const grades: Grade[] = ["G", "F", "E", "D", "C", "B", "A", "S"]
+
+afterEach(cleanup)
 
 function item(overrides: Partial<CharacterListItem> = {}): CharacterListItem {
   return {
@@ -21,6 +24,7 @@ function item(overrides: Partial<CharacterListItem> = {}): CharacterListItem {
     raceGrade: "G",
     raceLevel: 0,
     raceGradeBand: { min: 0, max: 10 },
+    portrait: null,
     ...overrides,
   }
 }
@@ -107,5 +111,25 @@ describe("race progression badges", () => {
     expect(screen.getByText("L0 - Early (inferred)")).toBeTruthy()
     render(<RaceBadges item={item({ raceGradeBand: null, raceLevel: 12 })} />)
     expect(screen.getByText("Level 12")).toBeTruthy()
+  })
+})
+
+describe("character portrait", () => {
+  it("shows the private portrait URL with character-specific alternative text", () => {
+    render(
+      <CharacterPortrait
+        item={item({
+          portrait: { assetId: "asset-1", url: "/api/assets/asset-1" },
+        })}
+      />
+    )
+    const image = screen.getByRole("img", { name: "Test portrait" })
+    expect(image.getAttribute("src")).toBe("/api/assets/asset-1")
+  })
+
+  it("shows stable initials when no portrait exists", () => {
+    render(<CharacterPortrait item={item({ portrait: null, name: "Mira" })} />)
+    expect(screen.getByText("M")).toBeTruthy()
+    expect(screen.queryByRole("img")).toBeNull()
   })
 })

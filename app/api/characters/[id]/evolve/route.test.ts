@@ -70,18 +70,21 @@ describe("POST /api/characters/[id]/evolve", () => {
     )
   })
 
-  it("keeps a legacy race path (no track key) as a race path", async () => {
-    const res = await POST(evolveReq({ optionId: "evo-r", version: 0 }), ctx())
+  it("hands a race track to the service with its track preserved", async () => {
+    const res = await POST(
+      evolveReq({ track: "race", optionId: "evo-r", version: 0 }),
+      ctx()
+    )
     expect(res.status).toBe(200)
     expect(evolveCharacterMock).toHaveBeenCalledWith(
       "chr-1",
-      { optionId: "evo-r", version: 0 },
+      { track: "race", optionId: "evo-r", version: 0 },
       user
     )
   })
 
-  it("returns 400 for a payload with no evolution shape", async () => {
-    const res = await POST(evolveReq({}), ctx())
+  it("returns 400 for a payload with no track", async () => {
+    const res = await POST(evolveReq({ optionId: "evo-r", version: 0 }), ctx())
     expect(res.status).toBe(400)
     expect(evolveCharacterMock).not.toHaveBeenCalled()
   })

@@ -1,6 +1,10 @@
 import { requireAdmin, requireUser } from "@/lib/auth/guard"
 import { badRequest, respond } from "@/lib/server/errors"
-import { catalogCreateSchema, catalogKindSchema } from "@/lib/server/schemas"
+import {
+  catalogCreateSchema,
+  catalogKindSchema,
+  normalizeCatalogKind,
+} from "@/lib/server/schemas"
 import { isCatalogPublic } from "@/lib/server/env"
 import { createCatalogItem, listCatalog } from "@/lib/db/service"
 
@@ -11,7 +15,10 @@ type Ctx = { params: Promise<{ kind: string }> }
 export async function GET(req: Request, ctx: Ctx) {
   return respond(async () => {
     const { kind } = await ctx.params
-    const parsed = catalogKindSchema.safeParse(kind)
+    // Accept the legacy `consumables` path as an alias for `items` (a legacy
+    // alias for old callers only); the echoed `kind` keeps the caller's spelling.
+    const normalizedKind = normalizeCatalogKind(kind)
+    const parsed = catalogKindSchema.safeParse(normalizedKind)
     if (!parsed.success)
       throw badRequest("invalid_kind", `Unknown catalog kind "${kind}"`)
     const includeArchived =
@@ -21,7 +28,7 @@ export async function GET(req: Request, ctx: Ctx) {
     } else if (!isCatalogPublic()) {
       await requireUser(req)
     }
-    const items = await listCatalog(kind, { includeArchived })
+    const items = await listCatalog(normalizedKind, { includeArchived })
     return Response.json({ kind, items })
   })
 }
@@ -30,7 +37,8 @@ export async function POST(req: Request, ctx: Ctx) {
   return respond(async () => {
     await requireAdmin(req)
     const { kind } = await ctx.params
-    const parsedKind = catalogKindSchema.safeParse(kind)
+    const normalizedKind = normalizeCatalogKind(kind)
+    const parsedKind = catalogKindSchema.safeParse(normalizedKind)
     if (!parsedKind.success)
       throw badRequest("invalid_kind", `Unknown catalog kind "${kind}"`)
     const body = await req.json().catch(() => null)
@@ -38,7 +46,7 @@ export async function POST(req: Request, ctx: Ctx) {
     if (!parsed.success) {
       throw badRequest("validation", "Invalid catalog payload")
     }
-    const item = await createCatalogItem(kind, parsed.data)
+    const item = await createCatalogItem(normalizedKind, parsed.data)
     return Response.json({ item }, { status: 201 })
   })
 }

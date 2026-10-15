@@ -100,7 +100,7 @@ evolution_choice_required`).
   consumables, caps, ...), so numbers are transparent rather than opaque.
 - **Immutable history & trusted-backup export/import**: every progression event is
   written to an append-only journal, and a character (state + live status + skill
-  offers + journal) can be exported as a `primal-character/6` JSON backup keyed by
+  offers + journal) can be exported as a `primal-character/7` JSON backup keyed by
   stable catalog identifiers. A backup can be re-imported (`POST
 /api/characters/import`) as a NEW character owned by the current user; it is a
   trusted-but-unverified backup, so it is marked `imported` in the UI and its
@@ -108,13 +108,22 @@ evolution_choice_required`).
   treated as server-verified. The live status is recomputed from the current
   catalog, catalog references are resolved by `kind` + `stableId` (no catalog
   content is auto-created), and any required definition that is missing, archived,
-  or the wrong kind rejects the whole import. The current v6 backup carries owned
+  or the wrong kind rejects the whole import. The current v7 backup carries owned
   inventory quantities and a `legacyUnowned` marker on equipment associations
   (grandfathered links may round-trip with zero stock), a per-link ring
   `equipmentPosition` so a character's two `Ring`-slot rings round-trip their
-  physical positions, and the append-only skill-offer generation and cancellation
-  state (every exported offer records a `generation` and a nullable `canceledAt`).
-  The v5 backup carried the inventory, `legacyUnowned` marker and ring positions
+  physical positions, the append-only skill-offer generation and cancellation
+  state (every exported offer records a `generation` and a nullable `canceledAt`),
+  and the god + tier blessing model: a `blessing` association references a `gods`
+  definition and carries a REQUIRED `tier`, because the legacy `blessings` catalog
+  kind was retired and a blessing's tier now lives on the association link. A
+  v7 backup's inventory `definition.kind` is `equipment` or `items` only (the
+  legacy `consumables` alias is rejected, not normalized). Legacy
+  `primal-character/3` through `primal-character/6` backups are still accepted,
+  but the service rejects any legacy doc carrying a `blessing` association with an
+  actionable 400 migration notice (the `blessings` catalog rows no longer exist),
+  and normalizes a legacy v4/v5/v6 inventory `consumables` kind to `items`. The v5
+  backup carried the inventory, `legacyUnowned` marker and ring positions
   but no such offer-generation/cancellation state; the legacy
   `primal-character/3` through `primal-character/5` backups are still accepted (v5
   imports without offer generations, v4 imports stock, and v3 imports none and
@@ -137,9 +146,10 @@ evolution_choice_required`).
   read-only; the apply inserts every missing row in one atomic `SERIALIZABLE`
   transaction and never overwrites an existing row. `sourceUrl` is optional but
   HTTPS when supplied (an unverified admin paste must not claim a `verified`
-  status), and would-create blessings revalidate their patron god against
-  both the live catalog and gods created by the same upload (archived / missing
-  patrons roll back the whole import). An optional content digest (SHA256 of the
+  status). Blessings are no longer a catalog kind - a god + tier now lives on a
+  character association - so the upload only creates `gods` catalog rows and never
+  resolves a patron, making row order irrelevant. An optional content digest
+  (SHA256 of the
   uploaded text) is a content-integrity check, not proof that a preview ran;
   preview is UI policy, not a server-enforced prerequisite. Like the reviewed
   manifest, it is never run by `db:seed` or app startup, and created rows are
@@ -156,17 +166,21 @@ evolution_choice_required`).
   remain usable and removable at zero stock. A same-slot swap retains the
   existing stock rather than consuming a new copy. Live effects still recalculate
   from the current catalog as before.
-- **Consumables on a character**: a character can consume real catalog
-  consumables, and each consumption requires and decrements exactly one owned
-  stock of that consumable in the same compare-and-swap (CAS) transaction as the
-  stat gain/effect and the immutable journal event - there is no free direct
-  consumption. Permanent consumables grant a permanent external stat gain
-  capped by the grade-based race-level capacity (F3/E5/D15/C45, a **house**
-  assumption pending verification); temporary potions produce a temporary effect
-  that expires after a number of quarters. Every consumption mutates the stored
-  state and writes an immutable `consume` progression event to the journal.
+- **Consumables on a character**: a character owns real catalog items (the
+  `items` kind, which replaced the legacy `consumables` alias) as inventory stock,
+  and there is no dedicated consume endpoint - spending a unit is an inventory
+  `remove`, and each such remove requires and decrements at least one owned unit
+  in the same compare-and-swap (CAS) transaction as the immutable journal event,
+  so there is no free direct consumption. The permanent/temporary effect is NOT
+  applied at spend time: permanent external stat gains are authored immutably in
+  `Character.state.permanentGains` (capped by the grade-based race-level capacity,
+  F3/E5/D15/C45, a **house** assumption pending verification), and temporary
+  potion effects are recorded among the stored active effects. The engine derives
+  consumable caps/effects from that stored state, never from the live inventory
+  quantity. Spending writes an immutable `inventory_adjust` progression event to
+  the journal.
 - **Manual inventory management UI/API**: an authenticated owner/admin can adjust
-  the owned equipment and consumable stock on an active character from a
+  the owned equipment and item (`items` kind) stock on an active character from a
   dedicated inventory UI/API. Adjustments are made in bounded quantities, each
   requires a source note (recorded, audited), and stock on an archived character
   is discarded. An equipment's final owned copy cannot be discarded while it is

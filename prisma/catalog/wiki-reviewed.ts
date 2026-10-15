@@ -13,11 +13,13 @@
  *   - The wiki is a secondary source, so none of this is asserted as canon; the
  *     manifest deliberately carries no provenance taxonomy. The reviewed catalog
  *     simply stores the source URL and the vetted entry config.
- *   - Entry kinds: `professions`, `blessings`, `bloodlines`, `skills`, `titles`.
- *   - Blessings / bloodlines / skills that carry no numeric effect in the source
- *     are stored with `effects: []` rather than a fabricated universal bonus.
- *     Skills that have no configured milestone are stored without `track` /
- *     `milestone`, so they are never auto-offered.
+ *   - Entry kinds: `professions`, `gods`, `bloodlines`, `skills`, `titles`.
+ *   - Bloodlines / skills that carry no numeric effect in the source are stored
+ *     with `effects: []` rather than a fabricated universal bonus. A god records
+ *     its numeric blessing effects under `blessingEffects`; a tier with no
+ *     reliable source number is omitted from that map (the link stays valid but
+ *     carries no synthesized bonus). Skills that have no configured milestone are
+ *     stored without `track` / `milestone`, so they are never auto-offered.
  *
  * Source terms: the Fandom wiki forbids automated scraping (direct page fetches
  * often return 403), so entries are reviewed manually and never re-fetched.
@@ -52,16 +54,17 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     },
   },
   {
-    kind: "blessings",
-    stableId: "true-blessing-malefic-viper",
-    name: "True Blessing of the Malefic Viper",
+    kind: "gods",
+    stableId: "the-malefic-viper",
+    name: "The Malefic Viper",
     description:
-      "The True-tier blessing of the Malefic Viper. Its effects are recorded as narrative-only here: blessing tiers evolve in the source and the numerical stage at this tier is not pinned by a reliable table, so no numeric bonus is invented (effects stays an empty list).",
+      "The patron god of the Order of the Malefic Viper. Its True-tier blessing is recorded as narrative-only here: blessing tiers evolve in the source and the numerical stage at this tier is not pinned by a reliable table, so no numeric bonus is invented (blessingEffects.True stays an empty list).",
     sourceUrl:
       "https://the-primal-hunter.fandom.com/wiki/True_Blessing_of_the_Malefic_Viper",
     config: {
-      tier: "True",
-      effects: [],
+      blessingEffects: {
+        True: [],
+      },
     },
   },
   {

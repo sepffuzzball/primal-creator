@@ -188,9 +188,8 @@ the row number.
 
 A legacy/partial `config` that the service layer would reject on a create (a
 blessing missing `tier`/`effects`, a consumable missing `type`, a skill with only
-one of `track`/`milestone`, a bloodline missing `effects`, a transcendent missing
-`passiveEffects`, or an evolution that is neither a complete race path nor a
-complete class/profession path) is rejected with an `invalid_config` error, because
+one of `track`/`milestone`, a bloodline missing `effects`, or a transcendent missing
+`passiveEffects`) is rejected with an `invalid_config` error, because
 the importer never copies an untrusted config into the database unvalidated.
 
 `gradeDescriptions`, when present, is a strict object whose keys must be from the

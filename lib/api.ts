@@ -253,6 +253,62 @@ export interface ConsumableStatus {
   capUsage: CapUsage[]
 }
 
+/** The three core derived resource pools (HP / MP / SP). Mirrors lib/rules/types.ts. */
+export type DerivedResource = "hp" | "mp" | "sp"
+
+/**
+ * Per-resource breakdown of an authoritative derived HP/MP/SP maximum. Mirrors
+ * lib/rules/types.ts; exposed so a consumer can distinguish the attribute-derived
+ * base from the flat and percentage equipment contributions.
+ */
+export interface DerivedStatBreakdown {
+  /** The attribute that drives this resource's base value. */
+  attribute: AttributeKey
+  /** Base value: finalAttributes[attribute] * 10 (may be negative). */
+  base: number
+  /** Sum of equipment `derivedFlat` contributions for this resource. */
+  flat: number
+  /** Sum of equipment `derivedPercentBasisPoints` contributions. */
+  percentBasisPoints: number
+  /** Floored percentage of the positive (base + flat) (0 when base + flat <= 0). */
+  percentApplied: number
+  /** Clamped final maximum. */
+  max: number
+}
+
+/**
+ * Authoritative maxima for the three core derived resource pools, always present
+ * and never `null`. Derived from the FINAL attributes after every phase,
+ * independent of the equipment cap budgets. Mirrors lib/rules/types.ts.
+ */
+export interface DerivedStats {
+  hp: number
+  mp: number
+  sp: number
+  /**
+   * Optional per-resource breakdown, useful for provenance and tests. Always
+   * computed by the engine; optional only so the type degrades to the literal
+   * `{ hp; mp; sp }` shape for consumers that do not need it.
+   */
+  breakdown?: Record<DerivedResource, DerivedStatBreakdown>
+}
+
+/**
+ * Source of the historical fixed attribute points, split per track
+ * (race / class / profession). Mirrors lib/rules/types.ts. Each vector is the
+ * SUM of the `fixed` vectors from `historicalLevelAwards` attributable to that
+ * track: known track literals (`"race"` / `"class"` / `"profession"`) map
+ * directly, while genuinely unknown legacy track strings are split evenly among
+ * the applicable tracks in deterministic Race, Class, Profession order. The
+ * three vectors sum, per attribute, exactly to the `historical-fixed` trace
+ * delta.
+ */
+export interface HistoricalFixedByTrack {
+  race: AttributeVector
+  class: AttributeVector
+  profession: AttributeVector
+}
+
 export interface StatusResult {
   attributes: AttributeVector
   traces: AttributeTrace[]
@@ -260,9 +316,12 @@ export interface StatusResult {
   totalFreePoints: number
   allocatedPoints: number
   resources: ResourceStatus[]
+  derivedStats: DerivedStats
   equipment: EquipmentStatus
   consumables: ConsumableStatus
   capUsage: CapUsage[]
+  /** Historical fixed award points, sourced per track. See {@link HistoricalFixedByTrack}. */
+  historicalFixedByTrack: HistoricalFixedByTrack
 }
 
 // ------------------------------------------------------------------ //
@@ -330,6 +389,12 @@ export interface CharacterListItem {
    * driven, not level driven.
    */
   raceGradeBand: { min: number; max: number } | null
+  /**
+   * The character's active portrait, or null when none has been uploaded. The
+   * `url` is always the canonical authenticated `/api/assets/{id}` route (never a
+   * filesystem path). Present on every list response.
+   */
+  portrait: PortraitView | null
   status?: StatusResult
   /**
    * The version of the server-wide house-rules config this list item was derived
@@ -360,6 +425,12 @@ export interface CharacterAssociationView {
   improvement?: { seriesId: string; rank: number; minRaceGrade: string }
   /** Whether the linked catalog definition is currently archived. */
   definitionArchived: boolean
+  /**
+   * The exact blessing tier a blessing link was granted at, present ONLY on a
+   * blessing association (a blessing references a `gods` definition). The live
+   * effect is synthesized from the god's `blessingEffects[tier]`; never inferred.
+   */
+  tier?: string
   /** Rarity tier, present on equipment and skill links that declare one. */
   rarity?: string
   /** Whether an equipment link is soulbound (metadata only; no transfer mechanic). */
@@ -414,13 +485,13 @@ export interface SkillOfferView {
  * An owned inventory row. Ownership is per-definition house bookkeeping (no item
  * instances, no capacity/stacking): only the integer `quantity` and the linked
  * definition's identity/metadata are exposed. `kind` is the catalog kind of the
- * linked definition - always `"equipment"` or `"consumables"`.
+ * linked definition - always `"equipment"` or `"items"`.
  */
 export interface CharacterInventoryItem {
   id: string
   definitionId: string
   name: string
-  kind: "equipment" | "consumables"
+  kind: "equipment" | "items"
   quantity: number
   /** Whether the linked catalog definition is currently archived. */
   archived: boolean
@@ -524,13 +595,23 @@ export interface CharacterDetail {
   updatedAt: string
   associations: CharacterAssociationView[]
   /**
-   * Owned inventory quantities (equipment + consumables), including archived
+   * Owned inventory quantities (equipment + items), including archived
    * catalog stock. Absent = zero owned stock of that definition.
    */
   inventory: CharacterInventoryItem[]
   /** Pending + selected skill offers (milestone choices) for this character. */
   skillOffers: SkillOfferView[]
   status?: StatusResult
+  /**
+   * Server-computed grade-ceiling blockers for a +Level on each level-able track,
+   * keyed by track (`race` | `class` | `profession`). A track is present only when
+   * a level-up on it is blocked by the authoritative current grade ceiling; an
+   * absent key means a level-up is allowed on that track (or the track is not
+   * level-able in the character's current mode). Computed server-side from the same
+   * grade table and race derivation as the progression engine - never a second
+   * query and never mutated state.
+   */
+  levelUpBlocked?: Partial<Record<"race" | "class" | "profession", string>>
   /**
    * Server-computed permanent-consumable capacity per attribute. Authoritative -
    * the UI must not recompute this.
@@ -560,7 +641,7 @@ export interface CharacterResponse {
  * at most 8 unique nonempty ids, and no id may appear in more than one field.
  */
 export interface SpecialAbilitiesSelection {
-  blessingId?: string | null
+  blessing?: { godId: string; tier: string }
   bloodlineIds?: string[]
   transcendentSkillIds?: string[]
 }
@@ -663,27 +744,16 @@ export interface EvolveJournal {
   from: Grade
   to: Grade
   level: number
-  /** Present when the evolution came from a catalog race or track path choice. */
+  /** Present when the evolution came from a catalog race/track definition choice. */
   source?: "catalog" | "track"
-  /** The class/profession track evolved (present on track evolutions). */
-  track?: "class" | "profession"
-  /** Catalog id of the chosen evolution path (present for path evolutions). */
+  /** The track evolved (present on any evolution; "race" on a race evolution). */
+  track?: "race" | "class" | "profession"
+  /** Catalog id of the chosen destination definition (present on all evolutions). */
   optionId?: string
   option?: { id: string; name: string; stableId: string }
-  prerequisites?: {
-    fromRaceStableId?: string
-    toRaceStableId?: string
-    fromGrade?: Grade
-    toGrade?: Grade
-    minRaceLevel?: number | null
-    fromDefinitionStableId?: string
-    toDefinitionStableId?: string
-    minTrackLevel?: number | null
-    requiredTitleStableIds?: string[]
-    requiredSkillStableIds?: string[]
-  }
-  destinationRace?: { id: string; stableId: string; name: string }
-  /** Destination definition snapshot for a class/profession track evolution. */
+  /** Old race snapshot for a race evolution. */
+  oldRace?: { id: string | null; stableId: string | null; name: string | null }
+  /** Destination definition snapshot for the evolution. */
   destination?: { id: string; stableId: string; name: string; grade: Grade }
   /** Engine track-evolution journal fields: old/new track definition ids. */
   oldDefinitionId?: string
@@ -697,8 +767,12 @@ export interface EvolveResponse {
   journal: EvolveJournal
 }
 
-/** A contextual evolution option derived from an `evolutions` catalog entry. */
+/** A contextual next-grade evolution option derived from the definitions catalog. */
 export interface EvolutionOptionView {
+  /**
+   * The DESTINATION catalog definition id (a races/classes/professions row). The
+   * client submits this id as `optionId` on POST /evolve.
+   */
   id: string
   name: string
   description: string | null
@@ -706,24 +780,22 @@ export interface EvolutionOptionView {
   toGrade: Grade
   /** Destination display name (race, class, or profession name). */
   toTrackName: string
-  /** The track this evolution path targets. */
+  /** The track this evolution option targets. */
   track: "race" | "class" | "profession"
   sourceUrl: string | null
   /** Whether all mechanical (hard) requirements are met. */
   eligible: boolean
   /** Human-readable unmet mechanical requirements (empty when eligible). */
   blockers: string[]
-  /** Whether the path declares a narrative `manualRequirementsText` hard gate. */
-  manualReview: boolean
 }
 
 export interface EvolutionOptionsResult {
   options: EvolutionOptionView[]
   /**
-   * True only when NO valid catalog race path targets the character's next grade,
-   * i.e. the legacy grade-only house fallback is offered.
+   * Always false: race/class/profession evolution is no longer gated by catalog
+   * paths, so there is never a legacy grade-only fallback to offer.
    */
-  legacyAvailable: boolean
+  legacyAvailable: false
 }
 
 export interface AllocateResponse {
@@ -766,6 +838,12 @@ export interface AssociationRequest {
    * non-equipment kind.
    */
   equipmentPosition?: "Ring 1" | "Ring 2"
+  /**
+   * The exact blessing tier, meaningful only on a `blessing` operation (the
+   * `definitionId` names the god that granted it; the tier is persisted verbatim
+   * and the live effect is synthesized from the god's `blessingEffects[tier]`).
+   */
+  tier?: string
 }
 
 export interface AssociationResponse {
@@ -842,20 +920,26 @@ export interface ExportAssociation {
    * The physical ring position for a Ring-slot equipment link (`'Ring 1'` /
    * `'Ring 2'`), and `null` for a non-ring equipment link (the single canonical
    * "Ring" catalog slot is worn in two positions). Present only on equipment
-   * links in the current v5 backup; absent on the legacy v3/v4 shapes.
+   * links in the current backup; absent on the legacy v3/v4 shapes.
    */
   equipmentPosition?: "Ring 1" | "Ring 2" | null
+  /**
+   * The exact blessing tier a blessing link was granted at, present ONLY on a
+   * blessing association (which references a `gods` definition). The current
+   * backup emits it so the god + tier relationship round-trips exactly.
+   */
+  tier?: string
   definition: ExportDefinitionSnapshot
 }
 
 /**
  * An exported owned-stock entry. `definition.kind` is always `"equipment"` or
- * `"consumables"` (the only kinds that can be inventoried); `quantity` is the
- * owned count, bounded 1..999999. The definition references the LOCAL catalog by
- * `kind` + `stableId`.
+ * `"items"` (the only kinds that can be inventoried - `items` replaces the legacy
+ * `consumables` kind); `quantity` is the owned count, bounded 1..999999. The
+ * definition references the LOCAL catalog by `kind` + `stableId`.
  */
 export interface ExportInventoryItem {
-  definition: { kind: "equipment" | "consumables"; stableId: string }
+  definition: { kind: "equipment" | "items"; stableId: string }
   quantity: number
 }
 
@@ -899,7 +983,7 @@ export interface SkillOfferExport {
 }
 
 export interface ExportResponse {
-  /** "primal-character/6" - the current trusted-backup schema. */
+  /** "primal-character/7" - the current trusted-backup schema. */
   schema: string
   rulesetVersion: string
   identity: CharacterIdentityExport
@@ -919,7 +1003,7 @@ export interface ExportResponse {
    */
   isTranscendent: boolean
   associations: ExportAssociation[]
-  /** Owned stock (equipment + consumables) keyed by stable catalog identifier. */
+  /** Owned stock (equipment + items) keyed by stable catalog identifier. */
   inventory: ExportInventoryItem[]
   events: ProgressionEvent[]
   skillOffers: SkillOfferExport[]

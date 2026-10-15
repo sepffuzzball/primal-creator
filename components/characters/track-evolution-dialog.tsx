@@ -24,8 +24,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 
 function TrackNameBadge({ option }: { option: EvolutionOptionView }) {
   const label =
@@ -42,14 +40,14 @@ function TrackNameBadge({ option }: { option: EvolutionOptionView }) {
 }
 
 /**
- * Class/profession evolution dialog.
+ * Per-track evolution dialog (race, class, or profession).
  *
- * This is deliberately per-track: it only ever evolves the selected class or
- * profession track's own `grade`/`definitionId` and never suggests changing the
- * race grade. The options are the contextual next-grade-only catalog paths for
- * that track, and there is no class/profession grade-only legacy fallback - so
- * when the track has no explicit grade (a legacy graded-unknown state) this
- * dialog shows the note below and offers no paths.
+ * It only ever evolves the selected track's own `grade` and switches the
+ * character's `raceId`/`classId`/`professionId` to the chosen destination
+ * definition. The options are the contextual next-grade-only candidates derived
+ * from the definitions catalog - there is no legacy grade-only fallback and no
+ * path/title/manual gate, so `legacyAvailable` is always false and an option is
+ * selectable only when no engine grade-band / grade-gate blocker applies.
  *
  * The parent mounts this only while a track is selected, so it starts fresh on
  * every open and fetches its options on mount.
@@ -57,27 +55,29 @@ function TrackNameBadge({ option }: { option: EvolutionOptionView }) {
 export function TrackEvolutionDialog({
   track,
   character,
-  isAdmin,
   onClose,
   onEvolved,
 }: {
-  track: "class" | "profession"
+  track: "race" | "class" | "profession"
   character: CharacterDetail
-  isAdmin: boolean
   onClose: () => void
   onEvolved: () => void
 }) {
-  const trackName = track === "class" ? "Class" : "Profession"
-  const trackState = character.state.tracks[track]
-  const trackGrade = trackState?.grade
-  const trackLevel = trackState?.level ?? 0
+  const trackName =
+    track === "race" ? "Race" : track === "class" ? "Class" : "Profession"
+  // The race grade/level live on the race state; class/profession live on tracks.
+  const trackState =
+    track === "race" ? undefined : character.state.tracks[track]
+  const trackGrade =
+    track === "race" ? character.state.race.grade : trackState?.grade
+  const trackLevel =
+    track === "race" ? character.state.race.level : (trackState?.level ?? 0)
 
   const [options, setOptions] = React.useState<EvolutionOptionsResult | null>(
     null
   )
   const [error, setError] = React.useState<string | null>(null)
   const [selectedOptionId, setSelectedOptionId] = React.useState("")
-  const [reason, setReason] = React.useState("")
   const [busy, setBusy] = React.useState(false)
   const [reloadKey, setReloadKey] = React.useState(0)
 
@@ -95,9 +95,7 @@ export function TrackEvolutionDialog({
       .then((res) => {
         if (ignore) return
         setOptions(res)
-        const firstSelectable = res.options.find(
-          (o) => o.eligible && (isAdmin ? true : !o.manualReview)
-        )
+        const firstSelectable = res.options.find((o) => o.eligible)
         setSelectedOptionId(firstSelectable?.id ?? res.options[0]?.id ?? "")
         setError(null)
       })
@@ -109,15 +107,12 @@ export function TrackEvolutionDialog({
     return () => {
       ignore = true
     }
-  }, [track, trackGrade, reloadKey, character.id, isAdmin])
+  }, [track, trackGrade, reloadKey, character.id])
 
   const selectedOption = (options?.options ?? []).find(
     (o) => o.id === selectedOptionId
   )
-  const canConfirm =
-    options != null &&
-    selectedOption?.eligible === true &&
-    (!selectedOption.manualReview || (isAdmin && reason.trim().length > 0))
+  const canConfirm = options != null && selectedOption?.eligible === true
 
   const submit = React.useCallback(async () => {
     if (!selectedOption) return
@@ -129,7 +124,6 @@ export function TrackEvolutionDialog({
           track,
           optionId: selectedOption.id,
           version: character.version,
-          ...(reason.trim() ? { reason: reason.trim() } : {}),
         }),
       })
       toast.success(
@@ -148,7 +142,6 @@ export function TrackEvolutionDialog({
     track,
     trackName,
     selectedOption,
-    reason,
     onClose,
     onEvolved,
   ])
@@ -160,7 +153,9 @@ export function TrackEvolutionDialog({
           <DialogTitle>Evolve {trackName.toLowerCase()} grade</DialogTitle>
           <DialogDescription>
             This only progresses the {trackName.toLowerCase()} track&apos;s own
-            grade and definition. The race grade is never touched.
+            grade and definition. The{" "}
+            {track === "race" ? "class and profession" : "race"} grade is never
+            touched.
           </DialogDescription>
         </DialogHeader>
 
@@ -177,8 +172,8 @@ export function TrackEvolutionDialog({
         {trackGrade == null ? (
           <p className="text-xs/relaxed text-muted-foreground">
             This {trackName.toLowerCase()} track has no explicit grade yet (a
-            legacy state). There are no class/profession evolution paths to
-            offer until it is given an explicit grade.
+            legacy state). There are no evolution options to offer until it is
+            given an explicit grade.
           </p>
         ) : loading ? (
           <p className="text-xs text-muted-foreground">
@@ -229,9 +224,6 @@ export function TrackEvolutionDialog({
                       {option.fromGrade} {"->"} {option.toGrade}
                     </Badge>
                     <TrackNameBadge option={option} />
-                    {option.manualReview ? (
-                      <Badge variant="outline">Manual review</Badge>
-                    ) : null}
                     {!selectable ? (
                       <Badge variant="outline">Blocked</Badge>
                     ) : null}
@@ -251,30 +243,11 @@ export function TrackEvolutionDialog({
                       ))}
                     </ul>
                   ) : null}
-                  {option.manualReview && !isAdmin ? (
-                    <span className="text-muted-foreground">
-                      An admin must provide a reason to override the manual
-                      requirements for this path.
-                    </span>
-                  ) : null}
                 </button>
               )
             })}
           </div>
         )}
-
-        {selectedOption?.manualReview && isAdmin ? (
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="track-evolve-reason">
-              Reason (required to override manual requirements)
-            </Label>
-            <Input
-              id="track-evolve-reason"
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-            />
-          </div>
-        ) : null}
 
         {error && options != null ? (
           <p role="alert" className="text-xs/relaxed text-destructive">

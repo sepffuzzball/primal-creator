@@ -3,16 +3,15 @@
  *
  * Exercises the importer against a live database: applying an upload creates the
  * entries, a repeat apply is idempotent (skips every existing row), a pre-existing
- * row with a conflicting stableId is retained unchanged, and a blessing that names
- * a god created by the same upload resolves its patron FK regardless of row order.
- * Runs ONLY when explicitly opted in (see `resolveDbIntegration`); a normal
+ * row with a conflicting stableId is retained unchanged, and a `gods` entry with
+ * `blessingEffects` is created regardless of row order (there is no patron FK
+ * anymore - a blessing is a god + tier on a character association, not a catalog
+ * kind). Runs ONLY when explicitly opted in (see `resolveDbIntegration`); a normal
  * `pnpm test` skips this file.
  *
  * These tests never delete pre-existing catalog rows. Every stableId this suite
  * uses is run-suffixed with a fresh `randomUUID`, and cleanup deletes only the
- * exact row ids this run created (never by fixed (kind, stableId) pairs), and it
- * deletes child `blessings` before their patron gods (the patronId FK is
- * RESTRICT, so a god cannot be removed while a blessing still references it).
+ * exact row ids this run created (never by fixed (kind, stableId) pairs).
  */
 
 import { afterAll, describe, expect, it } from "vitest"
@@ -38,24 +37,12 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
 
   afterAll(async () => {
     if (createdIds.length === 0) return
-    const ids = [...createdIds]
-    // Delete child blessings first: a blessing holds a RESTRICT FK (`patronId`)
-    // to its patron god, so the god must not be removed before the referencing
-    // blessing. Then delete every other created row. This runs even when an
-    // earlier assertion failed, and targets only the exact ids this suite made.
-    const blessingIds = (
-      await prisma.catalogDefinition.findMany({
-        where: { id: { in: ids }, kind: "blessings" },
-        select: { id: true },
-      })
-    ).map((row) => row.id)
-    if (blessingIds.length > 0) {
-      await prisma.catalogDefinition.deleteMany({
-        where: { id: { in: blessingIds } },
-      })
-    }
+    // Delete only the exact row ids this suite created. There is no patron FK to
+    // order around (a blessing is a god + tier on a character association), so all
+    // created rows are removed together. This runs even when an earlier assertion
+    // failed, and targets only the exact ids this suite made.
     await prisma.catalogDefinition.deleteMany({
-      where: { id: { in: ids } },
+      where: { id: { in: [...createdIds] } },
     })
   })
 
@@ -156,27 +143,27 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
     expect(row?.name).toBe("House Title")
   })
 
-  it("creates gods first so a blessing can reference a god later in the upload", async () => {
+  it("creates gods entries with blessingEffects regardless of row order", async () => {
     const godId = stable("pg-odin")
-    const blessId = stable("pg-bless")
+    const godId2 = stable("pg-thor")
     const upload = JSON.stringify([
-      {
-        kind: "blessings",
-        stableId: blessId,
-        name: "Blessing",
-        description: "d",
-        provenance: "house",
-        sourceUrl: null,
-        config: { tier: "Minor", effects: [], patronGodStableId: godId },
-      },
       {
         kind: "gods",
         stableId: godId,
-        name: "God",
+        name: "Odin",
         description: "d",
         provenance: "house",
         sourceUrl: null,
-        config: {},
+        config: { pantheon: "Aesir", blessingEffects: { True: [] } },
+      },
+      {
+        kind: "gods",
+        stableId: godId2,
+        name: "Thor",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: { pantheon: "Aesir", divineRank: "God" },
       },
     ])
     const entries = parseBulkEntries("json", upload)
@@ -187,14 +174,186 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
     createdIds.push(...result.createdIds)
     expect(result.createCount).toBe(2)
 
-    const god = await prisma.catalogDefinition.findUnique({
+    // A blessing is a god + tier on a character association, so there is no patron
+    // FK to resolve and no row ordering dependency.
+    const odin = await prisma.catalogDefinition.findUnique({
       where: { kind_stableId: { kind: "gods", stableId: godId } },
     })
-    const blessing = await prisma.catalogDefinition.findUnique({
-      where: { kind_stableId: { kind: "blessings", stableId: blessId } },
+    const thor = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "gods", stableId: godId2 } },
     })
-    expect(god).not.toBeNull()
-    expect(blessing).not.toBeNull()
-    expect(blessing?.patronId).toBe(god?.id)
+    expect(odin).not.toBeNull()
+    expect(thor).not.toBeNull()
+    expect(
+      (odin?.config as { blessingEffects?: unknown }).blessingEffects
+    ).toMatchObject({ True: [] })
+    expect((thor?.config as Record<string, unknown>).divineRank).toBe("God")
+  })
+
+  it("rejects an equipment entry whose required god does not exist and writes nothing", async () => {
+    const godStable = stable("pg-no-god")
+    const equipStable = stable("pg-no-god-ring")
+    const upload = JSON.stringify([
+      {
+        kind: "equipment",
+        stableId: equipStable,
+        name: "Ring of Nowhere",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: {
+          slot: "Ring",
+          rarity: "Common",
+          requiredGodStableId: godStable,
+        },
+      },
+    ])
+    const entries = parseBulkEntries("json", upload)
+    await expect(
+      applyBulkImport(entries, computeBulkRequestDigest("json", upload))
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // No god row exists, so nothing was created (the equipment row was never made).
+    const ring = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "equipment", stableId: equipStable } },
+    })
+    expect(ring).toBeNull()
+  })
+
+  it("accepts an equipment entry whose required god is created by the same upload", async () => {
+    const godStable = stable("pg-created-god")
+    const equipStable = stable("pg-created-god-ring")
+    const upload = JSON.stringify([
+      {
+        kind: "gods",
+        stableId: godStable,
+        name: "Created God",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: { blessingEffects: { True: [] } },
+      },
+      {
+        kind: "equipment",
+        stableId: equipStable,
+        name: "Created God Ring",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: {
+          slot: "Ring",
+          rarity: "Common",
+          requiredGodStableId: godStable,
+        },
+      },
+    ])
+    const entries = parseBulkEntries("json", upload)
+    const result = await applyBulkImport(
+      entries,
+      computeBulkRequestDigest("json", upload)
+    )
+    createdIds.push(...result.createdIds)
+    expect(result.createCount).toBe(2)
+    const ring = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "equipment", stableId: equipStable } },
+    })
+    expect(ring?.config).toMatchObject({ requiredGodStableId: godStable })
+    const god = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "gods", stableId: godStable } },
+    })
+    expect(god?.archived).toBe(false)
+  })
+
+  it("rejects an equipment entry whose required god is archived and writes nothing", async () => {
+    const godStable = stable("pg-archived-god")
+    const godRow = await prisma.catalogDefinition.create({
+      data: {
+        kind: "gods",
+        stableId: godStable,
+        name: "Archived God",
+        config: {},
+        archived: true,
+      },
+    })
+    createdIds.push(godRow.id)
+    const equipStable = stable("pg-archived-god-ring")
+    const upload = JSON.stringify([
+      {
+        kind: "equipment",
+        stableId: equipStable,
+        name: "Archived God Ring",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: {
+          slot: "Ring",
+          rarity: "Common",
+          requiredGodStableId: godStable,
+        },
+      },
+    ])
+    const entries = parseBulkEntries("json", upload)
+    await expect(
+      applyBulkImport(entries, computeBulkRequestDigest("json", upload))
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The equipment row was never created; the archived god is untouched.
+    const ring = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "equipment", stableId: equipStable } },
+    })
+    expect(ring).toBeNull()
+    const god = await prisma.catalogDefinition.findUnique({
+      where: { id: godRow.id },
+    })
+    expect(god?.archived).toBe(true)
+  })
+
+  it("apply re-reads the god state inside the transaction and rejects when the patron is archived concurrently after preview", async () => {
+    const godStable = stable("pg-concurrent-god")
+    const godRow = await prisma.catalogDefinition.create({
+      data: {
+        kind: "gods",
+        stableId: godStable,
+        name: "Concurrent God",
+        config: {},
+        archived: false,
+      },
+    })
+    createdIds.push(godRow.id)
+    const equipStable = stable("pg-concurrent-god-ring")
+    const upload = JSON.stringify([
+      {
+        kind: "equipment",
+        stableId: equipStable,
+        name: "Concurrent God Ring",
+        description: "d",
+        provenance: "house",
+        sourceUrl: null,
+        config: {
+          slot: "Ring",
+          rarity: "Common",
+          requiredGodStableId: godStable,
+        },
+      },
+    ])
+    const entries = parseBulkEntries("json", upload)
+    // Preview reads the god as active and would create the equipment row.
+    const preview = await previewBulkImport(
+      entries,
+      computeBulkRequestDigest("json", upload)
+    )
+    expect(preview.createCount).toBe(1)
+    // A concurrent write archives the patron between preview and apply, so the
+    // apply SERIALIZABLE transaction must reject rather than trust the stale
+    // preview result.
+    await prisma.catalogDefinition.update({
+      where: { id: godRow.id },
+      data: { archived: true },
+    })
+    await expect(
+      applyBulkImport(entries, computeBulkRequestDigest("json", upload))
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    const ring = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "equipment", stableId: equipStable } },
+    })
+    expect(ring).toBeNull()
   })
 })

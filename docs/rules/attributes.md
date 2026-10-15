@@ -63,3 +63,32 @@ The source never states how many hit points, mana, or stamina are derived from t
 attribute values, nor the multipliers. We deliberately do **not** invent defaults.
 The engine exposes these as configurable, unresolved multipliers (see
 `docs/rules/assumptions.md` and `docs/architecture/calculation-engine.md`).
+
+## House rule: derived HP / MP / SP maxima
+
+The engine additionally derives **authoritative** maxima for the three core
+resource pools from the **final attributes after every phase**, including
+temporary effects. These are always present (never `null`) and are independent of
+the legacy configurable `resourceMultipliers` / `resourceFormulas` engine, which
+stays untouched and continues to report `null` until a multiplier/formula is
+supplied. Consumers that want the authoritative pool size should read
+`StatusResult.derivedStats` instead of `resources`.
+
+The derivation is per resource, is **not capped** by the equipment 20% /
+15% attribute budgets, and does **not** compound across items:
+
+- HP max is derived from final **Vitality**; MP max from final **Wisdom**; SP max
+  from final **Endurance**.
+- `base = finalAttribute * 10`.
+- `flat` = the sum of each equipment item's `derivedFlat[resource]`. Legacy
+  equipment with no `derivedFlat` (or a missing resource key) contributes 0.
+- `pct` = the sum of each equipment item's `derivedPercentBasisPoints[resource]`,
+  expressed in integer basis points (10000 = 100%). The sum is applied **once** to
+  the positive `(base + flat)` value, never compounded item-by-item.
+- `max = max(0, base + flat + floor(max(0, base + flat) * pct / 10000))`.
+- A negative result is clamped to 0 (a negative flat or final attribute cannot
+  produce a negative pool).
+
+Because these derived bonuses do not consume the per-attribute aggregate or
+overall equipment cap budgets, an equipment item may contribute both a capped
+attribute bonus and an uncapped derived HP/MP/SP bonus without them interfering.

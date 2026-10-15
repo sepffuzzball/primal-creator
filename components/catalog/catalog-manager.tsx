@@ -33,13 +33,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import {
   Table,
   TableBody,
   TableCell,
@@ -60,17 +53,6 @@ const RARITIES = [...EQUIPMENT_RARITIES, EQUIPMENT_UNIQUE_RARITY] as const
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
-
-const BLESSING_TIERS = [
-  "Baptism",
-  "Minor",
-  "Lesser",
-  "Intermediate",
-  "Major",
-  "Greater",
-  "Divine",
-  "True",
-] as const
 
 interface FormState {
   name: string
@@ -133,6 +115,27 @@ interface BulkPreview {
 
 function toForm(item: CatalogItem): FormState {
   const config = isRecord(item.config) ? item.config : {}
+  const formConfig = { ...config }
+  if (item.kind === "equipment") {
+    if (
+      formConfig.minimumLevel === undefined &&
+      typeof formConfig.minRaceLevel === "number"
+    )
+      formConfig.minimumLevel = formConfig.minRaceLevel
+    if (
+      formConfig.requiredLevelType === undefined &&
+      typeof formConfig.requiredRaceType === "string"
+    ) {
+      formConfig.requiredLevelType =
+        formConfig.requiredRaceType === "enlightened"
+          ? "humanoidRace"
+          : formConfig.requiredRaceType === "monster"
+            ? "monstrousRace"
+            : undefined
+    }
+    delete formConfig.minRaceLevel
+    delete formConfig.requiredRaceType
+  }
   return {
     name: item.name,
     description: item.description ?? "",
@@ -141,7 +144,11 @@ function toForm(item: CatalogItem): FormState {
         ? config.naturalGrade
         : (item.grade ?? ""),
     sourceUrl: item.sourceUrl ?? "",
-    configText: JSON.stringify(item.config ?? {}, null, 2),
+    configText: JSON.stringify(
+      item.kind === "equipment" ? formConfig : (item.config ?? {}),
+      null,
+      2
+    ),
     gradeDescriptions: isRecord(
       (item as CatalogItem & { gradeDescriptions?: unknown }).gradeDescriptions
     )
@@ -190,25 +197,12 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [editing, setEditing] = React.useState<CatalogItem | null>(null)
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM)
+  const [gods, setGods] = React.useState<
+    Array<{ stableId: string; name: string }>
+  >([])
+  const [skills, setSkills] = React.useState<CatalogItem[]>([])
   const [descriptionGrade, setDescriptionGrade] =
     React.useState<(typeof GRADES)[number]>("G")
-  const blessingConfig = React.useMemo(() => {
-    if (kind !== "blessings") return null
-    try {
-      const value: unknown = JSON.parse(form.configText || "{}")
-      if (value == null || typeof value !== "object" || Array.isArray(value))
-        return { valid: false as const, config: null, legacy: false }
-      const config = value as Record<string, unknown>
-      return {
-        valid: true as const,
-        config,
-        legacy:
-          Object.hasOwn(config, "grade") || Object.hasOwn(config, "effect"),
-      }
-    } catch {
-      return { valid: false as const, config: null, legacy: false }
-    }
-  }, [form.configText, kind])
   const structuredConfig = React.useMemo(() => {
     try {
       const parsed: unknown = JSON.parse(form.configText || "{}")
@@ -234,6 +228,24 @@ export function CatalogManager({ kind }: { kind: string }) {
       }
     })
   }, [])
+  const updateEquipmentConfig = React.useCallback(
+    (key: string, value: unknown) => {
+      setForm((current) => {
+        try {
+          const config = JSON.parse(current.configText || "{}") as Record<
+            string,
+            unknown
+          >
+          if (value === undefined) delete config[key]
+          else config[key] = value
+          return { ...current, configText: JSON.stringify(config, null, 2) }
+        } catch {
+          return current
+        }
+      })
+    },
+    []
+  )
   const [submitting, setSubmitting] = React.useState(false)
   const [formError, setFormError] = React.useState<string | null>(null)
   const [showArchived, setShowArchived] = React.useState(false)
@@ -502,6 +514,39 @@ export function CatalogManager({ kind }: { kind: string }) {
   }, [catalogUrl])
 
   React.useEffect(() => {
+    if (kind !== "equipment") return
+    let active = true
+    apiFetch<CatalogListResponse>("/api/catalog/gods")
+      .then((response) => {
+        if (!active) return
+        setGods(
+          response.items.map(({ stableId, name }) => ({ stableId, name }))
+        )
+      })
+      .catch(() => {
+        if (active) setGods([])
+      })
+    return () => {
+      active = false
+    }
+  }, [kind])
+
+  React.useEffect(() => {
+    if (kind !== "equipment") return
+    let active = true
+    apiFetch<CatalogListResponse>("/api/catalog/skills")
+      .then((response) => {
+        if (active) setSkills(response.items.filter((skill) => !skill.archived))
+      })
+      .catch(() => {
+        if (active) setSkills([])
+      })
+    return () => {
+      active = false
+    }
+  }, [kind])
+
+  React.useEffect(() => {
     let active = true
     apiFetch<CatalogListResponse>(catalogUrl)
       .then((res) => {
@@ -595,9 +640,52 @@ export function CatalogManager({ kind }: { kind: string }) {
       return
     }
     if (kind === "equipment") {
+      const stableIds = config.grantedSkillStableIds
+      if (
+        stableIds !== undefined &&
+        (!Array.isArray(stableIds) ||
+          stableIds.some((id) => typeof id !== "string") ||
+          new Set(stableIds).size !== stableIds.length)
+      ) {
+        setFormError(
+          "Choose granted skills from the catalog without duplicates."
+        )
+        return
+      }
+      const originalIds = isRecord(editing?.config)
+        ? editing.config.grantedSkillStableIds
+        : undefined
+      const changedGrantIds =
+        stableStringify(stableIds ?? []) !== stableStringify(originalIds ?? [])
+      if (
+        changedGrantIds &&
+        Array.isArray(stableIds) &&
+        stableIds.some(
+          (id) =>
+            typeof id !== "string" ||
+            (!(Array.isArray(originalIds) && originalIds.includes(id)) &&
+              !skills.some((skill) => skill.stableId === id))
+        )
+      ) {
+        setFormError(
+          "Choose granted skills from the unarchived skills catalog."
+        )
+        return
+      }
+      if (
+        typeof config.requiredGodStableId === "string" &&
+        !gods.some((god) => god.stableId === config.requiredGodStableId)
+      ) {
+        setFormError("Choose a required god from the catalog.")
+        return
+      }
+      delete config.minRaceLevel
+      delete config.requiredRaceType
       for (const [vectorKey, integer] of [
         ["bonus", false],
         ["percentBasisPoints", true],
+        ["derivedFlat", false],
+        ["derivedPercentBasisPoints", true],
       ] as const) {
         const vector = config[vectorKey]
         if (vector === undefined) continue
@@ -619,17 +707,6 @@ export function CatalogManager({ kind }: { kind: string }) {
           return
         }
       }
-    }
-    if (
-      kind === "blessings" &&
-      (!editing ||
-        stableStringify(config) !== stableStringify(editing.config ?? {})) &&
-      (Object.hasOwn(config, "grade") || Object.hasOwn(config, "effect"))
-    ) {
-      setFormError(
-        "Legacy blessing config must be explicitly migrated to modern tier and effects config before saving."
-      )
-      return
     }
     const legacyRaceWithoutNaturalGrade =
       kind === "races" &&
@@ -887,7 +964,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     } finally {
       setSubmitting(false)
     }
-  }, [editing, form, kind, load, structuredKind])
+  }, [editing, form, gods, kind, load, skills, structuredKind])
 
   const openSource = React.useCallback((url: string | null) => {
     if (url) window.open(url, "_blank", "noopener")
@@ -898,10 +975,10 @@ export function CatalogManager({ kind }: { kind: string }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="font-heading text-lg font-medium capitalize">
-            {kind}
+            {kind === "items" ? "Items" : kind}
           </h1>
           <p className="text-xs text-muted-foreground">
-            Catalog entries for {kind}.
+            Catalog entries for {kind === "items" ? "items" : kind}.
           </p>
         </div>
         {isAdmin ? (
@@ -916,7 +993,7 @@ export function CatalogManager({ kind }: { kind: string }) {
             </label>
             <Button className="gap-1" onClick={openCreate}>
               <PlusIcon />
-              New entry
+              {kind === "items" ? "New Item" : "New entry"}
             </Button>
             <Button variant="outline" onClick={openImport}>
               Import reviewed wiki entries
@@ -1071,10 +1148,18 @@ export function CatalogManager({ kind }: { kind: string }) {
           className={`max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden ${structuredKind ? "sm:max-w-6xl" : "sm:max-w-lg"}`}
         >
           <DialogHeader>
-            <DialogTitle>{editing ? "Edit entry" : "New entry"}</DialogTitle>
+            <DialogTitle>
+              {editing
+                ? kind === "items"
+                  ? "Edit Item"
+                  : "Edit entry"
+                : kind === "items"
+                  ? "New Item"
+                  : "New entry"}
+            </DialogTitle>
             <DialogDescription>
-              Configure the catalog entry. Invalid JSON in the config field is
-              rejected before saving.
+              Configure the catalog entry. Optional config accepts a JSON
+              object; invalid JSON is rejected before saving.
             </DialogDescription>
           </DialogHeader>
           <div className="min-h-0 overflow-y-auto overscroll-contain pr-1">
@@ -1539,69 +1624,6 @@ export function CatalogManager({ kind }: { kind: string }) {
                 />
               </div>
               <div className="flex flex-col gap-1.5">
-                {kind === "blessings" ? (
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor="cat-blessing-tier">Blessing tier</Label>
-                    <Select
-                      value={
-                        blessingConfig?.valid &&
-                        !blessingConfig.legacy &&
-                        typeof blessingConfig.config.tier === "string"
-                          ? blessingConfig.config.tier
-                          : ""
-                      }
-                      disabled={!blessingConfig?.valid || blessingConfig.legacy}
-                      onValueChange={(value) => {
-                        if (
-                          !value ||
-                          !blessingConfig?.valid ||
-                          blessingConfig.legacy
-                        )
-                          return
-                        const next: Record<string, unknown> = {
-                          ...blessingConfig.config,
-                          tier: value,
-                        }
-                        if (
-                          !editing &&
-                          Object.keys(blessingConfig.config).length === 0
-                        )
-                          next.effects = []
-                        setForm((current) => ({
-                          ...current,
-                          configText: JSON.stringify(next, null, 2),
-                        }))
-                      }}
-                    >
-                      <SelectTrigger id="cat-blessing-tier" className="w-full">
-                        <SelectValue placeholder="Select a tier" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {BLESSING_TIERS.map((tier) => (
-                          <SelectItem key={tier} value={tier}>
-                            {tier}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-muted-foreground">
-                      Tier is descriptive only; it does not imply numeric
-                      effects.
-                    </p>
-                    {!blessingConfig?.valid ? (
-                      <p role="alert" className="text-sm text-destructive">
-                        Correct Config JSON before selecting a tier; current
-                        edits are preserved.
-                      </p>
-                    ) : blessingConfig.legacy ? (
-                      <p role="alert" className="text-sm text-destructive">
-                        Legacy grade/effect config cannot be changed here.
-                        Explicitly migrate to modern tier and effects config
-                        first.
-                      </p>
-                    ) : null}
-                  </div>
-                ) : null}
                 {kind === "equipment" || kind === "skills" ? (
                   <div className="flex flex-col gap-2 rounded-md border p-3">
                     <p className="text-sm font-medium">
@@ -1768,6 +1790,91 @@ export function CatalogManager({ kind }: { kind: string }) {
                               </TableBody>
                             </Table>
                           </div>
+                          <p className="text-sm font-medium">
+                            Derived HP / MP / SP
+                          </p>
+                          <div className="grid grid-cols-3 gap-2">
+                            {["hp", "mp", "sp"].map((stat) => {
+                              const flat = isRecord(
+                                structuredConfig?.derivedFlat
+                              )
+                                ? structuredConfig.derivedFlat
+                                : {}
+                              const percent = isRecord(
+                                structuredConfig?.derivedPercentBasisPoints
+                              )
+                                ? structuredConfig.derivedPercentBasisPoints
+                                : {}
+                              const update = (
+                                key: string,
+                                value: number | undefined
+                              ) => {
+                                const current = isRecord(
+                                  structuredConfig?.[key]
+                                )
+                                  ? (structuredConfig[key] as Record<
+                                      string,
+                                      unknown
+                                    >)
+                                  : {}
+                                const next = { ...current }
+                                if (value === undefined) delete next[stat]
+                                else next[stat] = value
+                                setConfigValue(key, next)
+                              }
+                              return (
+                                <div key={stat} className="flex flex-col gap-1">
+                                  <span className="text-xs font-medium uppercase">
+                                    {stat}
+                                  </span>
+                                  <Input
+                                    aria-label={`${stat.toUpperCase()} derived flat`}
+                                    type="number"
+                                    min="0"
+                                    step="any"
+                                    placeholder="Flat"
+                                    disabled={!structuredConfig}
+                                    value={
+                                      flat[stat] == null
+                                        ? ""
+                                        : String(flat[stat])
+                                    }
+                                    onChange={(e) =>
+                                      update(
+                                        "derivedFlat",
+                                        e.target.value === ""
+                                          ? undefined
+                                          : Number(e.target.value)
+                                      )
+                                    }
+                                  />
+                                  <Input
+                                    aria-label={`${stat.toUpperCase()} derived percent`}
+                                    type="number"
+                                    min="0"
+                                    step="0.01"
+                                    placeholder="Percent (%)"
+                                    disabled={!structuredConfig}
+                                    value={
+                                      percent[stat] == null
+                                        ? ""
+                                        : String(Number(percent[stat]) / 100)
+                                    }
+                                    onChange={(e) =>
+                                      update(
+                                        "derivedPercentBasisPoints",
+                                        e.target.value === ""
+                                          ? undefined
+                                          : Math.round(
+                                              Number(e.target.value) * 100
+                                            )
+                                      )
+                                    }
+                                  />
+                                </div>
+                              )
+                            })}
+                          </div>
                         </div>
                       </>
                     ) : null}
@@ -1805,6 +1912,122 @@ export function CatalogManager({ kind }: { kind: string }) {
                     </select>
                     {kind === "equipment" ? (
                       <>
+                        <section
+                          className="flex flex-col gap-2 rounded-md border p-3"
+                          aria-label="Granted skills"
+                        >
+                          <h3 className="text-sm font-medium">
+                            Granted skills (while equipped)
+                          </h3>
+                          <p className="text-xs text-muted-foreground">
+                            These skills are granted only while this equipment
+                            is worn. Archived skills are inert; remove them here
+                            if no longer wanted.
+                          </p>
+                          <Label htmlFor="granted-skill-picker">
+                            Add a skill
+                          </Label>
+                          <select
+                            id="granted-skill-picker"
+                            disabled={!structuredConfig}
+                            className="h-9 rounded-md border bg-background px-3 text-sm"
+                            value=""
+                            onChange={(event) => {
+                              const id = event.target.value
+                              if (!id) return
+                              const current = Array.isArray(
+                                structuredConfig?.grantedSkillStableIds
+                              )
+                                ? structuredConfig.grantedSkillStableIds.filter(
+                                    (value): value is string =>
+                                      typeof value === "string"
+                                  )
+                                : []
+                              if (!current.includes(id))
+                                updateEquipmentConfig("grantedSkillStableIds", [
+                                  ...current,
+                                  id,
+                                ])
+                            }}
+                          >
+                            <option value="">
+                              Choose from unarchived skills
+                            </option>
+                            {skills
+                              .filter(
+                                (skill) =>
+                                  !(
+                                    (structuredConfig?.grantedSkillStableIds as unknown[]) ??
+                                    []
+                                  ).includes(skill.stableId)
+                              )
+                              .map((skill) => (
+                                <option
+                                  key={skill.stableId}
+                                  value={skill.stableId}
+                                >
+                                  {skill.name}
+                                </option>
+                              ))}
+                          </select>
+                          {Array.isArray(
+                            structuredConfig?.grantedSkillStableIds
+                          ) &&
+                            structuredConfig.grantedSkillStableIds.map(
+                              (rawId) => {
+                                const id =
+                                  typeof rawId === "string"
+                                    ? rawId
+                                    : String(rawId)
+                                const skill = skills.find(
+                                  (candidate) => candidate.stableId === id
+                                )
+                                return (
+                                  <div
+                                    key={id}
+                                    className="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1.5 text-sm"
+                                  >
+                                    <span>
+                                      {skill ? (
+                                        <>
+                                          {skill.name}{" "}
+                                          <span className="text-muted-foreground">
+                                            {Array.isArray(skill.config.tags) &&
+                                            skill.config.tags.length > 0
+                                              ? skill.config.tags.join(", ")
+                                              : skill.stableId}
+                                          </span>
+                                        </>
+                                      ) : (
+                                        <>
+                                          {id}{" "}
+                                          <span className="text-destructive">
+                                            Unavailable (archived or missing)
+                                          </span>
+                                        </>
+                                      )}
+                                    </span>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      aria-label={`Remove ${skill?.name ?? id}`}
+                                      onClick={() =>
+                                        updateEquipmentConfig(
+                                          "grantedSkillStableIds",
+                                          (
+                                            structuredConfig.grantedSkillStableIds as unknown[]
+                                          ).filter((value) => value !== rawId)
+                                        )
+                                      }
+                                    >
+                                      Remove
+                                    </Button>
+                                  </div>
+                                )
+                              }
+                            )}
+                        </section>
                         <label className="flex items-center gap-2 text-sm">
                           <input
                             type="checkbox"
@@ -1816,53 +2039,131 @@ export function CatalogManager({ kind }: { kind: string }) {
                           />
                           Soulbound (metadata only)
                         </label>
-                        <Label htmlFor="min-race-level">
-                          Minimum race level
-                        </Label>
+                        <Label htmlFor="minimum-level">Minimum Level</Label>
                         <Input
-                          id="min-race-level"
+                          id="minimum-level"
                           type="number"
                           min="0"
+                          step="1"
                           disabled={!structuredConfig}
                           value={
-                            typeof structuredConfig?.minRaceLevel === "number"
-                              ? structuredConfig.minRaceLevel
+                            typeof structuredConfig?.minimumLevel === "number"
+                              ? structuredConfig.minimumLevel
                               : ""
                           }
                           onChange={(e) =>
-                            setConfigValue(
-                              "minRaceLevel",
+                            updateEquipmentConfig(
+                              "minimumLevel",
                               e.target.value === ""
                                 ? undefined
                                 : Number(e.target.value)
                             )
                           }
                         />
-                        <Label htmlFor="race-requirement">
-                          Required race type
+                        <Label htmlFor="required-level-type">
+                          Required Level Type
                         </Label>
                         <select
-                          id="race-requirement"
+                          id="required-level-type"
                           disabled={!structuredConfig}
                           className="h-9 rounded-md border bg-background px-3 text-sm"
                           value={
-                            typeof structuredConfig?.requiredRaceType ===
+                            typeof structuredConfig?.requiredLevelType ===
                             "string"
-                              ? structuredConfig.requiredRaceType
+                              ? structuredConfig.requiredLevelType
                               : ""
                           }
                           onChange={(e) =>
-                            setConfigValue(
-                              "requiredRaceType",
+                            updateEquipmentConfig(
+                              "requiredLevelType",
                               e.target.value || undefined
                             )
                           }
                         >
                           <option value="">Any</option>
-                          <option value="enlightened">
-                            Humanoid (enlightened)
-                          </option>
-                          <option value="monster">Monstrous (monster)</option>
+                          <option value="class">Class</option>
+                          <option value="profession">Profession</option>
+                          <option value="humanoidRace">Humanoid Race</option>
+                          <option value="monstrousRace">Monstrous Race</option>
+                        </select>
+                        <Label htmlFor="required-god">Required God</Label>
+                        <select
+                          id="required-god"
+                          disabled={!structuredConfig}
+                          className="h-9 rounded-md border bg-background px-3 text-sm"
+                          value={
+                            typeof structuredConfig?.requiredGodStableId ===
+                              "string" &&
+                            gods.some(
+                              (god) =>
+                                god.stableId ===
+                                structuredConfig.requiredGodStableId
+                            )
+                              ? structuredConfig.requiredGodStableId
+                              : ""
+                          }
+                          onChange={(e) => {
+                            updateEquipmentConfig(
+                              "requiredGodStableId",
+                              e.target.value || undefined
+                            )
+                            if (!e.target.value)
+                              updateEquipmentConfig(
+                                "minimumBlessingTier",
+                                undefined
+                              )
+                          }}
+                        >
+                          <option value="">No god requirement</option>
+                          {gods.map((god) => (
+                            <option key={god.stableId} value={god.stableId}>
+                              {god.name}
+                            </option>
+                          ))}
+                        </select>
+                        <Label htmlFor="minimum-blessing-tier">
+                          Minimum Blessing Tier
+                        </Label>
+                        <select
+                          id="minimum-blessing-tier"
+                          disabled={
+                            !structuredConfig ||
+                            !structuredConfig?.requiredGodStableId ||
+                            !gods.some(
+                              (god) =>
+                                god.stableId ===
+                                structuredConfig.requiredGodStableId
+                            )
+                          }
+                          className="h-9 rounded-md border bg-background px-3 text-sm"
+                          value={
+                            typeof structuredConfig?.minimumBlessingTier ===
+                            "string"
+                              ? structuredConfig.minimumBlessingTier
+                              : ""
+                          }
+                          onChange={(e) =>
+                            updateEquipmentConfig(
+                              "minimumBlessingTier",
+                              e.target.value || undefined
+                            )
+                          }
+                        >
+                          <option value="">Any tier</option>
+                          {[
+                            "Baptism",
+                            "Minor",
+                            "Lesser",
+                            "Intermediate",
+                            "Major",
+                            "Greater",
+                            "Divine",
+                            "True",
+                          ].map((tier) => (
+                            <option key={tier} value={tier}>
+                              {tier}
+                            </option>
+                          ))}
                         </select>
                       </>
                     ) : null}

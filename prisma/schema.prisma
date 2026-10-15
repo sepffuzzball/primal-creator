@@ -32,7 +32,7 @@ enum CatalogKind {
   skills
   blessings
   bloodlines
-  consumables
+  items
   evolutions
   gods
   transcendent_skills
@@ -45,6 +45,21 @@ enum AssociationKind {
   BLESSING
   BLOODLINE
   TRANSCENDENT
+}
+
+// The eight-tier blessing hierarchy, lowest to highest. Baptism is the lowest
+// entry tier (a ritual marking a follower as an adherent, below the seven
+// substantive blessing levels Minor..True). A blessing link stores the exact
+// tier it was granted at; it is never inferred from the god's config.
+enum BlessingTier {
+  Baptism
+  Minor
+  Lesser
+  Intermediate
+  Major
+  Greater
+  Divine
+  True
 }
 
 // ------------------------------------------------------------------ //
@@ -216,15 +231,6 @@ model CatalogDefinition {
   // band). Never auto-populated from `description`. The `{}` default means an
   // entry with no authored grade text reads back as an empty map.
   gradeDescriptions Json     @default("{}")
-  // The patron god for a `blessings` entry. Set only when the blessing config
-  // declares a `patronGodStableId`; the FK is resolved to the matching unarchived
-  // `gods` definition so the JSON stableId and the FK never diverge. RESTRICT
-  // because a referenced god is never deleted (its stableId must not change while
-  // any blessing references it - see updateCatalogItem).
-  patronId    String?
-  patron      CatalogDefinition? @relation("CatalogPatron", fields: [patronId], references: [id], onDelete: Restrict)
-  // Reverse relation: the `blessings` entries that name this definition as patron.
-  patronFor   CatalogDefinition[] @relation("CatalogPatron")
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
@@ -239,7 +245,6 @@ model CatalogDefinition {
   @@unique([kind, stableId])
   @@index([kind])
   @@index([kind, archived])
-  @@index([patronId])
   @@map("catalog_definitions")
 }
 
@@ -256,6 +261,10 @@ model CatalogDefinition {
 //
 // - `kind` TITLE, EQUIPMENT, SKILL, BLESSING, BLOODLINE or TRANSCENDENT.
 //   Only one link per (character, definition).
+// - A BLESSING link points at a `gods` catalog definition (there is no separate
+//   `blessings` catalog kind anymore), and carries the exact `blessingTier` the
+//   blessing was granted at. The tier is never inferred from the god's config;
+//   the live effect is synthesized from the god's current `blessingEffects[tier]`.
 // - Multiple distinct transcendents coexist on a character; there is no
 //   blessing singleton and no upgradeGroup replacement for them.
 // - Deleting a character cascades to its links. Deleting a catalog definition
@@ -268,6 +277,15 @@ model CharacterAssociation {
   definitionId String
   definition   CatalogDefinition @relation("AssociationDefinition", fields: [definitionId], references: [id], onDelete: Restrict)
   kind         AssociationKind
+  // The exact bless tier granted on a BLESSING link. Set only for a blessing
+  // association (which always references a `gods` definition); null on every
+  // other kind. Read never infers a tier from the god config - a link carries
+  // the tier it was granted at, and a missing tier synthesizes no effect.
+  // A database CHECK constraint (`character_associations_blessing_tier_check`,
+  // added by migration 0019) enforces the invariant that a BLESSING link is
+  // never null and a non-BLESSING link is always null, so the application and
+  // the DB agree and a null tier can never be written.
+  blessingTier BlessingTier?
   // True only for equipment links that predate the inventory-ownership model
   // (backfilled by migration 0010). A grandfathered link may stay equipped and
   // removable even when the character owns zero stock of that definition; a
@@ -295,7 +313,7 @@ model CharacterAssociation {
 // Character inventory (owner-managed quantities, house bookkeeping)
 // ------------------------------------------------------------------ //
 //
-// A per-character quantity of an EQUIPMENT or CONSUMABLES catalog definition the
+// A per-character quantity of an EQUIPMENT or ITEMS catalog definition the
 // user owns. This is intentionally NOT item-instance tracking: there is no slot
 // on a stored item, no instance uniqueness, and no capacity/stacking - ownership
 // is expressed only as a per-definition integer count. Adding/removing stock is

@@ -174,7 +174,7 @@ vi.mock("@/components/ui/table", () => ({
 
 const item = {
   id: "bless-1",
-  kind: "blessings",
+  kind: "gods",
   stableId: "bless-1",
   name: "Blessing One",
   description: null,
@@ -191,7 +191,7 @@ const preview = {
   source: "wiki-reviewed",
   entries: [
     {
-      kind: "blessings",
+      kind: "gods",
       stableId: "wiki-one",
       name: "Wiki One",
       sourceUrl: "https://wiki.example/one",
@@ -216,8 +216,8 @@ function setupMock() {
     if (init?.method === "PATCH") {
       return { item }
     }
-    if (url === "/api/catalog/blessings") {
-      return { kind: "blessings", items: [item] }
+    if (url === "/api/catalog/gods") {
+      return { kind: "gods", items: [item] }
     }
     throw new Error(`unexpected url ${url}`)
   })
@@ -234,13 +234,13 @@ function patchCalls(mock: ReturnType<typeof vi.fn>) {
   return mock.mock.calls.filter(
     ([url, init]) =>
       typeof url === "string" &&
-      url.startsWith("/api/catalog/blessings/") &&
+      url.startsWith("/api/catalog/gods/") &&
       (init as RequestInit | undefined)?.method === "PATCH"
   )
 }
 
 async function openEdit(itemName: string, mock: ReturnType<typeof vi.fn>) {
-  render(<CatalogManager kind="blessings" />)
+  render(<CatalogManager kind="gods" />)
   await flush()
   fireEvent.click(screen.getByLabelText("Edit"))
   await flush()
@@ -295,106 +295,60 @@ describe("CatalogManager config omission on edit", () => {
     expect((body.config as Record<string, unknown>).tier).toBe("Major")
   })
 
-  it.each([
-    "Baptism",
-    "Minor",
-    "Lesser",
-    "Intermediate",
-    "Major",
-    "Greater",
-    "Divine",
-    "True",
-  ])(
-    "sets the blessing tier to %s while preserving other config keys",
-    async (tier) => {
-      const mock = setupMock()
-      await openEdit("Blessing One", mock)
-      fireEvent.click(screen.getByRole("button", { name: tier }))
-      const configField = screen.getByLabelText(
-        "Config (JSON)"
-      ) as HTMLTextAreaElement
-      const updated = JSON.parse(configField.value)
-      expect(updated).toEqual({ tier, effects: [] })
-      fireEvent.click(screen.getByText("Save"))
-      await flush()
-      const body = JSON.parse(
-        (patchCalls(mock)[0][1] as RequestInit).body as string
-      )
-      if (tier === "Minor") expect(body).not.toHaveProperty("config")
-      else expect(body.config).toEqual({ tier, effects: [] })
-    }
-  )
-
-  it("preserves extra modern config keys and effects when changing the tier", async () => {
+  it("edits per-tier blessing effects through the Gods advanced JSON editor", async () => {
     const mock = setupMock()
     const richer = {
       ...item,
       config: {
-        tier: "Minor",
-        effects: [{ type: "x" }],
-        patronGodStableId: "god-1",
+        blessingEffects: { True: [{ type: "x" }] },
         note: "keep",
       },
     }
     mock.mockImplementation(async (url: string, init?: RequestInit) =>
       init?.method === "PATCH"
         ? { item: richer }
-        : { kind: "blessings", items: [richer] }
+        : { kind: "gods", items: [richer] }
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByLabelText("Edit"))
-    fireEvent.click(screen.getByRole("button", { name: "Divine" }))
+    const config = screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement
+    fireEvent.change(config, {
+      target: {
+        value: JSON.stringify({
+          blessingEffects: { True: [{ type: "updated" }] },
+        }),
+      },
+    })
     expect(
       JSON.parse(
         (screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement).value
       )
-    ).toEqual({ ...richer.config, tier: "Divine" })
+    ).toEqual({ blessingEffects: { True: [{ type: "updated" }] } })
   })
 
-  it("does not allow tier selection to overwrite invalid JSON or legacy config", async () => {
+  it("keeps gods config advanced and rejects invalid JSON without inventing effect inputs", async () => {
     const mock = setupMock()
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "New entry" }))
     const field = screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement
     fireEvent.change(field, { target: { value: '{ "pending":' } })
-    fireEvent.click(screen.getByRole("button", { name: "Major" }))
     expect(field.value).toBe('{ "pending":')
-    expect(screen.getByText(/Correct Config JSON/)).toBeTruthy()
-    fireEvent.change(field, {
-      target: { value: '{"grade":"old","effect":"legacy"}' },
-    })
-    fireEvent.click(screen.getByRole("button", { name: "Major" }))
-    expect(field.value).toBe('{"grade":"old","effect":"legacy"}')
-    expect(screen.getByText(/Explicitly migrate/)).toBeTruthy()
+    expect(screen.getByText(/Invalid JSON/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText(/Name/), {
       target: { value: "Legacy" },
     })
     fireEvent.click(screen.getByText("Save"))
     await flush()
-    expect(screen.getByText(/must be explicitly migrated/)).toBeTruthy()
+    expect(screen.getByRole("alert")).toBeTruthy()
     expect(
       mock.mock.calls.some(
         ([url, init]) =>
-          String(url) === "/api/catalog/blessings" &&
+          String(url) === "/api/catalog/gods" &&
           (init as RequestInit)?.method === "POST"
       )
     ).toBe(false)
-  })
-
-  it("initializes narrative-only empty effects on first tier selection for a new blessing", async () => {
-    setupMock()
-    render(<CatalogManager kind="blessings" />)
-    await flush()
-    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
-    fireEvent.click(screen.getByRole("button", { name: "True" }))
-    expect(
-      JSON.parse(
-        (screen.getByLabelText("Config (JSON)") as HTMLTextAreaElement).value
-      )
-    ).toEqual({ tier: "True", effects: [] })
-    expect(screen.getByText(/does not imply numeric effects/)).toBeTruthy()
   })
 
   it("bounds the edit dialog and keeps the config resizable", async () => {
@@ -419,19 +373,17 @@ describe("CatalogManager config omission on edit", () => {
       archived: true,
     }
     mock.mockImplementation(async (url: string) => ({
-      kind: "blessings",
+      kind: "gods",
       items: url.includes("includeArchived") ? [item, archived] : [item],
     }))
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     expect(
       mock.mock.calls.some(([url]) => String(url).includes("includeArchived=1"))
     ).toBe(false)
     fireEvent.click(screen.getByLabelText("Show archived"))
     await flush()
-    expect(mock).toHaveBeenCalledWith(
-      "/api/catalog/blessings?includeArchived=1"
-    )
+    expect(mock).toHaveBeenCalledWith("/api/catalog/gods?includeArchived=1")
     expect(screen.getByText("Archived")).toBeTruthy()
     expect(screen.getByRole("button", { name: "Unarchive" })).toBeTruthy()
   })
@@ -439,7 +391,7 @@ describe("CatalogManager config omission on edit", () => {
   it("never requests archived entries for a non-admin", async () => {
     mockIsAdmin = false
     const mock = setupMock()
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     expect(
       mock.mock.calls.every(([url]) => !String(url).includes("includeArchived"))
@@ -456,14 +408,14 @@ describe("CatalogManager config omission on edit", () => {
       archived: true,
     }
     mock.mockImplementation(async (url: string) => ({
-      kind: "blessings",
+      kind: "gods",
       items: url.includes("includeArchived") ? [item, archived] : [item],
     }))
     vi.stubGlobal(
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByLabelText("Show archived"))
     await flush()
@@ -480,7 +432,7 @@ describe("CatalogManager config omission on edit", () => {
     })
     expect(
       mock.mock.calls.some(
-        ([url]) => url === "/api/catalog/blessings?includeArchived=1"
+        ([url]) => url === "/api/catalog/gods?includeArchived=1"
       )
     ).toBe(true)
     vi.unstubAllGlobals()
@@ -498,7 +450,7 @@ describe("CatalogManager config omission on edit", () => {
       if (init?.method === "PATCH")
         throw new Error("Permission denied; ask an administrator.")
       return {
-        kind: "blessings",
+        kind: "gods",
         items: url.includes("includeArchived") ? [item, archived] : [item],
       }
     })
@@ -506,7 +458,7 @@ describe("CatalogManager config omission on edit", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByLabelText("Show archived"))
     await flush()
@@ -524,7 +476,7 @@ describe("CatalogManager config omission on edit", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(
       screen.getByRole("button", { name: "Import reviewed wiki entries" })
@@ -549,7 +501,7 @@ describe("CatalogManager config omission on edit", () => {
       )
     ).toBe(true)
     expect(
-      mock.mock.calls.filter(([url]) => url === "/api/catalog/blessings").length
+      mock.mock.calls.filter(([url]) => url === "/api/catalog/gods").length
     ).toBeGreaterThan(1)
     vi.unstubAllGlobals()
   })
@@ -557,7 +509,7 @@ describe("CatalogManager config omission on edit", () => {
   it("does not expose importer to non-admins", async () => {
     mockIsAdmin = false
     const mock = setupMock()
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     expect(
       screen.queryByRole("button", { name: "Import reviewed wiki entries" })
@@ -572,9 +524,9 @@ describe("CatalogManager config omission on edit", () => {
     mock.mockImplementation(async (url: string) => {
       if (url === "/api/admin/catalog-import")
         throw new Error("Preview unavailable")
-      return { kind: "blessings", items: [item] }
+      return { kind: "gods", items: [item] }
     })
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(
       screen.getByRole("button", { name: "Import reviewed wiki entries" })
@@ -661,7 +613,7 @@ describe("structured catalog editors", () => {
     })
     expect(screen.getByRole("option", { name: "Sacred" })).toBeTruthy()
     expect(screen.queryByRole("option", { name: "Mythic" })).toBeNull()
-    fireEvent.change(screen.getByLabelText("Minimum race level"), {
+    fireEvent.change(screen.getByLabelText("Minimum Level"), {
       target: { value: "0" },
     })
     fireEvent.click(screen.getByLabelText(/Soulbound/))
@@ -676,8 +628,60 @@ describe("structured catalog editors", () => {
       slot: "Head",
       rarity: "Ancient",
       soulbound: true,
-      minRaceLevel: 0,
+      minimumLevel: 0,
     })
+  })
+
+  it("adds distinct catalog skills, removes one, and saves only stable ids", async () => {
+    const mock = setupMock()
+    const equipment = {
+      ...item,
+      kind: "equipment",
+      id: "gear-1",
+      stableId: "gear-1",
+      name: "Helm",
+      config: { slot: "Head", rarity: "Common" },
+    }
+    const skill = (stableId: string, name: string) => ({
+      ...item,
+      kind: "skills",
+      stableId,
+      name,
+      archived: false,
+      config: { tags: ["magic"] },
+    })
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/equipment")
+        return { kind: "equipment", items: [equipment] }
+      if (url === "/api/catalog/skills")
+        return {
+          kind: "skills",
+          items: [
+            skill("skill-one", "First Skill"),
+            skill("skill-two", "Second Skill"),
+          ],
+        }
+      if (init?.method === "PATCH") return { item: equipment }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    expect(screen.getByText("Granted skills (while equipped)")).toBeTruthy()
+    const picker = screen.getByLabelText("Add a skill")
+    fireEvent.change(picker, { target: { value: "skill-one" } })
+    fireEvent.change(picker, { target: { value: "skill-two" } })
+    expect(screen.getByText("First Skill")).toBeTruthy()
+    expect(screen.getByText("Second Skill")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Remove First Skill" }))
+    fireEvent.change(picker, { target: { value: "skill-two" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const request = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    const body = JSON.parse((request?.[1] as RequestInit).body as string)
+    expect(body.config.grantedSkillStableIds).toEqual(["skill-two"])
   })
 
   it("creates a class track row with all fixed stats and preserves explicit zero", async () => {
@@ -767,6 +771,74 @@ describe("structured catalog editor legacy and sparse rows", () => {
         (init as RequestInit | undefined)?.method === "PATCH"
     )
   }
+
+  it("lets clearing a legacy minimum level remove it on save", async () => {
+    const legacyEquipment = {
+      ...item,
+      kind: "equipment",
+      id: "equipment-legacy",
+      stableId: "equipment-legacy",
+      name: "Legacy equipment",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        minRaceLevel: 5,
+        requiredRaceType: "enlightened",
+      },
+    }
+    const mock = useEditMock("equipment", legacyEquipment)
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    const minimumLevel = screen.getByLabelText(
+      "Minimum Level"
+    ) as HTMLInputElement
+    expect(minimumLevel.value).toBe("5")
+    fireEvent.change(minimumLevel, { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+
+    const calls = patchCallsFor(mock, "equipment")
+    const body = JSON.parse((calls[0][1] as RequestInit).body as string)
+    expect(body.config).not.toHaveProperty("minimumLevel")
+    expect(body.config).not.toHaveProperty("minRaceLevel")
+    expect(body.config).not.toHaveProperty("requiredRaceType")
+    expect(body.config.requiredLevelType).toBe("humanoidRace")
+  })
+
+  it("converts legacy equipment requirements when saving without edits", async () => {
+    const legacyEquipment = {
+      ...item,
+      kind: "equipment",
+      id: "equipment-legacy",
+      stableId: "equipment-legacy",
+      name: "Legacy equipment",
+      config: {
+        slot: "Head",
+        rarity: "Common",
+        minRaceLevel: 5,
+        requiredRaceType: "monster",
+      },
+    }
+    const mock = useEditMock("equipment", legacyEquipment)
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    expect(
+      (screen.getByLabelText("Minimum Level") as HTMLInputElement).value
+    ).toBe("5")
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+
+    const calls = patchCallsFor(mock, "equipment")
+    const body = JSON.parse((calls[0][1] as RequestInit).body as string)
+    expect(body.config).toMatchObject({
+      minimumLevel: 5,
+      requiredLevelType: "monstrousRace",
+    })
+    expect(body.config).not.toHaveProperty("minRaceLevel")
+    expect(body.config).not.toHaveProperty("requiredRaceType")
+  })
 
   it("patches naturalGrade from the grade field when editing a legacy race lacking config.naturalGrade", async () => {
     const legacyRace = {
@@ -964,7 +1036,7 @@ describe("CatalogManager import preview staleness", () => {
     source: "wiki-reviewed" as const,
     entries: [
       {
-        kind: "blessings",
+        kind: "gods",
         stableId: "wiki-one",
         name: "Wiki One",
         sourceUrl: "https://wiki.example/one",
@@ -984,12 +1056,12 @@ describe("CatalogManager import preview staleness", () => {
         if (failPreview) throw new Error("Preview unavailable")
         return preview
       }
-      if (url === "/api/catalog/blessings") {
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") {
+        return { kind: "gods", items: [item] }
       }
       throw new Error(`unexpected url ${url}`)
     })
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(
       screen.getByRole("button", { name: "Import reviewed wiki entries" })
@@ -1029,8 +1101,8 @@ describe("CatalogManager import preview staleness", () => {
         }
         return applied ? afterPreview : preview
       }
-      if (url === "/api/catalog/blessings") {
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") {
+        return { kind: "gods", items: [item] }
       }
       throw new Error(`unexpected url ${url}`)
     })
@@ -1038,7 +1110,7 @@ describe("CatalogManager import preview staleness", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(
       screen.getByRole("button", { name: "Import reviewed wiki entries" })
@@ -1073,8 +1145,8 @@ describe("CatalogManager import preview staleness", () => {
           )
         return preview
       }
-      if (url === "/api/catalog/blessings") {
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") {
+        return { kind: "gods", items: [item] }
       }
       throw new Error(`unexpected url ${url}`)
     })
@@ -1082,7 +1154,7 @@ describe("CatalogManager import preview staleness", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(
       screen.getByRole("button", { name: "Import reviewed wiki entries" })
@@ -1107,7 +1179,7 @@ describe("CatalogManager import preview staleness", () => {
     // The existing catalog view is not reloaded/overwritten on failure: only the
     // initial load fetch was issued.
     const catalogFetches = mock.mock.calls.filter(
-      ([url]) => url === "/api/catalog/blessings"
+      ([url]) => url === "/api/catalog/gods"
     )
     expect(catalogFetches).toHaveLength(1)
   })
@@ -1154,8 +1226,8 @@ describe("CatalogManager import preview existing metadata", () => {
     const mock = setupMock()
     mock.mockImplementation(async (url: string) => {
       if (url === "/api/admin/catalog-import") return skipPreview(existing)
-      if (url === "/api/catalog/blessings") {
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") {
+        return { kind: "gods", items: [item] }
       }
       throw new Error(`unexpected url ${url}`)
     })
@@ -1163,7 +1235,7 @@ describe("CatalogManager import preview existing metadata", () => {
   }
 
   async function openImportPreview() {
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(
       screen.getByRole("button", { name: "Import reviewed wiki entries" })
@@ -1230,7 +1302,7 @@ describe("CatalogManager bulk imports", () => {
     entries: [
       {
         row: 2,
-        kind: "blessings",
+        kind: "gods",
         stableId: "custom-one",
         name: "Custom One",
         sourceUrl: "https://example.test/source",
@@ -1258,8 +1330,7 @@ describe("CatalogManager bulk imports", () => {
     mock.mockReset()
     let applied = false
     mock.mockImplementation(async (url: string) => {
-      if (url === "/api/catalog/blessings")
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") return { kind: "gods", items: [item] }
       if (url === "/api/admin/catalog-import/bulk/preview")
         return bulkPreview("digest-1", applied)
       if (url === "/api/admin/catalog-import/bulk/apply") {
@@ -1288,7 +1359,7 @@ describe("CatalogManager bulk imports", () => {
     const mock = seedBulkMock()
     const confirm = vi.fn(() => true)
     vi.stubGlobal("confirm", confirm)
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     await chooseFile()
@@ -1315,7 +1386,7 @@ describe("CatalogManager bulk imports", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     await chooseFile()
@@ -1343,8 +1414,7 @@ describe("CatalogManager bulk imports", () => {
   it("keeps apply disabled and reports errors without false success", async () => {
     const mock = seedBulkMock()
     mock.mockImplementation(async (url: string) => {
-      if (url === "/api/catalog/blessings")
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") return { kind: "gods", items: [item] }
       if (url === "/api/admin/catalog-import/bulk/preview") return bulkPreview()
       if (url === "/api/admin/catalog-import/bulk/apply")
         throw new ApiError(409, "conflict", "Preview digest mismatch.")
@@ -1354,7 +1424,7 @@ describe("CatalogManager bulk imports", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     await chooseFile()
@@ -1378,8 +1448,7 @@ describe("CatalogManager bulk imports", () => {
     let failRefresh = false
     let failedOnce = false
     mock.mockImplementation(async (url: string, init?: RequestInit) => {
-      if (url === "/api/catalog/blessings")
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") return { kind: "gods", items: [item] }
       if (url === "/api/admin/catalog-import/bulk/preview") {
         if (failRefresh && !failedOnce && init?.method === "POST") {
           failedOnce = true
@@ -1401,7 +1470,7 @@ describe("CatalogManager bulk imports", () => {
       "confirm",
       vi.fn(() => true)
     )
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     await chooseFile()
@@ -1436,8 +1505,7 @@ describe("CatalogManager bulk imports", () => {
     let previewCount = 0
     let resolveOld!: (value: ReturnType<typeof bulkPreview>) => void
     mock.mockImplementation(async (url: string) => {
-      if (url === "/api/catalog/blessings")
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") return { kind: "gods", items: [item] }
       if (url === "/api/admin/catalog-import/bulk/preview") {
         previewCount += 1
         if (previewCount === 2)
@@ -1448,7 +1516,7 @@ describe("CatalogManager bulk imports", () => {
       }
       throw new Error(`unexpected url ${url}`)
     })
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     await chooseFile()
@@ -1468,7 +1536,7 @@ describe("CatalogManager bulk imports", () => {
     const mock = seedBulkMock()
     const confirm = vi.fn(() => true)
     vi.stubGlobal("confirm", confirm)
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     let resolveOld!: (value: string) => void
@@ -1512,8 +1580,7 @@ describe("CatalogManager bulk imports", () => {
     )
     let resolveOld!: (value: ReturnType<typeof bulkPreview>) => void
     mock.mockImplementation(async (url: string, init?: RequestInit) => {
-      if (url === "/api/catalog/blessings")
-        return { kind: "blessings", items: [item] }
+      if (url === "/api/catalog/gods") return { kind: "gods", items: [item] }
       if (
         url === "/api/admin/catalog-import/bulk/preview" &&
         (init?.body as string).includes("A")
@@ -1527,7 +1594,7 @@ describe("CatalogManager bulk imports", () => {
         return { ...bulkPreview(), createdIds: ["id"] }
       throw new Error(`unexpected url ${url}`)
     })
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     const choose = (name: string, text: string) => {
@@ -1565,7 +1632,7 @@ describe("CatalogManager bulk imports", () => {
 
   it("does not restore pending file state after closing and reopening", async () => {
     seedBulkMock()
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Import CSV/JSON" }))
     let resolve!: (value: string) => void
@@ -1596,7 +1663,7 @@ describe("CatalogManager bulk imports", () => {
   it("never renders bulk import controls or calls bulk endpoints for non-admins", async () => {
     mockIsAdmin = false
     const mock = setupMock()
-    render(<CatalogManager kind="blessings" />)
+    render(<CatalogManager kind="gods" />)
     await flush()
     expect(screen.queryByRole("button", { name: "Import CSV/JSON" })).toBeNull()
     expect(
@@ -1630,6 +1697,16 @@ describe("grade descriptions and equipment stats", () => {
         return { item: fixture ?? catalogItem(kind) }
       if (url === `/api/catalog/${kind}`)
         return { kind, items: fixture ? [fixture] : [] }
+      if (url === "/api/catalog/gods")
+        return {
+          kind: "gods",
+          items: [
+            catalogItem("gods", {
+              stableId: "goddess-moon",
+              name: "Moon Goddess",
+            }),
+          ],
+        }
       throw new Error(`unexpected URL ${url}`)
     })
     return mock
@@ -1679,14 +1756,14 @@ describe("grade descriptions and equipment stats", () => {
     }
   )
 
-  it.each(["skills", "blessings"])(
+  it.each(["skills", "gods"])(
     "PATCHes only gradeDescriptions on legacy %s without config",
     async (kind) => {
       const legacy = catalogItem(kind, {
         grade: "B",
         description: "legacy general",
         config:
-          kind === "blessings"
+          kind === "gods"
             ? { grade: "old", effect: "legacy" }
             : { rarity: "Common", legacy: true },
       })
@@ -1802,6 +1879,85 @@ describe("grade descriptions and equipment stats", () => {
     ).toBe(false)
   })
 
+  it("serializes canonical equipment level and god requirements plus derived percentages", async () => {
+    const mock = mockKind("equipment")
+    render(<CatalogManager kind="equipment" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Moonward" },
+    })
+    fireEvent.change(screen.getByLabelText("Slot"), {
+      target: { value: "Head" },
+    })
+    fireEvent.change(screen.getByLabelText("Rarity"), {
+      target: { value: "Common" },
+    })
+    fireEvent.change(screen.getByLabelText("Minimum Level"), {
+      target: { value: "12" },
+    })
+    fireEvent.change(screen.getByLabelText("Required Level Type"), {
+      target: { value: "class" },
+    })
+    fireEvent.change(screen.getByLabelText("Required God"), {
+      target: { value: "goddess-moon" },
+    })
+    fireEvent.change(screen.getByLabelText("Minimum Blessing Tier"), {
+      target: { value: "Major" },
+    })
+    fireEvent.change(screen.getByLabelText("HP derived flat"), {
+      target: { value: "15" },
+    })
+    fireEvent.change(screen.getByLabelText("HP derived percent"), {
+      target: { value: "25" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(bodyOf(mock, "POST").config).toMatchObject({
+      minimumLevel: 12,
+      requiredLevelType: "class",
+      requiredGodStableId: "goddess-moon",
+      minimumBlessingTier: "Major",
+      derivedFlat: { hp: 15 },
+      derivedPercentBasisPoints: { hp: 2500 },
+    })
+    expect(bodyOf(mock, "POST").config).not.toHaveProperty("minRaceLevel")
+  })
+
+  it.each([
+    ["enlightened", "humanoidRace"],
+    ["monster", "monstrousRace"],
+  ])(
+    "converts legacy race requirement %s to %s",
+    async (legacyType, canonicalType) => {
+      const equipment = catalogItem("equipment", {
+        config: {
+          slot: "Head",
+          rarity: "Common",
+          minRaceLevel: 7,
+          requiredRaceType: legacyType,
+        },
+      })
+      const mock = mockKind("equipment", equipment)
+      render(<CatalogManager kind="equipment" />)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Edit"))
+      await flush()
+      fireEvent.change(screen.getByLabelText("Description"), {
+        target: { value: "edited" },
+      })
+      fireEvent.click(screen.getByRole("button", { name: "Save" }))
+      await flush()
+      const config = bodyOf(mock, "PATCH").config
+      expect(config).toMatchObject({
+        minimumLevel: 7,
+        requiredLevelType: canonicalType,
+      })
+      expect(config).not.toHaveProperty("minRaceLevel")
+      expect(config).not.toHaveProperty("requiredRaceType")
+    }
+  )
+
   it("only offers Ring and warns for normalized legacy Ring 1 config while permitting metadata-only edit", async () => {
     const equipment = catalogItem("equipment", {
       config: { slot: "Ring 1", rarity: "Common", custom: true },
@@ -1829,5 +1985,25 @@ describe("grade descriptions and equipment stats", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     await flush()
     expect(bodyOf(mock, "PATCH")).not.toHaveProperty("config")
+  })
+
+  it("creates a generic Item with an empty config and no type or amount", async () => {
+    const mock = mockKind("items")
+    render(<CatalogManager kind="items" />)
+    await flush()
+    expect(screen.getByRole("heading", { name: "Items" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "New Item" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Moonstone" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(mock.mock.calls.some(([url]) => url === "/api/catalog/items")).toBe(
+      true
+    )
+    const body = bodyOf(mock, "POST")
+    expect(body).toMatchObject({ name: "Moonstone", config: {} })
+    expect(body).not.toHaveProperty("type")
+    expect(body).not.toHaveProperty("amount")
   })
 })

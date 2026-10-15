@@ -57,6 +57,171 @@ export function deriveRaceLevel(
 }
 
 /* ------------------------------------------------------------------ *
+ * Grade ceiling level-up blockers
+ * ------------------------------------------------------------------ */
+
+/**
+ * The tracks a +Level control can target and the map of grade-ceiling block
+ * reasons keyed by track. A track is present in the returned map only when a
+ * level-up on it is blocked by the authoritative current grade ceiling. A value
+ * of `null`/absent means a level-up is allowed (or the track cannot be leveled).
+ */
+export type LevelUpBlockedMap = Partial<
+  Record<"race" | "class" | "profession", string>
+>
+
+/**
+ * The entry level of the grade band immediately above `grade`, or `null` when
+ * there is no next grade (the top grade S) or the table configures no band for
+ * it. A `null` threshold means no ceiling, exactly as the engine treats a
+ * next-grade lookup that yields no band - such a track is never capped.
+ */
+function nextGradeEntry(grade: Grade, config: RulesConfig): number | null {
+  const next = nextGrade(grade)
+  if (!next) return null
+  const band = bandForGrade(next, config.gradeTable)
+  return band ? band.entryLevel : null
+}
+
+/**
+ * The reason a level-up that projects the race level to `projectedRaceLevel`
+ * would be blocked by the current race grade ceiling, or `null` when it is
+ * allowed. This mirrors the engine's race grade-ceiling gate exactly: a level-up
+ * may reach exactly the NEXT grade's entry level but may not push past it until
+ * the caller evolves the race grade. `raceGrade` is the authoritative stored
+ * grade (`state.race.grade`), never derived from level.
+ */
+function raceCeilingReason(
+  projectedRaceLevel: number,
+  raceGrade: Grade,
+  config: RulesConfig
+): string | null {
+  const entry = nextGradeEntry(raceGrade, config)
+  if (entry == null) return null
+  const next = nextGrade(raceGrade)!
+  if (projectedRaceLevel > entry) {
+    return `Race level-up would reach ${projectedRaceLevel}, past the ${raceGrade}->${next} ceiling (${entry}); evolve the race grade first`
+  }
+  return null
+}
+
+/**
+ * The reason a level-up on a graded class/profession track would be blocked by
+ * the track's OWN grade ceiling, or `null` when it is allowed. Identical to the
+ * engine's independent track-grade ceiling in `advanceQuarter`: a graded track
+ * may reach exactly the next grade's entry level but may not push past it until
+ * the caller explicitly evolves the track grade (it never uses the broad band
+ * max). An ungraded track is never capped here.
+ */
+function trackCeilingReason(
+  track: TrackId,
+  currentLevel: number,
+  trackGrade: Grade,
+  config: RulesConfig
+): string | null {
+  const entry = nextGradeEntry(trackGrade, config)
+  if (entry == null) return null
+  const next = nextGrade(trackGrade)!
+  const newLevel = currentLevel + 1
+  if (newLevel > entry) {
+    return `${track} level-up would reach ${newLevel}, past the ${trackGrade}->${next} ceiling (${entry}); evolve the ${track} grade first`
+  }
+  return null
+}
+
+/**
+ * Project the derived race level after a hypothetical level-up on `track`. The
+ * projection uses the exact same `config.raceDerivationStrategy` the engine uses,
+ * treating only the target track as incremented (the engine advances exactly one
+ * track per quarter advance). Only meaningful for a derived race; an independent
+ * race carries its own level and is not derived.
+ */
+function projectedRaceLevelAfterTrackLevelUp(
+  state: CharacterState,
+  track: TrackId,
+  config: RulesConfig
+): number {
+  const existing = state.tracks[track]
+  const tracks = {
+    ...state.tracks,
+    [track]: { ...existing, level: existing.level + 1 },
+  }
+  return deriveRaceLevel({ ...state, tracks }, config)
+}
+
+/**
+ * The grade-ceiling reason a +Level on `track` is blocked, or `null` when a
+ * level-up is allowed (or the track cannot be leveled). This is a read-only
+ * projection of the engine's actual grade gates - it never mutates state and
+ * takes no definition/config beyond `config`.
+ *
+ * - `race` is gated only for an independent (monster) race whose own level may
+ *   not push past the next grade band's entry level.
+ * - `class` / `profession` are gated for a derived (enlightened) race. The
+ *   derived race gate is evaluated FIRST using the projected race level after the
+ *   track level-up, so it is reported ahead of the track ceiling; then the track
+ *   grade ceiling applies only to a graded track. A legacy ungraded track carries
+ *   no track gate.
+ */
+export function gradeLevelUpBlockReason(
+  state: CharacterState,
+  track: TrackId,
+  config: RulesConfig
+): string | null {
+  if (track === "race") {
+    if (state.race.mode !== "independent") return null
+    return raceCeilingReason(state.race.level + 1, state.race.grade, config)
+  }
+  const existing = state.tracks[track]
+  if (!existing) return null
+
+  // Derived race gate first: an enlightened race derives its race level from the
+  // class/profession tracks, so a class/profession level-up may be blocked by the
+  // current race grade ceiling before any track-specific ceiling is considered.
+  if (state.race.mode === "derived") {
+    const raceReason = raceCeilingReason(
+      projectedRaceLevelAfterTrackLevelUp(state, track, config),
+      state.race.grade,
+      config
+    )
+    if (raceReason) return raceReason
+  }
+
+  // Track-grade ceiling: only an explicitly graded track is capped.
+  if (existing.grade) {
+    return trackCeilingReason(track, existing.level, existing.grade, config)
+  }
+  return null
+}
+
+/**
+ * The set of grade-ceiling blockers for every level-able track, keyed by track.
+ * A track appears only when a +Level on it would be blocked; an absent key means
+ * a level-up is allowed for that track (or the track is not level-able in the
+ * character's current mode).
+ *
+ * - A monster (independent race mode) exposes only the `race` key; an enlightened
+ *   (derived) race exposes only `class` / `profession`.
+ * - This is a pure read of `state` + `config`; it never mutates either.
+ */
+export function gradeLevelUpBlockers(
+  state: CharacterState,
+  config: RulesConfig
+): LevelUpBlockedMap {
+  const out: LevelUpBlockedMap = {}
+  if (state.race.mode === "independent") {
+    const reason = gradeLevelUpBlockReason(state, "race", config)
+    if (reason) out.race = reason
+    return out
+  }
+  for (const track of ["class", "profession"] as const) {
+    const reason = gradeLevelUpBlockReason(state, track, config)
+    if (reason) out[track] = reason
+  }
+  return out
+}
+
+/* ------------------------------------------------------------------ *
  * Available points
  * ------------------------------------------------------------------ */
 

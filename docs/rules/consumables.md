@@ -44,21 +44,23 @@ be conflated between them:
 
 ## Inventory ownership (backend notes)
 
-Consumables share the same per-definition owner-managed inventory quantity as
-equipment (`CharacterInventoryItem.quantity`, bounded 1..999999). This is **house
-bookkeeping**, not canon, and there is no item-instance or cap model. Consuming
-requires the character to own at least one unit: `consumeCharacter` checks the
-owned quantity and decrements/removes exactly one inside the SAME transaction as
-the permanent/temporary effect validation, the character version CAS, and the
-event journal. A failed cap, a missing duration, or a stale version rolls back
-the stock change, the state and the journal together. The consume event records
-the owned stock before and after (`stockPrior` / `stockAfter`).
+Consumables (catalog kind `items`, which replaced the legacy `consumables` alias)
+share the same per-definition owner-managed inventory quantity as equipment
+(`CharacterInventoryItem.quantity`, bounded 1..999999). This is **house
+bookkeeping**, not canon, and there is no item-instance or cap model. There is no
+dedicated consume endpoint: spending a unit is an inventory `remove`, and the
+permanent/temporary effect it represents is NOT applied at spend time. Permanent
+external stat gains have already been recorded immutably in
+`Character.state.permanentGains`, and temporary potion effects among the stored
+active effects, so removing stock never rewrites history. The engine derives
+consumable caps/effects from that authored state (see `permanentConsumableInfo`),
+never from the live inventory quantity.
 
 - Manual acquisition is the only acquisition path in this stage (no crafted-drop
   or economy is invented). `POST /api/characters/[id]/inventory` with
   `operation: add | remove`, `quantity` 1..999999, a mandatory `sourceNote`
   (nonempty, <= 500 chars), and the CAS `version`. An `add` only accepts active
-  (unarchived) consumable catalog entries; a `remove` is permitted for archived
+  (unarchived) `items` catalog entries; a `remove` is permitted for archived
   entries (owned stock may still be spent). The write runs under SERIALIZABLE
   isolation, CASes the character version, and appends an `inventory_adjust`
   journal event recording the prior/new quantity, the definition snapshot, the

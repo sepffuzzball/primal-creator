@@ -194,15 +194,20 @@ history of what was offered (and when) is preserved.
 - At most **one active** offer may exist per base key at any time; multiple
   generations may coexist as historical (canceled) records.
 
-## Backup import (v6)
+## Backup import (v7)
 
-A v6 backup (`primal-character/6`) carries the full append-only offer state:
-every exported skill offer requires a non-negative `generation` and a
-nullable `canceledAt`. A legacy v3/v4/v5 backup omits both; they default to
-`0`/`null`. A v6 backup is never "rewound": the importer preserves every offered
-option snapshot verbatim and restores canceled offers as canceled (so a restore
-does not re-activate a canceled offer or restamp its cancellation time). The
-importer rejects:
+The current backup schema is `primal-character/7`, and every exported skill offer
+carries the full append-only offer state: a non-negative `generation` and a
+nullable `canceledAt`. A legacy v6 backup (`primal-character/6`) carries the same
+append-only offer state, while a v3/v4/v5 backup omits both and the importer
+defaults them to `0`/`null`. A current backup is never "rewound": the importer
+preserves every offered option snapshot verbatim and restores canceled offers as
+canceled (so a restore does not re-activate a canceled offer or restamp its
+cancellation time). Legacy `primal-character/3` through `/6` backups are still
+accepted, but only when they carry no `blessing` association - the legacy
+`blessings` catalog kind was retired, so a legacy doc with an old blessing link
+is rejected with an actionable 400 migration notice even when it would otherwise
+resolve. The importer rejects:
 
 - a **duplicate** `(track, level, choiceGroup, generation)` key
   (`import_duplicate_offer`),
