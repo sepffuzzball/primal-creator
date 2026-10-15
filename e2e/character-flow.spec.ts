@@ -74,26 +74,6 @@ async function waitForHydrated(page: Page): Promise<void> {
   )
 }
 
-/**
- * Advance the class track one quarter, closing the progression journal dialog
- * that opens on every advance. Waits for the button to become enabled again
- * (the server reload disables it while the mutation is in flight).
- */
-async function advanceClassQuarter(page: Page): Promise<void> {
-  const button = page.getByRole("button", { name: /^Advance class/ })
-  await expect(button).toBeEnabled()
-  await button.click()
-
-  const journal = page
-    .locator("[role=dialog]")
-    .filter({ hasText: "Progression journal" })
-  await expect(journal).toBeVisible()
-  // base-ui <Dialog> closes on Escape; this also unblocks the next click.
-  await page.keyboard.press("Escape")
-  await expect(journal).toBeHidden()
-  await expect(button).toBeEnabled()
-}
-
 test.describe("character lifecycle", () => {
   test("login, create, progress, allocate, archive", async ({ page }) => {
     // ------------------------------------------------------------------ //
@@ -389,8 +369,12 @@ test.describe("character lifecycle", () => {
     await page.waitForURL(/\/characters\/(?!new$)[^/]+$/)
     const characterUrl = page.url()
 
-    // The character detail page shows the created name.
-    await expect(page.getByRole("heading", { name })).toBeVisible()
+    // The character detail page shows the created name. The page exposes the
+    // name twice - as the page's h1 and again as the Overview h2 - so scope the
+    // unique page title to the level-1 heading instead of matching both.
+    await expect(
+      page.getByRole("heading", { level: 1, name, exact: true })
+    ).toBeVisible()
 
     // The questionnaire's completion is done: no QuestionnairePrimitive item was
     // reported as missing from Root.items during any creation-wizard branch
@@ -475,17 +459,61 @@ ${missingItemWarnings.join("\n")}`
     ).toBe(true)
 
     // ------------------------------------------------------------------ //
-    // Progress: advance the class track four quarters (level 0 -> level 1).
+    // Progress: advance the class track to level 1 through the Class tab.
+    //
+    // The class track exposes a Base UI slider ("Class experience") that
+    // commits an experience-percent set on keyboard commit, and a "+ Level"
+    // button that performs the actual level-up. The progression journal dialog
+    // opens ONLY on a real level-up (the server returns `leveledUp`), never on
+    // a percent-only slider change, so this exercises both paths with real
+    // browser interaction and no network mocking.
     // ------------------------------------------------------------------ //
-    await advanceClassQuarter(page)
-    await advanceClassQuarter(page)
-    await advanceClassQuarter(page)
-    await advanceClassQuarter(page)
+    await page.getByRole("tab", { name: "Class" }).click()
 
-    // The class track reached level 1 quarter 0.
+    // The class track exposes a Base UI slider labelled by the "Class
+    // experience" group and starts at 0%. It is editable because the enlightened
+    // race mode makes the class track independently adjustable.
+    const classExperience = page.getByRole("group", {
+      name: "Class experience",
+    })
+    const classSlider = classExperience.getByRole("slider")
+    await expect(classSlider).toBeVisible()
+    await expect(page.getByText("Level 0", { exact: true })).toBeVisible()
     await expect(
-      page.getByRole("button", { name: /^Advance class \(L1 Q0\)/ })
-    ).toBeVisible()
+      page.getByRole("progressbar", { name: "Class experience" })
+    ).toHaveAttribute("aria-valuenow", "0")
+
+    // One actual keyboard increment (focus + ArrowRight, keyup commits) raises
+    // the displayed percent to 1%. Because no quarter boundary is crossed, this
+    // is a percent-only set and the progression journal must NOT open.
+    const classJournal = page
+      .locator("[role=dialog]")
+      .filter({ hasText: "Progression journal" })
+    await classSlider.focus()
+    await page.keyboard.press("ArrowRight")
+    await expect(classSlider).toHaveAttribute("aria-valuenow", "1")
+    await expect(
+      page.getByRole("progressbar", { name: "Class experience" })
+    ).toHaveAttribute("aria-valuenow", "1")
+    await expect(classJournal).toBeHidden()
+
+    // "+ Level" performs the real level-up (level 0 -> 1). It resets the class
+    // experience to 0% and opens the progression journal exactly once.
+    await page.getByRole("button", { name: "Increase class level" }).click()
+
+    // The level-up opens the progression journal exactly once. While this modal
+    // dialog is open the background becomes hidden from the accessibility tree,
+    // so the class-track assertions must run only after it is dismissed.
+    await expect(classJournal).toBeVisible()
+    await page.keyboard.press("Escape")
+    await expect(classJournal).toBeHidden()
+
+    // The real level-up reached level 1 and reset the class experience to 0%.
+    await expect(classSlider).toHaveAttribute("aria-valuenow", "0")
+    await expect(page.getByText("Level 1", { exact: true })).toBeVisible()
+    await expect(
+      page.getByRole("progressbar", { name: "Class experience" })
+    ).toHaveAttribute("aria-valuenow", "0")
 
     // ------------------------------------------------------------------ //
     // Allocate one attribute point.
