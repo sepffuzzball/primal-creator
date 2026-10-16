@@ -244,16 +244,17 @@ const VALID_ARCHIVE_LIST =
   ].join("\n") + "\n"
 
 /** The listing above without the TABLE DATA entries (a schema-only dump). */
-const SCHEMA_ONLY_ARCHIVE_LIST = [
-  "; Archive created at 2026-01-01 00:00:00 UTC",
-  ";     dbname: primal_creator",
-  ";",
-  "; Selected TOC Entries:",
-  ";",
-  "217; 1259 41096 TABLE public _prisma_migrations postgres",
-  "216; 1259 41089 TABLE public catalog_definitions postgres",
-  "215; 1259 41082 TABLE public users postgres",
-].join("\n") + "\n"
+const SCHEMA_ONLY_ARCHIVE_LIST =
+  [
+    "; Archive created at 2026-01-01 00:00:00 UTC",
+    ";     dbname: primal_creator",
+    ";",
+    "; Selected TOC Entries:",
+    ";",
+    "217; 1259 41096 TABLE public _prisma_migrations postgres",
+    "216; 1259 41089 TABLE public catalog_definitions postgres",
+    "215; 1259 41082 TABLE public users postgres",
+  ].join("\n") + "\n"
 
 /**
  * Build a pg_restore runner that dispatches on the subcommand so a single fake
@@ -267,7 +268,10 @@ function archiveRunner(
 ) {
   const oops = (args: string[]) =>
     new Error(`unexpected pg_restore args: ${args.join(" ")}`)
-  return (cmd: string, args: string[]): Promise<{
+  return (
+    cmd: string,
+    args: string[]
+  ): Promise<{
     code: number
     stdout: string
     stderr: string
@@ -324,11 +328,14 @@ function wrongDbnameArchiveRunner() {
     /dbname: primal_creator/,
     "dbname: another_db"
   )
-  return archiveRunner({ code: 0, stdout: list, stderr: "" }, {
-    code: 0,
-    stdout: "",
-    stderr: "",
-  })
+  return archiveRunner(
+    { code: 0, stdout: list, stderr: "" },
+    {
+      code: 0,
+      stdout: "",
+      stderr: "",
+    }
+  )
 }
 
 function silentLog(): (msg: string) => void {
@@ -453,9 +460,7 @@ describe("parseDatabaseUrl / parseTargetHost / assertTargetMatches", () => {
 
   it("rejects a duplicate query parameter", () => {
     expect(() =>
-      parseDatabaseUrl(
-        "postgresql://u:p@h:5432/db?schema=public&schema=public"
-      )
+      parseDatabaseUrl("postgresql://u:p@h:5432/db?schema=public&schema=public")
     ).toThrow(/more than once/)
     expect(() =>
       parseDatabaseUrl(
@@ -624,9 +629,9 @@ describe("assertArchiveContainsObjects", () => {
   })
 
   it("rejects a schema-only listing (TABLE defs but no TABLE DATA)", () => {
-    expect(() => assertArchiveContainsObjects(SCHEMA_ONLY_ARCHIVE_LIST)).toThrow(
-      /TABLE DATA/
-    )
+    expect(() =>
+      assertArchiveContainsObjects(SCHEMA_ONLY_ARCHIVE_LIST)
+    ).toThrow(/TABLE DATA/)
   })
 
   it("rejects a listing missing a required app object", () => {
@@ -670,9 +675,9 @@ describe("archiveHeaderDbname / assertArchiveDbname", () => {
   })
 
   it("rejects an archive recorded from a different database", () => {
-    expect(() =>
-      assertArchiveDbname(VALID_ARCHIVE_LIST, "another_db")
-    ).toThrow(/created from database "primal_creator"/)
+    expect(() => assertArchiveDbname(VALID_ARCHIVE_LIST, "another_db")).toThrow(
+      /created from database "primal_creator"/
+    )
   })
 })
 
@@ -783,11 +788,7 @@ describe("classifyPublicObjects", () => {
 
   it("passes the complete real baseline object set (tables, enums, indexes, constraints)", () => {
     expect(
-      classifyPublicObjects([
-        ...baselineRows,
-        ...indexRows,
-        ...constraintRows,
-      ])
+      classifyPublicObjects([...baselineRows, ...indexRows, ...constraintRows])
     ).toEqual([])
   })
 
