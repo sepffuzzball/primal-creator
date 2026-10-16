@@ -155,6 +155,12 @@ evolution_choice_required`).
   manifest, it is never run by `db:seed` or app startup, and created rows are
   never auto-granted to characters.
   See `docs/catalog/bulk-import.md`.
+- **MCP catalog publisher (local stdio client)**: an agent (via OpenCode) can
+  publish curated catalog entries to the deployed app's managed catalog through a
+  local MCP server (`scripts/mcp/catalog-server.ts`) that talks to the fixed
+  publisher routes with an environment-configured HTTPS origin and bearer token.
+  It is not a scraper and never runs by itself; see
+  `docs/catalog/mcp-publisher.md`.
 - **Title & equipment linking**: a character can attach real catalog titles and
   equip catalog equipment. Effects and equipment bonuses are synthesized live
   from the **current**, unarchived catalog config at read time; the stored
@@ -460,11 +466,16 @@ See `.env.example` and `docs/deployment.md`.
   on this volume (see `docs/deployment.md`).
 
 ```bash
-# Dump the database (run on the host next to compose):
-docker compose exec postgres pg_dump -U postgres primal_creator > backup.sql
+# Dump the database in CUSTOM FORMAT (-Fc), the only format the one-time 0.1.0
+# reset accepts as --backup-file (see docs/deployment.md section 1.4). Restore
+# via pg_restore, not psql.
+docker compose exec -T postgres \
+  pg_dump -Fc -U postgres -d primal_creator > backup.dump
 
-# Restore:
-docker compose exec -T postgres psql -U postgres primal_creator < backup.sql
+# Restore (destructive; run in a maintenance window):
+docker compose exec -T postgres \
+  pg_restore --clean --if-exists --no-owner -U postgres -d primal_creator \
+  < backup.dump
 
 # Back up the uploads volume:
 docker run --rm \
@@ -472,6 +483,12 @@ docker run --rm \
   -v "$PWD":/backup alpine \
   tar czf /backup/uploads.tar.gz -C /data .
 ```
+
+Release 0.1.0 replaces the `0001..0023` migration chain with a single
+from-scratch baseline. A pre-0.1.0 deployed database must be wiped and rebuilt
+through the one-time guarded reset (`pnpm db:reset:0.1.0`) - see
+`docs/deployment.md` section 1.4. For a fresh, empty database use the normal
+`db:migrate` then `db:seed` (no reset).
 
 See `docs/deployment.md` for the full deployment, operation and restore guide.
 

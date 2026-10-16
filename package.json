@@ -1,6 +1,6 @@
 {
   "name": "primal-creator",
-  "version": "0.0.12",
+  "version": "0.1.0",
   "type": "module",
   "private": true,
   "scripts": {
@@ -13,10 +13,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "mcp:catalog": "tsx scripts/mcp/catalog-server.ts",
     "db:seed": "prisma db seed",
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
     "db:generate": "prisma generate",
+    "db:reset:0.1.0": "node scripts/reset-db-0.1.0.mjs",
     "prisma:validate": "prisma validate"
   },
   "prisma": {
@@ -24,6 +26,7 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
+    "@modelcontextprotocol/server": "^2.3.1",
     "@prisma/client": "6.19.3",
     "@shadcn/react": "^0.3.1",
     "bcryptjs": "^3.0.3",
@@ -56,6 +59,7 @@
     "prettier": "^3.9.9",
     "prettier-plugin-tailwindcss": "^0.8.1",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5",
     "vitest": "^5.0.3"
   }

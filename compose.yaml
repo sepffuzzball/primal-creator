@@ -13,6 +13,18 @@ name: primal-creator
 #
 #   docker compose up -d --build
 #
+# Upgrading an EXISTING pre-0.1.0 deployed database (migrated with the old
+# 0001..0023 chain)? That chain is archived under prisma/migrations-archive/
+# pre-0.1.0 and the single 0.1.0 baseline refuses to run on it, so `db:migrate`
+# above is NOT the upgrade path. Stop the app, take a pg_dump -Fc backup, then
+# run the one-time guarded reset ONCE (see docs/deployment.md section 1.4):
+#
+#   docker compose run --rm -v "$PWD:/backups:ro" app pnpm db:reset:0.1.0 -- \
+#     --target-host postgres:5432 \
+#     --target-db "${POSTGRES_DB:-primal_creator}" \
+#     --confirm "DELETE ${POSTGRES_DB:-primal_creator} FOR 0.1.0" \
+#     --backup-file /backups/backup-0.1.0.dump
+#
 # Required before first `up`: set AUTH_SECRET (>= 32 chars), ADMIN_PASSWORD
 # (>= 12 chars, not a placeholder), and POSTGRES_PASSWORD. The default Postgres
 # password is a DEV-only value (`postgres`); it must be changed on any service
@@ -45,6 +57,11 @@ services:
       # seed additionally rejects weak/placeholder and <12 char values.
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Set a strong admin password}"
       CATALOG_PUBLIC: "${CATALOG_PUBLIC:-false}"
+      # SHA-256 (exactly 64 lowercase hex) of the raw MCP catalog publisher bearer
+      # token. Only the hash is ever compared; the raw token never appears in a
+      # config/log/error. Optional: an unset/empty value fails closed (503) on the
+      # publisher endpoints, so a publisher cannot be mistaken for authorized.
+      MCP_CATALOG_TOKEN_SHA256: "${MCP_CATALOG_TOKEN_SHA256:-}"
       # Public browser origin for the CSRF same-origin check. Optional: when run
       # behind a reverse proxy, set it to the real browser origin (e.g.
       # "https://app.example.com", HTTPS in production) so the app can reject

@@ -98,7 +98,8 @@ Archived bloodlines are inert: a linked but archived definition contributes no
 effect.
 
 At most ONE bloodline link may exist on a character (active or archived),
-enforced server-side, by the partial unique index at migration 0012, and across
+enforced server-side, by the partial unique index at migration 0012 (a migration
+in the archived `0001..0023` chain, replaced by the 0.1.0 baseline), and across
 create / association / import. Adding a bloodline atomically replaces EVERY
 existing bloodline link on the character (active or archived), so a character
 never holds two bloodlines. Selecting two bloodlines at create is a

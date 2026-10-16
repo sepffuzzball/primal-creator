@@ -202,7 +202,8 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
   assertHttpsSourceUrl(entry.sourceUrl, entry.stableId)
   // A gods manifest entry carries no catalog grade band (see `godGradeForbidden`):
   // a non-null grade is rejected before any write, so both preview and apply fail
-  // up front (migration 0020 nulled any pre-existing god grade).
+  // up front (migration 0020, archived 0001..0023 chain, nulled any pre-existing
+  // god grade).
   if (godGradeForbidden(kind, entry.grade)) {
     throw badRequest(
       "invalid_grade",

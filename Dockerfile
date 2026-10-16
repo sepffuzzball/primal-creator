@@ -66,6 +66,21 @@ RUN pnpm prisma generate
 FROM base AS runner
 WORKDIR /app
 
+# `pg_restore` (PostgreSQL 16 client) is required by the one-time 0.1.0 reset
+# script: it verifies the operator's pg_dump custom-format backup archive with
+# `pg_restore --list` before the destructive reset. The archive's format version
+# is produced by pg_dump 16 (the compose `postgres:16-alpine` service), so use
+# the PGDG PostgreSQL 16 client rather than bookworm's default 15.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl gnupg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV NODE_ENV="production" \
     PORT="3000" \
     HOSTNAME="0.0.0.0"
@@ -90,6 +105,10 @@ COPY --from=builder /app/public ./public
 
 # Prisma schema, migrations and the seed script, so migrate/seed run in-container.
 COPY --from=builder /app/prisma ./prisma
+
+# The one-time 0.1.0 reset script (and its dependencies under scripts/) so the
+# explicit `pnpm db:reset:0.1.0` can run in-container against prod data.
+COPY --from=builder /app/scripts ./scripts
 
 # Production dependency tree (prisma CLI, @prisma/client, bcryptjs, ...) used by
 # `pnpm db:migrate` and `pnpm db:seed`. Overlays the standalone node_modules with

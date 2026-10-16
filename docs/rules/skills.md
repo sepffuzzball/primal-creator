@@ -54,7 +54,8 @@ for offers):
 {
   // The advancing track this offer applies to: "race" | "class" | "profession".
   // Mandatory on a NEW or CONFIG-CHANGED skill. A legacy entry that predates the
-  // mandatory track is backfilled to "race" by migration 0023; an arbitrary legacy
+  // mandatory track is backfilled to "race" by migration 0023 (in the archived
+  // 0001..0023 chain, replaced by the 0.1.0 baseline); an arbitrary legacy
   // string is read safely and ignored for offers.
   track: "race" | "class" | "profession",
   // Optional legacy annotation: the track level at which this skill is offered.
@@ -104,7 +105,8 @@ for offers):
 
 - A **NEW or CONFIG-CHANGED skill must declare a `track`** (`"race"`, `"class"` or
   `"profession"`). A config missing `track` is rejected by the service with
-  `invalid_config`; the migration 0023 backfills a missing `track` in persisted
+  `invalid_config`; the migration 0023 (archived `0001..0023` chain) backfills a
+  missing `track` in persisted
   `skills` rows to `"race"` so a legacy entry stays readable without authoring
   every one. `milestone` is now an optional legacy annotation with no paired
   requirement and no offer gating.

@@ -416,7 +416,8 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
   const grade = optionalGrade(raw.grade, row)
   // A gods entry carries no catalog grade band (see `godGradeForbidden`): a
   // non-null grade is rejected before any write, so both preview and apply fail
-  // up front with no partial write (migration 0020 nulled any existing grade).
+  // up front with no partial write (migration 0020, archived 0001..0023 chain,
+  // nulled any existing grade).
   if (godGradeForbidden(kind, grade)) {
     throw badRequest(
       "invalid_grade",

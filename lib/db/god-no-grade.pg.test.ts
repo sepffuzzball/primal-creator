@@ -124,11 +124,15 @@ describe.skipIf(!gate.run)(
     })
 
     it("records migration 0020 as applied", async () => {
+      // The 0.1.0 baseline collapses the whole 0001..0023 chain into a single
+      // migration, so the schema may be established by the baseline migration
+      // rather than by the historical 0020 one. Accept either.
       const rows = await prisma.$queryRaw<Array<{ migration_name: string }>>`
       SELECT "migration_name" FROM "_prisma_migrations"
-      WHERE "migration_name" LIKE '0020%'
+      WHERE "migration_name" = '20261016000000_initial_0_1_0'
+         OR "migration_name" LIKE '0020%'
     `
-      expect(rows).toHaveLength(1)
+      expect(rows.length).toBeGreaterThanOrEqual(1)
     })
 
     it("the migration UPDATE clears a pre-existing god grade while preserving config and links", async () => {

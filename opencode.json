@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "primal-catalog": {
+      "type": "local",
+      "command": ["pnpm", "mcp:catalog"],
+      "environment": {
+        "PRIMAL_CATALOG_URL": "{env:PRIMAL_CATALOG_URL}",
+        "PRIMAL_CATALOG_TOKEN": "{env:PRIMAL_CATALOG_TOKEN}"
+      },
+      "enabled": true
+    }
+  }
+}

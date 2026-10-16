@@ -183,8 +183,10 @@ test.describe("character lifecycle", () => {
 
     // Creation-rules sanity check: the wizard's creation-rules endpoint must
     // report a valid, admin-configurable transcendent-skill cap. The seed applies
-    // the default of 3 (migration 0012 + seed), but an admin may have reconfigured
-    // the cap anywhere in 0..8, so running against a reused DB this assertion only
+    // the default of 3 (migration 0012 + seed - migration 0012 is in the archived
+    // 0001..0023 chain, now part of the 0.1.0 baseline), but an admin may have
+    // reconfigured the cap anywhere in 0..8, so running against a reused DB this
+    // assertion only
     // requires an integer inside that bound. The default of 3 is verified by the
     // ruleset and route unit/PG tests, not here. This is an assertion, not a
     // mutation: a non-integer or out-of-range cap (or a missing rules row) means

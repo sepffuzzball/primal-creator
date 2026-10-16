@@ -81,7 +81,10 @@ docker compose run --rm app pnpm db:migrate
 docker compose run --rm app pnpm db:seed
 ```
 
-- `db:migrate` = `prisma migrate deploy`. It applies `prisma/migrations`.
+- `db:migrate` = `prisma migrate deploy`. It applies `prisma/migrations`, which in
+  release 0.1.0 is the single from-scratch baseline
+  (`20261016000000_initial_0_1_0`) - the old `0001..0023` chain was archived (see
+  section 1.4).
 - `db:seed` = `prisma db seed`, which runs `node prisma/seed.ts` (Node 24 type
   stripping) against the same `DATABASE_URL`. It bootstraps the admin user and
   the verified/house catalog entries. It is idempotent (uses upsert/find) and
@@ -91,23 +94,143 @@ Run these **before** `docker compose up -d` if you want the first boot to be
 immediately usable, or after once; the app serves regardless because it never
 auto-migrates.
 
-#### Destructive migrations (backup first)
+This is the whole deployment for a **brand-new, empty** database. On a
+**pre-0.1.0** database that was migrated with the old `0001..0023` chain, the
+single 0.1.0 baseline refuses to run (it only ever builds from an empty
+database), so use the one-time guarded reset in section 1.4 instead of
+`db:migrate`.
 
-Migrations **0017, 0018 and 0019** form an irreversible destructive chain. In
-particular, `0019_god_blessing_tiers` **deletes every existing BLESSING
-association** and all `blessings` catalog rows (and drops the `patronId`
-column), then adds a database CHECK constraint that forbids a null-tier BLESSING
-link. The deleted blessing links cannot be recovered from the post-migration
-database, so before running `pnpm db:migrate` on a database that already has
-characters, **take a full PostgreSQL backup**:
+#### Historical destructive chain (archived)
+
+The `0001..0023` migrations are **archived**, not active: in release 0.1.0 the
+SQL was moved to `prisma/migrations-archive/pre-0.1.0` and replaced by the
+single from-scratch baseline (see section 1.4). The old destructive chain is
+historical context - it matters only if you operate a pre-0.1.0 backup, never
+for the released app.
+
+Historically, migrations **0017, 0018 and 0019** formed an irreversible
+destructive chain. In particular, `0019_god_blessing_tiers` **deleted every
+existing BLESSING association** and all `blessings` catalog rows (and dropped
+the `patronId` column), then added a database CHECK constraint that forbids a
+null-tier BLESSING link. The deleted blessing links cannot be recovered from the
+post-migration database, so before running the old chain on a database that
+already has characters, **take a full PostgreSQL backup**. For the 0.1.0 upgrade
+path that backup must be a custom-format archive the reset can verify (see
+section 1.4), not a plain-SQL `pg_dump > backup.sql`:
 
 ```bash
-docker compose exec postgres pg_dump -U postgres primal_creator > backup-before-0017.sql
+docker compose exec -T postgres \
+  pg_dump -Fc -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-primal_creator}" \
+  > backup-before-0.1.0.dump
 ```
 
-If a character's blessing links must be preserved, restore from that backup
-recreates the `blessings` catalog rows and the old BLESSING links, and someone
-must re-link each god + tier manually afterward. See `docs/rules/blessings.md`.
+If a character's blessing links must be preserved, restoring that archive (see
+section 5.1) recreates the `blessings` catalog rows and the old BLESSING links
+only on a pre-0.1.0 database, and someone must re-link each god + tier manually
+afterward. See `docs/rules/blessings.md`.
+
+### 1.4 One-time 0.1.0 migration (from a pre-0.1.0 database)
+
+Release 0.1.0 collapses the `0001..0023` migration chain into a single
+from-scratch baseline (`prisma/migrations/20261016000000_initial_0_1_0`). The
+baseline opens with a `DO` guard that only ever runs against an **empty**
+database: it refuses to re-create when `_prisma_migrations` already records an
+applied migration, or when the public schema already holds any non-migration
+object. Because that guard never drops anything, a database migrated with the old
+chain **cannot** be upgraded by `prisma migrate deploy` - it must first be wiped
+and rebuilt. This is a one-time, explicit, opt-in, fail-closed operation. It is
+**never** run automatically, and the app never auto-resets on boot.
+
+The historical `0001..0023` SQL is preserved (untouched) at
+`prisma/migrations-archive/pre-0.1.0`.
+
+> **Warning.** The reset drops ALL existing application data - users, admins,
+> characters, progression events, drafts, inventory, associations and every
+> catalog row - and rebuilds the 11 application tables, the active house-rules
+> row, the single baseline migration, the `>= 41` curated catalog entries and
+> the seeded admin from scratch. Portrait/upload binaries that live outside the
+> database (the `uploads` volume or `UPLOAD_DIR`) survive, but their database
+> references (the `assets` rows) are gone, so those files are orphaned.
+
+Prerequisites and exact steps, in order:
+
+```bash
+# 0. Ensure ADMIN_EMAIL / ADMIN_PASSWORD are set with a strong password. The
+#    reset enforces production-strength admin credentials (>= 12 chars, not a
+#    weak placeholder) BEFORE any deletion, regardless of NODE_ENV.
+
+# 1. Stop all app/writer instances. Keep Postgres running - it must serve the
+#    dump and the reset.
+docker compose stop app
+
+# 2. Take a FULL backup from the Postgres service to a host file, in pg_dump
+#    CUSTOM FORMAT (-Fc). The reset script REQUIRES a custom-format archive: it
+#    validates the PGDMP header plus the object/data list. A plain-SQL
+#    `pg_dump > backup.sql` from the older docs is NOT accepted by the reset's
+#    `--backup-file` check.
+docker compose exec -T postgres \
+  pg_dump -Fc -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-primal_creator}" \
+  > backup-0.1.0.dump
+
+# 3. Verify the backup BEFORE any destructive step: list the archive and run a
+#    full read/decompression rehearsal. The reset script performs the same
+#    checks itself, but validating here means you know the dump is good before
+#    you risk the data.
+docker compose exec -T postgres pg_restore --list < backup-0.1.0.dump
+#   Confirm the listing includes `TABLE public users`, `TABLE public
+#   catalog_definitions`, `_prisma_migrations` AND `TABLE DATA` for `users` /
+#   `catalog_definitions` (a schema-only dump fails here).
+docker compose exec -T postgres \
+  pg_restore --data-only --file /dev/null < backup-0.1.0.dump
+#   Reads and decompresses every data entry; a truncated/corrupt archive fails here.
+
+# 4. Pull / build the new 0.1.0 image (the one carrying the baseline migration
+#    and the reset script). The image is referenced by ${DOCKER_TAG:-latest}.
+#    `.github/workflows/docker.yml` publishes only `main`, `latest` and the
+#    short SHA on main pushes - there is NO `0.1.0` tag unless you also push a
+#    `v0.1.0` tag - so use `main` after GitHub Actions has published it, or
+#    build locally. Do not assume a `0.1.0` tag exists.
+#      Option A - pull a published tag (once the docker.yml publish job on
+#      `main` has succeeded; if the image is not available yet, wait for CI):
+export DOCKER_TAG=main
+docker compose pull app
+#      Option B - build locally from this checkout:
+# docker compose build app
+
+# 5. Mount the backup READ-ONLY into a one-off app runner and run the guarded
+#    reset. DATABASE_URL inside the container is compose-derived and always
+#    targets the `postgres` service (`postgres:5432`); `--target-host` and
+#    `--target-db` must match it EXACTLY, and `--confirm` must be exactly
+#    `DELETE <db> FOR 0.1.0`. The reset validates the backup, the target
+#    host/port/db, the admin credentials and a read-only preflight, then runs
+#    `prisma migrate reset --force --skip-seed` + `prisma db seed` and verifies
+#    the result (11 tables, active house_rules, one baseline migration, >= 41
+#    catalog entries, one admin).
+docker compose run --rm -v "${PWD}:/backups:ro" app pnpm db:reset:0.1.0 -- \
+  --target-host postgres:5432 \
+  --target-db "${POSTGRES_DB:-primal_creator}" \
+  --confirm "DELETE ${POSTGRES_DB:-primal_creator} FOR 0.1.0" \
+  --backup-file /backups/backup-0.1.0.dump
+
+# 6. ONLY after the reset reports success, start the app.
+docker compose up -d app
+```
+
+On any failure after step 2 (once the destructive phase has started), keep the
+app offline and restore the backup before retrying:
+
+```bash
+# Restore the custom-format dump (destructive; recreates the pre-0.1.0 data).
+docker compose exec -T postgres \
+  pg_restore --clean --if-exists --no-owner \
+  -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-primal_creator}" \
+  < backup-0.1.0.dump
+```
+
+Then re-run the reset. Never run `prisma migrate deploy` on the old-23-chain
+database before this reset - the baseline guard aborts it. For a **fresh,
+empty** database there is nothing to wipe: use the normal `db:migrate` then
+`db:seed` in section 1.3, no reset.
 
 ## 2. Health checks
 
@@ -275,19 +398,35 @@ repo's Compose file.
 
 ### 5.1 Database
 
-```bash
-# Backup
-docker compose exec postgres pg_dump -U postgres primal_creator > backup.sql
+Always use a **custom-format** (`-Fc`) dump. It is the only format the one-time
+0.1.0 reset will accept as `--backup-file` (section 1.4), and it restores via
+`pg_restore` (available in the `postgres` container), not `psql`. A plain-SQL
+`pg_dump > backup.sql` is still restorable with `psql`, but it is not a usable
+backup for the reset.
 
-# Restore (destructive; stops the running app first is not required for a
-# logical restore, but do it on a maintenance window)
-docker compose exec -T postgres psql -U postgres primal_creator < backup.sql
+```bash
+# Backup (custom-format archive on the host)
+docker compose exec -T postgres \
+  pg_dump -Fc -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-primal_creator}" \
+  > backup.dump
+
+# Verify the archive is readable BEFORE relying on it (lists the objects/data)
+docker compose exec -T postgres pg_restore --list < backup.dump
+
+# Restore (destructive; stopping the app is not required for a logical restore,
+# but do it on a maintenance window)
+docker compose exec -T postgres \
+  pg_restore --clean --if-exists --no-owner \
+  -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-primal_creator}" \
+  < backup.dump
 ```
 
 These examples assume the default `POSTGRES_USER=postgres` and
-`POSTGRES_DB=primal_creator`. If you changed either, substitute those values;
-`pg_dump` prompts for the password (or reads `PGPASSWORD`), which is why the
-`POSTGRES_PASSWORD` you set must be available to the command.
+`POSTGRES_DB=primal_creator`. If you changed either, substitute those values. The
+dump/restore commands run inside the `postgres` service container, where the
+local socket / peer auth as the `postgres` OS user is trusted, so no password is
+required; if you run them from the host instead, set `PGPASSWORD` (or supply
+the `POSTGRES_PASSWORD` you configured).
 
 The database is the source of truth for users, characters, progression events and
 the catalog. Back it up regularly.
@@ -314,7 +453,10 @@ docker run --rm \
 2. Restore the database dump (or recreate it from the schema + migrations and
    re-seed).
 3. Restore the uploads volume.
-4. Run `pnpm db:migrate` to be sure migrations are current.
+4. Run `pnpm db:migrate` on a fresh/extracted database to apply the 0.1.0
+   baseline (`20261016000000_initial_0_1_0`). If the restored dump predates
+   0.1.0 (an old `0001..0023` database), the baseline refuses to run, so run
+   the one-time reset in section 1.4 instead.
 5. Log in with the seed (or existing) admin.
 
 ## 6. Troubleshooting

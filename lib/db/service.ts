@@ -131,7 +131,7 @@ type CharacterWithCatalog = Prisma.CharacterGetPayload<{
   include: typeof characterInclude
 }>
 
-type DbClient = Prisma.TransactionClient | typeof prisma
+export type DbClient = Prisma.TransactionClient | typeof prisma
 
 /**
  * Declared equipment eligibility requirements (level/type and/or divine patron).
@@ -8359,7 +8359,10 @@ export async function importCharacter(
   // per-link tier). Reject ANY legacy blessing association up front with an
   // actionable migration notice - even when the referenced definition would
   // otherwise resolve - so the caller knows to recover the link from a
-  // pre-migration backup rather than silently dropping it.
+  // pre-migration backup rather than silently dropping it. Migration 0019 (in
+  // the archived 0001..0023 chain, now folded into the 0.1.0 baseline) is the
+  // migration that retired the kind; the notice points at the backup taken
+  // before it.
   if (input.schema !== IMPORT_SCHEMA_V7) {
     const legacyBlessing = input.associations.find((a) => a.kind === "blessing")
     if (legacyBlessing) {
@@ -8652,6 +8655,23 @@ export async function importCharacter(
 // Catalog persistence
 // ------------------------------------------------------------------ //
 
+/**
+ * Derive the catalog `stableId` for a write. A caller-supplied nonempty `stableId`
+ * wins verbatim; an omitted/empty one is slugified from the entry name (lowercase,
+ * non-alphanumeric runs collapsed to a single hyphen, trimmed), with a final
+ * "entry" fallback for a name that slugs to nothing. Matches the exact derivation
+ * the create path has always used so a P2002 conflict message reports the real
+ * resulting stableId.
+ */
+function deriveCatalogStableId(name: string, provided?: string): string {
+  if (provided) return provided
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+  return slug || "entry"
+}
+
 function parseConfigOr400(
   kind: string,
   config: unknown
@@ -8828,24 +8848,123 @@ export async function getCatalogItem(
   return catalogItem(row)
 }
 
-export async function createCatalogItem(
+/**
+ * A lightweight, read-only summary of a catalog entry exposed by the MCP catalog
+ * listing endpoint. It carries only identity/ordering/availability columns and
+ * never the heavy `config` / `description` / `gradeDescriptions` payloads, so a
+ * publisher can enumerate a whole catalog without downloading every definition.
+ */
+export interface McpCatalogSummary {
+  kind: string
+  stableId: string
+  name: string
+  grade: string | null
+  sourceUrl: string | null
+  archived: boolean
+}
+
+/**
+ * List catalog entries for the MCP publisher as lightweight summaries.
+ *
+ * Only the summary columns are selected; the heavy `config` / `description` /
+ * `gradeDescriptions` payload is never fetched, so the listing stays bounded even
+ * against an unbounded catalog. Active entries are returned by default; pass
+ * `includeArchived` to additionally return archived entries. Rows are ordered by
+ * grade then name for a stable browse. This is a read-only MCP path and never
+ * rewrites catalog rows.
+ */
+export async function listMcpCatalogSummaries(
   kind: string,
-  input: {
-    stableId?: string
-    name: string
-    description?: string | null
-    grade?: string | null
-    sourceUrl?: string | null
-    archived?: boolean
-    config?: Record<string, unknown>
-    gradeDescriptions?: Partial<Record<Grade, string>>
+  includeArchived: boolean
+): Promise<McpCatalogSummary[]> {
+  const normalizedKind = normalizeCatalogKind(kind)
+  const rows = await prisma.catalogDefinition.findMany({
+    where: {
+      kind: normalizedKind as never,
+      ...(includeArchived ? {} : { archived: false }),
+    },
+    select: {
+      kind: true,
+      stableId: true,
+      name: true,
+      grade: true,
+      sourceUrl: true,
+      archived: true,
+    },
+    orderBy: [{ grade: "asc" }, { name: "asc" }],
+  })
+  // The in-memory test mock does not honor `select`, so defensively project only
+  // the summary columns; a real Prisma `select` already restricts them.
+  return rows.map((row) => ({
+    kind: row.kind,
+    stableId: row.stableId,
+    name: row.name,
+    grade: row.grade,
+    sourceUrl: row.sourceUrl,
+    archived: row.archived,
+  }))
+}
+
+/**
+ * Fetch one full catalog entry by its composite `(kind, stableId)` key for the MCP
+ * publisher detail endpoint.
+ *
+ * Unlike the listing summary, this returns the complete `CatalogItem` including
+ * `config`, `description`, and `gradeDescriptions`, so a publisher can read a
+ * single entry's full content without enumerating the whole catalog. A missing
+ * entry (or a kind/stableId pair that does not match any row) throws 404
+ * `catalog_not_found`.
+ */
+export async function getMcpCatalogEntry(
+  kind: string,
+  stableId: string
+): Promise<CatalogItem> {
+  const normalizedKind = normalizeCatalogKind(kind)
+  const row = await prisma.catalogDefinition.findUnique({
+    where: {
+      kind_stableId: { kind: normalizedKind as never, stableId },
+    },
+  })
+  if (!row) {
+    throw notFound("catalog_not_found", "Catalog entry not found")
   }
+  return catalogItem(row)
+}
+
+export type CreateCatalogItemInput = {
+  stableId?: string
+  name: string
+  description?: string | null
+  grade?: string | null
+  sourceUrl?: string | null
+  archived?: boolean
+  config?: Record<string, unknown>
+  gradeDescriptions?: Partial<Record<Grade, string>>
+}
+
+/**
+ * Validate and persist a new catalog entry inside an already-open caller-owned
+ * transaction. This is the transactional core that `createCatalogItem` wraps.
+ *
+ * A caller that must sequence multiple catalog writes atomically (e.g. a managed
+ * MCP publisher) opens its own SERIALIZABLE transaction, passes the transaction
+ * client as `tx`, and calls this helper for each write. Every prevalidation check
+ * and catalog-reference guard (god patron, granted/graded skills, skill
+ * classStableId) runs against the SAME transaction snapshot as the insert, so a
+ * concurrent god/skill/class stableId rename (or a race-type change) cannot
+ * commit between the ref read and the write and leave a dangling reference. It
+ * never opens a nested transaction nor touches the global `prisma` client.
+ */
+export async function createCatalogItemInTransaction(
+  tx: DbClient,
+  kind: string,
+  input: CreateCatalogItemInput
 ): Promise<CatalogItem> {
   kind = normalizeCatalogKind(kind)
   // A gods entry carries no catalog grade band: divine power / blessing tier live
   // in `blessingEffects[tier]`, never the shared `grade` column. A non-null grade
   // on a new god is rejected before any write; `null`/omitted is the only legal
-  // value (migration 0020 nulled any pre-existing god grade).
+  // value (migration 0020, archived 0001..0023 chain, nulled any pre-existing god grade).
   if (godGradeForbidden(kind, input.grade)) {
     throw badRequest(
       "invalid_grade",
@@ -8922,14 +9041,46 @@ export async function createCatalogItem(
       'Equipment config uses the legacy "minRaceLevel"/"requiredRaceType"; use the canonical "minimumLevel"/"requiredLevelType"'
     )
   }
-  let stableId = input.stableId
-  if (!stableId) {
-    stableId =
-      input.name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "") || "entry"
+  const stableId = deriveCatalogStableId(input.name, input.stableId)
+  // A NEW equipment write must not reference a missing/archived divine patron.
+  if (kind === "equipment") await assertEquipmentGodRef(tx, config)
+  // A NEW equipment write must not grant a missing/archived passive skill.
+  if (kind === "equipment") await assertEquipmentGrantedSkillsRefs(tx, config)
+  // A NEW race/class/profession write must not reference a missing/archived
+  // grade-granted skill.
+  if (kind === "races" || kind === "classes" || kind === "professions") {
+    await assertGradeGrantedSkillsRefs(tx, config)
   }
+  // A NEW skill write that declares an optional class tie must reference an
+  // existing class (a new class-tie selection must be ACTIVE).
+  if (kind === "skills") {
+    await assertSkillClassRef(tx, config, null)
+  }
+  const row = await tx.catalogDefinition.create({
+    data: {
+      kind: kind as never,
+      stableId,
+      name: input.name,
+      description: input.description ?? null,
+      grade: input.grade ?? null,
+      sourceUrl: input.sourceUrl ?? null,
+      archived: input.archived ?? false,
+      config: config as Prisma.InputJsonValue,
+      ...(input.gradeDescriptions != null
+        ? {
+            gradeDescriptions: input.gradeDescriptions as Prisma.InputJsonValue,
+          }
+        : {}),
+    },
+  })
+  return catalogItem(row)
+}
+
+export async function createCatalogItem(
+  kind: string,
+  input: CreateCatalogItemInput
+): Promise<CatalogItem> {
+  const normalizedKind = normalizeCatalogKind(kind)
   // Bloodlines, equipment, races, classes, professions and skills run under
   // SERIALIZABLE isolation: two concurrent creates that race on the same (kind,
   // stableId) cannot both commit, and the loser surfaces as P2034 which we map to
@@ -8942,56 +9093,24 @@ export async function createCatalogItem(
   // commit and aborts the create (P2034 -> 409) rather than persisting a
   // reference to a renamed-away stableId.
   const serializable =
-    kind === "bloodlines" ||
-    kind === "equipment" ||
-    kind === "races" ||
-    kind === "classes" ||
-    kind === "professions" ||
-    kind === "skills"
+    normalizedKind === "bloodlines" ||
+    normalizedKind === "equipment" ||
+    normalizedKind === "races" ||
+    normalizedKind === "classes" ||
+    normalizedKind === "professions" ||
+    normalizedKind === "skills"
       ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       : undefined
   try {
-    return await prisma.$transaction(async (tx) => {
-      // A NEW equipment write must not reference a missing/archived divine patron.
-      if (kind === "equipment") await assertEquipmentGodRef(tx, config)
-      // A NEW equipment write must not grant a missing/archived passive skill.
-      if (kind === "equipment")
-        await assertEquipmentGrantedSkillsRefs(tx, config)
-      // A NEW race/class/profession write must not reference a missing/archived
-      // grade-granted skill.
-      if (kind === "races" || kind === "classes" || kind === "professions") {
-        await assertGradeGrantedSkillsRefs(tx, config)
-      }
-      // A NEW skill write that declares an optional class tie must reference an
-      // existing class (a new class-tie selection must be ACTIVE).
-      if (kind === "skills") {
-        await assertSkillClassRef(tx, config, null)
-      }
-      const row = await tx.catalogDefinition.create({
-        data: {
-          kind: kind as never,
-          stableId,
-          name: input.name,
-          description: input.description ?? null,
-          grade: input.grade ?? null,
-          sourceUrl: input.sourceUrl ?? null,
-          archived: input.archived ?? false,
-          config: config as Prisma.InputJsonValue,
-          ...(input.gradeDescriptions != null
-            ? {
-                gradeDescriptions:
-                  input.gradeDescriptions as Prisma.InputJsonValue,
-              }
-            : {}),
-        },
-      })
-      return catalogItem(row)
-    }, serializable)
+    return await prisma.$transaction(
+      (tx) => createCatalogItemInTransaction(tx, kind, input),
+      serializable
+    )
   } catch (err) {
     if (isUniqueViolation(err)) {
       throw conflict(
         "catalog_stable_id_conflict",
-        `Catalog entry with stableId "${stableId}" already exists`
+        `Catalog entry with stableId "${deriveCatalogStableId(input.name, input.stableId)}" already exists`
       )
     }
     if (isSerializationFailure(err)) {
@@ -9507,19 +9626,37 @@ function upgradeGroupForConfig(
   return typeof group === "string" && group.length > 0 ? group : undefined
 }
 
-export async function updateCatalogItem(
+export type UpdateCatalogItemPatch = {
+  stableId?: string
+  name?: string
+  description?: string | null
+  grade?: string | null
+  sourceUrl?: string | null
+  archived?: boolean
+  config?: Record<string, unknown>
+  gradeDescriptions?: Partial<Record<Grade, string>>
+}
+
+/**
+ * Validate and persist a catalog update inside an already-open caller-owned
+ * transaction. This is the transactional core that `updateCatalogItem` wraps.
+ *
+ * A caller that must sequence multiple catalog writes atomically (e.g. a managed
+ * MCP publisher) opens its own SERIALIZABLE transaction and passes the
+ * transaction client as `tx`. Every read, guard (title/skill/race/equipment
+ * stable-ID, link-collision, race-type-in-use) and the final write run against
+ * the same transaction snapshot, so a concurrent rename cannot commit between a
+ * guard's read and the write and leave a dangling reference. It never opens a
+ * nested transaction nor touches the global `prisma` client.
+ *
+ * Nullable PATCH semantics for `description` and `sourceUrl`: an omitted
+ * (`undefined`) value preserves the stored column; an explicit `null` clears it.
+ */
+export async function updateCatalogItemInTransaction(
+  tx: DbClient,
   kind: string,
   id: string,
-  patch: {
-    stableId?: string
-    name?: string
-    description?: string | null
-    grade?: string | null
-    sourceUrl?: string | null
-    archived?: boolean
-    config?: Record<string, unknown>
-    gradeDescriptions?: Partial<Record<Grade, string>>
-  }
+  patch: UpdateCatalogItemPatch
 ): Promise<CatalogItem> {
   kind = normalizeCatalogKind(kind)
   // A gods entry carries no catalog grade band (see `godGradeForbidden`): a PATCH
@@ -9543,6 +9680,254 @@ export async function updateCatalogItem(
       'A race/class/profession always carries a required catalog grade: "grade" cannot be cleared to null'
     )
   }
+  const existing = await tx.catalogDefinition.findUnique({ where: { id } })
+  if (!existing || existing.kind !== kind) {
+    throw notFound("catalog_not_found", "Catalog entry not found")
+  }
+  let config: Record<string, unknown> | undefined
+  if (patch.config != null) {
+    config = parseConfigOr400(kind, patch.config)
+    if (kind === "skills" && isIncompleteSkillConfig(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Skill config requires a "track": expected "race", "class" or "profession"'
+      )
+    }
+    if (kind === "skills" && hasInvalidSkillTrack(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Skill config has an invalid "track": expected "race", "class" or "profession"'
+      )
+    }
+    // A config-changing skill PATCH, like a new skill POST, must declare a
+    // valid rarity. A legacy config that never carried one is editable only
+    // via a metadata-only PATCH (no `config` in the payload).
+    if (kind === "skills" && isIncompleteSkillRarity(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Skill config requires a valid "rarity" (one of Inferior/Common/Uncommon/Rare/Epic/Ancient/Legendary/Mythical/Sacred/Divine/Unique)'
+      )
+    }
+    if (kind === "races" && isIncompleteRaceConfig(config)) {
+      // raceType / naturalGrade are either present-but-invalid or missing
+      // entirely. An explicitly-provided invalid value is rejected outright;
+      // a missing value is allowed only when the EXISTING config already
+      // carries a valid one (preserved into the new config, the same way a
+      // raceType is preserved). This keeps a config-changing PATCH on an
+      // already-typed race from silently erasing its naturalGrade into the
+      // legacy F fallback. A config-changing PATCH on a legacy race that never
+      // declared either field is rejected - there is nothing to preserve, so
+      // both must be supplied.
+      if (hasInvalidRaceTypeConfig(config)) {
+        throw badRequest(
+          "invalid_config",
+          'Race config has an invalid "raceType": expected "enlightened" or "monster"'
+        )
+      }
+      if (hasInvalidNaturalGradeConfig(config)) {
+        throw badRequest(
+          "invalid_config",
+          'Race config has an invalid "naturalGrade": expected one of "G","F","E","D","C","B","A","S"'
+        )
+      }
+      const merged = { ...config }
+      const existingParsed = parseCatalogConfig("races", existing.config ?? {})
+      const existingRaceType = existingParsed.raceType
+      if (
+        merged.raceType == null &&
+        (existingRaceType === "enlightened" || existingRaceType === "monster")
+      ) {
+        merged.raceType = existingRaceType as RaceType
+      }
+      const existingNaturalGrade = existingParsed.naturalGrade
+      if (
+        merged.naturalGrade == null &&
+        gradeSchema.safeParse(existingNaturalGrade).success
+      ) {
+        merged.naturalGrade = existingNaturalGrade as Grade
+      }
+      // After preservation, a legacy row that never declared an authoritative
+      // type or natural grade must supply BOTH explicitly.
+      if (
+        (merged.raceType !== "enlightened" && merged.raceType !== "monster") ||
+        !gradeSchema.safeParse(merged.naturalGrade).success
+      ) {
+        throw badRequest(
+          "invalid_config",
+          'Race config must declare a valid "raceType" ("enlightened"/"monster") and a valid "naturalGrade" ("G","F","E","D","C","B","A","S")'
+        )
+      }
+      config = merged
+    }
+    if (kind === "bloodlines" && isLegacyBloodlineConfig(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Bloodline config is missing required "effects" field'
+      )
+    }
+    if (
+      kind === "transcendent_skills" &&
+      isLegacyTranscendentSkillConfig(config)
+    ) {
+      throw badRequest(
+        "invalid_config",
+        'Transcendent skill config is missing required "passiveEffects" field'
+      )
+    }
+    // A config-changing equipment PATCH, like a new POST, requires the modern
+    // full shape: a valid slot AND a valid rarity. Legacy configs remain
+    // editable for metadata-only PATCHes (no `config` in the payload).
+    if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring/Weapon, or a documented legacy alias) and a valid "rarity"'
+      )
+    }
+    // A config-changing equipment PATCH must also persist the CANONICAL
+    // requirement keys, never the legacy `minRaceLevel` / `requiredRaceType`
+    // (the editor migrates them); an existing row that carries them stays
+    // readable and enforced, but a config change may not reintroduce them.
+    if (kind === "equipment" && hasLegacyEquipmentRequirements(config)) {
+      throw badRequest(
+        "invalid_config",
+        'Equipment config uses the legacy "minRaceLevel"/"requiredRaceType"; use the canonical "minimumLevel"/"requiredLevelType"'
+      )
+    }
+    // A config-changing equipment write must not reference a missing/archived
+    // divine patron.
+    if (kind === "equipment") await assertEquipmentGodRef(tx, config)
+    // A config-changing equipment write must not grant a missing/archived
+    // passive skill.
+    if (kind === "equipment") await assertEquipmentGrantedSkillsRefs(tx, config)
+    // A config-changing race/class/profession write must not reference a
+    // missing/archived grade-granted skill.
+    if (kind === "races" || kind === "classes" || kind === "professions") {
+      await assertGradeGrantedSkillsRefs(tx, config)
+    }
+    // A config-changing skill write that declares an optional class tie must
+    // reference an existing class. A NEW selection (a value differing from the
+    // existing config) must be ACTIVE; an unchanged prior reference to an
+    // archived class is tolerated.
+    if (kind === "skills") {
+      await assertSkillClassRef(
+        tx,
+        config,
+        parseCatalogConfig("skills", existing.config ?? {})
+      )
+    }
+  }
+  const finalConfig = config ?? parseCatalogConfig(kind, existing.config ?? {})
+  const finalArchived =
+    patch.archived != null ? patch.archived : existing.archived
+  // A race's `raceType` is a mechanical advancement-mode fact: it governs how
+  // a character advances and what tracks it may carry. A legacy config missing
+  // `raceType` is interpreted as "enlightened" (the same non-authoritative
+  // default used everywhere else). When the effective type would change and
+  // any character still references this race as its raceId, reject BEFORE the
+  // write (no silent conversion of those characters); metadata, archival /
+  // unarchival and same-type config edits are allowed.
+  if (kind === "races") {
+    const currentEffectiveType =
+      (parseCatalogConfig("races", existing.config ?? {}).raceType as
+        RaceType | undefined) ?? "enlightened"
+    const proposedType =
+      (finalConfig.raceType as RaceType | undefined) ?? "enlightened"
+    if (currentEffectiveType !== proposedType) {
+      const references = await tx.character.findMany({
+        where: { raceId: id },
+      })
+      if (references.length > 0) {
+        throw conflict(
+          "race_type_in_use",
+          `Race "${existing.name}" is referenced by ${references.length} character(s); its type cannot change from "${currentEffectiveType}" to "${proposedType}" without an explicit conversion`
+        )
+      }
+    }
+  }
+  // A config-changing equipment PATCH, like a new POST, requires the modern
+  // category while any character still links it: a linked ring has no slot to
+  // fall back to on a non-Ring item, and a linked non-Ring item cannot carry a
+  // ring position. Allowed once the item is unequipped (no links). Ring legacy
+  // ("Ring 1"/"Ring 2") -> canonical "Ring" is a same-category edit and is NOT
+  // blocked here; it preserves each link's position and is checked for
+  // duplicate active occupied positions by assertNoLinkCollision below.
+  if (kind === "equipment") {
+    const existingConfig = parseCatalogConfig(
+      "equipment",
+      existing.config ?? {}
+    )
+    const existingIsRing = slotForConfig(existingConfig) === "Ring"
+    const finalIsRing = slotForConfig(finalConfig) === "Ring"
+    if (existingIsRing !== finalIsRing) {
+      const links = await tx.characterAssociation.findMany({
+        where: { definitionId: id },
+      })
+      if (links.length > 0) {
+        throw conflict(
+          "equipment_position_conflict",
+          `Catalog "${existing.name}" would change from ${existingIsRing ? "a Ring slot" : "a non-Ring slot"} to ${finalIsRing ? "a Ring slot" : "a non-Ring slot"} but is equipped by ${links.length} character(s); unequip it first`
+        )
+      }
+    }
+  }
+  await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
+  // Renaming a god's stableId must not leave any equipment config referencing
+  // the old id dangling (a dangling patron would render the item permanently
+  // ineligible). Archiving is always allowed.
+  await assertGodStableIdRename(tx, kind, existing.stableId, patch.stableId)
+  // Renaming a skill's stableId must not leave any equipment config's
+  // granted-skill list referencing the old id dangling (a dangling grant would
+  // silently drop the item's synthesized passive). Archiving is always allowed.
+  await assertSkillStableIdRename(tx, kind, existing.stableId, patch.stableId)
+  // Renaming a class's stableId must not leave any skill config whose optional
+  // `classStableId` names the old id dangling (a dangling class tie would
+  // quietly drop the skill's class-priority sorting). Archiving is always
+  // allowed.
+  await assertClassStableIdRename(tx, kind, existing.stableId, patch.stableId)
+  if (kind === "titles") {
+    await assertTitleImprovementStable(
+      tx,
+      id,
+      parseCatalogConfig("titles", existing.config ?? {}),
+      finalConfig
+    )
+  }
+  if (kind === "skills") {
+    await assertSkillAssociationStable(
+      tx,
+      id,
+      parseCatalogConfig("skills", existing.config ?? {}),
+      finalConfig
+    )
+  }
+  const row = await tx.catalogDefinition.update({
+    where: { id },
+    data: {
+      ...(patch.stableId != null ? { stableId: patch.stableId } : {}),
+      ...(patch.name != null ? { name: patch.name } : {}),
+      ...(patch.description !== undefined
+        ? { description: patch.description }
+        : {}),
+      ...(patch.grade !== undefined ? { grade: patch.grade } : {}),
+      ...(patch.sourceUrl !== undefined ? { sourceUrl: patch.sourceUrl } : {}),
+      ...(patch.archived != null ? { archived: patch.archived } : {}),
+      ...(config != null ? { config: config as Prisma.InputJsonValue } : {}),
+      ...(patch.gradeDescriptions !== undefined
+        ? {
+            gradeDescriptions: patch.gradeDescriptions as Prisma.InputJsonValue,
+          }
+        : {}),
+    },
+  })
+  return catalogItem(row)
+}
+
+export async function updateCatalogItem(
+  kind: string,
+  id: string,
+  patch: UpdateCatalogItemPatch
+): Promise<CatalogItem> {
+  const normalizedKind = normalizeCatalogKind(kind)
   // A god stableId change, a race `raceType` change, every blessing / bloodline
   // config change, and every ranked-title identity guard (which reads the linked
   // character associations) read the existing row and then write it, so they run
@@ -9557,281 +9942,21 @@ export async function updateCatalogItem(
   // they must run SERIALIZABLE to abort (P2034 -> 409) instead of persisting a
   // reference to a god/skill that a concurrent rename stableId-changed away.
   const serializable =
-    kind === "gods" ||
-    kind === "races" ||
-    kind === "classes" ||
-    kind === "professions" ||
-    kind === "bloodlines" ||
-    kind === "titles" ||
-    kind === "skills" ||
-    kind === "equipment"
+    normalizedKind === "gods" ||
+    normalizedKind === "races" ||
+    normalizedKind === "classes" ||
+    normalizedKind === "professions" ||
+    normalizedKind === "bloodlines" ||
+    normalizedKind === "titles" ||
+    normalizedKind === "skills" ||
+    normalizedKind === "equipment"
       ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       : undefined
   try {
-    return await prisma.$transaction(async (tx) => {
-      const existing = await tx.catalogDefinition.findUnique({
-        where: { id },
-      })
-      if (!existing || existing.kind !== kind) {
-        throw notFound("catalog_not_found", "Catalog entry not found")
-      }
-      let config: Record<string, unknown> | undefined
-      if (patch.config != null) {
-        config = parseConfigOr400(kind, patch.config)
-        if (kind === "skills" && isIncompleteSkillConfig(config)) {
-          throw badRequest(
-            "invalid_config",
-            'Skill config requires a "track": expected "race", "class" or "profession"'
-          )
-        }
-        if (kind === "skills" && hasInvalidSkillTrack(config)) {
-          throw badRequest(
-            "invalid_config",
-            'Skill config has an invalid "track": expected "race", "class" or "profession"'
-          )
-        }
-        // A config-changing skill PATCH, like a new skill POST, must declare a
-        // valid rarity. A legacy config that never carried one is editable only
-        // via a metadata-only PATCH (no `config` in the payload).
-        if (kind === "skills" && isIncompleteSkillRarity(config)) {
-          throw badRequest(
-            "invalid_config",
-            'Skill config requires a valid "rarity" (one of Inferior/Common/Uncommon/Rare/Epic/Ancient/Legendary/Mythical/Sacred/Divine/Unique)'
-          )
-        }
-        if (kind === "races" && isIncompleteRaceConfig(config)) {
-          // raceType / naturalGrade are either present-but-invalid or missing
-          // entirely. An explicitly-provided invalid value is rejected outright;
-          // a missing value is allowed only when the EXISTING config already
-          // carries a valid one (preserved into the new config, the same way a
-          // raceType is preserved). This keeps a config-changing PATCH on an
-          // already-typed race from silently erasing its naturalGrade into the
-          // legacy F fallback. A config-changing PATCH on a legacy race that never
-          // declared either field is rejected - there is nothing to preserve, so
-          // both must be supplied.
-          if (hasInvalidRaceTypeConfig(config)) {
-            throw badRequest(
-              "invalid_config",
-              'Race config has an invalid "raceType": expected "enlightened" or "monster"'
-            )
-          }
-          if (hasInvalidNaturalGradeConfig(config)) {
-            throw badRequest(
-              "invalid_config",
-              'Race config has an invalid "naturalGrade": expected one of "G","F","E","D","C","B","A","S"'
-            )
-          }
-          const merged = { ...config }
-          const existingParsed = parseCatalogConfig(
-            "races",
-            existing.config ?? {}
-          )
-          const existingRaceType = existingParsed.raceType
-          if (
-            merged.raceType == null &&
-            (existingRaceType === "enlightened" ||
-              existingRaceType === "monster")
-          ) {
-            merged.raceType = existingRaceType as RaceType
-          }
-          const existingNaturalGrade = existingParsed.naturalGrade
-          if (
-            merged.naturalGrade == null &&
-            gradeSchema.safeParse(existingNaturalGrade).success
-          ) {
-            merged.naturalGrade = existingNaturalGrade as Grade
-          }
-          // After preservation, a legacy row that never declared an authoritative
-          // type or natural grade must supply BOTH explicitly.
-          if (
-            (merged.raceType !== "enlightened" &&
-              merged.raceType !== "monster") ||
-            !gradeSchema.safeParse(merged.naturalGrade).success
-          ) {
-            throw badRequest(
-              "invalid_config",
-              'Race config must declare a valid "raceType" ("enlightened"/"monster") and a valid "naturalGrade" ("G","F","E","D","C","B","A","S")'
-            )
-          }
-          config = merged
-        }
-        if (kind === "bloodlines" && isLegacyBloodlineConfig(config)) {
-          throw badRequest(
-            "invalid_config",
-            'Bloodline config is missing required "effects" field'
-          )
-        }
-        if (
-          kind === "transcendent_skills" &&
-          isLegacyTranscendentSkillConfig(config)
-        ) {
-          throw badRequest(
-            "invalid_config",
-            'Transcendent skill config is missing required "passiveEffects" field'
-          )
-        }
-        // A config-changing equipment PATCH, like a new POST, requires the modern
-        // full shape: a valid slot AND a valid rarity. Legacy configs remain
-        // editable for metadata-only PATCHes (no `config` in the payload).
-        if (kind === "equipment" && isIncompleteEquipmentConfig(config)) {
-          throw badRequest(
-            "invalid_config",
-            'Equipment config requires a valid "slot" (one of Head/Chest/Back/Arms/Hands/Legs/Feet/Neck/Ring/Weapon, or a documented legacy alias) and a valid "rarity"'
-          )
-        }
-        // A config-changing equipment PATCH must also persist the CANONICAL
-        // requirement keys, never the legacy `minRaceLevel` / `requiredRaceType`
-        // (the editor migrates them); an existing row that carries them stays
-        // readable and enforced, but a config change may not reintroduce them.
-        if (kind === "equipment" && hasLegacyEquipmentRequirements(config)) {
-          throw badRequest(
-            "invalid_config",
-            'Equipment config uses the legacy "minRaceLevel"/"requiredRaceType"; use the canonical "minimumLevel"/"requiredLevelType"'
-          )
-        }
-        // A config-changing equipment write must not reference a missing/archived
-        // divine patron.
-        if (kind === "equipment") await assertEquipmentGodRef(tx, config)
-        // A config-changing equipment write must not grant a missing/archived
-        // passive skill.
-        if (kind === "equipment")
-          await assertEquipmentGrantedSkillsRefs(tx, config)
-        // A config-changing race/class/profession write must not reference a
-        // missing/archived grade-granted skill.
-        if (kind === "races" || kind === "classes" || kind === "professions") {
-          await assertGradeGrantedSkillsRefs(tx, config)
-        }
-        // A config-changing skill write that declares an optional class tie must
-        // reference an existing class. A NEW selection (a value differing from the
-        // existing config) must be ACTIVE; an unchanged prior reference to an
-        // archived class is tolerated.
-        if (kind === "skills") {
-          await assertSkillClassRef(
-            tx,
-            config,
-            parseCatalogConfig("skills", existing.config ?? {})
-          )
-        }
-      }
-      const finalConfig =
-        config ?? parseCatalogConfig(kind, existing.config ?? {})
-      const finalArchived =
-        patch.archived != null ? patch.archived : existing.archived
-      // A race's `raceType` is a mechanical advancement-mode fact: it governs how
-      // a character advances and what tracks it may carry. A legacy config missing
-      // `raceType` is interpreted as "enlightened" (the same non-authoritative
-      // default used everywhere else). When the effective type would change and
-      // any character still references this race as its raceId, reject BEFORE the
-      // write (no silent conversion of those characters); metadata, archival /
-      // unarchival and same-type config edits are allowed.
-      if (kind === "races") {
-        const currentEffectiveType =
-          (parseCatalogConfig("races", existing.config ?? {}).raceType as
-            RaceType | undefined) ?? "enlightened"
-        const proposedType =
-          (finalConfig.raceType as RaceType | undefined) ?? "enlightened"
-        if (currentEffectiveType !== proposedType) {
-          const references = await tx.character.findMany({
-            where: { raceId: id },
-          })
-          if (references.length > 0) {
-            throw conflict(
-              "race_type_in_use",
-              `Race "${existing.name}" is referenced by ${references.length} character(s); its type cannot change from "${currentEffectiveType}" to "${proposedType}" without an explicit conversion`
-            )
-          }
-        }
-      }
-      // A config-changing equipment PATCH, like a new POST, requires the modern
-      // category while any character still links it: a linked ring has no slot to
-      // fall back to on a non-Ring item, and a linked non-Ring item cannot carry a
-      // ring position. Allowed once the item is unequipped (no links). Ring legacy
-      // ("Ring 1"/"Ring 2") -> canonical "Ring" is a same-category edit and is NOT
-      // blocked here; it preserves each link's position and is checked for
-      // duplicate active occupied positions by assertNoLinkCollision below.
-      if (kind === "equipment") {
-        const existingConfig = parseCatalogConfig(
-          "equipment",
-          existing.config ?? {}
-        )
-        const existingIsRing = slotForConfig(existingConfig) === "Ring"
-        const finalIsRing = slotForConfig(finalConfig) === "Ring"
-        if (existingIsRing !== finalIsRing) {
-          const links = await tx.characterAssociation.findMany({
-            where: { definitionId: id },
-          })
-          if (links.length > 0) {
-            throw conflict(
-              "equipment_position_conflict",
-              `Catalog "${existing.name}" would change from ${existingIsRing ? "a Ring slot" : "a non-Ring slot"} to ${finalIsRing ? "a Ring slot" : "a non-Ring slot"} but is equipped by ${links.length} character(s); unequip it first`
-            )
-          }
-        }
-      }
-      await assertNoLinkCollision(tx, kind, id, finalConfig, finalArchived)
-      // Renaming a god's stableId must not leave any equipment config referencing
-      // the old id dangling (a dangling patron would render the item permanently
-      // ineligible). Archiving is always allowed.
-      await assertGodStableIdRename(tx, kind, existing.stableId, patch.stableId)
-      // Renaming a skill's stableId must not leave any equipment config's
-      // granted-skill list referencing the old id dangling (a dangling grant would
-      // silently drop the item's synthesized passive). Archiving is always allowed.
-      await assertSkillStableIdRename(
-        tx,
-        kind,
-        existing.stableId,
-        patch.stableId
-      )
-      // Renaming a class's stableId must not leave any skill config whose optional
-      // `classStableId` names the old id dangling (a dangling class tie would
-      // quietly drop the skill's class-priority sorting). Archiving is always
-      // allowed.
-      await assertClassStableIdRename(
-        tx,
-        kind,
-        existing.stableId,
-        patch.stableId
-      )
-      if (kind === "titles") {
-        await assertTitleImprovementStable(
-          tx,
-          id,
-          parseCatalogConfig("titles", existing.config ?? {}),
-          finalConfig
-        )
-      }
-      if (kind === "skills") {
-        await assertSkillAssociationStable(
-          tx,
-          id,
-          parseCatalogConfig("skills", existing.config ?? {}),
-          finalConfig
-        )
-      }
-      const row = await tx.catalogDefinition.update({
-        where: { id },
-        data: {
-          ...(patch.stableId != null ? { stableId: patch.stableId } : {}),
-          ...(patch.name != null ? { name: patch.name } : {}),
-          ...(patch.description != null
-            ? { description: patch.description }
-            : {}),
-          ...(patch.grade !== undefined ? { grade: patch.grade } : {}),
-          ...(patch.sourceUrl != null ? { sourceUrl: patch.sourceUrl } : {}),
-          ...(patch.archived != null ? { archived: patch.archived } : {}),
-          ...(config != null
-            ? { config: config as Prisma.InputJsonValue }
-            : {}),
-          ...(patch.gradeDescriptions !== undefined
-            ? {
-                gradeDescriptions:
-                  patch.gradeDescriptions as Prisma.InputJsonValue,
-              }
-            : {}),
-        },
-      })
-      return catalogItem(row)
-    }, serializable)
+    return await prisma.$transaction(
+      (tx) => updateCatalogItemInTransaction(tx, kind, id, patch),
+      serializable
+    )
   } catch (err) {
     if (isUniqueViolation(err)) {
       throw conflict(

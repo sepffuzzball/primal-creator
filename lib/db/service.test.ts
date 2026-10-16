@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { prisma } from "@/lib/db/client"
 import {
+  type CatalogItem,
+  type DbClient,
   adjustCharacterInventory,
   advanceCharacter,
   allocateCharacter,
@@ -10,6 +12,7 @@ import {
   associateCharacter,
   buildRulesConfig,
   createCatalogItem,
+  createCatalogItemInTransaction,
   createCharacter,
   createInitialState,
   deserializeState,
@@ -31,6 +34,7 @@ import {
   skillCharacter,
   toListItem,
   updateCatalogItem,
+  updateCatalogItemInTransaction,
   updateCharacter,
   upgradeSkill,
 } from "@/lib/db/service"
@@ -9858,6 +9862,182 @@ describe("updateCatalogItem PATCH grade semantics (clear optional grades, never 
     )
     const item = await updateCatalogItem("titles", "title-up", { grade: "A" })
     expect(item.grade).toBe("A")
+  })
+})
+
+describe("catalog item transaction helpers (reusable create/update in one caller-owned tx)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("createCatalogItemInTransaction persists a row inside a caller-owned transaction", async () => {
+    const item = (await prisma.$transaction((tx) =>
+      createCatalogItemInTransaction(tx as DbClient, "items", {
+        stableId: "potion",
+        name: "Potion",
+        description: "A potion",
+        sourceUrl: "https://example.com/potion",
+      })
+    )) as CatalogItem
+    expect(item.stableId).toBe("potion")
+    expect(item.description).toBe("A potion")
+    expect(item.sourceUrl).toBe("https://example.com/potion")
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("updateCatalogItemInTransaction preserves description/sourceUrl when the PATCH omits them", async () => {
+    dbMock.store.addCatalog({
+      id: "item-1",
+      kind: "items",
+      stableId: "potion",
+      name: "Potion",
+      config: { markup: 2 },
+      description: "Original",
+      sourceUrl: "https://example.com/original",
+    })
+    const updated = (await prisma.$transaction((tx) =>
+      updateCatalogItemInTransaction(tx as DbClient, "items", "item-1", {
+        name: "Renamed",
+      })
+    )) as CatalogItem
+    expect(updated.name).toBe("Renamed")
+    expect(updated.description).toBe("Original")
+    expect(updated.sourceUrl).toBe("https://example.com/original")
+  })
+
+  it("updateCatalogItemInTransaction clears description/sourceUrl when the PATCH sends explicit null", async () => {
+    dbMock.store.addCatalog({
+      id: "item-1",
+      kind: "items",
+      stableId: "potion",
+      name: "Potion",
+      config: { markup: 2 },
+      description: "Original",
+      sourceUrl: "https://example.com/original",
+    })
+    const updated = (await prisma.$transaction((tx) =>
+      updateCatalogItemInTransaction(tx as DbClient, "items", "item-1", {
+        description: null,
+        sourceUrl: null,
+      })
+    )) as CatalogItem
+    expect(updated.description).toBeNull()
+    expect(updated.sourceUrl).toBeNull()
+  })
+
+  it("public wrapper updateCatalogItem clears description/sourceUrl on explicit null without config loss", async () => {
+    dbMock.store.addCatalog({
+      id: "item-1",
+      kind: "items",
+      stableId: "potion",
+      name: "Potion",
+      config: { markup: 2 },
+      description: "Original",
+      sourceUrl: "https://example.com/original",
+    })
+    const updated = await updateCatalogItem("items", "item-1", {
+      description: null,
+      sourceUrl: null,
+    })
+    expect(updated.description).toBeNull()
+    expect(updated.sourceUrl).toBeNull()
+    expect(updated.config).toMatchObject({ markup: 2 })
+  })
+
+  it("public wrapper updateCatalogItem preserves description/sourceUrl when the PATCH omits them", async () => {
+    dbMock.store.addCatalog({
+      id: "item-1",
+      kind: "items",
+      stableId: "potion",
+      name: "Potion",
+      config: { markup: 2 },
+      description: "Original",
+      sourceUrl: "https://example.com/original",
+    })
+    const updated = await updateCatalogItem("items", "item-1", {
+      name: "Renamed",
+    })
+    expect(updated.name).toBe("Renamed")
+    expect(updated.description).toBe("Original")
+    expect(updated.sourceUrl).toBe("https://example.com/original")
+  })
+
+  function seedLinkedRankedTitle() {
+    dbMock.store.addCatalog({
+      id: "title-1",
+      kind: "titles",
+      stableId: "ranked",
+      name: "Ranked",
+      grade: "C",
+      description: "Original title description",
+      config: {
+        improvement: { seriesId: "s1", rank: 1, minRaceGrade: "F" },
+        upgradeGroup: "s1",
+        flat: { strength: 2 },
+      },
+    })
+    dbMock.store.addCharacter({ id: "chr-1", ownerId: user.id, name: "C" })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+  }
+
+  it("helper transaction rolls back an earlier create when a later update guard fails", async () => {
+    seedLinkedRankedTitle()
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await createCatalogItemInTransaction(tx as DbClient, "items", {
+          stableId: "potion",
+          name: "Potion",
+        })
+        // Changing the ranked title's improvement identity while a character
+        // links it fails the guard AFTER the create above; the whole caller-owned
+        // transaction (including the create and the description clear) must roll
+        // back.
+        await updateCatalogItemInTransaction(
+          tx as DbClient,
+          "titles",
+          "title-1",
+          {
+            config: {
+              improvement: { seriesId: "s2", rank: 1, minRaceGrade: "F" },
+              upgradeGroup: "s2",
+              flat: { strength: 2 },
+            },
+            description: null,
+          }
+        )
+      })
+    ).rejects.toMatchObject({ status: 409, code: "title_improvement_conflict" })
+    // Only the seeded title remains; the previous create and description clear
+    // were restored.
+    expect(dbMock.store.catalog.size).toBe(1)
+    const title = dbMock.store.catalog.get("title-1")!
+    expect(title.description).toBe("Original title description")
+    expect(title.config).toMatchObject({
+      improvement: { seriesId: "s1", rank: 1, minRaceGrade: "F" },
+    })
+  })
+
+  it("public wrapper updateCatalogItem rolls back a description clear when a later guard fails", async () => {
+    seedLinkedRankedTitle()
+    await expect(
+      updateCatalogItem("titles", "title-1", {
+        config: {
+          improvement: { seriesId: "s2", rank: 1, minRaceGrade: "F" },
+          upgradeGroup: "s2",
+          flat: { strength: 2 },
+        },
+        description: null,
+      })
+    ).rejects.toMatchObject({ status: 409, code: "title_improvement_conflict" })
+    const title = dbMock.store.catalog.get("title-1")!
+    expect(title.description).toBe("Original title description")
+    expect(title.config).toMatchObject({
+      improvement: { seriesId: "s1", rank: 1, minRaceGrade: "F" },
+    })
   })
 })
 

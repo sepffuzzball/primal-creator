@@ -154,7 +154,8 @@ config changes - historical facts are immutable. Temporary potion effects are
 bounded only by their effect duration.
 
 These rates are NOT hard-coded. They live in a single server-wide `house_rules` row
-(`id = 'active'`, migration `0007_house_rules`) that an admin edits from the
+(`id = 'active'`, created by migration `0007_house_rules` - archived `0001..0023`
+chain, now part of the 0.1.0 baseline) that an admin edits from the
 Settings page via `GET`/`PATCH /api/admin/rules`. The engine receives the current
 validated config ONCE per request and passes it down through the service layer;
 helpers never issue their own hidden DB lookup. Because live status is re-derived
@@ -350,7 +351,9 @@ deliberately **not** authoritative character state. The contract is:
 - **At most one bloodline link per character, enforced at the database layer.**
   A character may hold AT MOST ONE `BLOODLINE` association (active or archived),
   the same singleton backstop migration 0011 built for blessings. The partial
-  unique index at migration 0012 enforces it; `associateCharacter` runs the add
+  unique index at migration 0012 enforces it (migrations 0011/0012 are in the
+  archived `0001..0023` chain, reproduced in the 0.1.0 baseline);
+  `associateCharacter` runs the add
   under SERIALIZABLE + CAS and maps a concurrent singleton-race `P2002` to a 409
   `bloodline_singleton_conflict`. A bloodline add atomically replaces EVERY
   existing bloodline link (active or archived); an import backup carrying more

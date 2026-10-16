@@ -17,7 +17,8 @@ else lives here.
 
 The defaults in sections 1 (equipment) and 2 (consumables) are NOT hard-coded. They
 are served from a single server-wide `house_rules` row (`id = 'active'`, created and
-seeded by migration `0007_house_rules`, never by the seed script) and edited by an
+seeded by migration `0007_house_rules` - archived `0001..0023` chain, held in the
+0.1.0 baseline - never by the seed script) and edited by an
 admin from the Settings page (`GET`/`PATCH /api/admin/rules`). The app-facing config
 keys are `equipmentIndividualCapPercent`, `equipmentCombinedCapPercent` and
 `consumableGradeRates.{F,E,D,C}`.

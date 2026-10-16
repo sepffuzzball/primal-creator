@@ -51,7 +51,7 @@ function validateAdminPassword(password: string): void {
   const trimmed = password.trim()
   if (WEAK_ADMIN_PASSWORDS.has(trimmed.toLowerCase())) {
     throw new Error(
-      `ADMIN_PASSWORD "${password}" is a weak/placeholder value. Set a strong password (>= 12 chars) in production.`
+      `ADMIN_PASSWORD is a weak/placeholder value. Set a strong password (>= 12 chars) in production.`
     )
   }
   if (trimmed.length < 12) {

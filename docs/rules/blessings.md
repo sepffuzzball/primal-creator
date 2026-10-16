@@ -150,12 +150,21 @@ rows no longer exist. The notice does not recommend a post-migration re-export
 (re-exporting cannot recover a link whose catalog row and tier live only in the
 pre-migration database); it tells the caller to **take a PostgreSQL backup BEFORE
 applying migration 0019** and recreate the god + tier links manually afterward,
-and to remove the links from the old file only if that is intentional. A legacy
+and to remove the links from the old file only if that is intentional. (Migration
+`0019` is part of the archived `0001..0023` chain, kept at
+`prisma/migrations-archive/pre-0.1.0` and replaced by the single 0.1.0 baseline;
+see the migration notes below.) A legacy
 v4/v5/v6 inventory `consumables` kind is normalized to `items`. An import backup
 carrying more than one total blessing link (active + archived) is rejected with
 400 `import_link_collision` before any write.
 
 ## Migration (0019)
+
+> **Archived.** This SQL belongs to the historical `0001..0023` chain, which was
+> moved to `prisma/migrations-archive/pre-0.1.0` in release 0.1.0 and replaced by
+> the single from-scratch baseline. It is context, not an active migration - the
+> released app never applies it - but the runtime shape it produced (a blessing
+> tier on the association link, `gods` not `blessings`) still applies.
 
 Migration `0019_god_blessing_tiers` is **destructive** and **irreversible**: it
 deletes every existing `BLESSING` association, preflights and deletes all
@@ -176,6 +185,9 @@ the application (schema + service) and the database agree that a blessing link i
 never created with a null tier.
 
 ## Migration (0020)
+
+> **Archived.** Same note as migration (0019) - this is historical `0001..0023`
+> SQL, kept at `prisma/migrations-archive/pre-0.1.0`, not applied by 0.1.0.
 
 Migration `0020_ungrade_gods` is **non-destructive**: it runs
 `UPDATE catalog_definitions SET grade = NULL WHERE kind = 'gods' AND grade IS NOT NULL`,

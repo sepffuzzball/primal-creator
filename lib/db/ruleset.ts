@@ -3,8 +3,9 @@
  *
  * The `house_rules` table holds a SINGLE row (`id = 'active'`) carrying the
  * validated, admin-editable house-rule defaults for the calculation engine. It
- * is created and seeded by migration 0007_house_rules (never by the seed script)
- * so the application never silently falls back to an in-memory default.
+ * is created and seeded by migration 0007_house_rules (in the archived
+ * 0001..0023 chain, now part of the single 0.1.0 baseline; never by the seed
+ * script) so the application never silently falls back to an in-memory default.
  *
  * `loadHouseRules(db)` must be called at most ONCE per service public read or
  * mutation request, and - for a mutation - through the SAME transaction client
@@ -88,7 +89,8 @@ export const houseRulesConfigSchema = z
 
 /**
  * The documented default house config. Matches exactly what migration 0007
- * inserts (plus the `maxTranscendentSkills` default added by migration 0012);
+ * (archived 0001..0023 chain, now part of the 0.1.0 baseline) inserts (plus the
+ * `maxTranscendentSkills` default added by migration 0012);
  * kept here for tests and for describing the startup defaults.
  */
 export const DEFAULT_HOUSE_RULES_CONFIG: HouseRulesConfig = {
