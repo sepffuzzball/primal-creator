@@ -24,11 +24,13 @@ import {
   godGradeForbidden,
   hasInvalidNaturalGradeConfig,
   hasInvalidRaceTypeConfig,
+  hasInvalidSkillTrack,
   hasLegacyEquipmentRequirements,
   inventoryPostSchema,
   isCanonicalEquipmentSlot,
   isIncompleteEquipmentConfig,
   isIncompleteRaceConfig,
+  isIncompleteSkillConfig,
   isIncompleteSkillRarity,
   isLegacyBloodlineConfig,
   isLegacyTranscendentSkillConfig,
@@ -41,6 +43,7 @@ import {
   rarityOrderIndex,
   raritySchema,
   requiredGradeNullForbidden,
+  skillClassStableIdOf,
   skillConfigSchema,
   skillUpgradeSchema,
   specialAbilitiesSchema,
@@ -1558,6 +1561,56 @@ describe("skill rarity (shared vocabulary + monotonic ordering)", () => {
     ).toBe(false)
     expect(isIncompleteSkillRarity({ tag: "x", rarity: "Unique" })).toBe(false)
     expect(isIncompleteSkillRarity({ rarity: "Commoner" })).toBe(true)
+  })
+
+  it("isIncompleteSkillConfig requires a track on a NEW or config-changing skill", () => {
+    // A skill without any track is incomplete (must be typed).
+    expect(isIncompleteSkillConfig({})).toBe(true)
+    expect(isIncompleteSkillConfig({ milestone: 4 })).toBe(true)
+    expect(isIncompleteSkillConfig({ rarity: "Common" })).toBe(true)
+    // Any declared track satisfies the requirement; validity is checked separately.
+    expect(isIncompleteSkillConfig({ track: "race" })).toBe(false)
+    expect(isIncompleteSkillConfig({ track: "class", milestone: 4 })).toBe(
+      false
+    )
+    expect(isIncompleteSkillConfig({ track: "profession" })).toBe(false)
+  })
+
+  it("hasInvalidSkillTrack accepts race/class/profession and rejects anything else", () => {
+    expect(hasInvalidSkillTrack({ track: "race" })).toBe(false)
+    expect(hasInvalidSkillTrack({ track: "class" })).toBe(false)
+    expect(hasInvalidSkillTrack({ track: "profession" })).toBe(false)
+    expect(hasInvalidSkillTrack({ track: "spells" })).toBe(true)
+    expect(hasInvalidSkillTrack({ track: "" })).toBe(true)
+    // A missing track is not invalid (isIncompleteSkillConfig owns that check).
+    expect(hasInvalidSkillTrack({})).toBe(false)
+  })
+
+  it("skillConfigSchema accepts a classStableId and rejects an empty one", () => {
+    expect(
+      skillConfigSchema.safeParse({
+        track: "class",
+        milestone: 4,
+        classStableId: "archer",
+      }).success
+    ).toBe(true)
+    // A nonempty-required classStableId must not be blank.
+    expect(
+      skillConfigSchema.safeParse({
+        track: "class",
+        classStableId: "",
+      }).success
+    ).toBe(false)
+  })
+
+  it("skillClassStableIdOf extracts a trimmed nonempty classStableId or returns null", () => {
+    expect(skillClassStableIdOf({ classStableId: "  archer  " })).toBe("archer")
+    expect(skillClassStableIdOf({ classStableId: "archer" })).toBe("archer")
+    expect(skillClassStableIdOf({})).toBeNull()
+    expect(skillClassStableIdOf({ classStableId: "" })).toBeNull()
+    expect(skillClassStableIdOf({ classStableId: "   " })).toBeNull()
+    // Unknown / malformed keys are ignored (legacy passthrough).
+    expect(skillClassStableIdOf({ classStableId: 42 })).toBeNull()
   })
 
   it("skillUpgradeSchema requires definitionId, version and a 1..500 reason", () => {

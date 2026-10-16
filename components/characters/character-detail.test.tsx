@@ -291,7 +291,11 @@ vi.mock("@/components/ui/tabs", () => {
 })
 
 vi.mock("@/components/ui/sheet", () => ({
-  Sheet: ({ children }: React.ComponentProps<"div">) => <div>{children}</div>,
+  Sheet: ({
+    children,
+    open,
+  }: React.ComponentProps<"div"> & { open?: boolean }) =>
+    open ? <div>{children}</div> : null,
   SheetContent: ({ children }: React.ComponentProps<"div">) => (
     <div>{children}</div>
   ),
@@ -1013,6 +1017,19 @@ async function renderDetail() {
   await flush()
 }
 
+/** Locate an open panel through its accessible, visually-hidden sheet title. */
+function associationSheetContent(
+  panel: "titlesSkills" | "powers" | "inventoryEquipment" = "titlesSkills"
+) {
+  const names = {
+    titlesSkills: "Titles and skills",
+    powers: "Blessings and bloodlines",
+    inventoryEquipment: "Inventory and equipment",
+  }
+  return screen.getByRole("heading", { name: names[panel] }).parentElement!
+    .parentElement!
+}
+
 beforeEach(() => {
   evolutionsError = null
   mockRouteId = "chr-1"
@@ -1024,6 +1041,45 @@ afterEach(() => {
 })
 
 // --- Tests ---------------------------------------------------------------- //
+
+describe("association panel separation", () => {
+  it("opens only the requested category and keeps each panel's tabs isolated", async () => {
+    setupMock()
+    await renderDetail()
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage titles" }))
+    const titles = associationSheetContent("titlesSkills")
+    expect(within(titles).getByRole("tab", { name: "Titles" })).toBeTruthy()
+    expect(within(titles).getByRole("tab", { name: "Skills" })).toBeTruthy()
+    expect(
+      screen.queryByRole("heading", { name: "Blessings and bloodlines" })
+    ).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage equipment" }))
+    const equipment = associationSheetContent("inventoryEquipment")
+    expect(
+      within(equipment).getByRole("tab", { name: "Inventory" })
+    ).toBeTruthy()
+    expect(
+      within(equipment).getByRole("tab", { name: "Equipment" })
+    ).toBeTruthy()
+    expect(
+      screen.queryByRole("heading", { name: "Titles and skills" })
+    ).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage blessings" }))
+    const powers = associationSheetContent("powers")
+    expect(within(powers).getByRole("tab", { name: "Blessings" })).toBeTruthy()
+    expect(within(powers).getByRole("tab", { name: "Bloodlines" })).toBeTruthy()
+    expect(
+      within(powers).getByRole("tab", { name: "Transcendent skills" })
+    ).toBeTruthy()
+    expect(within(powers).queryByRole("tab", { name: "Titles" })).toBeNull()
+    expect(
+      screen.queryByRole("heading", { name: "Inventory and equipment" })
+    ).toBeNull()
+  })
+})
 
 describe("scheduled skill choice prompts", () => {
   const pendingOffer = (overrides: Record<string, unknown> = {}) => ({
@@ -1038,6 +1094,161 @@ describe("scheduled skill choice prompts", () => {
       { definitionId: "skill-1", nameSnapshot: "Quick Shot", archived: false },
     ],
     ...overrides,
+  })
+
+  it("routes owner offer selection through Titles and Skills before confirming the select API action", async () => {
+    setupMock({
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+                classPriority: true,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Choose skill" }))
+    const sheet = associationSheetContent("titlesSkills")
+    expect(within(sheet).getByRole("tab", { name: "Skills" })).toBeTruthy()
+    expect(within(sheet).getByText("Class match")).toBeTruthy()
+    fireEvent.click(within(sheet).getByRole("button", { name: "Select" }))
+    fireEvent.click(screen.getAllByRole("button", { name: "Select" }).at(-1)!)
+    await flush()
+    expect(skillSelectPosts).toEqual([
+      expect.objectContaining({
+        operation: "select",
+        offerId: "offer-class-1",
+        definitionId: "skill-1",
+        version: 3,
+      }),
+    ])
+    expect(skillSelectPosts.some((post) => post.operation === "grant")).toBe(
+      false
+    )
+  })
+
+  it("shows a zero-option waiting state in the Skills sheet and retries refresh", async () => {
+    setupMock({
+      character: {
+        ...character,
+        skillOffers: [pendingOffer({ options: [] })],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Manage skills" }))
+    const sheet = associationSheetContent("titlesSkills")
+    expect(
+      within(sheet).getByText("No eligible skill options are available yet.")
+    ).toBeTruthy()
+    fireEvent.click(
+      within(sheet).getByRole("button", { name: "Retry refresh" })
+    )
+    await flush()
+    expect(skillRefreshPosts).toBe(2)
+  })
+
+  it("keeps server option order, badges class priority, and leaves cross-class options selectable", async () => {
+    const offer = pendingOffer({
+      options: [
+        {
+          definitionId: "priority",
+          nameSnapshot: "Priority Skill",
+          archived: false,
+          classPriority: true,
+        },
+        {
+          definitionId: "other",
+          nameSnapshot: "Other Class Skill",
+          archived: false,
+          classPriority: false,
+        },
+      ],
+    })
+    setupMock({
+      character: { ...character, skillOffers: [offer] } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Manage skills" }))
+    const sheet = associationSheetContent("titlesSkills")
+    const priority = within(sheet).getByText("Priority Skill").parentElement!
+    expect(within(priority).getByText("Class match")).toBeTruthy()
+    expect(within(sheet).getByText("Other Class Skill")).toBeTruthy()
+    expect(
+      within(sheet).getAllByRole("button", { name: "Select" })
+    ).toHaveLength(2)
+  })
+
+  it("counts pending monster Race offers on the sheet", async () => {
+    setupMock({
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({ id: "race-offer", track: "race", options: [] }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Manage skills" }))
+    const sheet = associationSheetContent("titlesSkills")
+    expect(within(sheet).getByText("Race: 1 pending")).toBeTruthy()
+    expect(within(sheet).getByText("Class: 0 pending")).toBeTruthy()
+  })
+
+  it("opens the matching Skills sheet with Choose now and defers without a request", async () => {
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Choose now" }))
+    const sheet = associationSheetContent("titlesSkills")
+    expect(within(sheet).getByRole("tab", { name: "Skills" })).toBeTruthy()
+    expect(sheet.querySelector("#skill-offer-offer-class-1")).toBeTruthy()
+    expect(skillSelectPosts).toHaveLength(0)
+
+    expect(skillSelectPosts).toHaveLength(0)
+  })
+
+  it("closes a level-up prompt with Decide later without submitting a selection", async () => {
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Decide later" }))
+    await flush()
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+    expect(skillSelectPosts).toHaveLength(0)
   })
 
   it("prompts only for a newly generated scheduled credit, selects through the skill API, and does not repeat on load", async () => {
@@ -1060,7 +1271,10 @@ describe("scheduled skill choice prompts", () => {
     )
     await flush()
     expect(screen.getByText("Choose a skill")).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Quick Shot" }))
+    fireEvent.click(screen.getByRole("button", { name: "Choose now" }))
+    const sheet = associationSheetContent("titlesSkills")
+    fireEvent.click(within(sheet).getByRole("button", { name: "Select" }))
+    fireEvent.click(screen.getAllByRole("button", { name: "Select" }).at(-1)!)
     await flush()
     expect(skillSelectPosts).toEqual([
       expect.objectContaining({
@@ -1091,8 +1305,11 @@ describe("scheduled skill choice prompts", () => {
       } as typeof character,
     })
     await renderDetail()
-    expect(screen.getByText("Class: 1")).toBeTruthy()
-    expect(screen.getByText("Profession: 1")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const skillsPanel = screen.getByTestId("panel-skills")
+    expect(within(skillsPanel).getByText("Class: 1 pending")).toBeTruthy()
+    expect(within(skillsPanel).getByText("Profession: 1 pending")).toBeTruthy()
     fireEvent.click(
       screen.getByRole("button", { name: "Increase class level" })
     )
@@ -1243,11 +1460,16 @@ describe("scheduled skill choice prompts", () => {
 
     // The dialog and its offer stay, and the pending count is untouched.
     expect(screen.getByText("Choose a skill")).toBeTruthy()
-    expect(screen.getByRole("button", { name: "Quick Shot" })).toBeTruthy()
-    expect(screen.getByText("Class: 1")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Choose now" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Choose now" }))
+    const skillSheet = associationSheetContent("titlesSkills")
+    fireEvent.click(within(skillSheet).getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(within(skillSheet).getByText("Class: 1 pending")).toBeTruthy()
 
     // A subsequent action still carries the current (newer) version.
-    fireEvent.click(screen.getByRole("button", { name: "Quick Shot" }))
+    fireEvent.click(within(skillSheet).getByRole("button", { name: "Select" }))
+    fireEvent.click(screen.getAllByRole("button", { name: "Select" }).at(-1)!)
     await flush()
     expect(skillSelectPosts).toEqual([
       expect.objectContaining({ operation: "select", version: 4 }),
@@ -1289,7 +1511,10 @@ describe("scheduled skill choice prompts", () => {
       version: 5,
       skillOffers: [pendingOffer({ selectedDefinitionId: "skill-1" })],
     } as typeof activeCharacter
-    fireEvent.click(screen.getByRole("button", { name: "Quick Shot" }))
+    fireEvent.click(screen.getByRole("button", { name: "Choose now" }))
+    const skillSheet = associationSheetContent("titlesSkills")
+    fireEvent.click(within(skillSheet).getByRole("button", { name: "Select" }))
+    fireEvent.click(screen.getAllByRole("button", { name: "Select" }).at(-1)!)
     await flush()
     expect(screen.queryByText("Choose a skill")).toBeNull()
 
@@ -1304,11 +1529,12 @@ describe("scheduled skill choice prompts", () => {
     })
     await flush()
 
-    expect(screen.getByText("Class: 0")).toBeTruthy()
-    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    fireEvent.click(within(skillSheet).getByRole("tab", { name: "Skills" }))
     await flush()
+    const skillsPanel = skillSheet
+    expect(within(skillsPanel).getByText("Class: 0 pending")).toBeTruthy()
     expect(screen.getByText("Selected")).toBeTruthy()
-    expect(screen.queryByText("Pending")).toBeNull()
+    expect(within(skillsPanel).queryByText("Pending")).toBeNull()
   })
 
   it("does not let a delayed same-version refresh omit offer details that still exist", async () => {
@@ -1347,8 +1573,12 @@ describe("scheduled skill choice prompts", () => {
     })
     await flush()
     expect(screen.getByText("Choose a skill")).toBeTruthy()
-    expect(screen.getByRole("button", { name: "Quick Shot" })).toBeTruthy()
-    expect(screen.getByText("Class: 1")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Choose now" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(
+      within(screen.getByTestId("panel-skills")).getByText("Class: 1 pending")
+    ).toBeTruthy()
   })
 
   it("retains selected/canceled terminal status when a same-version refresh returns pending offers", async () => {
@@ -1565,7 +1795,7 @@ describe("scheduled skill choice prompts", () => {
       screen.getByRole("button", { name: "Increase class level" })
     )
     await flush()
-    expect(screen.getByRole("button", { name: "Quick Shot" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Choose now" })).toBeTruthy()
 
     // The catalog archives the offer's definition (same version). The mutable
     // `archived` flag flips, but the incoming snapshot's different name does NOT
@@ -1613,10 +1843,8 @@ describe("scheduled skill choice prompts", () => {
     } as typeof character
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getAllByRole("button", { name: "Quick Shot" })).toHaveLength(
-      1
-    )
-    expect(screen.queryByRole("button", { name: "Renamed Shot" })).toBeNull()
+    expect(screen.getAllByText("Quick Shot")).toHaveLength(1)
+    expect(screen.queryByText("Renamed Shot")).toBeNull()
   })
 
   it("does not let a deferred same-version GET roll back archive state that a newer refresh applied", async () => {
@@ -1772,7 +2000,7 @@ describe("scheduled skill choice prompts", () => {
     await flush()
 
     // The refresh re-enabled the option; it is selectable again.
-    expect(screen.getByRole("button", { name: "Select" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Choose skill" })).toBeTruthy()
     expect(screen.queryByText("Archived")).toBeNull()
 
     // The stale GET resolves LAST with archived:true (same version); it must NOT
@@ -1796,7 +2024,7 @@ describe("scheduled skill choice prompts", () => {
     })
     await flush()
 
-    expect(screen.getByRole("button", { name: "Select" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Choose skill" })).toBeTruthy()
     expect(screen.queryByText("Archived")).toBeNull()
   })
 
@@ -1974,7 +2202,7 @@ describe("scheduled skill choice prompts", () => {
     await flush()
 
     expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
-    expect(screen.getByRole("button", { name: "Select" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Choose skill" })).toBeTruthy()
     expect(screen.getByText("Aim Shot")).toBeTruthy()
   })
 
@@ -2355,9 +2583,7 @@ describe("CharacterDetail ranked title claims", () => {
   it("requires a self-reported first-clear detail and sends it with version", async () => {
     setupMock({ titles: [rankedTitle("pioneer-1", "Pioneer I", 1)] })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
     expect(
@@ -2393,9 +2619,7 @@ describe("CharacterDetail ranked title claims", () => {
   it("blocks below-grade claims and skipped ranks", async () => {
     setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2, "C")] })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     expect(screen.getByText(/Locked: race grade G is below C/)).toBeTruthy()
     expect(
@@ -2410,9 +2634,7 @@ describe("CharacterDetail ranked title claims", () => {
   it("does not offer rank 2 when no rank 1 is linked", async () => {
     setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2)] })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     expect(screen.getByText(/Locked: only rank 1 is next/)).toBeTruthy()
     expect(
@@ -2447,9 +2669,7 @@ describe("CharacterDetail ranked title claims", () => {
       titles: [rankedTitle("pioneer-4", "Pioneer IV", 4, "E")],
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     expect(screen.getByText("Rank 4 / minimum race grade E")).toBeTruthy()
     expect(
@@ -2482,9 +2702,7 @@ describe("CharacterDetail ranked title claims", () => {
       titles: [rankedTitle("pioneer-2", "Pioneer II", 2)],
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     expect(
       screen.getByText(
@@ -2507,9 +2725,7 @@ describe("CharacterDetail ranked title claims", () => {
       ],
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     const titleRow =
       screen.getByText("Ordinary title").parentElement?.parentElement
@@ -2534,9 +2750,7 @@ describe("CharacterDetail ranked title claims", () => {
       titles: [rankedTitle("pioneer-1", "Pioneer I", 1)],
     })
     await renderDetail()
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
-    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
     fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
     fireEvent.change(screen.getByLabelText("Qualifying first-clear details"), {
@@ -2727,16 +2941,25 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
-    expect(screen.getAllByText("Soulbound").length).toBeGreaterThan(0)
-    expect(screen.getAllByText("Requires level 30").length).toBeGreaterThan(0)
-    expect(screen.getAllByText("Monstrous (monster)").length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole("button", { name: "Manage inventory" }))
+    await flush()
+    const sheet = associationSheetContent("inventoryEquipment")
+    expect(within(sheet).getAllByText("Soulbound").length).toBeGreaterThan(0)
     expect(
-      screen
+      within(sheet).getAllByText("Requires level 30").length
+    ).toBeGreaterThan(0)
+    expect(
+      within(sheet).getAllByText("Monstrous (monster)").length
+    ).toBeGreaterThan(0)
+    expect(
+      within(sheet)
         .getAllByRole("button", { name: "Equip" })
         .some((button) => (button as HTMLButtonElement).disabled)
     ).toBe(true)
-    expect(screen.getByRole("button", { name: "Add stock" })).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Unequip" }))
+    expect(
+      within(sheet).getByRole("button", { name: "Add stock" })
+    ).toBeTruthy()
+    fireEvent.click(within(sheet).getByRole("button", { name: "Unequip" }))
     await flush()
     expect(
       activeCharacter.associations.some((row) => row.kind === "equipment")
@@ -4036,7 +4259,7 @@ describe("CharacterDetail inventory", () => {
     // load catalogs on its own; open the associations sheet to trigger the
     // catalog loads that back the Add stock dialog.
     fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]
     )
     await flush()
 
@@ -4136,8 +4359,11 @@ describe("CharacterDetail inventory", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Manage inventory" }))
+    await flush()
 
-    const ownedItems = within(screen.getByLabelText("Owned items"))
+    const sheet = associationSheetContent("inventoryEquipment")
+    const ownedItems = within(within(sheet).getByLabelText("Owned items"))
     // Archived stock stays visible and is honestly marked inert.
     expect(ownedItems.getByText("Old Token")).toBeTruthy()
     expect(ownedItems.getByText("Qty 1")).toBeTruthy()
@@ -4152,7 +4378,9 @@ describe("CharacterDetail inventory", () => {
     fireEvent.click(discard)
     await flush()
 
-    const heading = screen.getByRole("heading", { name: "Discard stock" })
+    const heading = within(sheet).getByRole("heading", {
+      name: "Discard stock",
+    })
     const dialog = heading.closest("div")!.parentElement!
     fireEvent.change(within(dialog).getByLabelText("Quantity (1-1)"), {
       target: { value: "1" },
@@ -4179,7 +4407,7 @@ describe("CharacterDetail inventory", () => {
 
     // The row disappears on reload; the archived catalog entry remains visible
     // only via the management sheet, not as owned stock.
-    const after = within(screen.getByLabelText("Owned items"))
+    const after = within(within(sheet).getByLabelText("Owned items"))
     expect(after.queryByText("Old Token")).toBeNull()
     expect(after.queryByText("Qty 1")).toBeNull()
   })
@@ -4210,13 +4438,11 @@ describe("CharacterDetail inventory", () => {
 
     await renderDetail()
     fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]
     )
     await flush()
 
-    const sheetContent = screen
-      .getByText("Character associations")
-      .closest("div")!.parentElement!
+    const sheetContent = associationSheetContent("inventoryEquipment")
     fireEvent.click(
       within(sheetContent).getByRole("tab", { name: "Equipment" })
     )
@@ -4252,9 +4478,7 @@ describe("CharacterDetail inventory", () => {
     })
 
     // The reload reflects the unlink: the sheet now requires stock to equip.
-    const after = within(
-      screen.getByText("Character associations").closest("div")!.parentElement!
-    )
+    const after = within(associationSheetContent("inventoryEquipment"))
     expect(after.queryByRole("button", { name: "Remove" })).toBeNull()
     expect(after.getByRole("button", { name: "Add stock first" })).toBeTruthy()
   })
@@ -4286,8 +4510,11 @@ describe("CharacterDetail inventory", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Manage inventory" }))
+    await flush()
 
-    const ownedEquip = within(screen.getByLabelText("Owned equipment"))
+    const sheet = associationSheetContent("inventoryEquipment")
+    const ownedEquip = within(within(sheet).getByLabelText("Owned equipment"))
     expect(ownedEquip.getByText("Final Sword")).toBeTruthy()
     expect(ownedEquip.getByText("Qty 1")).toBeTruthy()
     expect(
@@ -4326,8 +4553,11 @@ describe("CharacterDetail inventory", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Manage inventory" }))
+    await flush()
 
-    const ownedEquip = within(screen.getByLabelText("Owned equipment"))
+    const sheet = associationSheetContent("inventoryEquipment")
+    const ownedEquip = within(within(sheet).getByLabelText("Owned equipment"))
     const discard = ownedEquip.getByRole("button", {
       name: "Discard",
     }) as HTMLButtonElement
@@ -4337,7 +4567,9 @@ describe("CharacterDetail inventory", () => {
     fireEvent.click(discard)
     await flush()
 
-    const heading = screen.getByRole("heading", { name: "Discard stock" })
+    const heading = within(sheet).getByRole("heading", {
+      name: "Discard stock",
+    })
     const dialog = heading.closest("div")!.parentElement!
     const qtyInput = within(dialog).getByLabelText(
       "Quantity (1-1)"
@@ -4601,22 +4833,23 @@ describe("CharacterDetail ring equipment position and gating", () => {
     })
     await renderDetail()
     fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]
     )
     await flush()
-    const sheetContent = screen
-      .getByText("Character associations")
-      .closest("div")!.parentElement!
+    const sheetContent = associationSheetContent("inventoryEquipment")
     fireEvent.click(
       within(sheetContent).getByRole("tab", { name: "Equipment" })
     )
     await flush()
+    const equipmentPanel = within(sheetContent).getByTestId("panel-equipment")
     fireEvent.change(
-      within(sheetContent).getByLabelText("Equip position for Ring of Power"),
+      within(equipmentPanel).getByLabelText("Equip position for Ring of Power"),
       { target: { value: "Ring 2" } }
     )
     await flush()
-    fireEvent.click(within(sheetContent).getByRole("button", { name: "Equip" }))
+    fireEvent.click(
+      within(equipmentPanel).getByRole("button", { name: "Equip" })
+    )
     await flush()
     const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
     const post = mock.mock.calls.find(
@@ -4663,7 +4896,10 @@ describe("CharacterDetail ring equipment position and gating", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
-    const ownedEquip = within(screen.getByLabelText("Owned equipment"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage inventory" }))
+    await flush()
+    const sheet = associationSheetContent("inventoryEquipment")
+    const ownedEquip = within(within(sheet).getByLabelText("Owned equipment"))
     // The normalized inventory slot alone identifies this as a ring and offers
     // the position selector.
     fireEvent.change(
@@ -4723,7 +4959,10 @@ describe("CharacterDetail ring equipment position and gating", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Inventory" }))
     await flush()
-    const ownedEquip = within(screen.getByLabelText("Owned equipment"))
+    fireEvent.click(screen.getByRole("button", { name: "Manage inventory" }))
+    await flush()
+    const sheet = associationSheetContent("inventoryEquipment")
+    const ownedEquip = within(within(sheet).getByLabelText("Owned equipment"))
     expect(
       ownedEquip.queryByLabelText("Equip position for Iron Sword")
     ).toBeNull()
@@ -4801,32 +5040,32 @@ describe("CharacterDetail ring equipment position and gating", () => {
     })
     await renderDetail()
     fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]
     )
     await flush()
-    const sheetContent = screen
-      .getByText("Character associations")
-      .closest("div")!.parentElement!
+    const sheetContent = associationSheetContent("inventoryEquipment")
     fireEvent.click(
       within(sheetContent).getByRole("tab", { name: "Equipment" })
     )
     await flush()
 
+    const equipmentPanel = within(sheetContent).getByTestId("panel-equipment")
+
     // Zero owned stock: Equip is replaced by a disabled "Add stock first".
-    const noStock = within(sheetContent).getByRole("button", {
+    const noStock = within(equipmentPanel).getByRole("button", {
       name: "Add stock first",
     }) as HTMLButtonElement
     expect(noStock.disabled).toBe(true)
 
     // Owned but unmet requirements: Equip is disabled and carries the reason.
-    const unmet = within(sheetContent).getByRole("button", {
+    const unmet = within(equipmentPanel).getByRole("button", {
       name: "Equip",
     }) as HTMLButtonElement
     expect(unmet.disabled).toBe(true)
     expect(unmet.title).toBe("Requires level 40")
 
     // A linked-but-ineligible item is still removable (Remove is busy-gated only).
-    const remove = within(sheetContent).getByRole("button", {
+    const remove = within(equipmentPanel).getByRole("button", {
       name: "Remove",
     }) as HTMLButtonElement
     expect(remove.disabled).toBe(false)
@@ -4886,12 +5125,10 @@ describe("CharacterDetail linked grade descriptions", () => {
     ).toBeGreaterThan(0)
 
     fireEvent.click(
-      screen.getAllByRole("button", { name: "Manage titles & equipment" })[0]
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]
     )
     await flush()
-    const sheetContent = screen
-      .getByText("Character associations")
-      .closest("div")!.parentElement!
+    const sheetContent = associationSheetContent("inventoryEquipment")
     fireEvent.click(
       within(sheetContent).getByRole("tab", { name: "Equipment" })
     )

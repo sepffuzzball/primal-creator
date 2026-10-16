@@ -83,6 +83,7 @@ import {
   parseCatalogConfig,
   rarityOrderIndex,
   requiredGradeNullForbidden,
+  skillClassStableIdOf,
   titleImprovementSchema,
   legacyRingPositionForConfig,
   type BlessingTier,
@@ -241,6 +242,16 @@ export interface SkillOfferOptionView {
   archived: boolean
   /** Catalog tier grade of the offered definition, when set. */
   grade?: string
+  /**
+   * Whether the option is priority-tied to the offer's snapshotted earned class.
+   * True only when the option's PERSISTED config snapshot declares a nonempty
+   * `classStableId` exactly equal to the offer's snapshotted `classStableIdAtEarn`
+   * (itself nonempty). Always false on a legacy/imported offer (no earned-class
+   * snapshot) and for a monster race credit (which has no class). Computed from
+   * the persisted earned context, never the character's current class.
+   * Priority-only: never eligibility, never order-changing.
+   */
+  classPriority: boolean
 }
 
 export interface SkillOfferView {
@@ -268,6 +279,15 @@ export interface SkillOfferView {
    * Null on legacy/imported offers.
    */
   trackDefinitionStableId?: string | null
+  /**
+   * Catalog stableId of the character's selected CLASS at the moment the credit
+   * was earned, snapshotted at EARNING time for class/profession credits and null
+   * for a monster race credit (which has no class). Populated only on a
+   * scheduled/milestone offer; null on legacy/imported offers. Priority-only: it
+   * drives deterministic option ordering (skills whose `classStableId` matches
+   * sort first), never eligibility.
+   */
+  classStableIdAtEarn?: string | null
 }
 
 export interface CharacterDetail {
@@ -1556,10 +1576,120 @@ function associationView(
   return view
 }
 
+/**
+ * Class-tie priority for a skill option: 0 when the skill's IMMUTABLE earned
+ * snapshot `classStableId` (the persisted `configSnapshot`, never the live
+ * catalog config) matches the offer's snapshotted `classStableIdAtEarn`, else 1.
+ * Never hides a nonmatching class-tied skill - it only orders it after the
+ * matching one. A null `classStableIdAtEarn` (race credit or no snapshot) leaves
+ * every option at priority 1.
+ */
+function skillOptionClassTiePriority(
+  configSnapshot: Record<string, unknown>,
+  classStableIdAtEarn: string | null | undefined
+): number {
+  const cs = skillClassStableIdOf(configSnapshot)
+  if (cs == null || classStableIdAtEarn == null) return 1
+  return cs === classStableIdAtEarn ? 0 : 1
+}
+
+/**
+ * Whether an offered skill option is priority-tied to the offer's snapshotted
+ * earned class. True only when the option's PERSISTED config snapshot declares a
+ * nonempty `classStableId` exactly equal to the offer's snapshotted
+ * `classStableIdAtEarn` (itself nonempty). Always false on a legacy/imported
+ * offer (no earned-class snapshot) and for a monster race credit (which has no
+ * class). Computed from the persisted earned context, never the character's
+ * current class. Priority-only: it never gates eligibility and never reorders
+ * options (the SORT already ran); it is a read-time UI indicator.
+ */
+function skillOptionClassPriority(
+  configSnapshot: Record<string, unknown>,
+  classStableIdAtEarn: string | null | undefined
+): boolean {
+  const cs = skillClassStableIdOf(configSnapshot)
+  if (cs == null || classStableIdAtEarn == null) return false
+  return cs === classStableIdAtEarn
+}
+
+/**
+ * Deterministic option order: class tie matching the earned snapshot first, then
+ * the SNAPSHOT name casefold, then stableId, then id. Class tie and name are read
+ * from the immutable earned snapshot (`configSnapshot` / `nameSnapshot`), never
+ * the live catalog config - so a post-earn catalog edit (renaming a skill or
+ * retying its class) never moves an already-offered option.
+ */
+function compareSkillOfferOptions(
+  a: {
+    configSnapshot: Record<string, unknown>
+    name: string
+    stableId: string
+    id: string
+  },
+  b: {
+    configSnapshot: Record<string, unknown>
+    name: string
+    stableId: string
+    id: string
+  },
+  classStableIdAtEarn: string | null | undefined
+): number {
+  const pa = skillOptionClassTiePriority(a.configSnapshot, classStableIdAtEarn)
+  const pb = skillOptionClassTiePriority(b.configSnapshot, classStableIdAtEarn)
+  if (pa !== pb) return pa - pb
+  const na = a.name.toLocaleLowerCase()
+  const nb = b.name.toLocaleLowerCase()
+  if (na !== nb) return na < nb ? -1 : 1
+  if (a.stableId !== b.stableId) return a.stableId < b.stableId ? -1 : 1
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+
 /** Build the read-time skill-offer view with the current archived status of each option. */
 function skillOfferView(
   offer: CharacterWithCatalog["skillOffers"][number]
 ): SkillOfferView {
+  // Options are serialized in a deterministic order: a skill whose `classStableId`
+  // matches the offer's snapshotted earned class sorts first (class tie), then by
+  // name casefold, then stableId, then id. This survives refresh and import, where
+  // option rows are appended in catalog order, because the view always re-sorts.
+  // The class tie and name come from the option's IMMUTABLE earned snapshot
+  // (`configSnapshot` / `nameSnapshot`), never the live catalog config, so a
+  // post-earn catalog edit (rename or class retie) never reorders an already
+  // offered option. A nonmatching class-tied skill is never hidden - it only sorts
+  // after the match.
+  //
+  // The earning-time class snapshot is MEANINGFUL only on a scheduled
+  // class/profession credit: BOTH provenance halves present AND the offer is on
+  // the 'class'/'profession' track. A monster RACE credit has no earned class and
+  // a legacy/untyped offer (no provenance) has no snapshot, so neither may attach
+  // earned-class priority - even if a persisted row (from a pre-fix import) holds
+  // a value where none belongs. Computed here so the sort, the priority badge and
+  // the exposed field all agree.
+  const isClassProfTrack =
+    offer.track === "class" || offer.track === "profession"
+  const hasProvenance =
+    offer.earnedGrade != null && offer.trackDefinitionStableId != null
+  const classSnapshot =
+    hasProvenance && isClassProfTrack
+      ? (offer.classStableIdAtEarn ?? null)
+      : null
+  const sortedOptions = [...offer.options].sort((a, b) =>
+    compareSkillOfferOptions(
+      {
+        configSnapshot: (a.configSnapshot ?? {}) as Record<string, unknown>,
+        name: a.nameSnapshot,
+        stableId: a.definition?.stableId ?? "",
+        id: a.definitionId,
+      },
+      {
+        configSnapshot: (b.configSnapshot ?? {}) as Record<string, unknown>,
+        name: b.nameSnapshot,
+        stableId: b.definition?.stableId ?? "",
+        id: b.definitionId,
+      },
+      classSnapshot
+    )
+  )
   return {
     id: offer.id,
     track: offer.track,
@@ -1567,15 +1697,22 @@ function skillOfferView(
     choiceGroup: offer.choiceGroup,
     generation: offer.generation,
     canceledAt: offer.canceledAt ? offer.canceledAt.toISOString() : null,
-    options: offer.options.map((o) => ({
+    options: sortedOptions.map((o) => ({
       definitionId: o.definitionId,
       nameSnapshot: o.nameSnapshot,
       archived: o.definition?.archived ?? false,
       ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
+      classPriority: skillOptionClassPriority(
+        (o.configSnapshot ?? {}) as Record<string, unknown>,
+        classSnapshot
+      ),
     })),
     selectedDefinitionId: offer.selectedDefinitionId,
     earnedGrade: offer.earnedGrade,
     trackDefinitionStableId: offer.trackDefinitionStableId,
+    ...(offer.earnedGrade != null || offer.trackDefinitionStableId != null
+      ? { classStableIdAtEarn: classSnapshot }
+      : {}),
   }
 }
 
@@ -2585,65 +2722,51 @@ export async function archiveCharacter(
 
 /**
  * Whether an unarchived `skills` catalog definition matches a schedule-credit
- * (milestone) offer by the SAME eligibility rules the offer was (or would be)
- * generated under: the config `track` is EXACT, the `milestone` equals the offer
- * level, the catalog `grade` (when set) equals the earned grade exactly, and
- * `eligibleDefinitionStableIds` (when present) includes the track's catalog
- * stableId. The skill's own `choiceGroup` is deliberately ignored for a schedule
- * credit - all matches collapse into the single "standard" offer. Shared by the
- * initial credit offer AND by `refreshPendingSkillOffers`, so a refresh never
- * appends an option the original credit would have rejected.
+ * (milestone) credit offer. A scheduled credit offers ANY active skill matching
+ * the earned track type exactly plus an EXACT catalog grade when the skill sets
+ * one; the skill's `milestone`, `choiceGroup` and `eligibleDefinitionStableIds`
+ * are LEGACY annotations that no longer restrict scheduled-credit eligibility. The
+ * skill's own `choiceGroup` is deliberately ignored - all matches collapse into
+ * the single "standard" offer. Shared by the initial credit offer AND by
+ * `refreshPendingSkillOffers`, so a refresh never appends an option the original
+ * credit would have rejected.
  */
 function skillDefMatchesScheduledOffer(
   def: { grade: string | null; config: unknown },
-  offer: {
-    track: string
-    level: number
-    earnedGrade: string
-    trackDefinitionStableId: string
-  }
+  offer: { track: string; earnedGrade: string }
 ): boolean {
   const config = parseCatalogConfig("skills", def.config ?? {})
   if (config.track !== offer.track) return false
-  const milestone = Number(config.milestone)
-  if (!Number.isFinite(milestone) || milestone !== offer.level) return false
   // Grade, when specified, must match the earned grade exactly. For a graded
   // class/profession track this is the TRACK's own grade (independent of the race
-  // grade); for an ungraded legacy track it falls back to the race grade.
+  // grade); for an ungraded current track it falls back to the race grade. Only
+  // the catalog `grade` column is consulted - `milestone` no longer gates.
   if (def.grade && def.grade !== offer.earnedGrade) return false
-  // Filter to the selected track's catalog stableId when the skill constrains its
-  // eligible class/profession definitions. When `eligibleDefinitionStableIds` is
-  // present - even as an empty array - the restriction applies via `includes`:
-  // an empty list skips the skill (no selected stableId can be included), while
-  // an absent list imposes no restriction.
-  const stableIds = config.eligibleDefinitionStableIds
-  if (
-    Array.isArray(stableIds) &&
-    !stableIds.includes(offer.trackDefinitionStableId)
-  ) {
-    return false
-  }
   return true
 }
 
 /**
  * Create the SINGLE skill-choice credit offer for a character that just leveled a
- * class/profession track to a MILESTONE level.
+ * class/profession track (or a monster race) to a MILESTONE level.
  *
  * A credit is generated only when the track's authoritative grade (passed as
  * `offerGrade`) is a skill-choice MILESTONE at `newLevel` under the transaction's
- * `intervals` schedule (G never credits). Non-milestone level-ups produce no
- * offer, even when skills are configured for that level.
+ * `intervals` schedule (every grade G..S now credits). Non-milestone level-ups
+ * produce no offer, even when skills are configured for that level.
  *
  * When a credit IS due, exactly ONE offer is created with choiceGroup
  * `"standard"` - regardless of any skill config `choiceGroup` - and it is created
  * even when zero unarchived skills match (a zero-option milestone credit). The
- * offer options are the unarchived `skills` catalog entries whose config `track` /
- * `milestone` exactly match the advanced track/level, whose catalog `grade` (when
- * set) equals the earned grade (no inferred compatibility), and whose
- * `eligibleDefinitionStableIds` (when present) includes the selected track's
- * catalog stableId. Provenance (`earnedGrade`, `trackDefinitionStableId`) is
- * persisted on the offer; legacy/imported offers are never backfilled.
+ * offer options are the unarchived `skills` catalog entries whose config `track`
+ * exactly matches the advanced track and whose catalog `grade` (when set) equals
+ * the earned grade (no inferred compatibility). The skill's `milestone`,
+ * `choiceGroup` and `eligibleDefinitionStableIds` are LEGACY annotations ignored
+ * for scheduled-credit eligibility; every matching-typed skill is offered at any
+ * credit milestone. Options are ordered deterministically BEFORE insert: a skill
+ * whose `classStableId` matches the snapshotted class (`classStableIdAtEarn`)
+ * sorts first, then name casefold, then stableId, then id. Provenance
+ * (`earnedGrade`, `trackDefinitionStableId`, `classStableIdAtEarn`) is persisted
+ * on the offer; legacy/imported offers are never backfilled.
  *
  * A pre-existing ACTIVE (canceledAt null) offer for the same
  * (character, track, level, "standard") is left untouched (never duplicated); a
@@ -2659,14 +2782,15 @@ function skillDefMatchesScheduledOffer(
 async function createSkillOffersForAdvance(
   tx: DbClient,
   characterId: string,
-  track: "class" | "profession",
+  track: "race" | "class" | "profession",
   newLevel: number,
   offerGrade: Grade,
   trackStableId: string | undefined,
+  classStableIdAtEarn: string | null,
   intervals: SkillChoiceIntervals
 ): Promise<Array<{ id: string; choiceGroup: string }>> {
   // Only a configured skill-choice milestone credits. "Other level-ups no offers
-  // even if skills configured; G no credits."
+  // even if skills configured."
   if (!isSkillChoiceMilestone(offerGrade, newLevel, intervals)) return []
 
   const skillDefs = await tx.catalogDefinition.findMany({
@@ -2676,6 +2800,7 @@ async function createSkillOffersForAdvance(
     def: {
       id: string
       name: string
+      stableId: string
       grade: string | null
       config: unknown
     }
@@ -2684,26 +2809,49 @@ async function createSkillOffersForAdvance(
   for (const def of skillDefs) {
     // The skill config `choiceGroup` is deliberately IGNORED for a schedule
     // credit: all matching options collapse into a single "standard" offer so a
-    // credit is never multiplied. The track/milestone/grade/stableId eligibility
-    // is shared with `refreshPendingSkillOffers` so a refresh never inserts an
-    // option the original credit would have rejected.
+    // credit is never multiplied. The track/grade eligibility is shared with
+    // `refreshPendingSkillOffers` so a refresh never inserts an option the
+    // original credit would have rejected.
     if (
       !skillDefMatchesScheduledOffer(
         { grade: def.grade, config: def.config },
-        {
-          track,
-          level: newLevel,
-          earnedGrade: offerGrade,
-          trackDefinitionStableId: trackStableId ?? "",
-        }
+        { track, earnedGrade: offerGrade }
       )
     ) {
       continue
     }
     eligible.push({
-      def: { id: def.id, name: def.name, grade: def.grade, config: def.config },
+      def: {
+        id: def.id,
+        name: def.name,
+        stableId: def.stableId,
+        grade: def.grade,
+        config: def.config,
+      },
     })
   }
+
+  // Deterministic eligible-option order before any DB insert (class tie first).
+  // At EARNING time each option's `def.config` is exactly the config snapped into
+  // `configSnapshot`, so sorting on it here is sorting on the future snapshot: a
+  // later catalog edit never retroactively reorders an already-inserted option.
+  eligible.sort((a, b) =>
+    compareSkillOfferOptions(
+      {
+        configSnapshot: parseCatalogConfig("skills", a.def.config ?? {}),
+        name: a.def.name,
+        stableId: a.def.stableId,
+        id: a.def.id,
+      },
+      {
+        configSnapshot: parseCatalogConfig("skills", b.def.config ?? {}),
+        name: b.def.name,
+        stableId: b.def.stableId,
+        id: b.def.id,
+      },
+      classStableIdAtEarn
+    )
+  )
 
   // EXACTLY ONE offer per (character, track, level), always choiceGroup
   // "standard", even when zero skills match (a zero-option milestone credit).
@@ -2730,6 +2878,7 @@ async function createSkillOffersForAdvance(
       generation,
       earnedGrade: offerGrade,
       trackDefinitionStableId: trackStableId ?? null,
+      classStableIdAtEarn: classStableIdAtEarn ?? null,
       options: {
         create: eligible.map((e) => ({
           definitionId: e.def.id,
@@ -2816,31 +2965,54 @@ export async function advanceCharacter(
       )
     }
 
-    // Skills are offered, never auto-awarded: on a CLASS/PROFESSION LEVEL-UP only,
-    // generate one offer per choice group from the current unarchived skills
-    // catalog. A quarter-only advance (no level up) and a race-only advance (which
-    // has no skill offers) produce none. The offers are created inside the same
-    // transaction as the CAS state write and the immutable advance event, so a
-    // conflict rolls all of them back together.
+    // Skills are offered, never auto-awarded: on a level-up, generate one offer
+    // from the current unarchived skills catalog. A class/profession level-up
+    // (enlightened race) and an independent (monster) race level-up both earn a
+    // single choiceGroup "standard" credit offer at a matching grade milestone,
+    // even with zero options; a quarter-only advance (no level up) produces none.
+    // The offers are created inside the same transaction as the CAS state write and
+    // the immutable advance event, so a conflict rolls all of them back together.
     let skillOffers: Array<{ id: string; choiceGroup: string }> = []
-    if (!isRaceTrack && body.track !== "race" && result.journal.leveledUp) {
+    if (result.journal.leveledUp) {
       const newLevel = result.journal.levelAfter
-      const raceGrade = result.state.race.grade
-      // A graded class/profession track filters milestone offers by the track's OWN
-      // grade (independent of the race grade); an ungraded legacy track uses the
-      // race grade.
-      const trackGrade = result.state.tracks[body.track]?.grade ?? raceGrade
-      const trackStableId =
-        body.track === "class" ? row.class?.stableId : row.profession?.stableId
-      skillOffers = await createSkillOffersForAdvance(
-        tx,
-        id,
-        body.track,
-        newLevel,
-        trackGrade,
-        trackStableId ?? undefined,
-        houseRules.config.skillChoiceIntervals
-      )
+      if (isRaceTrack) {
+        // Independent (monster) race: a race level-up earns a skill-choice credit
+        // offer at every matching grade milestone, even with zero options. No
+        // class/profession offer is ever made for a monster. The earned grade is
+        // the race's own grade; the track stableId is the race's catalog stableId
+        // (the race identity is preserved across evolution, never re-derived).
+        const raceStableId = row.race?.stableId
+        skillOffers = await createSkillOffersForAdvance(
+          tx,
+          id,
+          "race",
+          newLevel,
+          result.state.race.grade,
+          raceStableId ?? undefined,
+          null,
+          houseRules.config.skillChoiceIntervals
+        )
+      } else {
+        const raceGrade = result.state.race.grade
+        // A graded class/profession track filters milestone offers by the track's OWN
+        // grade (independent of the race grade); an ungraded legacy track uses the
+        // race grade.
+        const trackGrade = result.state.tracks[body.track]?.grade ?? raceGrade
+        const trackStableId =
+          body.track === "class"
+            ? row.class?.stableId
+            : row.profession?.stableId
+        skillOffers = await createSkillOffersForAdvance(
+          tx,
+          id,
+          body.track,
+          newLevel,
+          trackGrade,
+          trackStableId ?? undefined,
+          row.class?.stableId ?? null,
+          houseRules.config.skillChoiceIntervals
+        )
+      }
     }
 
     const advanceJournal: Record<string, unknown> = { ...result.journal }
@@ -3606,27 +3778,49 @@ export async function experienceCharacter(
 
       const leveledUp = result.journal.leveledUp === true
 
-      // Skill offers are generated only on an actual level-up of a class /
-      // profession track, exactly once inside this transaction (a race level-up
-      // and a percent-only set produce none).
+      // Skill offers are generated only on an actual level-up, exactly once inside
+      // this transaction. A class/profession track (enlightened race) and an
+      // independent (monster) race level-up both earn a single choiceGroup
+      // "standard" credit offer at a grade milestone, even with zero options; a
+      // percent-only set (no level-up) produces none.
       let skillOffers: Array<{ id: string; choiceGroup: string }> = []
-      if (leveledUp && body.track !== "race") {
+      if (leveledUp) {
         const newLevel = result.journal.levelAfter
-        const raceGrade = result.state.race.grade
-        const trackGrade = result.state.tracks[body.track]?.grade ?? raceGrade
-        const trackStableId =
-          body.track === "class"
-            ? row.class?.stableId
-            : row.profession?.stableId
-        skillOffers = await createSkillOffersForAdvance(
-          tx,
-          id,
-          body.track,
-          newLevel,
-          trackGrade,
-          trackStableId ?? undefined,
-          houseRules.config.skillChoiceIntervals
-        )
+        if (isRaceTrack) {
+          // Independent (monster) race: a race level-up earns a skill-choice credit
+          // offer at every matching grade milestone, even with zero options. No
+          // class/profession offer is ever made for a monster. The earned grade is
+          // the race's own grade; the track stableId is the race's catalog stableId
+          // (preserved identity across evolution).
+          const raceStableId = row.race?.stableId
+          skillOffers = await createSkillOffersForAdvance(
+            tx,
+            id,
+            "race",
+            newLevel,
+            result.state.race.grade,
+            raceStableId ?? undefined,
+            null,
+            houseRules.config.skillChoiceIntervals
+          )
+        } else {
+          const raceGrade = result.state.race.grade
+          const trackGrade = result.state.tracks[body.track]?.grade ?? raceGrade
+          const trackStableId =
+            body.track === "class"
+              ? row.class?.stableId
+              : row.profession?.stableId
+          skillOffers = await createSkillOffersForAdvance(
+            tx,
+            id,
+            body.track,
+            newLevel,
+            trackGrade,
+            trackStableId ?? undefined,
+            row.class?.stableId ?? null,
+            houseRules.config.skillChoiceIntervals
+          )
+        }
       }
 
       const journal: Record<string, unknown> = { ...result.journal }
@@ -4770,12 +4964,7 @@ export async function refreshPendingSkillOffers(
             if (
               !skillDefMatchesScheduledOffer(
                 { grade: def.grade, config: def.config },
-                {
-                  track: offer.track,
-                  level: offer.level,
-                  earnedGrade: offer.earnedGrade,
-                  trackDefinitionStableId: offer.trackDefinitionStableId,
-                }
+                { track: offer.track, earnedGrade: offer.earnedGrade }
               )
             ) {
               continue
@@ -6979,14 +7168,16 @@ export async function exportCharacter(
         configSnapshot: (o.configSnapshot ?? {}) as Record<string, unknown>,
       })),
       // Schedule-credit provenance: a scheduled offer carries BOTH the earned grade
-      // and the selected track's stableId. A legacy offer (both null) omits both so
-      // its backup shape is unchanged; a mismatched row is normalized to the pair
-      // (with null for the missing half) rather than dropped, so a re-import still
-      // validates against the schema's required-together rule.
+      // and the selected track's stableId (and, when the credit was earned on a
+      // class/profession track, the snapshotted class). A legacy offer (all null)
+      // omits them so its backup shape is unchanged; a mismatched row is normalized
+      // to the pair (with null for the missing half) rather than dropped, so a
+      // re-import still validates against the schema's required-together rule.
       ...(offer.earnedGrade != null || offer.trackDefinitionStableId != null
         ? {
             earnedGrade: offer.earnedGrade ?? null,
             trackDefinitionStableId: offer.trackDefinitionStableId ?? null,
+            classStableIdAtEarn: offer.classStableIdAtEarn ?? null,
           }
         : {}),
     }
@@ -7555,6 +7746,14 @@ type ResolvedOffer = {
   /** Schedule-credit provenance (nullable on legacy/imported offers). */
   earnedGrade: string | null
   trackDefinitionStableId: string | null
+  /**
+   * Catalog stableId of the character's selected CLASS at the moment the credit
+   * was earned, snapshotted at EARNING time for class/profession credits and null
+   * for a monster race credit. Populated only on a v7 scheduled offer; null on
+   * legacy/imported offers. Priority-only (drives deterministic option ordering),
+   * never eligibility.
+   */
+  classStableIdAtEarn: string | null
 }
 
 function parseOfferDate(value: string | number | null | undefined): Date {
@@ -7677,6 +7876,21 @@ async function resolveSkillOfferRefs(
       "trackDefinitionStableId" in o
         ? (o.trackDefinitionStableId ?? null)
         : null
+    // `classStableIdAtEarn` (the earning-time class snapshot) is meaningful ONLY
+    // on a scheduled class/profession credit: BOTH provenance halves present AND
+    // the offer is on the 'class'/'profession' track. A monster RACE credit has
+    // no earned class and a legacy/untyped offer (no provenance) has no snapshot,
+    // so on those the value is normalized to null - never attach earned-class
+    // priority where none belongs. This is the same invariant the document schema
+    // enforces, re-applied here so a direct service caller that bypasses the
+    // route's Zod check (and an already-passed malformed document) never persists
+    // a stray class snapshot.
+    const isClassProfTrack = o.track === "class" || o.track === "profession"
+    const hasProvenance = earnedGrade != null && trackDefinitionStableId != null
+    const classStableIdAtEarn =
+      "classStableIdAtEarn" in o && hasProvenance && isClassProfTrack
+        ? (o.classStableIdAtEarn ?? null)
+        : null
 
     result.push({
       track: o.track,
@@ -7695,6 +7909,7 @@ async function resolveSkillOfferRefs(
       options,
       earnedGrade,
       trackDefinitionStableId,
+      classStableIdAtEarn,
     })
   }
   return result
@@ -8232,6 +8447,7 @@ export async function importCharacter(
             // Schedule-credit provenance (nullable on legacy/imported offers).
             earnedGrade: o.earnedGrade,
             trackDefinitionStableId: o.trackDefinitionStableId,
+            classStableIdAtEarn: o.classStableIdAtEarn,
             options: {
               create: o.options.map((opt) => ({
                 definitionId: opt.definitionId,
@@ -8505,13 +8721,13 @@ export async function createCatalogItem(
   if (kind === "skills" && isIncompleteSkillConfig(config)) {
     throw badRequest(
       "invalid_config",
-      'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
+      'Skill config requires a "track": expected "race", "class" or "profession"'
     )
   }
   if (kind === "skills" && hasInvalidSkillTrack(config)) {
     throw badRequest(
       "invalid_config",
-      'Skill config has an invalid "track": expected "class" or "profession"'
+      'Skill config has an invalid "track": expected "race", "class" or "profession"'
     )
   }
   // A NEW skill must declare a valid rarity (the same ordered vocabulary as
@@ -8579,22 +8795,24 @@ export async function createCatalogItem(
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || "entry"
   }
-  // Bloodlines, equipment, races, classes and professions run under SERIALIZABLE
-  // isolation: two concurrent creates that race on the same (kind, stableId)
-  // cannot both commit, and the loser surfaces as P2034 which we map to a 409
-  // rather than a silent 500. Equipment, race/class/profession and bloodline
-  // creates also validate catalog references (god patron, granted/graded skills)
-  // against the live catalog inside the transaction, so a concurrent skill/god
-  // stableId rename (or a race-type change) cannot commit between the ref read
-  // and the write, leaving a dangling reference. SERIALIZABLE re-checks the
-  // read/write dependency at commit and aborts the create (P2034 -> 409) rather
-  // than persisting a reference to a renamed-away stableId.
+  // Bloodlines, equipment, races, classes, professions and skills run under
+  // SERIALIZABLE isolation: two concurrent creates that race on the same (kind,
+  // stableId) cannot both commit, and the loser surfaces as P2034 which we map to
+  // a 409 rather than a silent 500. Equipment, race/class/profession, bloodline
+  // and skill creates also validate catalog references (god patron,
+  // granted/graded skills, skill classStableId) against the live catalog inside
+  // the transaction, so a concurrent god/skill/class stableId rename (or a
+  // race-type change) cannot commit between the ref read and the write, leaving
+  // a dangling reference. SERIALIZABLE re-checks the read/write dependency at
+  // commit and aborts the create (P2034 -> 409) rather than persisting a
+  // reference to a renamed-away stableId.
   const serializable =
     kind === "bloodlines" ||
     kind === "equipment" ||
     kind === "races" ||
     kind === "classes" ||
-    kind === "professions"
+    kind === "professions" ||
+    kind === "skills"
       ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       : undefined
   try {
@@ -8608,6 +8826,11 @@ export async function createCatalogItem(
       // grade-granted skill.
       if (kind === "races" || kind === "classes" || kind === "professions") {
         await assertGradeGrantedSkillsRefs(tx, config)
+      }
+      // A NEW skill write that declares an optional class tie must reference an
+      // existing class (a new class-tie selection must be ACTIVE).
+      if (kind === "skills") {
+        await assertSkillClassRef(tx, config, null)
       }
       const row = await tx.catalogDefinition.create({
         data: {
@@ -8788,6 +9011,43 @@ async function assertEquipmentGodRef(
 }
 
 /**
+ * Verify that a `skills` config's optional `classStableId` reference resolves to an
+ * existing, unarchived `classes` catalog entry. Used on a NEW / config-changing
+ * skill write. A missing `classStableId` is a no-op (priority-only). A NEW
+ * selection (a value that differs from the existing config) must reference an
+ * ACTIVE class; an archived class is tolerated only when the skill already
+ * referenced that same class (a prior reference), so editing a skill that already
+ * ties to an archived class never breaks. No-op when the config names no class.
+ */
+async function assertSkillClassRef(
+  tx: DbClient,
+  config: Record<string, unknown>,
+  existingConfig: Record<string, unknown> | null
+): Promise<void> {
+  const classStableId = skillClassStableIdOf(config)
+  if (classStableId == null) return
+  const cls = await tx.catalogDefinition.findUnique({
+    where: { kind_stableId: { kind: "classes", stableId: classStableId } },
+  })
+  if (!cls) {
+    throw badRequest(
+      "invalid_config",
+      `Skill config classStableId "${classStableId}" does not exist in the catalog`
+    )
+  }
+  if (cls.archived) {
+    const priorClassStableId =
+      existingConfig != null ? skillClassStableIdOf(existingConfig) : null
+    if (priorClassStableId !== classStableId) {
+      throw badRequest(
+        "invalid_config",
+        `Skill config classStableId "${classStableId}" is archived; a new class-tie selection must reference an active class`
+      )
+    }
+  }
+}
+
+/**
  * Verify that an equipment config's equipment-granted passive-skill references
  * (`grantedSkillStableIds`) all resolve to an existing, unarchived `skills`
  * catalog definition. Used on a NEW / config-changing equipment write so a config
@@ -8954,6 +9214,43 @@ async function assertSkillStableIdRename(
     throw conflict(
       "skill_stable_id_in_use",
       `Skill "${existingStableId}" is granted by ${gradeRefs.length} race/class/profession grade entr${gradeRefs.length === 1 ? "y" : "ies"} (${labels}); renaming it would leave those grants dangling`
+    )
+  }
+}
+
+/**
+ * Prevent a class `stableId` rename that would dangle any skill config whose
+ * optional `classStableId` names the OLD id. Archiving a class is always allowed
+ * (an archived class just means a tied skill no longer gets class-priority
+ * sorting, and a prior reference to it stays valid), but a rename must be blocked
+ * while any skill config - including archived skill rows - still names the old id
+ * in its class tie, otherwise the reference silently dangles and the class-tie
+ * priority is permanently lost. No-op unless a class's stableId is actually
+ * changing.
+ */
+async function assertClassStableIdRename(
+  tx: DbClient,
+  kind: string,
+  existingStableId: string,
+  proposedStableId: string | undefined
+): Promise<void> {
+  if (kind !== "classes") return
+  if (proposedStableId == null || proposedStableId === existingStableId) return
+  const skills = await tx.catalogDefinition.findMany({
+    where: { kind: "skills" },
+  })
+  const refs: Array<{ kind: string; stableId: string }> = []
+  for (const row of skills) {
+    const cfg = parseCatalogConfig("skills", row.config ?? {})
+    if (skillClassStableIdOf(cfg) === existingStableId) {
+      refs.push({ kind: "skills", stableId: row.stableId })
+    }
+  }
+  if (refs.length > 0) {
+    const labels = refs.map((r) => `${r.kind}:${r.stableId}`).join(", ")
+    throw conflict(
+      "class_stable_id_in_use",
+      `Class "${existingStableId}" is referenced as the class tie by ${refs.length} skill entr${refs.length === 1 ? "y" : "ies"} (${labels}); renaming it would leave those references dangling`
     )
   }
 }
@@ -9149,13 +9446,13 @@ export async function updateCatalogItem(
         if (kind === "skills" && isIncompleteSkillConfig(config)) {
           throw badRequest(
             "invalid_config",
-            'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
+            'Skill config requires a "track": expected "race", "class" or "profession"'
           )
         }
         if (kind === "skills" && hasInvalidSkillTrack(config)) {
           throw badRequest(
             "invalid_config",
-            'Skill config has an invalid "track": expected "class" or "profession"'
+            'Skill config has an invalid "track": expected "race", "class" or "profession"'
           )
         }
         // A config-changing skill PATCH, like a new skill POST, must declare a
@@ -9269,6 +9566,17 @@ export async function updateCatalogItem(
         if (kind === "races" || kind === "classes" || kind === "professions") {
           await assertGradeGrantedSkillsRefs(tx, config)
         }
+        // A config-changing skill write that declares an optional class tie must
+        // reference an existing class. A NEW selection (a value differing from the
+        // existing config) must be ACTIVE; an unchanged prior reference to an
+        // archived class is tolerated.
+        if (kind === "skills") {
+          await assertSkillClassRef(
+            tx,
+            config,
+            parseCatalogConfig("skills", existing.config ?? {})
+          )
+        }
       }
       const finalConfig =
         config ?? parseCatalogConfig(kind, existing.config ?? {})
@@ -9334,6 +9642,16 @@ export async function updateCatalogItem(
       // granted-skill list referencing the old id dangling (a dangling grant would
       // silently drop the item's synthesized passive). Archiving is always allowed.
       await assertSkillStableIdRename(
+        tx,
+        kind,
+        existing.stableId,
+        patch.stableId
+      )
+      // Renaming a class's stableId must not leave any skill config whose optional
+      // `classStableId` names the old id dangling (a dangling class tie would
+      // quietly drop the skill's class-priority sorting). Archiving is always
+      // allowed.
+      await assertClassStableIdRename(
         tx,
         kind,
         existing.stableId,

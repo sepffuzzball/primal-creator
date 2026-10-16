@@ -146,7 +146,16 @@ describe("api/admin/rules (unit, mocked db)", () => {
       equipmentCombinedCapPercent: 20,
       consumableGradeRates: { F: 4, E: 6, D: 18, C: 50 },
       maxTranscendentSkills: 5,
-      skillChoiceIntervals: { F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 },
+      skillChoiceIntervals: {
+        G: 5,
+        F: 5,
+        E: 5,
+        D: 20,
+        C: 30,
+        B: 40,
+        A: 50,
+        S: 60,
+      },
     }
     const res = await PATCH(
       authed(rulesReq("PATCH", { version: 0, config: nextConfig }), token)
@@ -215,7 +224,16 @@ describe("api/admin/rules (unit, mocked db)", () => {
       equipmentCombinedCapPercent: 20,
       consumableGradeRates: { F: 4, E: 6, D: 18, C: 50 },
       maxTranscendentSkills: 5,
-      skillChoiceIntervals: { F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 },
+      skillChoiceIntervals: {
+        G: 5,
+        F: 5,
+        E: 5,
+        D: 20,
+        C: 30,
+        B: 40,
+        A: 50,
+        S: 60,
+      },
     }
     const first = await PATCH(
       authed(rulesReq("PATCH", { version: 0, config: firstConfig }), token)
@@ -235,7 +253,16 @@ describe("api/admin/rules (unit, mocked db)", () => {
       equipmentCombinedCapPercent: 25,
       consumableGradeRates: { F: 5, E: 7, D: 20, C: 55 },
       maxTranscendentSkills: 6,
-      skillChoiceIntervals: { F: 6, E: 6, D: 22, C: 32, B: 42, A: 52, S: 62 },
+      skillChoiceIntervals: {
+        G: 6,
+        F: 6,
+        E: 6,
+        D: 22,
+        C: 32,
+        B: 42,
+        A: 52,
+        S: 62,
+      },
     }
     const second = await PATCH(
       authed(
@@ -282,6 +309,7 @@ describe("api/admin/rules (unit, mocked db)", () => {
             consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
             maxTranscendentSkills: 3,
             skillChoiceIntervals: {
+              G: 5,
               F: 5,
               E: 5,
               D: 20,

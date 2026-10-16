@@ -65,7 +65,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Sheet,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
@@ -438,6 +437,7 @@ function upgradeGroupFor(item: CatalogItem): string | undefined {
  * docs/rules/assumptions.md.
  */
 function AssociationSheet({
+  panel,
   open,
   onOpenChange,
   associationTab,
@@ -457,7 +457,13 @@ function AssociationSheet({
   onRemove,
   onPowerAdd,
   onPowerRemove,
+  skillOffers,
+  focusedOfferId,
+  onSelectSkill,
+  onRetrySkills,
+  inventoryContent,
 }: {
+  panel: "titlesSkills" | "powers" | "inventoryEquipment"
   open: boolean
   onOpenChange: (open: boolean) => void
   associationTab: string
@@ -489,6 +495,11 @@ function AssociationSheet({
     kind: "blessing" | "bloodline" | "transcendent",
     definitionId: string
   ) => void
+  skillOffers: CharacterDetail["skillOffers"]
+  focusedOfferId: string | null
+  onSelectSkill: (offerId: string, definitionId: string, name: string) => void
+  onRetrySkills: () => void
+  inventoryContent?: React.ReactNode
 }) {
   const [blessingTier, setBlessingTier] = React.useState("Minor")
   const [rankedClaim, setRankedClaim] = React.useState<CatalogItem | null>(null)
@@ -981,13 +992,13 @@ function AssociationSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="flex max-h-dvh flex-col gap-4 overflow-hidden">
         <SheetHeader>
-          <SheetTitle>Character associations</SheetTitle>
-          <SheetDescription>
-            Manage titles, equipment, blessings, and bloodlines directly onto
-            this character. Items are inventory stock, not character
-            associations. Source notes are not verified loot or crafting
-            records.
-          </SheetDescription>
+          <SheetTitle className="sr-only">
+            {panel === "titlesSkills"
+              ? "Titles and skills"
+              : panel === "powers"
+                ? "Blessings and bloodlines"
+                : "Inventory and equipment"}
+          </SheetTitle>
         </SheetHeader>
 
         <Tabs
@@ -998,344 +1009,499 @@ function AssociationSheet({
           className="flex min-h-0 flex-1 flex-col"
         >
           <TabsList variant="line">
-            <TabsTrigger value="titles">Titles</TabsTrigger>
-            <TabsTrigger value="equipment">Equipment</TabsTrigger>
-            <TabsTrigger value="blessings">Blessings</TabsTrigger>
-            <TabsTrigger value="bloodlines">Bloodlines</TabsTrigger>
-            <TabsTrigger value="transcendent">Transcendent skills</TabsTrigger>
+            {panel === "titlesSkills" ? (
+              <>
+                <TabsTrigger value="titles">Titles</TabsTrigger>
+                <TabsTrigger value="skills">Skills</TabsTrigger>
+              </>
+            ) : null}
+            {panel === "inventoryEquipment" ? (
+              <>
+                <TabsTrigger value="inventory">Inventory</TabsTrigger>
+                <TabsTrigger value="equipment">Equipment</TabsTrigger>
+              </>
+            ) : null}
+            {panel === "powers" ? (
+              <>
+                <TabsTrigger value="blessings">Blessings</TabsTrigger>
+                <TabsTrigger value="bloodlines">Bloodlines</TabsTrigger>
+                <TabsTrigger value="transcendent">
+                  Transcendent skills
+                </TabsTrigger>
+              </>
+            ) : null}
           </TabsList>
 
           <ScrollArea className="min-h-0 flex-1">
-            <TabsContent value="titles" className="pt-3">
-              {loading ? (
-                <p className="text-xs text-muted-foreground">
-                  Loading titles...
-                </p>
-              ) : titles.length === 0 && archivedLinkedTitles.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No titles in the catalog yet.
-                </p>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  {titles.map(titleRow)}
-                  {archivedLinkedTitles.map(archivedLinkedRow)}
-                </div>
-              )}
-            </TabsContent>
-
-            <TabsContent value="equipment" className="pt-3">
-              {loading ? (
-                <p className="text-xs text-muted-foreground">
-                  Loading equipment...
-                </p>
-              ) : equipment.length === 0 &&
-                archivedLinkedEquipment.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No equipment in the catalog yet.
-                </p>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  {equipment.map(equipmentRow)}
-                  {archivedLinkedEquipment.map(archivedLinkedRow)}
-                </div>
-              )}
-              <p className="mt-3 text-[0.6875rem] text-muted-foreground">
-                Equipment bonuses are capped (house assumption): 20% of the
-                pre-equipment value per attribute (aggregate, not per item) and
-                15% of the total across all attributes. Suppressed values above
-                are what these caps reject.
-              </p>
-            </TabsContent>
-
-            {(["blessing", "bloodline"] as const).map((kind) => {
-              const catalog = kind === "blessing" ? blessings : bloodlines
-              const linkedPower = character.associations.filter(
-                (a) => a.kind === kind
-              )
-              const options = [
-                ...catalog,
-                ...linkedPower
-                  .filter(
-                    (a) =>
-                      a.definitionArchived &&
-                      !catalog.some((c) => c.id === a.definitionId)
-                  )
-                  .map(
-                    (a) =>
-                      ({
-                        id: a.definitionId,
-                        name: a.name,
-                        description: null,
-                        grade: a.grade ?? null,
-                        archived: true,
-                        config: {},
-                      }) as CatalogItem
-                  ),
-              ]
-              return (
-                <TabsContent
-                  key={kind}
-                  value={kind === "blessing" ? "blessings" : "bloodlines"}
-                  className="pt-3"
-                >
-                  {kind === "blessing" ? (
-                    <div className="mb-3 flex flex-col gap-2">
-                      <Label htmlFor="association-blessing-tier">
-                        Blessing tier
-                      </Label>
-                      <Select
-                        value={blessingTier}
-                        onValueChange={(value) => {
-                          if (value) setBlessingTier(value)
-                        }}
-                      >
-                        <SelectTrigger
-                          id="association-blessing-tier"
-                          aria-label="Blessing tier"
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectGroup>
-                            {(
-                              [
-                                "Baptism",
-                                "Minor",
-                                "Lesser",
-                                "Intermediate",
-                                "Major",
-                                "Greater",
-                                "Divine",
-                                "True",
-                              ] as const
-                            ).map((tier) => (
-                              <SelectItem key={tier} value={tier}>
-                                {tier}
-                              </SelectItem>
-                            ))}
-                          </SelectGroup>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  ) : null}
-                  {loading ? (
+            {panel === "titlesSkills" ? (
+              <TabsContent value="titles" className="pt-3">
+                {loading ? (
+                  <p className="text-xs text-muted-foreground">
+                    Loading titles...
+                  </p>
+                ) : titles.length === 0 && archivedLinkedTitles.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No titles in the catalog yet.
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {titles.map(titleRow)}
+                    {archivedLinkedTitles.map(archivedLinkedRow)}
+                  </div>
+                )}
+              </TabsContent>
+            ) : null}
+            {panel === "titlesSkills" ? (
+              <TabsContent value="skills" className="pt-3">
+                <div className="flex flex-col gap-3">
+                  <h2 className="font-medium">Skill choices</h2>
+                  <div
+                    className="flex flex-wrap gap-2"
+                    aria-label="Unspent skill selections"
+                  >
+                    {(["race", "class", "profession"] as const).map((track) => (
+                      <Badge key={track} variant="outline">
+                        {track[0]!.toUpperCase() + track.slice(1)}:{" "}
+                        {
+                          skillOffers.filter(
+                            (offer) =>
+                              offer.track === track &&
+                              !offer.selectedDefinitionId &&
+                              !offer.canceledAt
+                          ).length
+                        }{" "}
+                        pending
+                      </Badge>
+                    ))}
+                  </div>
+                  {skillOffers.filter(
+                    (offer) => !offer.selectedDefinitionId && !offer.canceledAt
+                  ).length === 0 ? (
                     <p className="text-xs text-muted-foreground">
-                      Loading {kind}s...
-                    </p>
-                  ) : options.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No {kind}s in the catalog yet.
+                      No pending skill offers.
                     </p>
                   ) : (
                     <div className="flex flex-col gap-2">
-                      {options.map((item) => {
-                        const association = linkedPower.find(
-                          (a) => a.definitionId === item.id
+                      {skillOffers
+                        .filter(
+                          (offer) =>
+                            !offer.selectedDefinitionId && !offer.canceledAt
                         )
-                        return (
-                          <div
-                            key={item.id}
-                            className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
-                          >
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <span className="font-medium">
-                                  {kind === "blessing" && association?.tier
-                                    ? `${association.tier} Blessing of ${item.name}`
-                                    : item.name}
-                                </span>
-                                {item.grade ? (
-                                  <Badge variant="outline">{item.grade}</Badge>
-                                ) : null}
-                                {item.archived ? (
-                                  <Badge variant="outline">
-                                    Archived - inert
-                                  </Badge>
-                                ) : null}
-                              </div>
-                              <p className="text-xs whitespace-pre-wrap text-muted-foreground">
-                                {association?.grade
-                                  ? (association.gradeDescription ??
-                                    "No description for this grade")
-                                  : null}
-                              </p>
-                              {item.description ? (
-                                <p className="text-xs text-muted-foreground">
-                                  {item.description}
-                                </p>
+                        .map((offer) => {
+                          const eligible = offer.options.filter(
+                            (option) => !option.archived
+                          )
+                          return (
+                            <section
+                              key={offer.id}
+                              id={`skill-offer-${offer.id}`}
+                              className={cn(
+                                "flex flex-col gap-2 rounded-lg border bg-input/20 p-3",
+                                focusedOfferId === offer.id &&
+                                  "ring-2 ring-primary"
+                              )}
+                              aria-label={`${offer.track} level ${offer.level} skill offer`}
+                            >
+                              <h3 className="font-medium">
+                                {offer.track[0]!.toUpperCase() +
+                                  offer.track.slice(1)}{" "}
+                                level {offer.level} - {offer.choiceGroup}
+                              </h3>
+                              {eligible.length === 0 ? (
+                                <div className="flex flex-col items-start gap-2">
+                                  <p className="text-xs text-muted-foreground">
+                                    No eligible skill options are available yet.
+                                  </p>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={onRetrySkills}
+                                  >
+                                    Retry refresh
+                                  </Button>
+                                </div>
                               ) : null}
-                            </div>
-                            {association ? (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={busy}
-                                onClick={() =>
-                                  requestPowerAction(kind, item.id, "remove")
-                                }
-                              >
-                                Remove
-                              </Button>
-                            ) : item.archived ? null : (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={busy}
-                                onClick={() =>
-                                  requestPowerAction(
-                                    kind,
-                                    item.id,
-                                    "add",
-                                    kind === "blessing"
-                                      ? blessingTier
-                                      : undefined
-                                  )
-                                }
-                              >
-                                Add
-                              </Button>
-                            )}
-                          </div>
-                        )
-                      })}
+                              {offer.options.map((option) => (
+                                <div
+                                  key={option.definitionId}
+                                  className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-2"
+                                >
+                                  <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                                    <span>{option.nameSnapshot}</span>
+                                    {option.grade ? (
+                                      <Badge variant="outline">
+                                        {option.grade}
+                                      </Badge>
+                                    ) : null}
+                                    {option.classPriority ? (
+                                      <Badge variant="outline">
+                                        Class match
+                                      </Badge>
+                                    ) : null}
+                                    {option.archived ? (
+                                      <Badge variant="outline">Archived</Badge>
+                                    ) : null}
+                                  </div>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={busy || option.archived}
+                                    onClick={() =>
+                                      onSelectSkill(
+                                        offer.id,
+                                        option.definitionId,
+                                        option.nameSnapshot
+                                      )
+                                    }
+                                  >
+                                    Select
+                                  </Button>
+                                </div>
+                              ))}
+                            </section>
+                          )
+                        })}
                     </div>
                   )}
-                </TabsContent>
-              )
-            })}
-            <TabsContent value="transcendent" className="pt-3">
-              <div className="mb-3 flex flex-col gap-2">
-                <p className="text-xs text-muted-foreground">
-                  Selected{" "}
-                  {
-                    character.associations.filter(
-                      (a) => a.kind === "transcendent"
-                    ).length
-                  }{" "}
-                  / maximum {maxTranscendentSkills ?? "unavailable"}
+                </div>
+              </TabsContent>
+            ) : null}
+
+            {panel === "inventoryEquipment" ? (
+              <TabsContent value="equipment" className="pt-3">
+                {loading ? (
+                  <p className="text-xs text-muted-foreground">
+                    Loading equipment...
+                  </p>
+                ) : equipment.length === 0 &&
+                  archivedLinkedEquipment.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No equipment in the catalog yet.
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {equipment.map(equipmentRow)}
+                    {archivedLinkedEquipment.map(archivedLinkedRow)}
+                  </div>
+                )}
+                <p className="mt-3 text-[0.6875rem] text-muted-foreground">
+                  Equipment bonuses are capped (house assumption): 20% of the
+                  pre-equipment value per attribute (aggregate, not per item)
+                  and 15% of the total across all attributes. Suppressed values
+                  above are what these caps reject.
                 </p>
-                {creationRulesError ? (
-                  <Alert variant="destructive">
-                    <div className="flex flex-col gap-2">
-                      <span>{creationRulesError}</span>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onClick={onRetryCreationRules}
-                      >
-                        Retry rules
-                      </Button>
-                    </div>
-                  </Alert>
-                ) : null}
-              </div>
-              {loading ? (
-                <p className="text-xs text-muted-foreground">
-                  Loading transcendent skills...
-                </p>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  {transcendentOptions.map((item) => {
-                    const association = character.associations.find(
-                      (a) =>
-                        a.kind === "transcendent" && a.definitionId === item.id
-                    )
-                    const cost = item.config?.costDescription
-                    const acquisition = item.config?.acquisitionNotes
-                    return (
-                      <div
-                        key={item.id}
-                        className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-1.5 font-medium">
-                            {item.name}
-                            {item.grade ? (
-                              <Badge variant="outline">{item.grade}</Badge>
-                            ) : null}
-                            {item.archived ? (
-                              <Badge variant="outline">Archived</Badge>
-                            ) : null}
-                          </div>
-                          <p className="text-xs whitespace-pre-wrap text-muted-foreground">
-                            {association?.grade
-                              ? (association.gradeDescription ??
-                                "No description for this grade")
-                              : null}
-                          </p>
-                          {item.sourceUrl ? (
-                            <p className="text-[0.6875rem] text-muted-foreground">
-                              <a
-                                className="underline"
-                                href={item.sourceUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                Source
-                              </a>
-                            </p>
-                          ) : null}
-                          {item.description ? (
-                            <p className="text-xs text-muted-foreground">
-                              {item.description}
-                            </p>
-                          ) : null}
-                          {typeof cost === "string" ? (
-                            <p className="text-xs text-muted-foreground">
-                              Cost description (reference only): {cost}
-                            </p>
-                          ) : null}
-                          {typeof acquisition === "string" ? (
-                            <p className="text-xs text-muted-foreground">
-                              Acquisition notes: {acquisition}
-                            </p>
-                          ) : null}
+              </TabsContent>
+            ) : null}
+            {panel === "inventoryEquipment" ? (
+              <TabsContent value="inventory" className="pt-3">
+                {inventoryContent}
+              </TabsContent>
+            ) : null}
+
+            {panel === "powers"
+              ? (["blessing", "bloodline"] as const).map((kind) => {
+                  const catalog = kind === "blessing" ? blessings : bloodlines
+                  const linkedPower = character.associations.filter(
+                    (a) => a.kind === kind
+                  )
+                  const options = [
+                    ...catalog,
+                    ...linkedPower
+                      .filter(
+                        (a) =>
+                          a.definitionArchived &&
+                          !catalog.some((c) => c.id === a.definitionId)
+                      )
+                      .map(
+                        (a) =>
+                          ({
+                            id: a.definitionId,
+                            name: a.name,
+                            description: null,
+                            grade: a.grade ?? null,
+                            archived: true,
+                            config: {},
+                          }) as CatalogItem
+                      ),
+                  ]
+                  return (
+                    <TabsContent
+                      key={kind}
+                      value={kind === "blessing" ? "blessings" : "bloodlines"}
+                      className="pt-3"
+                    >
+                      {kind === "blessing" ? (
+                        <div className="mb-3 flex flex-col gap-2">
+                          <Label htmlFor="association-blessing-tier">
+                            Blessing tier
+                          </Label>
+                          <Select
+                            value={blessingTier}
+                            onValueChange={(value) => {
+                              if (value) setBlessingTier(value)
+                            }}
+                          >
+                            <SelectTrigger
+                              id="association-blessing-tier"
+                              aria-label="Blessing tier"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectGroup>
+                                {(
+                                  [
+                                    "Baptism",
+                                    "Minor",
+                                    "Lesser",
+                                    "Intermediate",
+                                    "Major",
+                                    "Greater",
+                                    "Divine",
+                                    "True",
+                                  ] as const
+                                ).map((tier) => (
+                                  <SelectItem key={tier} value={tier}>
+                                    {tier}
+                                  </SelectItem>
+                                ))}
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
                         </div>
-                        {association ? (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={busy}
-                            onClick={() =>
-                              requestPowerAction(
-                                "transcendent",
-                                item.id,
-                                "remove"
-                              )
-                            }
-                          >
-                            Remove
-                          </Button>
-                        ) : item.archived ? null : (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={
-                              busy ||
-                              maxTranscendentSkills == null ||
-                              character.associations.filter(
-                                (a) => a.kind === "transcendent"
-                              ).length >= maxTranscendentSkills
-                            }
-                            onClick={() =>
-                              requestPowerAction("transcendent", item.id, "add")
-                            }
-                          >
-                            Attach
-                          </Button>
-                        )}
+                      ) : null}
+                      {loading ? (
+                        <p className="text-xs text-muted-foreground">
+                          Loading {kind}s...
+                        </p>
+                      ) : options.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">
+                          No {kind}s in the catalog yet.
+                        </p>
+                      ) : (
+                        <div className="flex flex-col gap-2">
+                          {options.map((item) => {
+                            const association = linkedPower.find(
+                              (a) => a.definitionId === item.id
+                            )
+                            return (
+                              <div
+                                key={item.id}
+                                className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                              >
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className="font-medium">
+                                      {kind === "blessing" && association?.tier
+                                        ? `${association.tier} Blessing of ${item.name}`
+                                        : item.name}
+                                    </span>
+                                    {item.grade ? (
+                                      <Badge variant="outline">
+                                        {item.grade}
+                                      </Badge>
+                                    ) : null}
+                                    {item.archived ? (
+                                      <Badge variant="outline">
+                                        Archived - inert
+                                      </Badge>
+                                    ) : null}
+                                  </div>
+                                  <p className="text-xs whitespace-pre-wrap text-muted-foreground">
+                                    {association?.grade
+                                      ? (association.gradeDescription ??
+                                        "No description for this grade")
+                                      : null}
+                                  </p>
+                                  {item.description ? (
+                                    <p className="text-xs text-muted-foreground">
+                                      {item.description}
+                                    </p>
+                                  ) : null}
+                                </div>
+                                {association ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      requestPowerAction(
+                                        kind,
+                                        item.id,
+                                        "remove"
+                                      )
+                                    }
+                                  >
+                                    Remove
+                                  </Button>
+                                ) : item.archived ? null : (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      requestPowerAction(
+                                        kind,
+                                        item.id,
+                                        "add",
+                                        kind === "blessing"
+                                          ? blessingTier
+                                          : undefined
+                                      )
+                                    }
+                                  >
+                                    Add
+                                  </Button>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </TabsContent>
+                  )
+                })
+              : null}
+            {panel === "powers" ? (
+              <TabsContent value="transcendent" className="pt-3">
+                <div className="mb-3 flex flex-col gap-2">
+                  <p className="text-xs text-muted-foreground">
+                    Selected{" "}
+                    {
+                      character.associations.filter(
+                        (a) => a.kind === "transcendent"
+                      ).length
+                    }{" "}
+                    / maximum {maxTranscendentSkills ?? "unavailable"}
+                  </p>
+                  {creationRulesError ? (
+                    <Alert variant="destructive">
+                      <div className="flex flex-col gap-2">
+                        <span>{creationRulesError}</span>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={onRetryCreationRules}
+                        >
+                          Retry rules
+                        </Button>
                       </div>
-                    )
-                  })}
-                  {transcendentOptions.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No transcendent skills in the catalog.
-                    </p>
+                    </Alert>
                   ) : null}
                 </div>
-              )}
-            </TabsContent>
+                {loading ? (
+                  <p className="text-xs text-muted-foreground">
+                    Loading transcendent skills...
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {transcendentOptions.map((item) => {
+                      const association = character.associations.find(
+                        (a) =>
+                          a.kind === "transcendent" &&
+                          a.definitionId === item.id
+                      )
+                      const cost = item.config?.costDescription
+                      const acquisition = item.config?.acquisitionNotes
+                      return (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-3 rounded-lg border bg-input/20 p-2"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                              {item.name}
+                              {item.grade ? (
+                                <Badge variant="outline">{item.grade}</Badge>
+                              ) : null}
+                              {item.archived ? (
+                                <Badge variant="outline">Archived</Badge>
+                              ) : null}
+                            </div>
+                            <p className="text-xs whitespace-pre-wrap text-muted-foreground">
+                              {association?.grade
+                                ? (association.gradeDescription ??
+                                  "No description for this grade")
+                                : null}
+                            </p>
+                            {item.sourceUrl ? (
+                              <p className="text-[0.6875rem] text-muted-foreground">
+                                <a
+                                  className="underline"
+                                  href={item.sourceUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  Source
+                                </a>
+                              </p>
+                            ) : null}
+                            {item.description ? (
+                              <p className="text-xs text-muted-foreground">
+                                {item.description}
+                              </p>
+                            ) : null}
+                            {typeof cost === "string" ? (
+                              <p className="text-xs text-muted-foreground">
+                                Cost description (reference only): {cost}
+                              </p>
+                            ) : null}
+                            {typeof acquisition === "string" ? (
+                              <p className="text-xs text-muted-foreground">
+                                Acquisition notes: {acquisition}
+                              </p>
+                            ) : null}
+                          </div>
+                          {association ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() =>
+                                requestPowerAction(
+                                  "transcendent",
+                                  item.id,
+                                  "remove"
+                                )
+                              }
+                            >
+                              Remove
+                            </Button>
+                          ) : item.archived ? null : (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={
+                                busy ||
+                                maxTranscendentSkills == null ||
+                                character.associations.filter(
+                                  (a) => a.kind === "transcendent"
+                                ).length >= maxTranscendentSkills
+                              }
+                              onClick={() =>
+                                requestPowerAction(
+                                  "transcendent",
+                                  item.id,
+                                  "add"
+                                )
+                              }
+                            >
+                              Attach
+                            </Button>
+                          )}
+                        </div>
+                      )
+                    })}
+                    {transcendentOptions.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        No transcendent skills in the catalog.
+                      </p>
+                    ) : null}
+                  </div>
+                )}
+              </TabsContent>
+            ) : null}
           </ScrollArea>
         </Tabs>
         <Dialog
@@ -1466,8 +1632,14 @@ export function CharacterDetail({
   const [trackEvolveTrack, setTrackEvolveTrack] = React.useState<
     "race" | "class" | "profession" | null
   >(null)
-  const [associationsOpen, setAssociationsOpen] = React.useState(false)
-  const [associationTab, setAssociationTab] = React.useState("titles")
+  const [activeAssociationPanel, setActiveAssociationPanel] = React.useState<
+    "titlesSkills" | "powers" | "inventoryEquipment" | null
+  >(null)
+  const [associationTabs, setAssociationTabs] = React.useState({
+    titlesSkills: "titles",
+    powers: "blessings",
+    inventoryEquipment: "equipment",
+  })
   const [titlesCatalog, setTitlesCatalog] = React.useState<CatalogItem[]>([])
   const [equipmentCatalog, setEquipmentCatalog] = React.useState<CatalogItem[]>(
     []
@@ -1504,6 +1676,9 @@ export function CharacterDetail({
   const [levelUpOfferId, setLevelUpOfferId] = React.useState<string | null>(
     null
   )
+  const [focusedSkillOfferId, setFocusedSkillOfferId] = React.useState<
+    string | null
+  >(null)
   const [skillRefreshError, setSkillRefreshError] = React.useState(false)
   const refreshOnOpen = React.useRef<string | null>(null)
   const [grantOpen, setGrantOpen] = React.useState(false)
@@ -2333,16 +2508,42 @@ export function CharacterDetail({
   }, [])
 
   const openAssociations = React.useCallback(
-    (kind?: "blessing" | "bloodline" | "transcendent") => {
-      if (kind)
-        setAssociationTab(
-          kind === "blessing"
-            ? "blessings"
-            : kind === "bloodline"
-              ? "bloodlines"
-              : "transcendent"
-        )
-      setAssociationsOpen(true)
+    (
+      kind?:
+        | "title"
+        | "skill"
+        | "equipment"
+        | "blessing"
+        | "bloodline"
+        | "transcendent"
+        | "inventory",
+      offerId?: string
+    ) => {
+      const panel =
+        kind === "equipment" || kind === "inventory"
+          ? "inventoryEquipment"
+          : kind === "blessing" ||
+              kind === "bloodline" ||
+              kind === "transcendent"
+            ? "powers"
+            : "titlesSkills"
+      const tab =
+        kind === "equipment"
+          ? "equipment"
+          : kind === "inventory"
+            ? "inventory"
+            : kind === "blessing"
+              ? "blessings"
+              : kind === "bloodline"
+                ? "bloodlines"
+                : kind === "transcendent"
+                  ? "transcendent"
+                  : kind === "skill"
+                    ? "skills"
+                    : "titles"
+      setAssociationTabs((current) => ({ ...current, [panel]: tab }))
+      if (kind === "skill") setFocusedSkillOfferId(offerId ?? null)
+      setActiveAssociationPanel(panel)
       void loadCreationRules()
       if (titlesCatalog.length === 0) void loadCatalog("titles")
       if (equipmentCatalog.length === 0) void loadCatalog("equipment")
@@ -2667,6 +2868,470 @@ export function CharacterDetail({
     )
   }
 
+  function renderInventoryContent(): React.ReactNode {
+    if (!character) return null
+    return (
+      <>
+        <Card>
+          <CardContent>
+            <div className="flex flex-col gap-3">
+              <div>
+                <h3 className="font-medium">Owned inventory</h3>
+                <p className="text-sm text-muted-foreground">
+                  Manual bookkeeping only. Source notes are not verified loot or
+                  crafting records.
+                </p>
+              </div>
+              {(["equipment", "items"] as const).map((kind) => {
+                const rows = (character.inventory ?? []).filter(
+                  (item) => item.kind === kind
+                )
+                return (
+                  <section
+                    key={kind}
+                    aria-label={
+                      kind === "equipment" ? "Owned equipment" : "Owned items"
+                    }
+                  >
+                    <h4 className="mb-2 text-sm font-medium capitalize">
+                      {kind}
+                    </h4>
+                    {rows.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">
+                        No owned stock.
+                      </p>
+                    ) : (
+                      <div className="flex flex-col gap-2">
+                        {rows.map((item) => {
+                          const equipped = character.associations.some(
+                            (a) =>
+                              a.kind === "equipment" &&
+                              a.definitionId === item.definitionId
+                          )
+                          const linkedEquipment = character.associations.find(
+                            (a) =>
+                              a.kind === "equipment" &&
+                              a.definitionId === item.definitionId
+                          )
+                          const catalogEquipment = equipmentCatalog.find(
+                            (entry) => entry.id === item.definitionId
+                          )
+                          const ring = catalogEquipment
+                            ? isRing(catalogEquipment)
+                            : normalizeEquipmentSlot(item.slot ?? "") === "Ring"
+                          return (
+                            <div
+                              key={item.id}
+                              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"
+                            >
+                              <div>
+                                <div className="font-medium">
+                                  {item.name}{" "}
+                                  <Badge variant="outline">
+                                    Qty {item.quantity}
+                                  </Badge>{" "}
+                                  {item.archived ? (
+                                    <Badge variant="outline">
+                                      Archived - inert
+                                    </Badge>
+                                  ) : null}
+                                </div>
+                                <p className="text-xs text-muted-foreground">
+                                  {item.rarity
+                                    ? `Rarity: ${item.rarity} - `
+                                    : ""}
+                                  {item.slot ? `Slot: ${item.slot}` : ""}
+                                  {item.slot && equipped ? " - " : ""}
+                                  {equipped
+                                    ? `Equipped${linkedEquipment?.equipmentPosition ? ` in ${linkedEquipment.equipmentPosition}` : ""}`
+                                    : ""}
+                                </p>
+                                {catalogEquipment ? (
+                                  <p className="text-xs text-muted-foreground">
+                                    Flat bonus: {bonusFor(catalogEquipment)}
+                                    {catalogEquipment.config.percentBasisPoints
+                                      ? ` - Percent: ${percentBonusFor(catalogEquipment)}`
+                                      : ""}
+                                  </p>
+                                ) : null}
+                                {item.soulbound ? (
+                                  <Badge variant="outline">Soulbound</Badge>
+                                ) : null}
+                                {item.requirements?.minRaceLevel != null ? (
+                                  <Badge variant="outline">
+                                    Min race level{" "}
+                                    {item.requirements.minRaceLevel}
+                                  </Badge>
+                                ) : null}
+                                {item.requirements?.requiredRaceType ? (
+                                  <Badge variant="outline">
+                                    {item.requirements.requiredRaceType ===
+                                    "enlightened"
+                                      ? "Humanoid (enlightened)"
+                                      : "Monstrous (monster)"}
+                                  </Badge>
+                                ) : null}
+                                {item.equipmentEligibility?.eligible ===
+                                false ? (
+                                  <p className="text-xs text-muted-foreground">
+                                    {item.equipmentEligibility.reason ??
+                                      "Ineligible; equipment bonus inactive."}
+                                  </p>
+                                ) : null}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {item.kind === "equipment" ? (
+                                  equipped ? (
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      disabled={assocBusy}
+                                      onClick={() =>
+                                        void removeAssociation(
+                                          "equipment",
+                                          item.definitionId
+                                        )
+                                      }
+                                    >
+                                      Unequip
+                                    </Button>
+                                  ) : (
+                                    <div className="flex flex-col items-end gap-1">
+                                      {ring ? (
+                                        <label className="text-xs">
+                                          Equip position
+                                          <select
+                                            aria-label={`Equip position for ${item.name}`}
+                                            value={
+                                              inventoryRingPositions[
+                                                item.definitionId
+                                              ] ?? ""
+                                            }
+                                            onChange={(event) =>
+                                              setInventoryRingPositions(
+                                                (current) => ({
+                                                  ...current,
+                                                  [item.definitionId]: event
+                                                    .target.value as
+                                                    "Ring 1" | "Ring 2",
+                                                })
+                                              )
+                                            }
+                                          >
+                                            <option value="">
+                                              Choose position
+                                            </option>
+                                            <option value="Ring 1">
+                                              Ring 1
+                                            </option>
+                                            <option value="Ring 2">
+                                              Ring 2
+                                            </option>
+                                          </select>
+                                        </label>
+                                      ) : null}
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={
+                                          assocBusy ||
+                                          item.archived ||
+                                          item.quantity < 1 ||
+                                          item.equipmentEligibility
+                                            ?.eligible === false ||
+                                          (ring &&
+                                            !inventoryRingPositions[
+                                              item.definitionId
+                                            ])
+                                        }
+                                        title={
+                                          item.equipmentEligibility
+                                            ?.eligible === false
+                                            ? (item.equipmentEligibility
+                                                .reason ??
+                                              "Equipment requirements not met")
+                                            : undefined
+                                        }
+                                        onClick={() =>
+                                          void addAssociation(
+                                            "equipment",
+                                            item.definitionId,
+                                            undefined,
+                                            ring
+                                              ? inventoryRingPositions[
+                                                  item.definitionId
+                                                ]
+                                              : undefined
+                                          )
+                                        }
+                                      >
+                                        Equip
+                                      </Button>
+                                    </div>
+                                  )
+                                ) : null}
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={
+                                    busy || (equipped && item.quantity <= 1)
+                                  }
+                                  onClick={() => {
+                                    setInventoryRemoveItem(item)
+                                    setInventoryQuantity("")
+                                    setInventorySourceNote("")
+                                    setInventoryError(null)
+                                  }}
+                                >
+                                  Discard
+                                </Button>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </section>
+                )
+              })}
+              <Button
+                variant="outline"
+                className="self-start"
+                onClick={() => {
+                  setInventoryDefinitionId("")
+                  setInventoryQuantity("")
+                  setInventorySourceNote("")
+                  setInventoryError(null)
+                  setInventoryAddOpen(true)
+                }}
+              >
+                Add stock
+              </Button>
+              {inventoryRemoveItem?.quantity === 1 &&
+              character.associations.some(
+                (a) =>
+                  a.kind === "equipment" &&
+                  a.definitionId === inventoryRemoveItem.definitionId
+              ) ? (
+                <p className="text-sm text-muted-foreground">
+                  Unequip {inventoryRemoveItem.name} before discarding its last
+                  stock.
+                </p>
+              ) : null}
+            </div>
+          </CardContent>
+        </Card>
+        <Dialog open={inventoryAddOpen} onOpenChange={setInventoryAddOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Add stock</DialogTitle>
+              <DialogDescription>
+                Manual bookkeeping only; source notes are not verified loot or
+                crafting records.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-3">
+              <Label htmlFor="inventory-add-item">Catalog item</Label>
+              <Select
+                value={inventoryDefinitionId}
+                onValueChange={(value) => setInventoryDefinitionId(value ?? "")}
+              >
+                <SelectTrigger id="inventory-add-item">
+                  <SelectValue placeholder="Choose an active item" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectLabel>Equipment</SelectLabel>
+                    {equipmentCatalog
+                      .filter((item) => !item.archived)
+                      .map((item) => (
+                        <SelectItem key={item.id} value={item.id}>
+                          {item.name}
+                        </SelectItem>
+                      ))}
+                  </SelectGroup>
+                  <SelectGroup>
+                    <SelectLabel>Items</SelectLabel>
+                    {itemsCatalog
+                      .filter((item) => !item.archived)
+                      .map((item) => (
+                        <SelectItem key={item.id} value={item.id}>
+                          {item.name}
+                        </SelectItem>
+                      ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Label htmlFor="inventory-add-quantity">Quantity</Label>
+              <Input
+                id="inventory-add-quantity"
+                type="number"
+                min={1}
+                max={999999}
+                required
+                value={inventoryQuantity}
+                onChange={(e) => setInventoryQuantity(e.target.value)}
+              />
+              <Label htmlFor="inventory-add-note">Source note</Label>
+              <Input
+                id="inventory-add-note"
+                required
+                maxLength={500}
+                value={inventorySourceNote}
+                onChange={(e) => setInventorySourceNote(e.target.value)}
+              />
+              {inventoryError ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {inventoryError}
+                </p>
+              ) : null}
+            </div>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setInventoryAddOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                disabled={
+                  inventoryBusy ||
+                  !inventoryDefinitionId ||
+                  !Number.isInteger(Number(inventoryQuantity)) ||
+                  Number(inventoryQuantity) < 1 ||
+                  Number(inventoryQuantity) > 999999 ||
+                  !inventorySourceNote.trim() ||
+                  inventorySourceNote.length > 500
+                }
+                onClick={() =>
+                  void submitInventory(
+                    "add",
+                    inventoryDefinitionId,
+                    Number(inventoryQuantity),
+                    inventorySourceNote,
+                    () => setInventoryAddOpen(false)
+                  )
+                }
+              >
+                Save
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+        <Dialog
+          open={!!inventoryRemoveItem}
+          onOpenChange={(open) => {
+            if (!open) setInventoryRemoveItem(null)
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Discard stock</DialogTitle>
+              <DialogDescription>
+                Discard stock of {inventoryRemoveItem?.name}.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-3">
+              <Label htmlFor="inventory-remove-quantity">
+                Quantity (1-
+                {inventoryRemoveItem
+                  ? Math.min(
+                      inventoryRemoveItem.quantity,
+                      character.associations.some(
+                        (a) =>
+                          a.kind === "equipment" &&
+                          a.definitionId === inventoryRemoveItem.definitionId
+                      )
+                        ? inventoryRemoveItem.quantity - 1
+                        : inventoryRemoveItem.quantity
+                    )
+                  : 1}
+                )
+              </Label>
+              <Input
+                id="inventory-remove-quantity"
+                type="number"
+                min={1}
+                max={
+                  inventoryRemoveItem
+                    ? Math.min(
+                        inventoryRemoveItem.quantity,
+                        character.associations.some(
+                          (a) =>
+                            a.kind === "equipment" &&
+                            a.definitionId === inventoryRemoveItem.definitionId
+                        )
+                          ? inventoryRemoveItem.quantity - 1
+                          : inventoryRemoveItem.quantity
+                      )
+                    : 1
+                }
+                required
+                value={inventoryQuantity}
+                onChange={(e) => setInventoryQuantity(e.target.value)}
+              />
+              <Label htmlFor="inventory-remove-note">Source note</Label>
+              <Input
+                id="inventory-remove-note"
+                required
+                maxLength={500}
+                value={inventorySourceNote}
+                onChange={(e) => setInventorySourceNote(e.target.value)}
+              />
+              {inventoryError ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {inventoryError}
+                </p>
+              ) : null}
+            </div>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setInventoryRemoveItem(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={
+                  inventoryBusy ||
+                  !inventoryRemoveItem ||
+                  !Number.isInteger(Number(inventoryQuantity)) ||
+                  Number(inventoryQuantity) < 1 ||
+                  Number(inventoryQuantity) >
+                    Math.min(
+                      inventoryRemoveItem.quantity,
+                      character.associations.some(
+                        (a) =>
+                          a.kind === "equipment" &&
+                          a.definitionId === inventoryRemoveItem.definitionId
+                      )
+                        ? inventoryRemoveItem.quantity - 1
+                        : inventoryRemoveItem.quantity
+                    ) ||
+                  !inventorySourceNote.trim() ||
+                  inventorySourceNote.length > 500
+                }
+                onClick={() =>
+                  inventoryRemoveItem &&
+                  void submitInventory(
+                    "remove",
+                    inventoryRemoveItem.definitionId,
+                    Number(inventoryQuantity),
+                    inventorySourceNote,
+                    () => setInventoryRemoveItem(null)
+                  )
+                }
+              >
+                Discard stock
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </>
+    )
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -2910,496 +3575,22 @@ export function CharacterDetail({
           <TabsTrigger value="history">History</TabsTrigger>
           <TabsTrigger value="notes">Notes</TabsTrigger>
         </TabsList>
-        <p
-          className="flex gap-3 text-xs text-muted-foreground"
-          aria-label="Pending skill choices"
-        >
-          <span>
-            Class:{" "}
-            {
-              character.skillOffers.filter(
-                (o) =>
-                  o.track === "class" &&
-                  !o.selectedDefinitionId &&
-                  !o.canceledAt
-              ).length
-            }
-          </span>
-          <span>
-            Profession:{" "}
-            {
-              character.skillOffers.filter(
-                (o) =>
-                  o.track === "profession" &&
-                  !o.selectedDefinitionId &&
-                  !o.canceledAt
-              ).length
-            }
-          </span>
-        </p>
-
         <TabsContent value="inventory" className="pt-3">
-          <Card>
-            <CardContent>
-              <div className="flex flex-col gap-3">
-                <div>
-                  <h3 className="font-medium">Owned inventory</h3>
-                  <p className="text-sm text-muted-foreground">
-                    Manual bookkeeping only. Source notes are not verified loot
-                    or crafting records.
-                  </p>
-                </div>
-                {(["equipment", "items"] as const).map((kind) => {
-                  const rows = (character.inventory ?? []).filter(
-                    (item) => item.kind === kind
-                  )
-                  return (
-                    <section
-                      key={kind}
-                      aria-label={
-                        kind === "equipment" ? "Owned equipment" : "Owned items"
-                      }
-                    >
-                      <h4 className="mb-2 text-sm font-medium capitalize">
-                        {kind}
-                      </h4>
-                      {rows.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">
-                          No owned stock.
-                        </p>
-                      ) : (
-                        <div className="flex flex-col gap-2">
-                          {rows.map((item) => {
-                            const equipped = character.associations.some(
-                              (a) =>
-                                a.kind === "equipment" &&
-                                a.definitionId === item.definitionId
-                            )
-                            const linkedEquipment = character.associations.find(
-                              (a) =>
-                                a.kind === "equipment" &&
-                                a.definitionId === item.definitionId
-                            )
-                            const catalogEquipment = equipmentCatalog.find(
-                              (entry) => entry.id === item.definitionId
-                            )
-                            const ring = catalogEquipment
-                              ? isRing(catalogEquipment)
-                              : normalizeEquipmentSlot(item.slot ?? "") ===
-                                "Ring"
-                            return (
-                              <div
-                                key={item.id}
-                                className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"
-                              >
-                                <div>
-                                  <div className="font-medium">
-                                    {item.name}{" "}
-                                    <Badge variant="outline">
-                                      Qty {item.quantity}
-                                    </Badge>{" "}
-                                    {item.archived ? (
-                                      <Badge variant="outline">
-                                        Archived - inert
-                                      </Badge>
-                                    ) : null}
-                                  </div>
-                                  <p className="text-xs text-muted-foreground">
-                                    {item.rarity
-                                      ? `Rarity: ${item.rarity} - `
-                                      : ""}
-                                    {item.slot ? `Slot: ${item.slot}` : ""}
-                                    {item.slot && equipped ? " - " : ""}
-                                    {equipped
-                                      ? `Equipped${linkedEquipment?.equipmentPosition ? ` in ${linkedEquipment.equipmentPosition}` : ""}`
-                                      : ""}
-                                  </p>
-                                  {catalogEquipment ? (
-                                    <p className="text-xs text-muted-foreground">
-                                      Flat bonus: {bonusFor(catalogEquipment)}
-                                      {catalogEquipment.config
-                                        .percentBasisPoints
-                                        ? ` - Percent: ${percentBonusFor(catalogEquipment)}`
-                                        : ""}
-                                    </p>
-                                  ) : null}
-                                  {item.soulbound ? (
-                                    <Badge variant="outline">Soulbound</Badge>
-                                  ) : null}
-                                  {item.requirements?.minRaceLevel != null ? (
-                                    <Badge variant="outline">
-                                      Min race level{" "}
-                                      {item.requirements.minRaceLevel}
-                                    </Badge>
-                                  ) : null}
-                                  {item.requirements?.requiredRaceType ? (
-                                    <Badge variant="outline">
-                                      {item.requirements.requiredRaceType ===
-                                      "enlightened"
-                                        ? "Humanoid (enlightened)"
-                                        : "Monstrous (monster)"}
-                                    </Badge>
-                                  ) : null}
-                                  {item.equipmentEligibility?.eligible ===
-                                  false ? (
-                                    <p className="text-xs text-muted-foreground">
-                                      {item.equipmentEligibility.reason ??
-                                        "Ineligible; equipment bonus inactive."}
-                                    </p>
-                                  ) : null}
-                                </div>
-                                <div className="flex flex-wrap gap-2">
-                                  {item.kind === "equipment" ? (
-                                    equipped ? (
-                                      <Button
-                                        size="sm"
-                                        variant="outline"
-                                        disabled={assocBusy}
-                                        onClick={() =>
-                                          void removeAssociation(
-                                            "equipment",
-                                            item.definitionId
-                                          )
-                                        }
-                                      >
-                                        Unequip
-                                      </Button>
-                                    ) : (
-                                      <div className="flex flex-col items-end gap-1">
-                                        {ring ? (
-                                          <label className="text-xs">
-                                            Equip position
-                                            <select
-                                              aria-label={`Equip position for ${item.name}`}
-                                              value={
-                                                inventoryRingPositions[
-                                                  item.definitionId
-                                                ] ?? ""
-                                              }
-                                              onChange={(event) =>
-                                                setInventoryRingPositions(
-                                                  (current) => ({
-                                                    ...current,
-                                                    [item.definitionId]: event
-                                                      .target.value as
-                                                      "Ring 1" | "Ring 2",
-                                                  })
-                                                )
-                                              }
-                                            >
-                                              <option value="">
-                                                Choose position
-                                              </option>
-                                              <option value="Ring 1">
-                                                Ring 1
-                                              </option>
-                                              <option value="Ring 2">
-                                                Ring 2
-                                              </option>
-                                            </select>
-                                          </label>
-                                        ) : null}
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          disabled={
-                                            assocBusy ||
-                                            item.archived ||
-                                            item.quantity < 1 ||
-                                            item.equipmentEligibility
-                                              ?.eligible === false ||
-                                            (ring &&
-                                              !inventoryRingPositions[
-                                                item.definitionId
-                                              ])
-                                          }
-                                          title={
-                                            item.equipmentEligibility
-                                              ?.eligible === false
-                                              ? (item.equipmentEligibility
-                                                  .reason ??
-                                                "Equipment requirements not met")
-                                              : undefined
-                                          }
-                                          onClick={() =>
-                                            void addAssociation(
-                                              "equipment",
-                                              item.definitionId,
-                                              undefined,
-                                              ring
-                                                ? inventoryRingPositions[
-                                                    item.definitionId
-                                                  ]
-                                                : undefined
-                                            )
-                                          }
-                                        >
-                                          Equip
-                                        </Button>
-                                      </div>
-                                    )
-                                  ) : null}
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    disabled={
-                                      busy || (equipped && item.quantity <= 1)
-                                    }
-                                    onClick={() => {
-                                      setInventoryRemoveItem(item)
-                                      setInventoryQuantity("")
-                                      setInventorySourceNote("")
-                                      setInventoryError(null)
-                                    }}
-                                  >
-                                    Discard
-                                  </Button>
-                                </div>
-                              </div>
-                            )
-                          })}
-                        </div>
-                      )}
-                    </section>
-                  )
-                })}
-                <Button
-                  variant="outline"
-                  className="self-start"
-                  onClick={() => {
-                    setInventoryDefinitionId("")
-                    setInventoryQuantity("")
-                    setInventorySourceNote("")
-                    setInventoryError(null)
-                    setInventoryAddOpen(true)
-                  }}
-                >
-                  Add stock
-                </Button>
-                {inventoryRemoveItem?.quantity === 1 &&
-                character.associations.some(
-                  (a) =>
-                    a.kind === "equipment" &&
-                    a.definitionId === inventoryRemoveItem.definitionId
-                ) ? (
-                  <p className="text-sm text-muted-foreground">
-                    Unequip {inventoryRemoveItem.name} before discarding its
-                    last stock.
-                  </p>
-                ) : null}
-              </div>
-            </CardContent>
-          </Card>
-          <Dialog open={inventoryAddOpen} onOpenChange={setInventoryAddOpen}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Add stock</DialogTitle>
-                <DialogDescription>
-                  Manual bookkeeping only; source notes are not verified loot or
-                  crafting records.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="flex flex-col gap-3">
-                <Label htmlFor="inventory-add-item">Catalog item</Label>
-                <Select
-                  value={inventoryDefinitionId}
-                  onValueChange={(value) =>
-                    setInventoryDefinitionId(value ?? "")
-                  }
-                >
-                  <SelectTrigger id="inventory-add-item">
-                    <SelectValue placeholder="Choose an active item" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectLabel>Equipment</SelectLabel>
-                      {equipmentCatalog
-                        .filter((item) => !item.archived)
-                        .map((item) => (
-                          <SelectItem key={item.id} value={item.id}>
-                            {item.name}
-                          </SelectItem>
-                        ))}
-                    </SelectGroup>
-                    <SelectGroup>
-                      <SelectLabel>Items</SelectLabel>
-                      {itemsCatalog
-                        .filter((item) => !item.archived)
-                        .map((item) => (
-                          <SelectItem key={item.id} value={item.id}>
-                            {item.name}
-                          </SelectItem>
-                        ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-                <Label htmlFor="inventory-add-quantity">Quantity</Label>
-                <Input
-                  id="inventory-add-quantity"
-                  type="number"
-                  min={1}
-                  max={999999}
-                  required
-                  value={inventoryQuantity}
-                  onChange={(e) => setInventoryQuantity(e.target.value)}
-                />
-                <Label htmlFor="inventory-add-note">Source note</Label>
-                <Input
-                  id="inventory-add-note"
-                  required
-                  maxLength={500}
-                  value={inventorySourceNote}
-                  onChange={(e) => setInventorySourceNote(e.target.value)}
-                />
-                {inventoryError ? (
-                  <p role="alert" className="text-sm text-destructive">
-                    {inventoryError}
-                  </p>
-                ) : null}
-              </div>
-              <DialogFooter>
-                <Button
-                  variant="outline"
-                  onClick={() => setInventoryAddOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  disabled={
-                    inventoryBusy ||
-                    !inventoryDefinitionId ||
-                    !Number.isInteger(Number(inventoryQuantity)) ||
-                    Number(inventoryQuantity) < 1 ||
-                    Number(inventoryQuantity) > 999999 ||
-                    !inventorySourceNote.trim() ||
-                    inventorySourceNote.length > 500
-                  }
-                  onClick={() =>
-                    void submitInventory(
-                      "add",
-                      inventoryDefinitionId,
-                      Number(inventoryQuantity),
-                      inventorySourceNote,
-                      () => setInventoryAddOpen(false)
-                    )
-                  }
-                >
-                  Save
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-          <Dialog
-            open={!!inventoryRemoveItem}
-            onOpenChange={(open) => {
-              if (!open) setInventoryRemoveItem(null)
-            }}
-          >
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Discard stock</DialogTitle>
-                <DialogDescription>
-                  Discard stock of {inventoryRemoveItem?.name}.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="flex flex-col gap-3">
-                <Label htmlFor="inventory-remove-quantity">
-                  Quantity (1-
-                  {inventoryRemoveItem
-                    ? Math.min(
-                        inventoryRemoveItem.quantity,
-                        character.associations.some(
-                          (a) =>
-                            a.kind === "equipment" &&
-                            a.definitionId === inventoryRemoveItem.definitionId
-                        )
-                          ? inventoryRemoveItem.quantity - 1
-                          : inventoryRemoveItem.quantity
-                      )
-                    : 1}
-                  )
-                </Label>
-                <Input
-                  id="inventory-remove-quantity"
-                  type="number"
-                  min={1}
-                  max={
-                    inventoryRemoveItem
-                      ? Math.min(
-                          inventoryRemoveItem.quantity,
-                          character.associations.some(
-                            (a) =>
-                              a.kind === "equipment" &&
-                              a.definitionId ===
-                                inventoryRemoveItem.definitionId
-                          )
-                            ? inventoryRemoveItem.quantity - 1
-                            : inventoryRemoveItem.quantity
-                        )
-                      : 1
-                  }
-                  required
-                  value={inventoryQuantity}
-                  onChange={(e) => setInventoryQuantity(e.target.value)}
-                />
-                <Label htmlFor="inventory-remove-note">Source note</Label>
-                <Input
-                  id="inventory-remove-note"
-                  required
-                  maxLength={500}
-                  value={inventorySourceNote}
-                  onChange={(e) => setInventorySourceNote(e.target.value)}
-                />
-                {inventoryError ? (
-                  <p role="alert" className="text-sm text-destructive">
-                    {inventoryError}
-                  </p>
-                ) : null}
-              </div>
-              <DialogFooter>
-                <Button
-                  variant="outline"
-                  onClick={() => setInventoryRemoveItem(null)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  variant="destructive"
-                  disabled={
-                    inventoryBusy ||
-                    !inventoryRemoveItem ||
-                    !Number.isInteger(Number(inventoryQuantity)) ||
-                    Number(inventoryQuantity) < 1 ||
-                    Number(inventoryQuantity) >
-                      Math.min(
-                        inventoryRemoveItem.quantity,
-                        character.associations.some(
-                          (a) =>
-                            a.kind === "equipment" &&
-                            a.definitionId === inventoryRemoveItem.definitionId
-                        )
-                          ? inventoryRemoveItem.quantity - 1
-                          : inventoryRemoveItem.quantity
-                      ) ||
-                    !inventorySourceNote.trim() ||
-                    inventorySourceNote.length > 500
-                  }
-                  onClick={() =>
-                    inventoryRemoveItem &&
-                    void submitInventory(
-                      "remove",
-                      inventoryRemoveItem.definitionId,
-                      Number(inventoryQuantity),
-                      inventorySourceNote,
-                      () => setInventoryRemoveItem(null)
-                    )
-                  }
-                >
-                  Discard stock
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+          <div className="flex flex-col gap-3">
+            <div>
+              <h3 className="font-medium">Owned inventory</h3>
+              <p className="text-sm text-muted-foreground">
+                Review and manage the equipment and items this character owns.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              className="self-start"
+              onClick={() => openAssociations("inventory")}
+            >
+              Manage inventory
+            </Button>
+          </div>
         </TabsContent>
 
         <TabsContent value="overview" className="pt-3">
@@ -4087,6 +4278,33 @@ export function CharacterDetail({
         ) : null}
 
         <TabsContent value="skills" className="pt-3">
+          <div
+            className="mb-3 flex flex-wrap gap-2"
+            aria-label="Unspent skill selections"
+          >
+            {(["race", "class", "profession"] as const).map((track) => (
+              <Badge key={track} variant="outline">
+                {track[0]!.toUpperCase() + track.slice(1)}:{" "}
+                {
+                  character.skillOffers.filter(
+                    (offer) =>
+                      offer.track === track &&
+                      !offer.selectedDefinitionId &&
+                      !offer.canceledAt
+                  ).length
+                }{" "}
+                pending
+              </Badge>
+            ))}
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mb-3"
+            onClick={() => openAssociations("skill")}
+          >
+            Manage skills
+          </Button>
           <Card>
             <CardContent>
               <div className="flex flex-col gap-4">
@@ -4125,7 +4343,11 @@ export function CharacterDetail({
                         >
                           <div className="flex items-center justify-between gap-2">
                             <span className="font-medium">
-                              {offer.track === "class" ? "Class" : "Profession"}{" "}
+                              {offer.track === "race"
+                                ? "Race"
+                                : offer.track === "class"
+                                  ? "Class"
+                                  : "Profession"}{" "}
                               level {offer.level} - {offer.choiceGroup}
                             </span>
                             {offer.canceledAt ? (
@@ -4175,6 +4397,11 @@ export function CharacterDetail({
                                           {opt.grade}
                                         </Badge>
                                       ) : null}
+                                      {opt.classPriority ? (
+                                        <Badge variant="outline">
+                                          Class match
+                                        </Badge>
+                                      ) : null}
                                       {opt.archived ? (
                                         <Badge variant="outline">
                                           Archived
@@ -4194,14 +4421,10 @@ export function CharacterDetail({
                                       size="sm"
                                       disabled={skillBusy}
                                       onClick={() =>
-                                        setSelectConfirm({
-                                          offerId: offer.id,
-                                          definitionId: opt.definitionId,
-                                          name: opt.nameSnapshot,
-                                        })
+                                        openAssociations("skill", offer.id)
                                       }
                                     >
-                                      Select
+                                      Choose skill
                                     </Button>
                                   )}
                                 </div>
@@ -4446,9 +4669,9 @@ export function CharacterDetail({
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => openAssociations()}
+                  onClick={() => openAssociations("title")}
                 >
-                  Manage titles & equipment
+                  Manage titles
                 </Button>
               </div>
               {character.associations.filter((a) => a.kind === "title")
@@ -4502,9 +4725,9 @@ export function CharacterDetail({
             <Button
               variant="outline"
               size="sm"
-              onClick={() => openAssociations()}
+              onClick={() => openAssociations("equipment")}
             >
-              Manage titles & equipment
+              Manage equipment
             </Button>
           </div>
           {status && status.equipment.items.length > 0 ? (
@@ -4793,10 +5016,15 @@ export function CharacterDetail({
       ) : null}
 
       <AssociationSheet
-        open={associationsOpen}
-        onOpenChange={setAssociationsOpen}
-        associationTab={associationTab}
-        onAssociationTabChange={setAssociationTab}
+        panel="titlesSkills"
+        open={activeAssociationPanel === "titlesSkills"}
+        onOpenChange={(open) => {
+          if (!open) setActiveAssociationPanel(null)
+        }}
+        associationTab={associationTabs.titlesSkills}
+        onAssociationTabChange={(value) =>
+          setAssociationTabs((current) => ({ ...current, titlesSkills: value }))
+        }
         character={character}
         titles={titlesCatalog}
         equipment={equipmentCatalog}
@@ -4817,9 +5045,99 @@ export function CharacterDetail({
         onPowerAdd={(kind, definitionId, tier) =>
           void addAssociation(kind, definitionId, undefined, undefined, tier)
         }
-        onPowerRemove={(kind, definitionId) => {
+        onPowerRemove={(kind, definitionId) =>
           void removeAssociation(kind, definitionId)
+        }
+        skillOffers={character.skillOffers}
+        focusedOfferId={focusedSkillOfferId}
+        onSelectSkill={(offerId, definitionId, name) =>
+          setSelectConfirm({ offerId, definitionId, name })
+        }
+        onRetrySkills={() => void refreshSkills()}
+      />
+      <AssociationSheet
+        panel="powers"
+        open={activeAssociationPanel === "powers"}
+        onOpenChange={(open) => {
+          if (!open) setActiveAssociationPanel(null)
         }}
+        associationTab={associationTabs.powers}
+        onAssociationTabChange={(value) =>
+          setAssociationTabs((current) => ({ ...current, powers: value }))
+        }
+        character={character}
+        titles={titlesCatalog}
+        equipment={equipmentCatalog}
+        blessings={blessingsCatalog}
+        bloodlines={bloodlinesCatalog}
+        transcendentSkills={transcendentCatalog}
+        maxTranscendentSkills={maxTranscendentSkills}
+        creationRulesError={creationRulesError}
+        onRetryCreationRules={() => void loadCreationRules()}
+        loading={catalogLoading}
+        busy={assocBusy}
+        onAdd={(kind, definitionId, reason, equipmentPosition) =>
+          void addAssociation(kind, definitionId, reason, equipmentPosition)
+        }
+        onRemove={(kind, definitionId) =>
+          void removeAssociation(kind, definitionId)
+        }
+        onPowerAdd={(kind, definitionId, tier) =>
+          void addAssociation(kind, definitionId, undefined, undefined, tier)
+        }
+        onPowerRemove={(kind, definitionId) =>
+          void removeAssociation(kind, definitionId)
+        }
+        skillOffers={character.skillOffers}
+        focusedOfferId={focusedSkillOfferId}
+        onSelectSkill={(offerId, definitionId, name) =>
+          setSelectConfirm({ offerId, definitionId, name })
+        }
+        onRetrySkills={() => void refreshSkills()}
+      />
+      <AssociationSheet
+        panel="inventoryEquipment"
+        open={activeAssociationPanel === "inventoryEquipment"}
+        inventoryContent={renderInventoryContent()}
+        onOpenChange={(open) => {
+          if (!open) setActiveAssociationPanel(null)
+        }}
+        associationTab={associationTabs.inventoryEquipment}
+        onAssociationTabChange={(value) =>
+          setAssociationTabs((current) => ({
+            ...current,
+            inventoryEquipment: value,
+          }))
+        }
+        character={character}
+        titles={titlesCatalog}
+        equipment={equipmentCatalog}
+        blessings={blessingsCatalog}
+        bloodlines={bloodlinesCatalog}
+        transcendentSkills={transcendentCatalog}
+        maxTranscendentSkills={maxTranscendentSkills}
+        creationRulesError={creationRulesError}
+        onRetryCreationRules={() => void loadCreationRules()}
+        loading={catalogLoading}
+        busy={assocBusy}
+        onAdd={(kind, definitionId, reason, equipmentPosition) =>
+          void addAssociation(kind, definitionId, reason, equipmentPosition)
+        }
+        onRemove={(kind, definitionId) =>
+          void removeAssociation(kind, definitionId)
+        }
+        onPowerAdd={(kind, definitionId, tier) =>
+          void addAssociation(kind, definitionId, undefined, undefined, tier)
+        }
+        onPowerRemove={(kind, definitionId) =>
+          void removeAssociation(kind, definitionId)
+        }
+        skillOffers={character.skillOffers}
+        focusedOfferId={focusedSkillOfferId}
+        onSelectSkill={(offerId, definitionId, name) =>
+          setSelectConfirm({ offerId, definitionId, name })
+        }
+        onRetrySkills={() => void refreshSkills()}
       />
 
       <Dialog open={removePortraitOpen} onOpenChange={setRemovePortraitOpen}>
@@ -4859,27 +5177,25 @@ export function CharacterDetail({
           <DialogHeader>
             <DialogTitle>Choose a skill</DialogTitle>
             <DialogDescription>
-              Choose one skill for this level-up, or decide later.
+              Choose now to review this offer, or decide later.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-2">
             {character.skillOffers
               .find((offer) => offer.id === levelUpOfferId)
-              ?.options.filter((option) => !option.archived)
-              .map((option) => (
-                <Button
-                  key={option.definitionId}
-                  variant="outline"
-                  disabled={skillBusy}
-                  onClick={() => {
-                    const offerId = levelUpOfferId
-                    setLevelUpOfferId(null)
-                    if (offerId) void selectSkill(offerId, option.definitionId)
-                  }}
-                >
-                  {option.nameSnapshot}
-                </Button>
-              ))}
+              ?.options.filter((option) => !option.archived).length ? (
+              <Button
+                variant="outline"
+                disabled={skillBusy}
+                onClick={() => {
+                  const offerId = levelUpOfferId
+                  setLevelUpOfferId(null)
+                  if (offerId) openAssociations("skill", offerId)
+                }}
+              >
+                Choose now
+              </Button>
+            ) : null}
             {character.skillOffers
               .find((offer) => offer.id === levelUpOfferId)
               ?.options.filter((option) => !option.archived).length === 0 ? (

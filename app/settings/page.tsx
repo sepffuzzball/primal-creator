@@ -638,7 +638,8 @@ function HouseRulesCard() {
   }
 
   const setSkillInterval =
-    (grade: "F" | "E" | "D" | "C" | "B" | "A" | "S") => (value: number) => {
+    (grade: "G" | "F" | "E" | "D" | "C" | "B" | "A" | "S") =>
+    (value: number) => {
       setConfig((prev) =>
         prev
           ? {
@@ -741,20 +742,23 @@ function HouseRulesCard() {
               </legend>
               <p className="text-xs text-muted-foreground">
                 Levels between earned skill-choice credits. Changes apply only
-                to future-earned credits; G grants none.
+                to future-earned credits. Monster Race G grants credits every 5
+                levels; Class and Profession G grades use this interval too.
               </p>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {(["F", "E", "D", "C", "B", "A", "S"] as const).map((grade) => (
-                  <HouseRuleInput
-                    key={grade}
-                    label={`${grade} Class interval`}
-                    value={config.skillChoiceIntervals[grade]}
-                    onChange={setSkillInterval(grade)}
-                    min={1}
-                    max={250}
-                    hint={`Default ${{ F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 }[grade]}.`}
-                  />
-                ))}
+                {(["G", "F", "E", "D", "C", "B", "A", "S"] as const).map(
+                  (grade) => (
+                    <HouseRuleInput
+                      key={grade}
+                      label={`${grade} Class interval`}
+                      value={config.skillChoiceIntervals[grade]}
+                      onChange={setSkillInterval(grade)}
+                      min={1}
+                      max={250}
+                      hint={`Default ${{ G: 5, F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 }[grade]}.`}
+                    />
+                  )
+                )}
               </div>
             </fieldset>
 

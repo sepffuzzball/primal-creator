@@ -102,6 +102,13 @@ export interface TestSkillOfferRow {
   // the selected track's catalog stableId. Null on legacy/imported offers.
   earnedGrade?: string | null
   trackDefinitionStableId?: string | null
+  /**
+   * Catalog stableId of the character's selected CLASS at the moment the credit
+   * was earned, snapshotted at EARNING time for class/profession credits and null
+   * for a monster race credit. Null on legacy/imported offers. Priority-only
+   * (drives deterministic option ordering), never eligibility.
+   */
+  classStableIdAtEarn?: string | null
   // Relational options, only set on the object returned by findUnique/findMany.
   options?: TestSkillOfferOptionRow[]
 }
@@ -1257,6 +1264,8 @@ export function createTestPrisma(): TestPrismaInstance {
           earnedGrade: (data.earnedGrade as string | null) ?? null,
           trackDefinitionStableId:
             (data.trackDefinitionStableId as string | null) ?? null,
+          classStableIdAtEarn:
+            (data.classStableIdAtEarn as string | null) ?? null,
         }
         skillOffers.push(offer)
         const nestedOptions = (

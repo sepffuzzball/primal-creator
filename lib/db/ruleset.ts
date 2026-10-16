@@ -43,10 +43,12 @@ export interface HouseRulesConfig {
   maxTranscendentSkills: number
   /**
    * The configurable number of levels between skill-choice CREDITS, per grade.
-   * G is intentionally absent (G grades earn no skill-choice credits). Each value
-   * is an integer 1..250. Used to determine whether a class/profession level-up
-   * awards a skill-choice milestone credit; edits after a credit is earned never
-   * alter already-earned offers (see `isSkillChoiceMilestone`).
+   * G is now configurable too (default 5): a G-grade monster/race earns credits on
+   * the same cadence as F, but is capped by the F band (see
+   * `isSkillChoiceMilestone`). Each value is an integer 1..250. Used to determine
+   * whether a class/profession (or race) level-up awards a skill-choice milestone
+   * credit; edits after a credit is earned never alter already-earned offers (see
+   * `isSkillChoiceMilestone`).
    */
   skillChoiceIntervals: SkillChoiceIntervals
 }
@@ -71,6 +73,7 @@ export const houseRulesConfigSchema = z
     maxTranscendentSkills: z.number().int().min(0).max(8),
     skillChoiceIntervals: z
       .object({
+        G: z.number().int().min(1).max(250),
         F: z.number().int().min(1).max(250),
         E: z.number().int().min(1).max(250),
         D: z.number().int().min(1).max(250),
@@ -93,7 +96,16 @@ export const DEFAULT_HOUSE_RULES_CONFIG: HouseRulesConfig = {
   equipmentCombinedCapPercent: 15,
   consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
   maxTranscendentSkills: 3,
-  skillChoiceIntervals: { F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 },
+  skillChoiceIntervals: {
+    G: 5,
+    F: 5,
+    E: 5,
+    D: 20,
+    C: 30,
+    B: 40,
+    A: 50,
+    S: 60,
+  },
 }
 
 /** A loaded (validated) house-rules row. */

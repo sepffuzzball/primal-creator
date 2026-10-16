@@ -84,7 +84,7 @@ const defaults = {
   equipmentCombinedCapPercent: 15,
   consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
   maxTranscendentSkills: 3,
-  skillChoiceIntervals: { F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 },
+  skillChoiceIntervals: { G: 5, F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 },
 }
 const response = (config = defaults, version = 7) => ({
   version,
@@ -124,12 +124,14 @@ describe("admin skill choice settings", () => {
       ).toBe(String(value))
       expect(screen.getAllByText(`Default ${value}.`).length).toBeGreaterThan(0)
     }
-    expect(screen.getByText(/G grants none/)).toBeTruthy()
+    expect(
+      screen.getByText(/Monster Race G grants credits every 5 levels/)
+    ).toBeTruthy()
   })
 
   it("PATCHes the complete versioned configuration, preserving other house rules", async () => {
     await load()
-    const values = { F: 6, E: 7, D: 21, C: 31, B: 41, A: 51, S: 61 }
+    const values = { G: 6, F: 6, E: 7, D: 21, C: 31, B: 41, A: 51, S: 61 }
     for (const [grade, value] of Object.entries(values))
       fireEvent.change(screen.getByLabelText(`${grade} Class interval`), {
         target: { value: String(value) },
@@ -155,6 +157,24 @@ describe("admin skill choice settings", () => {
     async (value) => {
       await load()
       const field = screen.getByLabelText("F Class interval")
+      fireEvent.change(field, { target: { value } })
+      fireEvent.blur(field)
+      fireEvent.click(screen.getByRole("button", { name: "Save house rules" }))
+      expect(
+        await screen.findByText("Enter a whole number from 1 to 250.")
+      ).toBeTruthy()
+      expect(apiFetch).not.toHaveBeenCalledWith(
+        "/api/admin/rules",
+        expect.objectContaining({ method: "PATCH" })
+      )
+    }
+  )
+
+  it.each(["", "2.5", "0", "251"])(
+    "rejects G interval value %s without PATCH",
+    async (value) => {
+      await load()
+      const field = screen.getByLabelText("G Class interval")
       fireEvent.change(field, { target: { value } })
       fireEvent.blur(field)
       fireEvent.click(screen.getByRole("button", { name: "Save house rules" }))

@@ -94,6 +94,20 @@ async function waitForHydrated(page: Page): Promise<void> {
   )
 }
 
+/**
+ * The currently open association side panel (a Base UI modal dialog popup).
+ *
+ * The character detail page renders three separated association panels, each a
+ * modal `role=dialog` popup carrying only a visually-hidden title naming the
+ * panel ("Titles and skills", "Blessings and bloodlines", "Inventory and
+ * equipment"). Scoping a panel through that title isolates it from the page
+ * behind it and from the other two panels, so the assert-only smoke below never
+ * matches a tab/button inside a different panel or on the detail page itself.
+ */
+function associationSheet(page: Page, title: string) {
+  return page.locator("[role=dialog]").filter({ hasText: title })
+}
+
 test.describe("character lifecycle", () => {
   test("login, create, progress, allocate, archive", async ({ page }) => {
     // A cold `next dev --webpack` compile can take tens of seconds per route on
@@ -500,6 +514,88 @@ ${missingItemWarnings.join("\n")}`
     ).toBe(true)
 
     // ------------------------------------------------------------------ //
+    // Smoke the separated association side panels.
+    //
+    // Each top-level tab (Inventory, Equipment, Skills, Blessings, Titles)
+    // opens its own dedicated modal side panel through a "Manage ..." button,
+    // and that panel carries an ISOLATED inner tab list (the Inventory and
+    // equipment panel exposes only Inventory/Equipment, never the titles/skills
+    // tabs, and so on). This block drives each entry point and asserts the
+    // panel's structure/state only, then closes it with Escape. It never
+    // submits, so it performs no DB mutation - it only renders the character
+    // that was just created.
+    // ------------------------------------------------------------------ //
+
+    // Inventory: the Inventory and equipment panel exposes only the Inventory
+    // and Equipment tabs, and the Inventory tab offers "Add stock". The panel
+    // defaults to the inventory tab on this entry point, but we click it
+    // explicitly so the assertion does not depend on that default.
+    await page.getByRole("tab", { name: "Inventory", exact: true }).click()
+    await page.getByRole("button", { name: "Manage inventory" }).click()
+    let sheet = associationSheet(page, "Inventory and equipment")
+    await expect(sheet).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Inventory" })).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Equipment" })).toBeVisible()
+    await sheet.getByRole("tab", { name: "Inventory" }).click()
+    await expect(sheet.getByRole("button", { name: "Add stock" })).toBeVisible()
+    await page.keyboard.press("Escape")
+    await expect(sheet).toBeHidden()
+
+    // Equipment: the same Inventory and equipment panel opened from the
+    // Equipment tab selects the Equipment subtab.
+    await page.getByRole("tab", { name: "Equipment", exact: true }).click()
+    await page.getByRole("button", { name: "Manage equipment" }).click()
+    sheet = associationSheet(page, "Inventory and equipment")
+    await expect(sheet).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Equipment" })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    )
+    await page.keyboard.press("Escape")
+    await expect(sheet).toBeHidden()
+
+    // Skills: the Titles and skills panel exposes Titles/Skills, opens on the
+    // Skills tab, and shows the unspent skill-selections entry.
+    await page.getByRole("tab", { name: "Skills", exact: true }).click()
+    await page.getByRole("button", { name: "Manage skills" }).click()
+    sheet = associationSheet(page, "Titles and skills")
+    await expect(sheet).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Titles" })).toBeVisible()
+    const skillsTab = sheet.getByRole("tab", { name: "Skills" })
+    await expect(skillsTab).toBeVisible()
+    await expect(skillsTab).toHaveAttribute("aria-selected", "true")
+    await expect(sheet.getByLabel("Unspent skill selections")).toBeVisible()
+    await page.keyboard.press("Escape")
+    await expect(sheet).toBeHidden()
+
+    // Blessings: the Blessings and bloodlines panel exposes the Blessings /
+    // Bloodlines / Transcendent skills tabs.
+    await page.getByRole("tab", { name: "Blessings", exact: true }).click()
+    await page.getByRole("button", { name: "Manage blessings" }).click()
+    sheet = associationSheet(page, "Blessings and bloodlines")
+    await expect(sheet).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Blessings" })).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Bloodlines" })).toBeVisible()
+    await expect(
+      sheet.getByRole("tab", { name: "Transcendent skills" })
+    ).toBeVisible()
+    await page.keyboard.press("Escape")
+    await expect(sheet).toBeHidden()
+
+    // Titles: the Titles and skills panel opened from the Titles tab selects
+    // the Titles subtab.
+    await page.getByRole("tab", { name: "Titles", exact: true }).click()
+    await page.getByRole("button", { name: "Manage titles" }).click()
+    sheet = associationSheet(page, "Titles and skills")
+    await expect(sheet).toBeVisible()
+    await expect(sheet.getByRole("tab", { name: "Titles" })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    )
+    await page.keyboard.press("Escape")
+    await expect(sheet).toBeHidden()
+
+    // ------------------------------------------------------------------ //
     // Progress: advance the class track to level 1 through the Class tab.
     //
     // The class track exposes a Base UI slider ("Class experience") that
@@ -581,6 +677,131 @@ ${missingItemWarnings.join("\n")}`
     // allocated free point brings the final value to 2.
     const strengthRow = page.locator("tbody tr").filter({ hasText: "strength" })
     await expect(strengthRow.locator("td").nth(1)).toHaveText("2")
+
+    // ------------------------------------------------------------------ //
+    // Earn and spend an F-grade class level-5 skill-choice credit.
+    //
+    // Advancing the class track to level 1 earned no skill credit: the F-grade
+    // skill-choice schedule credits at a 5-level interval above its entry of 0
+    // (levels 5, 10, 15, 20; level 1 is not one of them). This block creates a
+    // uniquely stableId'd, unarchived CLASS-track skill in the catalog (never
+    // touching a pre-existing fixture), advances the class track 1 -> 5 through
+    // four real level-ups, and on the level-5 milestone (the first F-grade
+    // credit) uses the milestone choice dialog to open the Titles and skills
+    // sidebar's Skills tab, selects the offered class skill, and confirms the
+    // existing Select dialog. It then asserts the earned credit is spent (the
+    // unspent class selection count drops) and the skill is persisted as a
+    // character association.
+    // ------------------------------------------------------------------ //
+
+    // A unique catalog identity so repeated runs never collide with a leftover
+    // skill, exactly as the character name is unique above.
+    const skillStableId = `e2e-class-skill-${Date.now()}`
+    const skillName = `E2E Archery Choice ${skillStableId}`
+    // `page.request` does not attach a browser `Origin` header, so an unsafe
+    // (state-changing) request would be rejected by the app's CSRF origin guard
+    // (403 bad_origin). Send the current page origin explicitly.
+    const skillRes = await page.request.post("/api/catalog/skills", {
+      headers: { origin: new URL(page.url()).origin },
+      data: {
+        name: skillName,
+        stableId: skillStableId,
+        config: { track: "class", classStableId: "archer", rarity: "Common" },
+      },
+    })
+    expect(skillRes.status()).toBe(201)
+
+    // Return to the Class tab (the allocation block left us on Stats) and advance
+    // 1 -> 5. Levels 2/3/4 are not skill-choice milestones, so only the
+    // progression journal opens and is dismissed; level 5 IS the first F-grade
+    // milestone and also opens the "Choose a skill" milestone choice dialog.
+    await page.getByRole("tab", { name: "Class" }).click()
+    for (let target = 2; target <= 5; target++) {
+      await page.getByRole("button", { name: "Increase class level" }).click()
+      await expect(classJournal).toBeVisible()
+      if (target < 5) {
+        await page.keyboard.press("Escape")
+        await expect(classJournal).toBeHidden()
+        continue
+      }
+      // Milestone: both the journal and the "Choose a skill" dialog open. Click
+      // "Choose now" to open the Titles and skills sidebar's Skills tab focused
+      // on this offer.
+      const skillChoiceDialog = page
+        .locator("[role=dialog]")
+        .filter({ hasText: "Choose a skill" })
+      await expect(skillChoiceDialog).toBeVisible()
+      await skillChoiceDialog
+        .getByRole("button", { name: "Choose now" })
+        .click()
+    }
+
+    // The Titles and skills sidebar opens on the Skills subtab. The earned credit
+    // shows as one unspent class selection and the offered skill option is listed
+    // with a "Select" button.
+    const skillSheet = associationSheet(page, "Titles and skills")
+    await expect(skillSheet).toBeVisible()
+    await expect(
+      skillSheet.getByRole("tab", { name: "Skills" })
+    ).toHaveAttribute("aria-selected", "true")
+    const unspentSelections = skillSheet.getByLabel("Unspent skill selections")
+    await expect(unspentSelections.getByText("Class: 1 pending")).toBeVisible()
+    const offerSection = skillSheet.getByRole("region", {
+      name: "class level 5 skill offer",
+    })
+    await expect(
+      offerSection.getByText(skillName, { exact: true })
+    ).toBeVisible()
+    const myOption = offerSection
+      .locator("div")
+      .filter({ hasText: skillName })
+      .first()
+    await myOption.getByRole("button", { name: "Select" }).click()
+
+    // The existing Select confirm dialog appears; confirm the selection.
+    const selectDialog = page
+      .locator("[role=dialog]")
+      .filter({ hasText: "Select skill" })
+    await expect(selectDialog).toBeVisible()
+    await selectDialog.getByRole("button", { name: "Select" }).click()
+
+    // The credit is spent: the unspent class selection drops to 0.
+    await expect(unspentSelections.getByText("Class: 0 pending")).toBeVisible()
+
+    // Close the Titles and skills sidebar through its own Close control, then
+    // dismiss the still-open progression journal. With multiple Base UI modals
+    // stacked, an Escape keypress does not reliably target the topmost dialog
+    // (on the earlier run it dismissed the journal first, leaving the sidebar
+    // open), so close the sidebar via its own button and use Escape only for the
+    // journal.
+    await skillSheet.getByRole("button", { name: "Close" }).click()
+    await expect(skillSheet).toBeHidden()
+    await page.keyboard.press("Escape")
+    await expect(classJournal).toBeHidden()
+
+    // The class track is now level 5 (milestone earnings never alter EXP, which
+    // resets to 0 after every level-up).
+    await expect(page.getByText("Level 5", { exact: true })).toBeVisible()
+    await expect(
+      page.getByRole("progressbar", { name: "Class experience" })
+    ).toHaveAttribute("aria-valuenow", "0")
+
+    // The acquired skill shows in the main Skills tab's "Acquired skills" list.
+    await page.getByRole("tab", { name: "Skills", exact: true }).click()
+    await expect(page.getByText(skillName, { exact: true })).toBeVisible()
+
+    // And the association is persisted server-side.
+    const detailAfterRes = await page.request.get(
+      `/api/characters/${characterId}`
+    )
+    expect(detailAfterRes.ok()).toBeTruthy()
+    const detailAfter = (await detailAfterRes.json()) as {
+      character: { associations: Array<{ kind: string; name: string }> }
+    }
+    const assocKeysAfter = detailAfter.character.associations.map(
+      (a) => `${a.kind}:${a.name}`
+    )
+    expect(assocKeysAfter).toContain(`skill:${skillName}`)
 
     // ------------------------------------------------------------------ //
     // Archive through the confirmation dialog.

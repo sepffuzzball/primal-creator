@@ -188,9 +188,13 @@ export function bandForGrade(
  * The grade entry point used by the skill-choice milestone schedule. Unlike the
  * grade band `entryLevel` (which is 10 for F because of the G/F overlap), the
  * skill-choice entry for F is 0: an F-grade track is eligible from level 1.
- * G intentionally has no entry - G grades never earn a skill-choice credit.
+ * G's entry is also 0: a G-grade monster/race earns skill-choice credits from
+ * level 1 on the same cadence as F. G is capped explicitly by the F band (see
+ * `isSkillChoiceMilestone`), because F's own skill-choice entry (0) would
+ * otherwise overlap and cap every G level.
  */
 export const SKILL_CHOICE_ENTRY: Partial<Record<Grade, number>> = {
+  G: 0,
   F: 0,
   E: 25,
   D: 100,
@@ -202,10 +206,12 @@ export const SKILL_CHOICE_ENTRY: Partial<Record<Grade, number>> = {
 
 /**
  * The configurable number of levels between skill-choice CREDITS, per grade.
- * G is intentionally absent: G grades earn no skill-choice credits. Each value is
- * an integer 1..250 (validated by `houseRulesConfigSchema`).
+ * G is now configurable too (default 5): a G-grade track earns credits on the
+ * same cadence as F, but is capped by the F band (see `isSkillChoiceMilestone`).
+ * Each value is an integer 1..250 (validated by `houseRulesConfigSchema`).
  */
 export interface SkillChoiceIntervals {
+  G: number
   F: number
   E: number
   D: number

@@ -45,24 +45,38 @@ rarity ladder are treated as **data/configuration**, not hard-coded formulas, si
 neither is pinned by a source table. The schedule is encoded per skill in the
 catalog `config`; the service reads it live.
 
-A `skills` catalog entry's config supports (all optional, or partial for legacy
-entries that remain readable/editable as metadata-only):
+A `skills` catalog entry's config supports (all optional except `track`, which is
+mandatory on a NEW or CONFIG-CHANGED entry; legacy entries missing it are read as
+`"race"` by the migration backfill and an unknown track is read safely and ignored
+for offers):
 
 ```ts
 {
-  // The advancing track this offer applies to: "class" | "profession".
-  // Legacy entries may carry an arbitrary string; it is read safely and ignored
-  // for offers. A NEW or CONFIG-CHANGED skill must use the enum value.
-  track?: "class" | "profession",
-  // The track level at which this skill is offered (non-negative integer).
+  // The advancing track this offer applies to: "race" | "class" | "profession".
+  // Mandatory on a NEW or CONFIG-CHANGED skill. A legacy entry that predates the
+  // mandatory track is backfilled to "race" by migration 0023; an arbitrary legacy
+  // string is read safely and ignored for offers.
+  track: "race" | "class" | "profession",
+  // Optional legacy annotation: the track level at which this skill is offered.
+  // No longer gates eligibility - a scheduled credit offers any matching-track skill
+  // at any milestone of its track. Kept only as a readable legacy hint.
   milestone?: number,
   // Choice group the skill belongs to; options sharing a group are offered
-  // together (defaults to "standard" when absent).
+  // together (defaults to "standard" when absent). IGNORED for a scheduled credit,
+  // which always collapses into a single "standard" offer.
   choiceGroup?: string,
   // Restrict this skill to the selected class/profession catalog stableId. When
   // present - even as an empty array - the restriction applies via `includes`;
   // an empty list offers nothing, while an absent list imposes no restriction.
+  // IGNORED for a scheduled credit (all matching-track skills are eligible).
   eligibleDefinitionStableIds?: string[],
+  // Optional class tie. Priority-ONLY: a skill whose `classStableId` matches the
+  // offer's snapshotted `classStableIdAtEarn` sorts FIRST among the offer options;
+  // a nonmatching class-tied skill is still offered (never hidden), only later.
+  // Never restricts eligibility. Must reference an existing class; a NEW selection
+  // must be an ACTIVE class (an unchanged prior reference to an archived class is
+  // tolerated).
+  classStableId?: string,
   // Ordered rarity tier (Inferior..Divine, plus the incomparable `Unique`).
   // A NEW or CONFIG-CHANGED skill must declare a valid rarity; a legacy entry
   // without one stays readable and metadata-only-editable.
@@ -88,21 +102,30 @@ entries that remain readable/editable as metadata-only):
 }
 ```
 
-- An **offer-eligible milestone skill requires BOTH `track` and `milestone`**.
-  A new/changed config that declares exactly one is rejected by the service with
-  `invalid_config`; a legacy entry with neither (or a metadata-only partial) stays
-  readable and editable.
-- When a character **levels up** a class/profession track, the service queries the
-  unarchived `skills` catalog and keeps only entries whose config `track` /
-  `milestone` **exactly** match the advanced track and the reached level, whose
-  explicit catalog `grade` (when set) **exactly equals** the character's current
-  race grade (no inferred compatibility), and whose `eligibleDefinitionStableIds`
-  (when present) includes the character's selected class/profession stableId.
-- The surviving entries are grouped by `choiceGroup ?? "standard"`. **Exactly one
-  offer per group** is created (unique on character/track/level/choiceGroup) and
-  carries read-only option snapshots (name + config), so a later catalog edit never
-  rewrites what the character was actually offered. Quarter-only advances produce
-  no offers.
+- A **NEW or CONFIG-CHANGED skill must declare a `track`** (`"race"`, `"class"` or
+  `"profession"`). A config missing `track` is rejected by the service with
+  `invalid_config`; the migration 0023 backfills a missing `track` in persisted
+  `skills` rows to `"race"` so a legacy entry stays readable without authoring
+  every one. `milestone` is now an optional legacy annotation with no paired
+  requirement and no offer gating.
+- When a character **levels up** a class/profession track **or an independent
+  (monster) race**, the service queries the unarchived `skills` catalog and keeps
+  only entries whose config `track` **exactly** matches the advanced track and
+  whose explicit catalog `grade` (when set) **exactly equals** the earned grade (no
+  inferred compatibility). The skill's `milestone` and `eligibleDefinitionStableIds`
+  are legacy annotations **ignored** for a scheduled credit: every matching-typed
+  skill is offered at any credit milestone. The `choiceGroup` is also ignored - all
+  surviving options collapse into the single `"standard"` offer.
+- The surviving entries are ordered deterministically **before insert**: a skill
+  whose `classStableId` matches the offer's snapshotted `classStableIdAtEarn` (the
+  character's selected CLASS at EARNING time) sorts first (class tie), then by name
+  casefold, then stableId, then id. A nonmatching class-tied skill is never hidden -
+  it merely sorts after a class match. Provenance (`earnedGrade`,
+  `trackDefinitionStableId`, `classStableIdAtEarn`) is persisted on the offer;
+  legacy/imported offers are never backfilled. **Exactly one offer per credit** is
+  created (unique on character/track/level/choiceGroup) and carries read-only option
+  snapshots (name + config), so a later catalog edit never rewrites what the
+  character was actually offered. Quarter-only advances produce no offers.
 - The player (or an admin) **selects** one option from a pending offer; that links
   the skill as a character association (kind `SKILL`) and stamps the offer
   `selected`. Administrators can also **grant** a skill manually (provenance
@@ -148,9 +171,19 @@ entries that remain readable/editable as metadata-only):
   titles/equipment effects are. Editing a skill's `effects` recalculates the live
   status without rewriting historical awards. An archived linked skill contributes
   no effect and is shown as unavailable.
-- A **legacy `track` string** that is not `"class"` / `"profession"` is read
-  safely (no parse error) and ignored for offers; a NEW or CONFIG-CHANGED skill
+- A **legacy `track` string** that is not `"race"` / `"class"` / `"profession"` is
+  read safely (no parse error) and ignored for offers; a NEW or CONFIG-CHANGED skill
   must use the enum value or the service rejects it with `invalid_config`.
+- A NEW or CONFIG-CHANGED skill that declares an optional **`classStableId`** must
+  reference an existing `classes` catalog entry. A **prior** reference (the skill
+  already ties to that same class) may be an archived class, but a **NEW** selection
+  (a value that differs from the existing config) must reference an **active** class,
+  and a create always requires an active class. On import paths the class may be
+  authored by the same upload. The class tie drives **option ordering only** - it
+  never restricts eligibility (a nonmatching class-tied skill is still offered, just
+  later). Renaming a class's `stableId` is rejected with 409 `class_stable_id_in_use`
+  while any skill config's `classStableId` still names the old id, so the class-tie
+  priority is never silently defanged (archiving a class is always allowed).
 - A catalog config edit that would put two **already-linked** skills on the same
   character into the same `upgradeGroup` is rejected with 409 `link_collision`
   (atomic rollback), just like an equipment `slot` or title `upgradeGroup`
@@ -163,20 +196,24 @@ entries that remain readable/editable as metadata-only):
 ## Skill-choice credit schedule (per grade)
 
 In addition to the per-skill `milestone` entries, a class/profession track level-up
-may award a skill-choice **credit** on a **grade-keyed configurable schedule**, even
-when the catalog contains zero matching skills at that level. House rules
-`skillChoiceIntervals` map each grade (F/E/D/C/B/A/S) to the number of levels
-between credits (each an integer `1..250`; G earns no credits). When a track levels
-up, the service consults the pure helper
+**or an independent (monster) race level-up** may award a skill-choice **credit** on
+a **grade-keyed configurable schedule**, even when the catalog contains zero
+matching skills at that level. House rules `skillChoiceIntervals` map each grade
+(G/F/E/D/C/B/A/S) to the number of levels between credits (each an integer
+`1..250`). When a track levels up, the service consults the pure helper
 `isSkillChoiceMilestone(grade, level, intervals)`; on a milestone it creates exactly
 one `choiceGroup: "standard"` offer for that `(track, level)`, even with zero
 eligible skills.
 
 The schedule uses the **stored track grade** when present (authoritative); a legacy
-ungraded track falls back to its **race grade**. Entries:
+ungraded track falls back to its **race grade**. For a monster race the earned grade
+is the race's own grade and the track stableId is the race's catalog stableId (the
+race identity is preserved across evolution, never re-derived). A monster earns a
+race skill offer and never a class/profession offer. Entries:
 
 | Grade | Skill-choice entry | Default interval |
 | ----- | ------------------ | ---------------- |
+| G     | 0                  | 5                |
 | F     | 0                  | 5                |
 | E     | 25                 | 5                |
 | D     | 100                | 20               |
@@ -184,7 +221,6 @@ ungraded track falls back to its **race grade**. Entries:
 | B     | 350                | 40               |
 | A     | 500                | 50               |
 | S     | 750                | 60               |
-| G     | (none)             | (no credits)     |
 
 A credit is earned only when ALL of these hold: `level > entry`;
 `(level - entry) % interval === 0`; and `level` is within the grade's applicable
@@ -195,13 +231,22 @@ entry, and never awards at or past the next grade's entry - so an E-grade level-
 (whose next grade D begins at 100) does not earn an E credit, and a D-grade
 level-200 (C begins at 200) does not earn a D credit.
 
+**G is special** because its next grade is F and F's skill-choice entry is 0 - the
+same as G's own entry - so the "next grade's entry" cannot be the upper bound (it
+would cap every G level). Instead G caps at the F band's published max (24),
+exclusive: a G-grade track credits on the same cadence as F (levels 5/10/15/20 with a
+G interval of 5) and never credits at the move into the next band (level 25). This
+deliberately differs from the grade-band `entryLevel` (0 for G, 10 for F); the
+skill-choice schedule overlays its own semantics.
+
 At a credit milestone the offer options come only from unarchived skills whose
-config `track` equals the advanced track, whose `milestone` equals the reached
-level, whose catalog `grade` (when set) equals the earned grade, and whose
-`eligibleDefinitionStableIds` (when present) includes the track's definition
-stableId. The skill's own `choiceGroup` is **ignored** at a credit milestone: every
+config `track` equals the advanced track and whose catalog `grade` (when set) equals
+the earned grade. The skill's `milestone`, `choiceGroup` and
+`eligibleDefinitionStableIds` are all **ignored** at a credit milestone: every
 surviving skill collapses into the single `"standard"` offer (which is created even
-when the list is empty). Credits are never multiplied per matching skill.
+when the list is empty). Credits are never multiplied per matching skill. Options
+are ordered deterministically (class tie first, then name, then stableId, then id)
+using the offer's snapshotted `classStableIdAtEarn`.
 
 ## Refreshing a pending scheduled credit (POST /api/characters/[id]/skills/refresh)
 
@@ -216,11 +261,13 @@ exists to close that gap: it re-queries the unarchived `skills` catalog and appe
   `trackDefinitionStableId` both set) that are still active (not selected, not
   canceled) are considered. A legacy offer lacking provenance is left untouched.
 - **Eligibility is identical to the original credit** (shared helper,
-  `skillDefMatchesScheduledOffer`): the config `track` is exact, the `milestone`
-  equals the offer level, the catalog `grade` (when set) equals the saved earned
-  grade exactly, and `eligibleDefinitionStableIds` (when present) includes the saved
-  track stableId. The skill's own `choiceGroup` is ignored, and archived skills never
-  appear.
+  `skillDefMatchesScheduledOffer`): the config `track` is exact, and the catalog
+  `grade` (when set) equals the saved earned grade exactly. The `milestone` /
+  `choiceGroup` / `eligibleDefinitionStableIds` annotations are ignored, and archived
+  skills never appear. The appended options are re-sorted deterministically in the
+  returned view (class tie matching the offer's `classStableIdAtEarn` first, then
+  name casefold, then stableId, then id); a nonmatching class-tied skill is never
+  hidden.
 - **Immutability.** Existing option snapshots are never modified, even if the skill
   has since been edited or archived. Only new rows are appended; the DB unique
   `(offerId, definitionId)` plus `createMany({ skipDuplicates: true })` make a
@@ -274,12 +321,16 @@ history of what was offered (and when) is preserved.
 The current backup schema is `primal-character/7`, and every exported skill offer
 carries the full append-only offer state: a non-negative `generation` and a
 nullable `canceledAt`. A scheduled offer additionally carries the schedule-credit
-provenance pair `earnedGrade` (the grade whose skill-choice interval awarded the
-offer) and `trackDefinitionStableId` (the selected track's catalog stableId at the
-moment the credit was earned) - the two are emitted **together**, so a legacy offer
-(both null) omits both and its backup shape is unchanged. The importer persists
-both columns and validates the pair: a malformed grade, an empty stableId, or one
-present without the other is rejected. A legacy v6 backup
+provenance `earnedGrade` (the grade whose skill-choice interval awarded the offer),
+`trackDefinitionStableId` (the selected track's catalog stableId at the moment the
+credit was earned) and `classStableIdAtEarn` (the character's selected CLASS
+snapshotted at EARNING time for a class/profession credit, null for a monster race
+credit) - the grade/track pair are emitted **together**, and `classStableIdAtEarn`
+is emitted within that same provenance block (it is nullable and omitted on a
+legacy offer, whose backup shape is unchanged). The importer persists all three
+columns and validates the pair: a malformed grade, an empty stableId, or one
+present without the other is rejected; `classStableIdAtEarn` only needs to be
+nonempty when present. A legacy v6 backup
 (`primal-character/6`) carries the same append-only offer state (but no provenance,
 which reads back as null), while a v3/v4/v5 backup omits both `generation` and
 `canceledAt` and the importer defaults them to `0`/`null`. A current backup is never

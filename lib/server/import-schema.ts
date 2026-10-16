@@ -240,7 +240,7 @@ const importDateValueSchema = z
 
 /** A skill offer exported from the source character (legacy v3/v4/v5 shape). */
 const skillOfferSchema = z.object({
-  track: z.enum(["class", "profession"]),
+  track: z.enum(["class", "profession", "race"]),
   level: z.number().int().nonnegative(),
   choiceGroup: z.string().min(1),
   // Offer generation. Present only in a v6 backup; a legacy v3/v4/v5 backup omits
@@ -270,7 +270,7 @@ const skillOfferSchema = z.object({
  * historical offer's snapshots.
  */
 const skillOfferSchemaV6 = z.object({
-  track: z.enum(["class", "profession"]),
+  track: z.enum(["class", "profession", "race"]),
   level: z.number().int().nonnegative(),
   choiceGroup: z.string().min(1),
   generation: z.number().int().nonnegative(),
@@ -287,18 +287,33 @@ const skillOfferSchemaV6 = z.object({
 
 /**
  * The v7 skill-offer shape. It is the v6 shape plus the schedule-credit
- * provenance pair, both optional nullable for backward compatibility with a
- * legacy backup that predates provenance (a v3/v4/v5/v6 offer omits both and
- * reads back as null on import). For a SCHEDULED offer both must be present
- * together: `earnedGrade` is the grade whose skill-choice interval awarded the
- * offer, and `trackDefinitionStableId` is the selected track's catalog stableId
- * at the moment the credit was earned. The superRefine rejects a malformed
- * grade, an empty stableId, and a mismatched pair (one set without the other).
+ * provenance, all optional nullable for backward compatibility with a
+ * legacy backup that predates provenance (a v3/v4/v5/v6 offer omits them and
+ * reads back as null on import). For a SCHEDULED offer `earnedGrade` and
+ * `trackDefinitionStableId` must be present together: `earnedGrade` is the grade
+ * whose skill-choice interval awarded the offer, and `trackDefinitionStableId` is
+ * the selected track's catalog stableId at the moment the credit was earned.
+ * `classStableIdAtEarn` is the character's selected CLASS at EARNING time (null
+ * for a monster race credit); when supplied it must be a nonempty stableId and it
+ * is priority-only (deterministic option ordering), never eligibility. It is only
+ * MEANINGFUL on a scheduled class/profession credit: an offer that carries BOTH
+ * `earnedGrade` and `trackDefinitionStableId` AND is on the 'class' or
+ * 'profession' track. A monster RACE credit has no earned class, and a
+ * legacy/untyped offer (no provenance) has no snapshot, so on those the snapshot
+ * must be null or omitted - never a real value that would attach earned-class
+ * priority where none belongs. The superRefine rejects a malformed grade, an
+ * empty stableId, a mismatched provenance pair (one set without the other), and a
+ * nonnull `classStableIdAtEarn` on a race or legacy offer.
  */
 const skillOfferSchemaV7 = skillOfferSchemaV6
   .extend({
     earnedGrade: gradeSchema.nullable().optional(),
     trackDefinitionStableId: z.string().min(1).nullable().optional(),
+    // Snapshot of the character's selected class stableId at EARNING time.
+    // Optional nullable; when present it must be a nonempty string. Priority-only,
+    // never eligibility. Null for a monster (race) credit. Allowed only on a
+    // scheduled class/profession offer (see superRefine).
+    classStableIdAtEarn: z.string().min(1).nullable().optional(),
   })
   .superRefine((data, ctx) => {
     const hasGrade = data.earnedGrade != null
@@ -309,6 +324,26 @@ const skillOfferSchemaV7 = skillOfferSchemaV6
         message:
           "A scheduled skill offer must carry both earnedGrade and trackDefinitionStableId together (or neither)",
         path: ["earnedGrade"],
+      })
+    }
+
+    // A nonnull `classStableIdAtEarn` is valid only on a scheduled class or
+    // profession credit: BOTH provenance halves present AND the offer track is
+    // 'class'/'profession'. A race credit has no earned class and a legacy/untyped
+    // offer (no provenance) has no snapshot, so a supplied snapshot on those is
+    // rejected rather than silently attaching earned-class priority.
+    const hasProvenance =
+      data.earnedGrade != null && data.trackDefinitionStableId != null
+    const isClassProfTrack =
+      data.track === "class" || data.track === "profession"
+    if (
+      data.classStableIdAtEarn != null &&
+      !(hasProvenance && isClassProfTrack)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `An earned-class snapshot (classStableIdAtEarn) is only valid on a scheduled class or profession offer that carries both earnedGrade and trackDefinitionStableId (got track "${data.track}")`,
+        path: ["classStableIdAtEarn"],
       })
     }
   })
@@ -445,9 +480,10 @@ const inventoryRefSchemaV7 = z.object({
  * skill-offer shape, inventory, ring positions) plus the god + tier blessing
  * model: a blessing association references a `gods` definition and carries a
  * REQUIRED `tier`. A v7 skill offer may additionally carry the schedule-credit
- * provenance pair (`earnedGrade` + `trackDefinitionStableId`, optional nullable
- * and validated together). This is the ONLY schema `exportCharacter` emits;
- * legacy v3-v6 documents still parse and are accepted unless they carry a
+ * provenance (`earnedGrade` + `trackDefinitionStableId`, optional nullable and
+ * validated together, plus the optional nullable `classStableIdAtEarn` earning-time
+ * class snapshot that is nonempty-when-present). This is the ONLY schema
+ * `exportCharacter` emits; legacy v3-v6 documents still parse and are accepted unless they carry a
  * blessing association (the service layer rejects those with a migration
  * notice).
  */

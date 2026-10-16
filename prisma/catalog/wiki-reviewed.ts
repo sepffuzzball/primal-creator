@@ -18,8 +18,10 @@
  *     with `effects: []` rather than a fabricated universal bonus. A god records
  *     its numeric blessing effects under `blessingEffects`; a tier with no
  *     reliable source number is omitted from that map (the link stays valid but
- *     carries no synthesized bonus). Skills that have no configured milestone are
- *     stored without `track` / `milestone`, so they are never auto-offered.
+ *     carries no synthesized bonus). Every skill now carries an explicit `track`
+ *     (`"race"`), because a skill without a track is incomplete under the modern
+ *     config rules; a skill that has no configured milestone is simply offered at
+ *     any matching milestone of its track.
  *
  * Source terms: the Fandom wiki forbids automated scraping (direct page fetches
  * often return 403), so entries are reviewed manually and never re-fetched.
@@ -85,9 +87,10 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     stableId: "one-step-mile",
     name: "One Step Mile",
     description:
-      "A descriptive speed skill. It carries no configured track/milestone, so the offer generator never auto-offers it at a class/profession milestone; it is metadata-only until an admin adds a milestone.",
+      "A descriptive speed skill. It carries a race track (backfilled from the manifest's missing-track default) but no milestone annotation, so it is only ever matched by exact track + grade and is never gated on a milestone; it is metadata-only until an admin adds a milestone.",
     sourceUrl: "https://the-primal-hunter.fandom.com/wiki/One_Step_Mile",
     config: {
+      track: "race",
       effects: [],
       rarity: "Ancient",
     },
@@ -97,10 +100,11 @@ export const WIKI_REVIEWED_ENTRIES: readonly WikiReviewedEntry[] = [
     stableId: "gaze-of-the-apex-hunter",
     name: "Gaze of the Apex Hunter",
     description:
-      "A descriptive skill of the Apex Hunter. Like One Step Mile it has no configured track/milestone, so it is never auto-offered at a milestone.",
+      "A descriptive skill of the Apex Hunter. Like One Step Mile it carries a race track (backfilled from the manifest's missing-track default) but no milestone annotation, so it is never gated on a milestone.",
     sourceUrl:
       "https://the-primal-hunter.fandom.com/wiki/Gaze_of_the_Apex_Hunter",
     config: {
+      track: "race",
       effects: [],
       rarity: "Legendary",
     },

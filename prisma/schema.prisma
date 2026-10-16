@@ -364,7 +364,8 @@ model SkillOffer {
   id                   String             @id @default(cuid())
   characterId          String
   character            Character          @relation(fields: [characterId], references: [id], onDelete: Cascade)
-  // The advancing track the offer was generated for: "class" or "profession".
+  // The advancing track the offer was generated for: "race", "class" or
+  // "profession".
   track                String
   // The track level reached at the time the offer was generated.
   level                Int
@@ -396,6 +397,12 @@ model SkillOffer {
   // Catalog stableId of the selected track (class or profession) at the moment
   // the credit was earned. Null on legacy/imported offers. Never backfilled.
   trackDefinitionStableId String?
+  // Catalog stableId of the character's selected CLASS at the moment the credit
+  // was earned, snapshotted at EARNING time for class/profession credits and null
+  // for a monster race credit (which has no class). Priority-only (drives
+  // deterministic option ordering), never eligibility. Null on legacy/imported
+  // offers. Never backfilled.
+  classStableIdAtEarn    String?
 
   @@unique([characterId, track, level, choiceGroup, generation])
   @@index([characterId])

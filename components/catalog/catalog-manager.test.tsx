@@ -1161,6 +1161,293 @@ describe("structured catalog editors", () => {
   })
 })
 
+describe("skill type and class priority", () => {
+  afterEach(() => cleanup())
+
+  it("requires a type before creating and submits classification by stable ID", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: [] }
+      if (url === "/api/catalog/classes")
+        return {
+          items: [
+            {
+              ...item,
+              id: "db-class",
+              stableId: "warrior",
+              name: "Warrior",
+              archived: false,
+            },
+          ],
+        }
+      if (init?.method === "POST") return { item }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Slash" },
+    })
+    fireEvent.change(screen.getByLabelText("Rarity"), {
+      target: { value: "Common" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit)?.method === "POST"
+      )
+    ).toBe(false)
+    expect(screen.getByText("Choose a skill type before saving.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("option", { name: "Profession" }))
+    fireEvent.change(screen.getByLabelText("Class tie"), {
+      target: { value: "warrior" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "POST"
+    )
+    const body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body.config).toMatchObject({
+      track: "profession",
+      classStableId: "warrior",
+      rarity: "Common",
+    })
+    expect(JSON.stringify(body)).not.toContain("db-class")
+  })
+
+  it.each(["Race", "Class"])("creates a %s skill", async (type) => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills" || url === "/api/catalog/classes")
+        return { items: [] }
+      if (init?.method === "POST") return { item }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: `${type} skill` },
+    })
+    fireEvent.change(screen.getByLabelText("Rarity"), {
+      target: { value: "Common" },
+    })
+    fireEvent.click(screen.getByRole("option", { name: type }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "POST"
+    )
+    expect(
+      JSON.parse((call?.[1] as RequestInit).body as string).config.track
+    ).toBe(type.toLowerCase())
+  })
+
+  it("backfills a legacy skill as Race on edit and keeps legacy annotations on config changes", async () => {
+    const fixture = {
+      ...item,
+      id: "db-skill",
+      kind: "skills",
+      stableId: "legacy-skill",
+      name: "Legacy",
+      config: {
+        rarity: "Common",
+        effects: [{ type: "damage", amount: 3 }],
+        milestone: 12,
+        eligibleDefinitionStableIds: ["def-alpha"],
+      },
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: [fixture] }
+      if (url === "/api/catalog/classes") return { items: [] }
+      if (init?.method === "PATCH") return { item: fixture }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    expect(
+      screen.getByText(/Race is selected as the migrated default/)
+    ).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+      target: { value: JSON.stringify({ ...fixture.config, rarity: "Rare" }) },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    expect(
+      JSON.parse((call?.[1] as RequestInit).body as string).config
+    ).toEqual({ ...fixture.config, rarity: "Rare" })
+  })
+
+  it("changes and clears class ties while preserving rarity, effects and legacy annotations", async () => {
+    const fixture = {
+      ...item,
+      id: "db-skill",
+      kind: "skills",
+      stableId: "skill-x",
+      name: "Skill",
+      config: {
+        track: "class",
+        classStableId: "class-old",
+        rarity: "Rare",
+        effects: [{ kind: "damage" }],
+        milestone: 4,
+        eligibleDefinitionStableIds: ["definition-one"],
+      },
+    }
+    const classes = ["class-old", "class-new"].map((stableId) => ({
+      ...item,
+      id: `db-${stableId}`,
+      kind: "classes",
+      stableId,
+      name: stableId === "class-old" ? "Old Class" : "New Class",
+      archived: false,
+    }))
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: [fixture] }
+      if (url === "/api/catalog/classes") return { items: classes }
+      if (init?.method === "PATCH") return { item: fixture }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    const tie = screen.getByLabelText("Class tie")
+    fireEvent.change(tie, { target: { value: "class-new" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    let call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    let saved = JSON.parse((call?.[1] as RequestInit).body as string).config
+    expect(saved).toMatchObject({
+      track: "class",
+      classStableId: "class-new",
+      rarity: "Rare",
+      effects: fixture.config.effects,
+      milestone: 4,
+      eligibleDefinitionStableIds: ["definition-one"],
+    })
+    cleanup()
+
+    mock.mockClear()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: [fixture] }
+      if (url === "/api/catalog/classes") return { items: classes }
+      if (init?.method === "PATCH") return { item: fixture }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.change(screen.getByLabelText("Class tie"), {
+      target: { value: "" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    saved = JSON.parse((call?.[1] as RequestInit).body as string).config
+    expect(saved).not.toHaveProperty("classStableId")
+    expect(saved).toMatchObject({
+      track: "class",
+      rarity: "Rare",
+      effects: fixture.config.effects,
+      milestone: 4,
+      eligibleDefinitionStableIds: ["definition-one"],
+    })
+  })
+
+  it("keeps an existing archived class tie and shows its unavailable label", async () => {
+    const fixture = {
+      ...item,
+      id: "db-skill",
+      kind: "skills",
+      stableId: "skill-x",
+      name: "Skill",
+      config: { track: "race", classStableId: "old-class", rarity: "Common" },
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: [fixture] }
+      if (url === "/api/catalog/classes") return { items: [] }
+      if (init?.method === "PATCH") return { item: fixture }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    expect(
+      screen.getByRole("option", { name: /old-class.*unavailable or archived/ })
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    expect(
+      JSON.parse((call?.[1] as RequestInit).body as string)
+    ).not.toHaveProperty("config")
+  })
+
+  it("shows class loading errors and retries rather than saving against an unknown catalog", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    let classRequests = 0
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/classes") {
+        classRequests += 1
+        if (classRequests === 1) throw new Error("Classes offline")
+        return { items: [] }
+      }
+      if (url === "/api/catalog/skills") return { items: [] }
+      if (init?.method === "POST") return { item }
+      return { items: [] }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    expect(screen.getByText("Classes offline")).toBeTruthy()
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Slash" },
+    })
+    fireEvent.change(screen.getByLabelText("Rarity"), {
+      target: { value: "Common" },
+    })
+    fireEvent.click(screen.getByRole("option", { name: "Race" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit)?.method === "POST"
+      )
+    ).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit)?.method === "POST"
+      )
+    ).toBe(true)
+  })
+})
+
 describe("structured catalog editor legacy and sparse rows", () => {
   afterEach(() => cleanup())
 
@@ -2317,6 +2604,7 @@ describe("grade descriptions and equipment stats", () => {
         return { item: fixture ?? catalogItem(kind) }
       if (url === `/api/catalog/${kind}`)
         return { kind, items: fixture ? [fixture] : [] }
+      if (url === "/api/catalog/classes") return { kind: "classes", items: [] }
       if (url === "/api/catalog/gods")
         return {
           kind: "gods",
@@ -2351,6 +2639,7 @@ describe("grade descriptions and equipment stats", () => {
       })
       if (kind === "races")
         fireEvent.click(screen.getByRole("option", { name: "G" }))
+      else fireEvent.click(screen.getByRole("option", { name: "Race" }))
       fireEvent.change(screen.getByLabelText("G-grade description"), {
         target: { value: "  Grade G copy  " },
       })

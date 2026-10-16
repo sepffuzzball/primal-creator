@@ -30,7 +30,7 @@ function skillEntry(stableId: string, name = stableId): WikiReviewedEntry {
     name,
     description: `Description for ${name}`,
     sourceUrl: `https://example.com/${stableId}`,
-    config: { effects: [], rarity: "Common" },
+    config: { track: "race", effects: [], rarity: "Common" },
   }
 }
 
@@ -1172,5 +1172,47 @@ describe("catalog import (unit, mocked db)", () => {
     )!
     expect(god.kind).toBe("gods")
     expect(god.grade).toBeNull()
+  })
+
+  it("rejects a manifest skill that omits a track (preview and apply, no write)", async () => {
+    // A NEW manifest skill must be typed so it can actually be offered; an
+    // `effects`+`rarity`-only config (no track) is an incomplete modern config.
+    const bad: WikiReviewedEntry[] = [
+      {
+        ...skillEntry("untracked-skill"),
+        config: { effects: [], rarity: "Common" },
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining('"track"'),
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining('"track"'),
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a manifest skill carrying an invalid track value (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        ...skillEntry("bad-track-skill"),
+        config: { track: "Class", effects: [], rarity: "Common" },
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining('"track"'),
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining('"track"'),
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
   })
 })

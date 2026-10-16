@@ -70,6 +70,36 @@ function baseDoc(
 }
 
 describe("import document skill-offer canceledAt validation", () => {
+  it("accepts a v6 race-track offer (track 'race')", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      baseDoc(IMPORT_SCHEMA_V6, [
+        {
+          track: "race",
+          level: 5,
+          choiceGroup: "standard",
+          generation: 0,
+          canceledAt: null,
+          options: [],
+        },
+      ])
+    )
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a legacy v3 race-track offer (track 'race')", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      baseDoc(IMPORT_SCHEMA_V3, [
+        {
+          track: "race",
+          level: 5,
+          choiceGroup: "standard",
+          options: [],
+        },
+      ])
+    )
+    expect(parsed.success).toBe(true)
+  })
+
   it("accepts a v6 offer with a null canceledAt (active offer)", () => {
     const parsed = characterImportDocumentSchema.safeParse(
       baseDoc(IMPORT_SCHEMA_V6, [
@@ -500,6 +530,17 @@ describe("import document v7 skill-offer schedule provenance pair", () => {
     expect(parsed.success).toBe(true)
   })
 
+  it("accepts a scheduled monstrous race offer (track 'race')", () => {
+    const parsed = parse([
+      v7Offer({
+        track: "race",
+        earnedGrade: "G",
+        trackDefinitionStableId: "wyrm",
+      }),
+    ])
+    expect(parsed.success).toBe(true)
+  })
+
   it("rejects a malformed grade even when the pair is otherwise complete", () => {
     const parsed = parse([
       v7Offer({ earnedGrade: "X", trackDefinitionStableId: "archer" }),
@@ -523,4 +564,88 @@ describe("import document v7 skill-offer schedule provenance pair", () => {
     const parsed = parse([v7Offer({ trackDefinitionStableId: "archer" })])
     expect(parsed.success).toBe(false)
   })
+
+  it("accepts a scheduled class offer with both provenance fields and the earning-time class snapshot", () => {
+    const parsed = parse([
+      v7Offer({
+        earnedGrade: "F",
+        trackDefinitionStableId: "archer",
+        classStableIdAtEarn: "archer",
+      }),
+    ])
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a scheduled profession offer with both provenance fields and the earning-time class snapshot", () => {
+    const parsed = parse([
+      v7Offer({
+        track: "profession",
+        earnedGrade: "F",
+        trackDefinitionStableId: "alchemist",
+        classStableIdAtEarn: "archer",
+      }),
+    ])
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a scheduled class offer with both provenance fields and a null class snapshot", () => {
+    const parsed = parse([
+      v7Offer({
+        earnedGrade: "F",
+        trackDefinitionStableId: "archer",
+        classStableIdAtEarn: null,
+      }),
+    ])
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects a legacy offer that omits provenance but carries a nonnull class snapshot", () => {
+    const parsed = parse([v7Offer({ classStableIdAtEarn: "archer" })])
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a race offer that carries a class snapshot even with both provenance fields", () => {
+    const parsed = parse([
+      v7Offer({
+        track: "race",
+        earnedGrade: "G",
+        trackDefinitionStableId: "wyrm",
+        classStableIdAtEarn: "archer",
+      }),
+    ])
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a class snapshot on a half-provided pair", () => {
+    const parsed = parse([
+      v7Offer({ earnedGrade: "F", classStableIdAtEarn: "archer" }),
+    ])
+    expect(parsed.success).toBe(false)
+  })
+
+  it.each([IMPORT_SCHEMA_V3, IMPORT_SCHEMA_V6])(
+    "accepts an older backup offer that has no class snapshot (schema %s)",
+    (schema) => {
+      const parsed = characterImportDocumentSchema.safeParse(
+        baseDoc(schema, [
+          schema === IMPORT_SCHEMA_V6
+            ? {
+                track: "class",
+                level: 1,
+                choiceGroup: "standard",
+                generation: 0,
+                canceledAt: null,
+                options: [],
+              }
+            : {
+                track: "class",
+                level: 1,
+                choiceGroup: "standard",
+                options: [],
+              },
+        ])
+      )
+      expect(parsed.success).toBe(true)
+    }
+  )
 })

@@ -110,11 +110,34 @@ describe("houseRulesConfigSchema", () => {
     ).toThrow()
   })
 
+  it("accepts the G skill-choice grade in the default shape", () => {
+    const parsed = houseRulesConfigSchema.parse(DEFAULT_HOUSE_RULES_CONFIG)
+    expect(parsed.skillChoiceIntervals.G).toBe(5)
+  })
+
   it("rejects a skill-choice interval below 1", () => {
     expect(() =>
       houseRulesConfigSchema.parse(
         cfg({ skillChoiceIntervals: { ...cfg({}).skillChoiceIntervals, F: 0 } })
       )
+    ).toThrow()
+  })
+
+  it("rejects a G skill-choice interval below 1", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse(
+        cfg({ skillChoiceIntervals: { ...cfg({}).skillChoiceIntervals, G: 0 } })
+      )
+    ).toThrow()
+  })
+
+  it("rejects a missing G skill-choice interval key", () => {
+    const intervals: Partial<HouseRulesConfig["skillChoiceIntervals"]> = {
+      ...cfg({}).skillChoiceIntervals,
+    }
+    delete intervals.G
+    expect(() =>
+      houseRulesConfigSchema.parse(cfg({ skillChoiceIntervals: intervals }))
     ).toThrow()
   })
 

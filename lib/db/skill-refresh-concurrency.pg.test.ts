@@ -35,7 +35,7 @@
  * and a concurrent suite never collides.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { randomUUID } from "node:crypto"
 import { prisma } from "@/lib/db/client"
 import {
@@ -61,6 +61,30 @@ describe.skipIf(!gate.run)("skill offer refresh vs selection (real PG)", () => {
   const createdCatalogIds: string[] = []
   const createdUserIds: string[] = []
 
+  /**
+   * Reset ALL state this suite has created so far. The concurrency tests rely on
+   * catalog isolation: under the modern rules a scheduled credit matches ANY skill
+   * with the advancing track and earned grade (`milestone`, `choiceGroup` and
+   * `eligibleDefinitionStableIds` are ignored), so a skill authored by an earlier
+   * test would otherwise leak into every later offer and inflate its option count.
+   * Deleting the suite's characters first (which cascades their offers -> options)
+   * releases the catalog-definition references, then the suite's own catalog rows
+   * are removed. The shared `ownerUser` is created in `beforeAll` and is left
+   * untouched - only suite-created characters and catalog entries are removed.
+   */
+  async function resetSuiteState(): Promise<void> {
+    for (const id of createdCharacterIds) {
+      await prisma.character.deleteMany({ where: { id } })
+    }
+    createdCharacterIds.length = 0
+    if (createdCatalogIds.length > 0) {
+      await prisma.catalogDefinition.deleteMany({
+        where: { id: { in: [...createdCatalogIds] } },
+      })
+    }
+    createdCatalogIds.length = 0
+  }
+
   beforeAll(async () => {
     // Idempotent: a crashed prior run may have left the user behind.
     await prisma.user.upsert({
@@ -75,6 +99,12 @@ describe.skipIf(!gate.run)("skill offer refresh vs selection (real PG)", () => {
       },
     })
     createdUserIds.push(ownerUser.id)
+  })
+
+  beforeEach(async () => {
+    // Isolation: each test (and each racing iteration) must start with only its own
+    // skills/characters in the catalog, so the offer's option count is deterministic.
+    await resetSuiteState()
   })
 
   afterAll(async () => {
@@ -386,6 +416,9 @@ describe.skipIf(!gate.run)("skill offer refresh vs selection (real PG)", () => {
     // lost / skipped the selected offer) or 2 (refresh committed before the
     // selection), and the offer is always selected.
     for (let i = 0; i < 8; i++) {
+      // Isolate the catalog for this iteration so its offer only matches THIS
+      // iteration's skills (the modern rule matches every same-track/grade skill).
+      await resetSuiteState()
       const { characterId, offerId } = await seedBaseFixture(`race-${i}`)
       const trackStable = `stable-race-${i}-${runSuffix}`
       const existingSkillId = `sg-skill-existing-race-${i}-${runSuffix}`

@@ -75,7 +75,7 @@ function validContent(): string {
       name: "Route Skill",
       provenance: "house",
       sourceUrl: "https://example.com/route-skill",
-      config: { effects: [], rarity: "Common" },
+      config: { track: "race", effects: [], rarity: "Common" },
     },
   ])
 }
@@ -234,7 +234,7 @@ describe("POST /api/admin/catalog-import/bulk/preview and /apply (mocked db)", (
       kind: "skills",
       stableId: "route-skill",
       name: "Old Skill",
-      config: { effects: [], rarity: "Common" },
+      config: { track: "race", effects: [], rarity: "Common" },
       archived: false,
     })
     const res = await previewPost(

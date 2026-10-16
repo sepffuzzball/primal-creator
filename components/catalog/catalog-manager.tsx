@@ -233,6 +233,15 @@ export function CatalogManager({ kind }: { kind: string }) {
     Array<{ stableId: string; name: string }>
   >([])
   const [skills, setSkills] = React.useState<CatalogItem[]>([])
+  const [classChoices, setClassChoices] = React.useState<CatalogItem[] | null>(
+    null
+  )
+  const [classChoicesError, setClassChoicesError] = React.useState<
+    string | null
+  >(null)
+  const [skillTrack, setSkillTrack] = React.useState("")
+  const [skillTrackTouched, setSkillTrackTouched] = React.useState(false)
+  const [classTie, setClassTie] = React.useState("")
   const [skillGrantGrade, setSkillGrantGrade] =
     React.useState<(typeof GRADES)[number]>("G")
   const [skillToGrant, setSkillToGrant] = React.useState("")
@@ -335,6 +344,25 @@ export function CatalogManager({ kind }: { kind: string }) {
   const bulkGeneration = React.useRef(0)
   const bulkPreviewRequest = React.useRef(0)
   const catalogUrl = `/api/catalog/${kind}${isAdmin && showArchived ? "?includeArchived=1" : ""}`
+
+  const loadSkillClasses = React.useCallback(async () => {
+    setClassChoicesError(null)
+    try {
+      const response = await apiFetch<CatalogListResponse>(
+        "/api/catalog/classes"
+      )
+      setClassChoices(response.items.filter((entry) => !entry.archived))
+    } catch (err) {
+      setClassChoicesError(
+        err instanceof Error ? err.message : "Could not load classes."
+      )
+      setClassChoices(null)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    if (kind === "skills") void Promise.resolve().then(loadSkillClasses)
+  }, [kind, loadSkillClasses])
 
   function clearBulkPreview() {
     setBulkPreview(null)
@@ -725,6 +753,9 @@ export function CatalogManager({ kind }: { kind: string }) {
     setDescriptionGrade("G")
     setBlessingTier("Baptism")
     setFormError(null)
+    setSkillTrack("")
+    setSkillTrackTouched(false)
+    setClassTie("")
     setDialogOpen(true)
   }, [])
 
@@ -734,6 +765,17 @@ export function CatalogManager({ kind }: { kind: string }) {
     setDescriptionGrade("G")
     setBlessingTier("Baptism")
     setFormError(null)
+    const config = isRecord(item.config) ? item.config : {}
+    setSkillTrack(
+      typeof config.track === "string" &&
+        ["race", "class", "profession"].includes(config.track)
+        ? config.track
+        : "race"
+    )
+    setSkillTrackTouched(false)
+    setClassTie(
+      typeof config.classStableId === "string" ? config.classStableId : ""
+    )
     setDialogOpen(true)
   }, [])
 
@@ -1091,6 +1133,45 @@ export function CatalogManager({ kind }: { kind: string }) {
       setFormError("Choose a supported rarity before creating a skill.")
       return
     }
+    if (kind === "skills") {
+      if (!skillTrack) {
+        setFormError("Choose a skill type before saving.")
+        return
+      }
+      if (classChoices === null) {
+        setFormError(
+          "Class catalog is unavailable. Retry loading classes before saving."
+        )
+        return
+      }
+      const existingTrack = isRecord(editing?.config)
+        ? editing.config.track
+        : undefined
+      if (
+        !editing ||
+        ["race", "class", "profession"].includes(String(existingTrack)) ||
+        skillTrackTouched
+      ) {
+        config.track = skillTrack
+      }
+      if (classTie) {
+        const originalTie = isRecord(editing?.config)
+          ? editing.config.classStableId
+          : undefined
+        if (
+          !classChoices.some((entry) => entry.stableId === classTie) &&
+          originalTie !== classTie
+        ) {
+          setFormError(
+            "Choose an active class, or keep/remove the existing archived class tie."
+          )
+          return
+        }
+        config.classStableId = classTie
+      } else {
+        delete config.classStableId
+      }
+    }
     setSubmitting(true)
     setFormError(null)
     try {
@@ -1169,7 +1250,19 @@ export function CatalogManager({ kind }: { kind: string }) {
     } finally {
       setSubmitting(false)
     }
-  }, [editing, form, gods, kind, load, skills, structuredKind])
+  }, [
+    editing,
+    form,
+    gods,
+    kind,
+    load,
+    skills,
+    structuredKind,
+    skillTrack,
+    skillTrackTouched,
+    classTie,
+    classChoices,
+  ])
 
   const openSource = React.useCallback((url: string | null) => {
     if (url) window.open(url, "_blank", "noopener")
@@ -2464,6 +2557,105 @@ export function CatalogManager({ kind }: { kind: string }) {
                         </div>
                       </>
                     ) : null}
+                    {kind === "skills" ? (
+                      <section
+                        className="flex flex-col gap-2 rounded-md border p-3"
+                        aria-label="Skill classification"
+                      >
+                        <Label htmlFor="skill-track">
+                          Skill type <span className="text-destructive">*</span>
+                        </Label>
+                        <Select
+                          value={skillTrack}
+                          onValueChange={(value) => {
+                            setSkillTrack(String(value ?? ""))
+                            setSkillTrackTouched(true)
+                          }}
+                        >
+                          <SelectTrigger
+                            id="skill-track"
+                            aria-label="Skill type"
+                          >
+                            <SelectValue placeholder="Choose a skill type" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectGroup>
+                              <SelectItem value="race">Race</SelectItem>
+                              <SelectItem value="class">Class</SelectItem>
+                              <SelectItem value="profession">
+                                Profession
+                              </SelectItem>
+                            </SelectGroup>
+                          </SelectContent>
+                        </Select>
+                        {editing &&
+                        (!isRecord(editing.config) ||
+                          !["race", "class", "profession"].includes(
+                            String(editing.config.track)
+                          )) ? (
+                          <p
+                            role="alert"
+                            className="text-xs text-muted-foreground"
+                          >
+                            Legacy skill type is malformed or missing; Race is
+                            selected as the migrated default.
+                          </p>
+                        ) : null}
+                        <Label htmlFor="skill-class-tie">
+                          Class tie (optional)
+                        </Label>
+                        {classChoicesError ? (
+                          <Alert variant="destructive">
+                            {classChoicesError}{" "}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              onClick={() => void loadSkillClasses()}
+                            >
+                              Retry
+                            </Button>
+                          </Alert>
+                        ) : null}
+                        <select
+                          id="skill-class-tie"
+                          aria-label="Class tie"
+                          className="h-9 rounded-md border bg-background px-3 text-sm"
+                          value={classTie}
+                          disabled={classChoices === null}
+                          onChange={(event) => setClassTie(event.target.value)}
+                        >
+                          <option value="">No class</option>
+                          {classChoices?.map((entry) => (
+                            <option key={entry.stableId} value={entry.stableId}>
+                              {entry.name}
+                            </option>
+                          ))}
+                          {classTie &&
+                          !classChoices?.some(
+                            (entry) => entry.stableId === classTie
+                          ) ? (
+                            <option value={classTie}>
+                              {classTie} (unavailable or archived; remove to
+                              clear)
+                            </option>
+                          ) : null}
+                        </select>
+                        {classTie ? (
+                          <p className="text-xs text-muted-foreground">
+                            Class priority:{" "}
+                            {classChoices?.find(
+                              (entry) => entry.stableId === classTie
+                            )?.name ?? classTie}
+                            . This is display priority, not exclusivity.
+                          </p>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            A class tie sets display priority only; it does not
+                            restrict who may learn this skill.
+                          </p>
+                        )}
+                      </section>
+                    ) : null}
                     <Label htmlFor="cat-rarity">Rarity</Label>
                     <select
                       id="cat-rarity"
@@ -3009,24 +3201,26 @@ export function CatalogManager({ kind }: { kind: string }) {
                     })()}
                   </section>
                 ) : null}
-                <details className="rounded-md border p-3">
-                  <summary className="cursor-pointer text-sm font-medium">
-                    Advanced JSON
-                  </summary>
-                  <p className="my-2 text-xs text-muted-foreground">
-                    Unrecognized configuration is preserved. Invalid JSON
-                    disables structured editing and saving.
-                  </p>
-                  <Label htmlFor="cat-config">Config (JSON)</Label>
-                  <Textarea
-                    id="cat-config"
-                    className="max-h-[40vh] min-h-28 resize-y font-mono text-[0.6875rem]"
-                    value={form.configText}
-                    onChange={(e) =>
-                      setForm((f) => ({ ...f, configText: e.target.value }))
-                    }
-                  />
-                </details>
+                {true ? (
+                  <details className="rounded-md border p-3">
+                    <summary className="cursor-pointer text-sm font-medium">
+                      Advanced JSON
+                    </summary>
+                    <p className="my-2 text-xs text-muted-foreground">
+                      Unrecognized configuration is preserved. Invalid JSON
+                      disables structured editing and saving.
+                    </p>
+                    <Label htmlFor="cat-config">Config (JSON)</Label>
+                    <Textarea
+                      id="cat-config"
+                      className="max-h-[40vh] min-h-28 resize-y font-mono text-[0.6875rem]"
+                      value={form.configText}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, configText: e.target.value }))
+                      }
+                    />
+                  </details>
+                ) : null}
               </div>
               {formError ? (
                 <Alert variant="destructive">{formError}</Alert>

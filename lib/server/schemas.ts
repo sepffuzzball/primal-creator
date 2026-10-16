@@ -1288,11 +1288,24 @@ export type SkillEffect = z.infer<typeof catalogEffectSchema>
  * Catalog config for a `skills` entry.
  *
  * `track` is read permissively so a legacy entry carrying an arbitrary string
- * (e.g. "Class") never breaks a read: such a config stays readable/editable and
- * its effects still synthesize, and the unrecognized track is simply ignored for
- * offers (it never matches an advancing "class"/"profession" track). A NEW or
- * CONFIG-CHANGED skill must use the enum value; the service layer rejects any
+ * (e.g. "Class") or no `track` at all never breaks a read: such a config stays
+ * readable/editable and its effects still synthesize, and the unrecognized /
+ * missing track is simply ignored for offers. A NEW or CONFIG-CHANGED skill MUST
+ * declare an exact enum value (`"race"` / `"class"` / `"profession"`); the
+ * service layer rejects a missing track via `isIncompleteSkillConfig` and any
  * other string via `hasInvalidSkillTrack`.
+ *
+ * `milestone`, `choiceGroup` and `eligibleDefinitionStableIds` are retained as
+ * LEGACY annotations carried by offer snapshots: they are still read, imported
+ * and exported verbatim, but they no longer restrict scheduled-credit
+ * eligibility (a scheduled credit ignores them entirely). `milestone` is
+ * optional and has no paired requirement; `choiceGroup` and
+ * `eligibleDefinitionStableIds` likewise only describe the authored intent.
+ *
+ * `classStableId` is an optional, nonempty catalog stableId of a `classes`
+ * entry, valid on ANY track. It is PRIORITY ONLY: it never restricts eligibility
+ * and is used solely to deterministically order offer options so a skill tied to
+ * the earned class sorts first.
  */
 export const skillConfigSchema = z
   .object({
@@ -1300,6 +1313,7 @@ export const skillConfigSchema = z
     milestone: z.number().int().nonnegative().optional(),
     choiceGroup: z.string().min(1).optional(),
     eligibleDefinitionStableIds: z.array(z.string()).optional(),
+    classStableId: z.string().min(1).optional(),
     effects: z.array(skillEffectSchema).optional(),
     upgradeGroup: z.string().optional(),
     rarity: raritySchema.optional(),
@@ -1320,32 +1334,47 @@ export function isIncompleteSkillRarity(
 }
 
 /**
- * A skill config is "offer-incomplete" when it declares exactly one of
- * `track` / `milestone`. An offer-eligible milestone skill requires BOTH: the
- * track the milestone applies to, and the level at which it is offered. Legacy
- * partial configs that carry neither (or carry only one) are still readable and
- * editable as metadata-only, but a NEW or CONFIG-CHANGED skill is rejected by
- * the service layer when this returns true, so an admin cannot create a skill
- * that silently never offers.
+ * A skill config is "incomplete" when it does not declare a `track`. A NEW or
+ * CONFIG-CHANGED skill must be typed (an exact `"race"` / `"class"` /
+ * `"profession"` value); a config that omits `track` entirely is rejected by the
+ * service layer when this returns true so an admin cannot create a skill that
+ * silently never offers. Legacy entries (the migration backfills a missing
+ * `track` in persisted `catalog_definitions` to `"race"`) stay readable and
+ * metadata-only-editable, but a missing `track` is never authoritative for a new
+ * or config-changing write.
  */
 export function isIncompleteSkillConfig(
   config: Record<string, unknown>
 ): boolean {
-  const hasTrack = config.track != null
-  const hasMilestone = config.milestone != null
-  return hasTrack !== hasMilestone
+  return config.track == null
 }
 
 /**
  * Detect a `skills` config whose `track` is present but not a recognized enum
- * value (`"class"` / `"profession"`). A legacy config may carry an arbitrary
- * track string that is safe to read and ignore for offers, but a NEW or
- * CONFIG-CHANGED skill is rejected by the service layer when this returns true.
+ * value (`"race"` / `"class"` / `"profession"`). A legacy config may carry an
+ * arbitrary track string that is safe to read and ignore for offers, but a NEW
+ * or CONFIG-CHANGED skill is rejected by the service layer when this returns
+ * true.
  */
 export function hasInvalidSkillTrack(config: Record<string, unknown>): boolean {
   const track = config.track
   if (track == null) return false
-  return track !== "class" && track !== "profession"
+  return track !== "race" && track !== "class" && track !== "profession"
+}
+
+/**
+ * Extract a skill config's optional `classStableId` as a trimmed nonempty string,
+ * or null when the config declares none (or an empty / malformed value, which the
+ * Zod schema would reject on a write but which a legacy row may still carry).
+ * Priority-only: this never gates eligibility, only sorts offer options.
+ */
+export function skillClassStableIdOf(
+  config: Record<string, unknown>
+): string | null {
+  const value = config.classStableId
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
 }
 
 /**

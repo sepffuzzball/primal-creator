@@ -38,7 +38,7 @@ function skill(
     description: `Description of ${stableId}`,
     provenance: "house",
     sourceUrl: "https://example.com/" + stableId,
-    config: { effects: [], rarity: "Common" },
+    config: { track: "race", effects: [], rarity: "Common" },
     ...extra,
   }
 }
@@ -376,13 +376,13 @@ describe("bulk CSV parsing and validation", () => {
           kind: "skills",
           stableId: "a",
           name: "A",
-          config: '{"effects":[],"rarity":"Common"}',
+          config: '{"track":"race","effects":[],"rarity":"Common"}',
         },
         {
           kind: "skills",
           stableId: "b",
           name: "B",
-          config: '{"effects":[],"rarity":"Common"}',
+          config: '{"track":"race","effects":[],"rarity":"Common"}',
         },
       ],
       { bom: true, crlf: true }
@@ -392,7 +392,11 @@ describe("bulk CSV parsing and validation", () => {
     // Header is line 1, first data row is line 2.
     expect(entries[0].row).toBe(2)
     expect(entries[1].row).toBe(3)
-    expect(entries[0].config).toEqual({ effects: [], rarity: "Common" })
+    expect(entries[0].config).toEqual({
+      track: "race",
+      effects: [],
+      rarity: "Common",
+    })
   })
 
   it("handles a quoted config with an embedded comma and newline", () => {
@@ -411,7 +415,7 @@ describe("bulk CSV parsing and validation", () => {
   it("treats a doubled quote inside a quoted field as a literal quote", () => {
     // name = 'He said "hi"'
     const content =
-      'kind,stableId,name,config\r\nskills,s,"He said ""hi""","{""effects"":[],""rarity"":""Common""}"\r\n'
+      'kind,stableId,name,config\r\nskills,s,"He said ""hi""","{""track"":""race"",""effects"":[],""rarity"":""Common""}"\r\n'
     const [entry] = parseBulkEntries("csv", content)
     expect(entry.name).toBe('He said "hi"')
   })
@@ -494,7 +498,7 @@ describe("bulk CSV parsing and validation", () => {
         kind: "skills",
         stableId: "a",
         name: "A",
-        config: '{"effects":[],"rarity":"Common"}',
+        config: '{"track":"race","effects":[],"rarity":"Common"}',
         gradeDescriptions: '{"G":"  hello  ","S":"world"}',
       },
     ])
@@ -508,7 +512,7 @@ describe("bulk CSV parsing and validation", () => {
         kind: "skills",
         stableId: "a",
         name: "A",
-        config: '{"effects":[],"rarity":"Common"}',
+        config: '{"track":"race","effects":[],"rarity":"Common"}',
       },
     ])
     const entries = parseBulkEntries("csv", content)
@@ -521,7 +525,7 @@ describe("bulk CSV parsing and validation", () => {
         kind: "skills",
         stableId: "a",
         name: "A",
-        config: '{"effects":[],"rarity":"Common"}',
+        config: '{"track":"race","effects":[],"rarity":"Common"}',
         gradeDescriptions: "{not json",
       },
     ])
@@ -536,7 +540,7 @@ describe("bulk CSV parsing and validation", () => {
         kind: "skills",
         stableId: "a",
         name: "A",
-        config: '{"effects":[],"rarity":"Common"}',
+        config: '{"track":"race","effects":[],"rarity":"Common"}',
         gradeDescriptions: "42",
       },
     ])
@@ -582,7 +586,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
     expect(dbMock.store.catalog.size).toBe(1)
     const row = [...dbMock.store.catalog.values()][0]
     expect(row.archived).toBe(false)
-    expect(row.config).toEqual({ effects: [], rarity: "Common" })
+    expect(row.config).toEqual({ track: "race", effects: [], rarity: "Common" })
   })
 
   it("skips an existing row and reports its actual metadata without overwriting it", async () => {
@@ -756,7 +760,7 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
         kind: "skills",
         stableId: "csv-gd",
         name: "Csv Gd",
-        config: '{"effects":[],"rarity":"Common"}',
+        config: '{"track":"race","effects":[],"rarity":"Common"}',
         gradeDescriptions: '{"B":"A B-grade blurb"}',
       },
     ])
@@ -1329,5 +1333,31 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
     expect(applied.skipCount).toBe(1)
     expect(applied.createdIds).toHaveLength(0)
     expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("rejects a skills row that omits a track (parse-time, no write)", async () => {
+    const bad = skill("skills", "untracked", {
+      config: { effects: [], rarity: "Common" },
+    })
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*"track"/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a skills row carrying an invalid track value (parse-time, no write)", async () => {
+    const bad = skill("skills", "bad-track", {
+      config: { track: "Class", effects: [], rarity: "Common" },
+    })
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*"track"/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
   })
 })

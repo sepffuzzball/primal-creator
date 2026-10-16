@@ -33,11 +33,11 @@ import {
  * ------------------------------------------------------------------ */
 
 /**
- * Whether a class/profession track level-up to `level` awards a skill-choice
- * credit for `grade` under the configured `intervals` schedule.
+ * Whether a class/profession (or race) track level-up to `level` awards a
+ * skill-choice credit for `grade` under the configured `intervals` schedule.
  *
  * A credit is earned when ALL of these hold:
- *   - `grade` has a skill-choice entry point (G has none -> never a credit);
+ *   - `grade` has a skill-choice entry point (every grade G..S now has one);
  *   - `level` is strictly ABOVE the grade's entry point;
  *   - `(level - entry) % interval === 0` (a whole number of intervals above the
  *     entry point);
@@ -55,6 +55,12 @@ import {
  * reaching its own entry point (`level > entry` is required), and never awards at
  * or past the next grade's entry point.
  *
+ * G is special: its next grade is F, and F's skill-choice entry is 0 - the same as
+ * G's own - so using the "next grade's entry" as the upper bound would cap every G
+ * level (no level is below 0). Instead G caps at the F band's published max (24),
+ * exclusive. This deliberately differs from the grade-band `entryLevel` (which is
+ * 0 for G and 10 for F); the skill-choice schedule overlays its own semantics.
+ *
  * This is a pure read of `grade`, `level`, and `intervals`; it never consults
  * state or a database.
  */
@@ -65,9 +71,7 @@ export function isSkillChoiceMilestone(
 ): boolean {
   if (!Number.isInteger(level) || level < 0) return false
   const entry = SKILL_CHOICE_ENTRY[grade]
-  if (entry == null) return false // G has no skill-choice credits.
-  // At this point `grade` is never "G" (only G has no skill-choice entry), so the
-  // index is safe; cast past the union so TS knows the key exists.
+  if (entry == null) return false
   const interval = intervals[grade as keyof SkillChoiceIntervals]
   if (
     typeof interval !== "number" ||
@@ -83,11 +87,24 @@ export function isSkillChoiceMilestone(
   // grade's skill-choice entry, so reaching that boundary level belongs to the
   // next grade (E-level-100 / D-level-200 never credit this grade). The top grade
   // S has no next entry and instead caps at its own inclusive band max (999).
+  //
+  // For the G/F overlap, the next grade's skill-choice entry (F = 0) is not
+  // strictly ahead of the current grade's entry (G = 0), so it cannot be used as
+  // the upper bound - it would cap every G level. Instead G caps at the next
+  // grade's published band max (F = 24), exclusive, so a G track credits through
+  // the F band and never at the move into the next band (level 25).
   const next = nextGrade(grade)
-  const hi =
-    next != null
-      ? (SKILL_CHOICE_ENTRY[next] ?? Infinity)
-      : bandForGrade(grade)?.max
+  let hi: number | null | undefined
+  if (next == null) {
+    hi = bandForGrade(grade)?.max
+  } else {
+    const nextEntry = SKILL_CHOICE_ENTRY[next]
+    if (nextEntry != null && nextEntry > entry) {
+      hi = nextEntry
+    } else {
+      hi = bandForGrade(next)?.max
+    }
+  }
   if (hi == null) return false
   if (next != null ? level >= hi : level > hi) return false
   return true

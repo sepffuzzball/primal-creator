@@ -1333,6 +1333,7 @@ describe("grade ceiling level-up blockers", () => {
 
 describe("isSkillChoiceMilestone (skill-choice credit schedule)", () => {
   const intervals: SkillChoiceIntervals = {
+    G: 5,
     F: 5,
     E: 5,
     D: 20,
@@ -1384,6 +1385,7 @@ describe("isSkillChoiceMilestone (skill-choice credit schedule)", () => {
 
   it("honors per-grade configurable intervals", () => {
     const custom: SkillChoiceIntervals = {
+      G: 2,
       F: 3,
       E: 7,
       D: 25,
@@ -1399,10 +1401,34 @@ describe("isSkillChoiceMilestone (skill-choice credit schedule)", () => {
     expect(isSkillChoiceMilestone("E", 33, custom)).toBe(false)
   })
 
-  it("G grades never earn a credit, regardless of level or interval", () => {
+  it("G earns a credit on the same cadence as F, capped by the F band", () => {
+    // G entry is 0; the G/F overlap means F's skill-choice entry (0) cannot be the
+    // upper bound, so G caps at the F band max (24), exclusive.
+    expect(isSkillChoiceMilestone("G", 5, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 10, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 15, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 20, intervals)).toBe(true)
+    // 25 is the move into the next band, never a G credit.
+    expect(isSkillChoiceMilestone("G", 25, intervals)).toBe(false)
+    // G never credits at its own entry.
+    expect(isSkillChoiceMilestone("G", 0, intervals)).toBe(false)
+    // Off-cadence G levels never credit.
     expect(isSkillChoiceMilestone("G", 1, intervals)).toBe(false)
-    expect(isSkillChoiceMilestone("G", 10, intervals)).toBe(false)
-    expect(isSkillChoiceMilestone("G", 250, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("G", 6, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("G", 21, intervals)).toBe(false)
+  })
+
+  it("G honors a custom interval, still capped by the F band", () => {
+    const g2: SkillChoiceIntervals = { ...intervals, G: 2 }
+    expect(isSkillChoiceMilestone("G", 2, g2)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 4, g2)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 24, g2)).toBe(false) // >= F band max 24
+    const g10: SkillChoiceIntervals = { ...intervals, G: 10 }
+    expect(isSkillChoiceMilestone("G", 10, g10)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 20, g10)).toBe(true)
+    expect(isSkillChoiceMilestone("G", 30, g10)).toBe(false)
+    // Off-schedule
+    expect(isSkillChoiceMilestone("G", 15, g10)).toBe(false)
   })
 
   it("rejects invalid (non 1..250) intervals by returning false", () => {

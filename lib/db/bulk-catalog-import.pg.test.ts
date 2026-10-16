@@ -56,7 +56,7 @@ describe.skipIf(!gate.run)("bulk catalog import (real PG)", () => {
         description: "Description",
         provenance: "house",
         sourceUrl: `https://example.com/${s}`,
-        config: { effects: [], rarity: "Common" },
+        config: { track: "race", effects: [], rarity: "Common" },
       },
     ])
   }

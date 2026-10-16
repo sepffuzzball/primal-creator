@@ -56,6 +56,7 @@ import {
   isLegacyTranscendentSkillConfig,
   normalizeCatalogKind,
   parseCatalogConfig,
+  skillClassStableIdOf,
 } from "@/lib/server/schemas"
 import type { Grade } from "@/lib/rules"
 
@@ -259,13 +260,13 @@ export function assertModernConfig(
   if (kind === "skills" && isIncompleteSkillConfig(config)) {
     throw badRequest(
       "invalid_config",
-      'Skill config is offer-incomplete: an offer-eligible milestone skill requires both a "track" and a "milestone"'
+      'Skill config requires a "track": expected "race", "class" or "profession"'
     )
   }
   if (kind === "skills" && hasInvalidSkillTrack(config)) {
     throw badRequest(
       "invalid_config",
-      'Skill config has an invalid "track": expected "class" or "profession"'
+      'Skill config has an invalid "track": expected "race", "class" or "profession"'
     )
   }
   // A NEW manifest skill must declare a valid rarity, same as a new skill POST.
@@ -476,6 +477,34 @@ function assertManifestGradeGrantedSkillRefs(
 }
 
 /**
+ * Verify that every skills manifest entry's optional class tie
+ * (`classStableId`) resolves to a class that will exist after the import: either
+ * an existing class row, or a class created by this same manifest (import always
+ * creates rows with `archived: false`). A dangling class tie would quietly drop
+ * the skill's class-priority sorting, so it is rejected up front before any write.
+ * No-op when the entry is not a skill or names no class. This checks existence
+ * only - ACTIVENESS of a newly referenced class is the single-entity create path's
+ * concern; a manifest class is always created unarchived, so a same-upload
+ * reference is always satisfiable.
+ */
+function assertManifestSkillClassRefs(
+  entries: readonly Pick<WikiReviewedEntry, "kind" | "stableId" | "config">[],
+  availableClassStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (entry.kind !== "skills") continue
+    const classStableId = skillClassStableIdOf(entry.config)
+    if (classStableId == null) continue
+    if (!availableClassStableIds.has(classStableId)) {
+      throw badRequest(
+        "invalid_config",
+        `Skills manifest entry "${entry.stableId}" ties to class "${classStableId}" which is neither an existing catalog class nor a class created by this manifest`
+      )
+    }
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row with that (kind, stableId) yet)
  * or `skip_existing` (a row already occupies the key, so it is never overwritten).
@@ -522,9 +551,25 @@ export async function previewWikiReviewedImport(
       unarchivedSkillStableIds.add(entry.stableId)
     }
   }
+  // A skills manifest entry's optional class tie must resolve to a class that
+  // will exist after import: either an existing UNARCHIVED class row, or a class
+  // created by this same manifest (a manifest class is always created unarchived).
+  // An archived existing class is rejected, mirroring the single-entity create
+  // path (a NEW class-tie selection must be active).
+  const availableClassStableIds = new Set(
+    rows
+      .filter((r) => r.kind === "classes" && !r.archived)
+      .map((r) => r.stableId)
+  )
+  for (const entry of newEntries) {
+    if (entry.kind === "classes") {
+      availableClassStableIds.add(entry.stableId)
+    }
+  }
   assertManifestEquipmentGodRefs(newEntries, unarchivedGods)
   assertManifestEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
   assertManifestGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
+  assertManifestSkillClassRefs(newEntries, availableClassStableIds)
   let createCount = 0
   let skipCount = 0
   const resultEntries = validated.map((entry) => {
@@ -604,12 +649,28 @@ export async function applyWikiReviewedImport(
             unarchivedSkillStableIds.add(entry.stableId)
           }
         }
+        // A skills manifest entry's optional class tie must resolve to a class that
+        // will exist after import: either an existing UNARCHIVED class row, or a
+        // class created by this same manifest (a manifest class is always created
+        // unarchived). An archived existing class is rejected, mirroring the
+        // single-entity create path (a NEW class-tie selection must be active).
+        const availableClassStableIds = new Set(
+          rows
+            .filter((r) => r.kind === "classes" && !r.archived)
+            .map((r) => r.stableId)
+        )
+        for (const entry of newEntries) {
+          if (entry.kind === "classes") {
+            availableClassStableIds.add(entry.stableId)
+          }
+        }
         assertManifestEquipmentGodRefs(newEntries, unarchivedGods)
         assertManifestEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
         assertManifestGradeGrantedSkillRefs(
           newEntries,
           unarchivedSkillStableIds
         )
+        assertManifestSkillClassRefs(newEntries, availableClassStableIds)
         const createdIds: string[] = []
         let skipCount = 0
         const resultEntries: CatalogImportEntryPreview[] = []

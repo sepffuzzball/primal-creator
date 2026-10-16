@@ -66,6 +66,7 @@ import {
   godGradeForbidden,
   normalizeCatalogKind,
   parseCatalogConfig,
+  skillClassStableIdOf,
 } from "@/lib/server/schemas"
 import { assertModernConfig, type CatalogKind } from "@/lib/db/catalog-import"
 import type { Grade } from "@/lib/rules"
@@ -985,6 +986,33 @@ function assertBulkGradeGrantedSkillRefs(
 }
 
 /**
+ * Verify that every skills entry's optional class tie (`classStableId`) resolves
+ * to a class that will exist after the upload: either an existing UNARCHIVED class
+ * row, or a class created by this same upload (import always creates rows with
+ * `archived: false`). A dangling class tie would quietly drop the skill's
+ * class-priority sorting, so it is rejected up front before any write. No-op when
+ * the entry is not a skill or names no class. An archived existing class is
+ * rejected, mirroring the single-entity create path (a NEW class-tie selection
+ * must be active); a same-upload class is always satisfiable.
+ */
+function assertBulkSkillClassRefs(
+  entries: readonly BulkCatalogEntry[],
+  availableClassStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (entry.kind !== "skills") continue
+    const classStableId = skillClassStableIdOf(entry.config)
+    if (classStableId == null) continue
+    if (!availableClassStableIds.has(classStableId)) {
+      throw badRequest(
+        "invalid_config",
+        `Bulk row ${entry.row}: skills entry ties to class "${classStableId}" which is neither an existing unarchived catalog class nor a class created by this upload`
+      )
+    }
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row occupies that (kind, stableId)
  * yet) or `skip_existing` (a row already occupies the key, so it is never
@@ -1034,9 +1062,25 @@ export async function previewBulkImport(
       unarchivedSkillStableIds.add(entry.stableId)
     }
   }
+  // A skills entry's optional class tie must resolve to a class that will exist
+  // after upload: either an existing UNARCHIVED class row, or a class created by
+  // this same upload (a bulk class is always created unarchived). An archived
+  // existing class is rejected, mirroring the single-entity create path (a NEW
+  // class-tie selection must be active).
+  const availableClassStableIds = new Set(
+    rows
+      .filter((r) => r.kind === "classes" && !r.archived)
+      .map((r) => r.stableId)
+  )
+  for (const entry of newEntries) {
+    if (entry.kind === "classes") {
+      availableClassStableIds.add(entry.stableId)
+    }
+  }
   assertBulkEquipmentGodRefs(newEntries, unarchivedGods)
   assertBulkEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
   assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
+  assertBulkSkillClassRefs(newEntries, availableClassStableIds)
 
   let createCount = 0
   let skipCount = 0
@@ -1127,9 +1171,27 @@ export async function applyBulkImport(
             unarchivedSkillStableIds.add(entry.stableId)
           }
         }
+        // A skills entry's optional class tie must resolve to a class that will
+        // exist after upload: either an existing UNARCHIVED class row, or a class
+        // created by this same upload (a bulk class is always created unarchived).
+        // An archived existing class is rejected, mirroring the single-entity
+        // create path (a NEW class-tie selection must be active). Recomputed
+        // INSIDE the serializable transaction so an apply never trusts a stale
+        // preview.
+        const availableClassStableIds = new Set(
+          rows
+            .filter((r) => r.kind === "classes" && !r.archived)
+            .map((r) => r.stableId)
+        )
+        for (const entry of newEntries) {
+          if (entry.kind === "classes") {
+            availableClassStableIds.add(entry.stableId)
+          }
+        }
         assertBulkEquipmentGodRefs(newEntries, unarchivedGods)
         assertBulkEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
         assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
+        assertBulkSkillClassRefs(newEntries, availableClassStableIds)
 
         const creationOrder = entries
           .map((entry, index) => ({ entry, index }))

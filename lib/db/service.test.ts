@@ -4976,6 +4976,7 @@ describe("updateCatalogItem link-collision rejection", () => {
     await expect(
       updateCatalogItem("skills", "sk-1", {
         config: {
+          track: "class",
           upgradeGroup: "tier",
           rarity: "Common",
           effects: [{ phase: "flat", amount: { strength: 5 } }],
@@ -4995,9 +4996,11 @@ describe("updateCatalogItem link-collision rejection", () => {
   it("rejects a linked skill config edit that changes its rarity or upgrade group (409 skill_rarity_conflict)", async () => {
     seedState()
     seedSkill("sk-1", {
+      track: "class",
       effects: [{ phase: "flat", amount: { strength: 5 } }],
     })
     seedSkill("sk-2", {
+      track: "class",
       upgradeGroup: "tier",
       effects: [{ phase: "flat", amount: { strength: 9 } }],
     })
@@ -5017,6 +5020,7 @@ describe("updateCatalogItem link-collision rejection", () => {
     await expect(
       updateCatalogItem("skills", "sk-1", {
         config: {
+          track: "class",
           upgradeGroup: "other-tier",
           rarity: "Common",
           effects: [{ phase: "flat", amount: { strength: 5 } }],
@@ -7917,6 +7921,138 @@ describe("importCharacter (trusted backup v3)", () => {
     expect(levelOne?.selectedDefinitionId).toBe("skill-1")
   })
 
+  it("keeps a legacy offer's option non-priority after export/import (no earned-class snapshot)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "skills",
+      "skill-1",
+      { classStableId: "archer" },
+      { name: "Skill One" }
+    )
+    // A LEGACY offer omits the schedule-credit provenance entirely (no
+    // `classStableIdAtEarn`), even though the option's configSnapshot declares a
+    // class tie. The read view is computed from the persisted earned class, so a
+    // legacy/imported offer must never flag the option as class-priority.
+    const doc = importDoc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          offeredAt: "2026-01-01T00:00:00.000Z",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: { classStableId: "archer" },
+            },
+          ],
+        },
+      ],
+    })
+    const imported = await importCharacter(doc, user)
+    const offer = imported.skillOffers[0]
+    // The read view omits `classStableIdAtEarn` entirely on a legacy offer (it
+    // never reads back as null), since the offer carries no earned-class snapshot.
+    expect(offer.classStableIdAtEarn).toBeUndefined()
+    expect(offer.options[0].classPriority).toBe(false)
+    // A full export/import round-trip preserves that: the offer stays legacy (the
+    // exporter omits `classStableIdAtEarn`), so the flag stays false after the
+    // re-import.
+    const portable = (await exportCharacter(
+      imported.id,
+      user
+    )) as unknown as CharacterImportDocument
+    const reimported = await importCharacter(portable, user)
+    expect(reimported.skillOffers[0].options[0].classPriority).toBe(false)
+  })
+
+  it("normalizes a stray class snapshot on a v7 race offer to null (no class priority)", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "skills",
+      "skill-1",
+      { classStableId: "archer" },
+      { name: "Skill One" }
+    )
+    // A race credit has no earned class. Even when the document supplies
+    // `classStableIdAtEarn` (which the schema would reject at the route layer, but
+    // a direct service caller may pass), the import must never attach earned-class
+    // priority to a race offer - the snapshot is normalized to null.
+    const doc = v7Doc({
+      skillOffers: [
+        {
+          track: "race",
+          level: 4,
+          choiceGroup: "standard",
+          generation: 0,
+          canceledAt: null,
+          offeredAt: "2026-03-03T12:00:00.000Z",
+          earnedGrade: "G",
+          trackDefinitionStableId: "wyrm",
+          classStableIdAtEarn: "archer",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: { classStableId: "archer" },
+            },
+          ],
+        },
+      ],
+    })
+    const imported = await importCharacter(doc, user)
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.characterId === imported.id
+    )!
+    expect(stored.classStableIdAtEarn).toBeNull()
+    const offer = imported.skillOffers[0]
+    expect(offer.track).toBe("race")
+    expect(offer.classStableIdAtEarn).toBeNull()
+    expect(offer.options[0].classPriority).toBe(false)
+  })
+
+  it("normalizes a stray class snapshot on a v7 legacy offer (no provenance) to null", async () => {
+    seedRaceClass()
+    addImportCatalog(
+      "skills",
+      "skill-1",
+      { classStableId: "archer" },
+      { name: "Skill One" }
+    )
+    // A legacy/untyped offer carries no schedule-credit provenance, so it has no
+    // earned-class snapshot. A stray `classStableIdAtEarn` supplied on it (again a
+    // schema-level rejection at the route) must never attach class priority.
+    const doc = v7Doc({
+      skillOffers: [
+        {
+          track: "class",
+          level: 1,
+          choiceGroup: "standard",
+          generation: 0,
+          canceledAt: null,
+          offeredAt: "2026-01-01T00:00:00.000Z",
+          classStableIdAtEarn: "archer",
+          options: [
+            {
+              stableId: "skill-1",
+              nameSnapshot: "Skill One",
+              configSnapshot: { classStableId: "archer" },
+            },
+          ],
+        },
+      ],
+    })
+    const imported = await importCharacter(doc, user)
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.characterId === imported.id
+    )!
+    expect(stored.classStableIdAtEarn).toBeNull()
+    const offer = imported.skillOffers[0]
+    expect(offer.classStableIdAtEarn).toBeUndefined()
+    expect(offer.options[0].classPriority).toBe(false)
+  })
+
   // A supplied skill-offer `canceledAt` must be a real timestamp. An invalid value
   // is rejected with 400 invalid_import BEFORE any write - it is never silently
   // restamped to "now", so a canceled offer's cancellation instant is preserved.
@@ -9921,8 +10057,12 @@ describe("skill offers (milestone choice model)", () => {
     expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
       "sk-class-any",
       "sk-class-archer",
+      "sk-class-mage",
     ])
-    // The profession skill is not offered because the character advanced "class".
+    // The `eligibleDefinitionStableIds` annotation is IGNORED for a scheduled
+    // credit, so the mage-restricted skill is still offered (only the track must
+    // match). The profession skill is not offered because the character advanced
+    // "class".
     expect(offer.options.some((o) => o.definitionId === "sk-prof")).toBe(false)
   })
 
@@ -10560,6 +10700,511 @@ describe("skill offers (milestone choice model)", () => {
     const journal = res.journal as { skillOffers?: unknown }
     expect(journal.skillOffers).toBeUndefined()
   })
+
+  it("offers any matching-track skill at a credit milestone regardless of milestone/choiceGroup/eligibleDefinitionStableIds, filtered only by grade", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(4, 3)
+    // The credit is for class level 5 (F milestone). These skills all match the
+    // class track and are offered because `milestone`, `choiceGroup` and
+    // `eligibleDefinitionStableIds` no longer gate a scheduled credit.
+    seedSkill("sk-any-milestone", {
+      track: "class",
+      milestone: 999,
+      effects: [],
+    })
+    seedSkill("sk-custom-group", {
+      track: "class",
+      choiceGroup: "special",
+      effects: [],
+    })
+    seedSkill("sk-restricted", {
+      track: "class",
+      eligibleDefinitionStableIds: ["some-other-class"],
+      effects: [],
+    })
+    // A wrong-grade skill is still filtered out (grade is the only gate).
+    seedSkill("sk-wrong-grade", { track: "class", effects: [] }, { grade: "E" })
+    // A different-track skill is excluded (track must match exactly).
+    seedSkill("sk-prof", { track: "profession", effects: [] })
+    seedSkill("sk-race", { track: "race", effects: [] })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    const offer = res.character.skillOffers[0]
+    expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
+      "sk-any-milestone",
+      "sk-custom-group",
+      "sk-restricted",
+    ])
+  })
+
+  it("sorts a skill tied to the earning-time class first, never hiding a nonmatching class-tied skill", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(4, 3)
+    // The character's selected class stableId is "archer", so the offer snapshots
+    // classStableIdAtEarn = "archer". A class-tied skill matching that snapshot
+    // sorts FIRST; a nonmatching class-tied skill is still offered, just later.
+    seedSkill("sk-archer", {
+      track: "class",
+      classStableId: "archer",
+      effects: [],
+    })
+    seedSkill("sk-mage", {
+      track: "class",
+      classStableId: "mage",
+      effects: [],
+    })
+    seedSkill("sk-any", { track: "class", effects: [] })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    const order = res.character.skillOffers[0].options.map(
+      (o) => o.definitionId
+    )
+    expect(order[0]).toBe("sk-archer")
+    expect(order.sort()).toEqual(["sk-any", "sk-archer", "sk-mage"])
+    // Neither the nonmatching class-tied skill nor the untied skill is hidden.
+    expect(order).toContain("sk-mage")
+    expect(order).toContain("sk-any")
+    // The view exposes classPriority: only the option whose persisted config
+    // snapshot matches the snapshotted earned class is flagged. The nonmatching
+    // class-tied skill and the untied skill are never flagged, and the boolean is
+    // read from the earned snapshot, never the character's current class.
+    const priority = Object.fromEntries(
+      res.character.skillOffers[0].options.map((o) => [
+        o.definitionId,
+        o.classPriority,
+      ])
+    )
+    expect(priority).toEqual({
+      "sk-archer": true,
+      "sk-mage": false,
+      "sk-any": false,
+    })
+  })
+
+  it("snapshots the character's selected class stableId when a profession earns a credit", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    dbMock.store.addCatalog({
+      id: "prof-1",
+      kind: "professions",
+      stableId: "alchemist",
+      name: "Alchemist",
+      config: { grades: { F: { fixed: { vitality: 2 }, free: 1 } } },
+    })
+    const state = createInitialState(
+      "integrated",
+      null,
+      { stableId: "alchemist" } as Parameters<typeof createInitialState>[2],
+      { stableId: "archer" } as Parameters<typeof createInitialState>[3]
+    )
+    state.tracks.profession = {
+      level: 4,
+      quarter: 3,
+      grade: "F",
+      definitionId: "alchemist:F",
+    }
+    state.tracks.class = {
+      level: 4,
+      quarter: 3,
+      grade: "F",
+      definitionId: "archer:F",
+    }
+    state.race = { ...state.race, level: 10, grade: "F" }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      classId: "cls-1",
+      professionId: "prof-1",
+      state: serializeState(state),
+      version: 0,
+    })
+    seedSkill("sk-1", { track: "profession", effects: [] })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "profession", version: 0 },
+      user
+    )
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.id === res.character.skillOffers[0].id
+    )!
+    // A profession credit snapshots the character's SELECTED CLASS at earning time.
+    expect(stored.classStableIdAtEarn).toBe("archer")
+    expect(stored.trackDefinitionStableId).toBe("alchemist")
+  })
+
+  it("marks a skill tied to the snapshotted earned class as priority on a profession credit", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    dbMock.store.addCatalog({
+      id: "prof-1",
+      kind: "professions",
+      stableId: "alchemist",
+      name: "Alchemist",
+      config: { grades: { F: { fixed: { vitality: 2 }, free: 1 } } },
+    })
+    const state = createInitialState(
+      "integrated",
+      null,
+      { stableId: "alchemist" } as Parameters<typeof createInitialState>[2],
+      { stableId: "archer" } as Parameters<typeof createInitialState>[3]
+    )
+    state.tracks.profession = {
+      level: 4,
+      quarter: 3,
+      grade: "F",
+      definitionId: "alchemist:F",
+    }
+    state.tracks.class = {
+      level: 4,
+      quarter: 3,
+      grade: "F",
+      definitionId: "archer:F",
+    }
+    state.race = { ...state.race, level: 10, grade: "F" }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      classId: "cls-1",
+      professionId: "prof-1",
+      state: serializeState(state),
+      version: 0,
+    })
+    // A profession track credit snapshots the character's SELECTED CLASS
+    // ("archer") at EARNING time. The option tied to that same class is flagged
+    // priority; the untied option is not.
+    seedSkill("sk-archer-prof", {
+      track: "profession",
+      classStableId: "archer",
+      effects: [],
+    })
+    seedSkill("sk-untied-prof", { track: "profession", effects: [] })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "profession", version: 0 },
+      user
+    )
+    const offer = res.character.skillOffers[0]
+    const order = offer.options.map((o) => o.definitionId)
+    // The class-tied option sorts first (class tie).
+    expect(order[0]).toBe("sk-archer-prof")
+    const priority = Object.fromEntries(
+      offer.options.map((o) => [o.definitionId, o.classPriority])
+    )
+    expect(priority).toEqual({
+      "sk-archer-prof": true,
+      "sk-untied-prof": false,
+    })
+  })
+})
+
+describe("monster race skill offers (milestone choice model)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  // A monster race catalog row with a per-grade race definition. The race's
+  // authoritative advancement mode is resolved from the config (`raceType:
+  // "monster"`), so a monster character holds no class/profession tracks.
+  function monsterRaceRow(grade: Grade = "F") {
+    return {
+      id: "race-1",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          [grade]: {
+            id: `wyrm:${grade}`,
+            perLevel: { strength: 2 },
+            freePerLevel: 1,
+          },
+        },
+      },
+    }
+  }
+
+  function seedMonsterCatalog(grade: Grade = "F") {
+    return dbMock.store.addCatalog(monsterRaceRow(grade))
+  }
+
+  function seedMonsterCharacter(
+    level: number,
+    quarter: number,
+    grade: Grade = "F"
+  ) {
+    const state = createInitialState("integrated", monsterRaceRow(grade), null)
+    // Override the stored race to the level/quarter/grade under test. The monster
+    // config already produces `mode: "independent"` and an empty tracks map.
+    state.race = { ...state.race, level, quarter, grade }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Wyrm",
+      raceId: "race-1",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedMonsterSkill(
+    id: string,
+    config: Record<string, unknown>
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: `Skill ${id}`,
+      config,
+    })
+  }
+
+  it("a monster race level-up earns a race skill-choice credit at a G milestone", async () => {
+    seedMonsterCatalog("G")
+    seedMonsterCharacter(4, 3, "G")
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    const journal = res.journal as { leveledUp: boolean; levelAfter: number }
+    expect(journal.leveledUp).toBe(true)
+    expect(journal.levelAfter).toBe(5)
+    expect(res.character.skillOffers).toHaveLength(1)
+    const offer = res.character.skillOffers[0]
+    expect(offer.track).toBe("race")
+    expect(offer.level).toBe(5)
+    expect(offer.choiceGroup).toBe("standard")
+    expect(offer.earnedGrade).toBe("G")
+    expect(offer.trackDefinitionStableId).toBe("wyrm")
+  })
+
+  it("never creates a class or profession offer for a monster (race-only)", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 3, "F")
+    // A class/profession skill at the same milestone must be ignored; the race
+    // offer is created with zero options.
+    seedMonsterSkill("sk-cls", {
+      track: "class",
+      milestone: 5,
+      effects: [],
+    })
+    seedMonsterSkill("sk-prof", {
+      track: "profession",
+      milestone: 5,
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    expect(dbMock.store.skillOffers[0].track).toBe("race")
+    expect(res.character.skillOffers[0].options).toHaveLength(0)
+  })
+
+  it("creates a zero-option race offer at a matching grade milestone (still credits)", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 3, "F")
+    // No skills configured at all: the schedule credit still awards the race offer.
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    expect(res.character.skillOffers).toHaveLength(1)
+    const offer = res.character.skillOffers[0]
+    expect(offer.level).toBe(5)
+    expect(offer.choiceGroup).toBe("standard")
+    expect(offer.options).toHaveLength(0)
+    expect(dbMock.store.skillOffers[0].earnedGrade).toBe("F")
+  })
+
+  it("never flags a race offer option as class-priority on a monster (no earned class)", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 3, "F")
+    // A race-track skill may declare a `classStableId`, but a monster's race
+    // credit has no earned class (`classStableIdAtEarn` is null), so the option is
+    // never class-prioritized even though the skill is class-tied.
+    seedMonsterSkill("sk-race", {
+      track: "race",
+      classStableId: "archer",
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    const offer = res.character.skillOffers[0]
+    expect(offer.track).toBe("race")
+    expect(offer.classStableIdAtEarn).toBeNull()
+    expect(offer.options).toHaveLength(1)
+    expect(offer.options[0].definitionId).toBe("sk-race")
+    expect(offer.options[0].classPriority).toBe(false)
+  })
+
+  it("a monster race level-up via experienceCharacter levelUp also earns the credit", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 0, "F")
+    const res = await experienceCharacter(
+      "chr-1",
+      { operation: "levelUp", track: "race", version: 0 },
+      user
+    )
+    expect(res.character.skillOffers).toHaveLength(1)
+    const offer = res.character.skillOffers[0]
+    expect(offer.track).toBe("race")
+    expect(offer.level).toBe(5)
+    expect(dbMock.store.skillOffers[0].earnedGrade).toBe("F")
+  })
+
+  it("persists schedule-credit provenance for a race offer (earnedGrade + race stableId)", async () => {
+    seedMonsterCatalog("G")
+    seedMonsterCharacter(4, 3, "G")
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.id === res.character.skillOffers[0].id
+    )!
+    expect(stored.earnedGrade).toBe("G")
+    expect(stored.trackDefinitionStableId).toBe("wyrm")
+  })
+
+  it("undo cancels a pending race offer and a re-earned race level re-offers at the next generation", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 3, "F")
+    const first = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    const firstId = dbMock.store.skillOffers[0].id
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "race", version: first.character.version },
+      user
+    )
+    const canceled = dbMock.store.skillOffers.find((o) => o.id === firstId)!
+    expect(canceled.canceledAt).toBeInstanceOf(Date)
+    await advanceCharacter(
+      "chr-1",
+      { track: "race", version: undone.character.version },
+      user
+    )
+    const reoffer = dbMock.store.skillOffers.find((o) => o.id !== firstId)!
+    expect(reoffer.generation).toBe(1)
+    expect(reoffer.canceledAt).toBeNull()
+    expect(reoffer.earnedGrade).toBe("F")
+  })
+
+  it("blocks race undo when the earned offer was selected", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 3, "F")
+    seedMonsterSkill("sk-1", { track: "race", milestone: 5, effects: [] })
+    const first = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    const offerId = first.character.skillOffers[0].id
+    expect(offerId).toBeDefined()
+    const selected = await skillCharacter(
+      "chr-1",
+      {
+        operation: "select",
+        offerId,
+        definitionId: "sk-1",
+        version: first.character.version,
+      },
+      user
+    )
+    await expect(
+      experienceCharacter(
+        "chr-1",
+        {
+          operation: "undo",
+          track: "race",
+          version: selected.character.version,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "level_undo_blocked" })
+  })
+
+  it("does not credit an off-milestone monster race level even when a race skill exists", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(3, 3, "F")
+    // Level 4 is NOT a milestone under the default F schedule (F:5 -> 5,10,...).
+    seedMonsterSkill("sk-1", { track: "race", milestone: 4, effects: [] })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    expect(res.character.skillOffers).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+  })
+
+  it("snapshots a null earning-time class for a race credit and applies no class priority", async () => {
+    seedMonsterCatalog("F")
+    seedMonsterCharacter(4, 3, "F")
+    // A race credit has no earning class (classStableIdAtEarn is null), so a race
+    // skill carrying a classStableId must NOT sort ahead of an untied race skill -
+    // class priority is a class/profession-credit behavior only.
+    seedMonsterSkill("sk-mage", {
+      track: "race",
+      milestone: 5,
+      classStableId: "mage",
+      effects: [],
+    })
+    seedMonsterSkill("sk-any", {
+      track: "race",
+      milestone: 5,
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "race", version: 0 },
+      user
+    )
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.id === res.character.skillOffers[0].id
+    )!
+    // The race credit never backfills an earning-time class.
+    expect(stored.classStableIdAtEarn).toBeNull()
+    const order = res.character.skillOffers[0].options.map(
+      (o) => o.definitionId
+    )
+    // No class priority: the tie falls back to name ordering, so the class-tied
+    // skill is not pushed ahead of the untied one.
+    expect(order).toEqual(["sk-any", "sk-mage"])
+  })
 })
 
 describe("skill catalog config (legacy track + validation)", () => {
@@ -10668,6 +11313,236 @@ describe("skill catalog config (legacy track + validation)", () => {
     )!
     const flat = strengthTrace.phases.find((p) => p.phase === "flat")!
     expect(flat.delta).toBe(3)
+  })
+
+  it("rejects a new skill that omits a track entirely", async () => {
+    // A missing track is an incomplete modern config: a NEW skill must be typed so
+    // it can actually be offered. `effects` + `rarity` alone never offer.
+    await expect(
+      createCatalogItem("skills", {
+        name: "Untyped",
+        config: { effects: [], rarity: "Common" },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining('"track"'),
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a config-changing PATCH that omits a track entirely", async () => {
+    dbMock.store.addCatalog({
+      id: "sk-typed",
+      kind: "skills",
+      stableId: "sk-typed",
+      name: "Typed",
+      config: { track: "class", milestone: 4, rarity: "Common" },
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-typed", {
+        config: {
+          effects: [{ phase: "flat", amount: { strength: 1 } }],
+          rarity: "Common",
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // The rejected update never applied - the prior track survives.
+    expect(
+      (dbMock.store.catalog.get("sk-typed")!.config as { track: string }).track
+    ).toBe("class")
+  })
+
+  it("validates a skill's classStableId on create against an existing, active class", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-active",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    dbMock.store.addCatalog({
+      id: "cls-archived",
+      kind: "classes",
+      stableId: "mage",
+      name: "Mage",
+      config: { grades: { F: { fixed: { wisdom: 2 }, free: 1 } } },
+      archived: true,
+    })
+    // A nonexistent class tie is rejected on create.
+    await expect(
+      createCatalogItem("skills", {
+        name: "TieMissing",
+        config: {
+          track: "class",
+          rarity: "Common",
+          classStableId: "no-such-class",
+          effects: [],
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // An archived class tie is rejected as a NEW selection.
+    await expect(
+      createCatalogItem("skills", {
+        name: "TieArchived",
+        config: {
+          track: "class",
+          rarity: "Common",
+          classStableId: "mage",
+          effects: [],
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(2)
+    // An active class tie is accepted and persisted.
+    const ok = await createCatalogItem("skills", {
+      name: "TieOk",
+      config: {
+        track: "class",
+        rarity: "Common",
+        classStableId: "archer",
+        effects: [],
+      },
+    })
+    expect((ok.config as { classStableId: string }).classStableId).toBe(
+      "archer"
+    )
+  })
+
+  it("tolerates an unchanged prior reference to an archived class on update, but rejects a new archived selection", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-active",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    dbMock.store.addCatalog({
+      id: "cls-archived",
+      kind: "classes",
+      stableId: "mage",
+      name: "Mage",
+      config: { grades: { F: { fixed: { wisdom: 2 }, free: 1 } } },
+      archived: true,
+    })
+    // A skill already tied to the archived `mage` class.
+    dbMock.store.addCatalog({
+      id: "sk-prior",
+      kind: "skills",
+      stableId: "sk-prior",
+      name: "Prior",
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        classStableId: "mage",
+        effects: [],
+      },
+    })
+    // Changing to a nonexistent class is rejected.
+    await expect(
+      updateCatalogItem("skills", "sk-prior", {
+        config: {
+          track: "class",
+          milestone: 4,
+          rarity: "Common",
+          classStableId: "no-such",
+          effects: [],
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // Changing to a DIFFERENT archived class (a new selection) is rejected.
+    dbMock.store.addCatalog({
+      id: "cls-archived-2",
+      kind: "classes",
+      stableId: "warlock",
+      name: "Warlock",
+      config: { grades: { F: { fixed: { willpower: 2 }, free: 1 } } },
+      archived: true,
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-prior", {
+        config: {
+          track: "class",
+          milestone: 4,
+          rarity: "Common",
+          classStableId: "warlock",
+          effects: [],
+        },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // Keeping the SAME archived prior reference on a config change is tolerated.
+    const kept = await updateCatalogItem("skills", "sk-prior", {
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        classStableId: "mage",
+        effects: [
+          { phase: "flat", amount: { strength: 9 }, stacking: "stack" },
+        ],
+      },
+    })
+    expect((kept.config as { classStableId: string }).classStableId).toBe(
+      "mage"
+    )
+    // Changing to a different ACTIVE class is allowed.
+    const changed = await updateCatalogItem("skills", "sk-prior", {
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        classStableId: "archer",
+        effects: [],
+      },
+    })
+    expect((changed.config as { classStableId: string }).classStableId).toBe(
+      "archer"
+    )
+  })
+
+  it("blocks a class stableId rename while a skill ties the old id (409 class_stable_id_in_use)", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-1",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    dbMock.store.addCatalog({
+      id: "sk-tied",
+      kind: "skills",
+      stableId: "sk-tied",
+      name: "Tied",
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        classStableId: "archer",
+        effects: [],
+      },
+    })
+    await expect(
+      updateCatalogItem("classes", "cls-1", { stableId: "archer-renamed" })
+    ).rejects.toMatchObject({ status: 409, code: "class_stable_id_in_use" })
+    // The rename never applied - the class keeps its original stableId.
+    expect(
+      (dbMock.store.catalog.get("cls-1") as { stableId: string }).stableId
+    ).toBe("archer")
+  })
+
+  it("allows a class stableId rename when no skill ties the old id", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-2",
+      kind: "classes",
+      stableId: "free",
+      name: "Free",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+    const updated = await updateCatalogItem("classes", "cls-2", {
+      stableId: "free-renamed",
+    })
+    expect(updated.stableId).toBe("free-renamed")
   })
 })
 
@@ -17697,6 +18572,7 @@ describe("refresh pending scheduled skill offers", () => {
       }>
       selectedDefinitionId?: string | null
       canceledAt?: Date | null
+      classStableIdAtEarn?: string | null
     }
   ): void {
     const characterId = opts.characterId ?? "chr-1"
@@ -17713,6 +18589,7 @@ describe("refresh pending scheduled skill offers", () => {
       selectedAt: opts.selectedDefinitionId ? new Date() : null,
       earnedGrade: opts.earnedGrade,
       trackDefinitionStableId: opts.trackDefinitionStableId,
+      classStableIdAtEarn: opts.classStableIdAtEarn ?? null,
     })
     for (const o of opts.options ?? []) {
       dbMock.store.skillOfferOptions.push({
@@ -17842,7 +18719,7 @@ describe("refresh pending scheduled skill offers", () => {
     ).toHaveLength(2)
   })
 
-  it("respects the earned grade and eligibleDefinitionStableIds when matching", async () => {
+  it("respects the earned grade when matching (eligibleDefinitionStableIds is ignored)", async () => {
     seedCharacterForRefresh()
     seedScheduledOffer("off-1", {
       level: 4,
@@ -17856,14 +18733,15 @@ describe("refresh pending scheduled skill offers", () => {
       { track: "class", milestone: 4, effects: [] },
       { grade: "E" }
     )
-    // Correct grade but restricted to a different track's stableId -> excluded.
+    // Correct grade. The eligibleDefinitionStableIds annotation is IGNORED for a
+    // scheduled credit, so the mage-restricted skill is now offered.
     seedSkill("sk-mage", {
       track: "class",
       milestone: 4,
       eligibleDefinitionStableIds: ["mage"],
       effects: [],
     })
-    // Correct grade and correct stableId restriction -> included.
+    // Correct grade -> included.
     seedSkill("sk-archer", {
       track: "class",
       milestone: 4,
@@ -17872,7 +18750,10 @@ describe("refresh pending scheduled skill offers", () => {
     })
     const res = await refreshPendingSkillOffers("chr-1", user)
     const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
-    expect(offer.options.map((o) => o.definitionId)).toEqual(["sk-archer"])
+    expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
+      "sk-archer",
+      "sk-mage",
+    ])
   })
 
   it("excludes archived skills from a refresh even when they would otherwise match", async () => {
@@ -17997,5 +18878,227 @@ describe("refresh pending scheduled skill offers", () => {
     expect(importedOffer.earnedGrade).toBe("F")
     expect(importedOffer.trackDefinitionStableId).toBe("archer")
     expect(importedOffer.selectedDefinitionId).toBe("sk-1")
+  })
+
+  it("exports the earning-time class snapshot for a scheduled offer and omits it for a legacy offer", async () => {
+    seedCharacterForRefresh()
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      classStableIdAtEarn: "archer",
+      options: [{ definitionId: "sk-1" }],
+    })
+    seedLegacyOffer("off-legacy", {
+      level: 5,
+      options: [{ definitionId: "sk-1" }],
+    })
+    const portable = await exportCharacter("chr-1", user)
+    const offers = portable.skillOffers as Array<Record<string, unknown>>
+    const scheduled = offers.find((o) => o.level === 4)!
+    expect(scheduled).toMatchObject({
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      classStableIdAtEarn: "archer",
+    })
+    const legacy = offers.find((o) => o.level === 5)!
+    expect("earnedGrade" in legacy).toBe(false)
+    expect("trackDefinitionStableId" in legacy).toBe(false)
+    expect("classStableIdAtEarn" in legacy).toBe(false)
+  })
+
+  it("re-imports the earning-time class snapshot and persists it", async () => {
+    seedHumanRace()
+    seedArcherClass()
+    seedCharacterForRefresh("race-human", "cls-archer")
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      classStableIdAtEarn: "archer",
+      options: [{ definitionId: "sk-1" }],
+    })
+    const portable = await exportCharacter("chr-1", user)
+    const imported = await importCharacter(
+      portable as unknown as CharacterImportDocument,
+      user
+    )
+    const importedOffer = dbMock.store.skillOffers.find(
+      (o) => o.characterId === imported.id
+    )!
+    expect(importedOffer.classStableIdAtEarn).toBe("archer")
+    expect(importedOffer.earnedGrade).toBe("F")
+    expect(importedOffer.trackDefinitionStableId).toBe("archer")
+  })
+
+  it("re-sorts options by the snapshotted class after a refresh and never rewrites an existing snapshot", async () => {
+    seedCharacterForRefresh()
+    // The credit was earned while the character's class was `archer`; the offer
+    // snapshots that at EARNING time (classStableIdAtEarn). An existing option is
+    // seeded with a hand-authored snapshot that must never be rewritten.
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      classStableIdAtEarn: "archer",
+      options: [{ definitionId: "sk-old", nameSnapshot: "Old Snapshot" }],
+    })
+    seedSkill("sk-archer", {
+      track: "class",
+      milestone: 4,
+      classStableId: "archer",
+      effects: [],
+    })
+    seedSkill("sk-mage", {
+      track: "class",
+      milestone: 4,
+      classStableId: "mage",
+      effects: [],
+    })
+    seedSkill("sk-old", { track: "class", milestone: 4, effects: [] })
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    // The class-tied option matching the snapshotted class sorts FIRST, even
+    // though its name would not sort before the hand-authored "Old Snapshot".
+    const order = offer.options.map((o) => o.definitionId)
+    expect(order[0]).toBe("sk-archer")
+    expect(order).toEqual(["sk-archer", "sk-old", "sk-mage"])
+    // The pre-existing snapshot is preserved, not rewritten to the current name.
+    const oldOpt = offer.options.find((o) => o.definitionId === "sk-old")!
+    expect(oldOpt.nameSnapshot).toBe("Old Snapshot")
+  })
+
+  it("keeps an earned class-tied option first and priority after the catalog reties/renames it post-earn", async () => {
+    seedCharacterForRefresh()
+    // The credit was earned while the character's class was `archer`; the offer
+    // snapshots that at EARNING time (classStableIdAtEarn = "archer").
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      classStableIdAtEarn: "archer",
+      options: [
+        {
+          definitionId: "sk-archer",
+          // The snapshot name sorts LAST, so only the class tie can put it first.
+          nameSnapshot: "Zulu Archer",
+          configSnapshot: { classStableId: "archer" },
+        },
+        {
+          definitionId: "sk-untied",
+          nameSnapshot: "Alpha Step",
+          configSnapshot: {},
+        },
+      ],
+    })
+    // The live skill was authored as archer-tied at earn time.
+    seedSkill(
+      "sk-archer",
+      { track: "class", milestone: 4, classStableId: "archer", effects: [] },
+      { name: "Zulu Archer" }
+    )
+    seedSkill(
+      "sk-untied",
+      { track: "class", milestone: 4, effects: [] },
+      { name: "Alpha Step" }
+    )
+    // Post-earn the catalog reties and renames the formerly-archer skill to mage.
+    const row = dbMock.store.catalog.get("sk-archer")!
+    row.name = "Mage Fire"
+    ;(row.config as Record<string, unknown>).classStableId = "mage"
+
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    // The order and the classPriority badge read the IMMUTABLE earned snapshot
+    // (configSnapshot/nameSnapshot), never the live catalog config - so the earned
+    // archer option is STILL first (its snapshot ties to archer, matching the
+    // earned class) and flagged even though the live skill now says "mage". It is
+    // never reordered by the post-earn rename or class retie. Without the snapshot
+    // tie, "Zulu Archer" would sort AFTER "Alpha Step" and lose the top position.
+    const order = offer.options.map((o) => o.definitionId)
+    expect(order[0]).toBe("sk-archer")
+    expect(order).toEqual(["sk-archer", "sk-untied"])
+    // The untied option is not hidden by the class-tied one.
+    expect(order).toContain("sk-untied")
+    const priority = Object.fromEntries(
+      offer.options.map((o) => [o.definitionId, o.classPriority])
+    )
+    expect(priority).toEqual({ "sk-archer": true, "sk-untied": false })
+    // The pre-existing name snapshot is preserved, not rewritten to "Mage Fire".
+    expect(
+      offer.options.find((o) => o.definitionId === "sk-archer")!.nameSnapshot
+    ).toBe("Zulu Archer")
+    // The post-earn rename/retie must not change offer eligibility: both options
+    // remain offered and answerable.
+    expect(offer.options.map((o) => o.definitionId)).toContain("sk-untied")
+  })
+
+  it("appends a newly authored class-tied skill on refresh without reordering the earned snapshot option", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      classStableIdAtEarn: "archer",
+      options: [
+        {
+          definitionId: "sk-archer",
+          nameSnapshot: "Zulu Archer",
+          configSnapshot: { classStableId: "archer" },
+        },
+        {
+          definitionId: "sk-untied",
+          nameSnapshot: "Alpha",
+          configSnapshot: {},
+        },
+      ],
+    })
+    seedSkill(
+      "sk-archer",
+      { track: "class", milestone: 4, classStableId: "archer", effects: [] },
+      { name: "Zulu Archer" }
+    )
+    seedSkill(
+      "sk-untied",
+      { track: "class", milestone: 4, effects: [] },
+      { name: "Alpha" }
+    )
+    // A NEW mage-tied skill authored after the original credit: a refresh appends
+    // it (its LIVE config carries classStableId "mage").
+    seedSkill(
+      "sk-mage",
+      { track: "class", milestone: 4, classStableId: "mage", effects: [] },
+      { name: "Bravo Mage" }
+    )
+    // Post-earn the formerly-archer skill is retied and renamed to mage.
+    const row = dbMock.store.catalog.get("sk-archer")!
+    row.name = "Mage Fire"
+    ;(row.config as Record<string, unknown>).classStableId = "mage"
+
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    // The earned archer option stays FIRST and flagged (immutable snapshot tie).
+    // The newly appended mage skill does not match the earned archer snapshot, so
+    // it is NOT priority and sorts by snapshot name after the untied option. If
+    // the sort read the LIVE config, the earned archer option (now "mage") would
+    // lose the class tie and drop to the end ("Zulu" sorts last) - but it stays
+    // first because the tie is read from the immutable snapshot.
+    const order = offer.options.map((o) => o.definitionId)
+    expect(order[0]).toBe("sk-archer")
+    expect(order).toEqual(["sk-archer", "sk-untied", "sk-mage"])
+    const priority = Object.fromEntries(
+      offer.options.map((o) => [o.definitionId, o.classPriority])
+    )
+    expect(priority).toEqual({
+      "sk-archer": true,
+      "sk-untied": false,
+      "sk-mage": false,
+    })
+    // The existing option's snapshot is never rewritten to the live mage name.
+    expect(
+      offer.options.find((o) => o.definitionId === "sk-archer")!.nameSnapshot
+    ).toBe("Zulu Archer")
   })
 })

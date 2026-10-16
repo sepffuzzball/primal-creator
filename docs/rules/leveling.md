@@ -59,12 +59,16 @@ historical offer.
 
 ## Skill-choice credit milestones
 
-A class/profession level-up generates a pending skill offer only when the level is a
-**skill-choice credit** under the configurable per-grade schedule
-(`house_rules.config.skillChoiceIntervals`), not at every level. The pure helper
-`isSkillChoiceMilestone(grade, level, intervals)` decides this from the stored
-track grade (or the race grade for a legacy ungraded track); G earns no credits.
-See `docs/rules/skills.md` for the schedule and the single-`"standard"`-offer
+A class/profession level-up **or an independent (monster) race level-up** generates a
+pending skill offer only when the level is a **skill-choice credit** under the
+configurable per-grade schedule (`house_rules.config.skillChoiceIntervals`), not at
+every level. The pure helper `isSkillChoiceMilestone(grade, level, intervals)`
+decides this from the stored track grade (or the race grade for a legacy ungraded
+track, or the race's own grade for a monster race). Every grade G..S is now
+configurable; a G-grade track credits on the same cadence as F but is capped by the
+F band (see `docs/rules/skills.md`). A monster race earns exactly one `"standard"`
+offer per matching milestone - even with zero options - and never a class/profession
+offer. See `docs/rules/skills.md` for the schedule and the single-`"standard"`-offer
 semantics.
 
 ## Track grade ceiling (class / profession)

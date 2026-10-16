@@ -134,10 +134,12 @@ export interface AdminHouseRulesConfig {
   maxTranscendentSkills: number
   /**
    * The configurable number of levels between skill-choice CREDITS, per grade
-   * (default F:5, E:5, D:20, C:30, B:40, A:50, S:60). G is intentionally absent
-   * (G grades earn no credits). Each value is an integer 1..250.
+   * (default G:5, F:5, E:5, D:20, C:30, B:40, A:50, S:60). G earns credits on
+   * the same cadence as F but is capped by the F band (see
+   * `isSkillChoiceMilestone`). Each value is an integer 1..250.
    */
   skillChoiceIntervals: {
+    G: number
     F: number
     E: number
     D: number
@@ -476,6 +478,16 @@ export interface SkillOfferOptionView {
   archived: boolean
   /** Catalog tier grade of the offered definition, when set. */
   grade?: string
+  /**
+   * Whether the option is priority-tied to the offer's snapshotted earned class.
+   * True only when the option's PERSISTED config snapshot declares a nonempty
+   * `classStableId` exactly equal to the offer's snapshotted `classStableIdAtEarn`
+   * (itself nonempty). Always false on a legacy/imported offer (no earned-class
+   * snapshot) and for a monster race credit (which has no class). Computed from
+   * the persisted earned context, never the character's current class.
+   * Priority-only: never eligibility, never order-changing.
+   */
+  classPriority: boolean
 }
 
 export interface SkillOfferView {
@@ -505,6 +517,15 @@ export interface SkillOfferView {
    * `null` on a legacy offer.
    */
   trackDefinitionStableId?: string | null
+  /**
+   * Catalog stableId of the character's selected CLASS at the moment the credit
+   * was earned, snapshotted at EARNING time for class/profession credits and null
+   * for a monster race credit (which has no class). Present (with `earnedGrade`)
+   * only on a scheduled/milestone offer; `null` on a legacy offer. Priority-only:
+   * it drives deterministic option ordering (skills whose `classStableId` matches
+   * sort first), never eligibility.
+   */
+  classStableIdAtEarn?: string | null
 }
 
 /**
@@ -1016,6 +1037,25 @@ export interface SkillOfferExport {
   offeredAt: string
   selectedStableId: string | null
   options: SkillOfferOptionExport[]
+  /**
+   * Schedule-credit provenance (nullable on legacy/imported offers): the grade
+   * whose skill-choice interval awarded this offer. Present only on a
+   * scheduled/milestone offer.
+   */
+  earnedGrade?: string | null
+  /**
+   * Catalog stableId of the selected track at the moment the credit was earned.
+   * Present (with `earnedGrade`) only on a scheduled/milestone offer.
+   */
+  trackDefinitionStableId?: string | null
+  /**
+   * Catalog stableId of the character's selected CLASS at the moment the credit
+   * was earned, snapshotted at EARNING time for class/profession credits and null
+   * for a monster race credit. Present (with `earnedGrade`) only on a
+   * scheduled/milestone offer; null on legacy offers. Priority-only, never
+   * eligibility.
+   */
+  classStableIdAtEarn?: string | null
 }
 
 export interface ExportResponse {
