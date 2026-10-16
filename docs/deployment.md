@@ -135,11 +135,17 @@ Release 0.1.0 collapses the `0001..0023` migration chain into a single
 from-scratch baseline (`prisma/migrations/20261016000000_initial_0_1_0`). The
 baseline opens with a `DO` guard that only ever runs against an **empty**
 database: it refuses to re-create when `_prisma_migrations` already records an
-applied migration, or when the public schema already holds any non-migration
-object. Because that guard never drops anything, a database migrated with the old
-chain **cannot** be upgraded by `prisma migrate deploy` - it must first be wiped
-and rebuilt. This is a one-time, explicit, opt-in, fail-closed operation. It is
-**never** run automatically, and the app never auto-resets on boot.
+applied migration, or when the public schema already holds any **non-extension**
+public object (an existing app schema). Extension-owned objects are allowed and
+treated as empty: the views and composite row types installed by a Postgres
+extension such as `pg_stat_statements` (which Crunchy PGO installs into
+`public`) are recognised as extension members via `pg_depend` and permitted, so
+they are never a reason to refuse, and they are never mistaken for an existing
+app schema. Because that guard never drops anything, a database migrated with
+the old chain **cannot** be upgraded by `prisma migrate deploy` - it must first
+be wiped and rebuilt. This is a one-time, explicit, opt-in, fail-closed
+operation. It is **never** run automatically, and the app never auto-resets on
+boot.
 
 The historical `0001..0023` SQL is preserved (untouched) at
 `prisma/migrations-archive/pre-0.1.0`.
@@ -471,3 +477,47 @@ docker run --rm \
 - **Compose refuses to start until I set `AUTH_SECRET`** - that is intentional
   (no hardcoded secrets). Set it via a git-ignored `.env`:
   `echo 'AUTH_SECRET=...' >> .env`.
+- **`prisma migrate deploy` fails with `P3018` (a failed migration row
+  exists)** - Prisma already recorded a failed attempt at the baseline
+  `20261016000000_initial_0_1_0` in `_prisma_migrations` (its `finished_at` and
+  `rolled_back_at` are both NULL). Inspect that row BEFORE doing anything:
+  `SELECT migration_name, finished_at, rolled_back_at, logs FROM
+  "_prisma_migrations" ORDER BY started_at;` and check `prisma migrate status`.
+  Then inspect the public schema for partial app objects - list the public
+  tables and enum types (`SELECT tablename FROM pg_tables WHERE schemaname =
+  'public';` alongside the enum rows from `pg_type`) and confirm no app table or
+  enum was half-created. ONLY when (a) the failed row is exactly the baseline
+  migration and (b) there is no partial app schema, mark the baseline as rolled
+  back and re-run deploy:
+  `prisma migrate resolve --rolled-back 20261016000000_initial_0_1_0` then
+  `pnpm db:migrate`. The one-time guarded reset (section 1.4) is the alternative
+  for a database that genuinely holds app data.
+- **`prisma migrate deploy` fails with `P3005` ("database schema is not
+  empty")** - this is the no-failed-row case. Prisma refuses to even start the
+  baseline because the public schema already holds objects that are NOT part of
+  the app, and there is NO failed migration row to resolve. Do NOT run
+  `prisma migrate resolve` here - nothing failed, and resolving a row that does
+  not exist is a no-op at best. Instead inspect the non-extension objects: if
+  they are app or old-chain objects (the `0001..0023` tables, or a half-applied
+  schema), use the one-time guarded reset (section 1.4); if the only public
+  objects are members of a Postgres extension (such as `pg_stat_statements` on a
+  fresh Crunchy PGO database), the baseline ignores them and `pnpm db:migrate`
+  proceeds - see the PGO bullet below.
+- **The baseline already applied successfully** - if `_prisma_migrations`
+  already holds a row for `20261016000000_initial_0_1_0` whose `finished_at` is
+  NOT NULL, the baseline already succeeded. NEVER run
+  `prisma migrate resolve --rolled-back 20261016000000_initial_0_1_0` on it, and
+  NEVER re-run the baseline, just because the checksum recorded in the database
+  differs from the file on disk. The baseline only ever builds from an EMPTY
+  database, so a second run would wrongly refuse on its own schema. Leave the
+  applied row alone - `prisma migrate status` is the source of truth.
+- **A fresh PGO (Crunchy Postgres Operator) database that has `pg_stat_statements`
+  installed into public** - the 0.1.0 baseline recognises the extension's views
+  and composite row types as extension members (via `pg_depend`, never by name)
+  and treats the database as empty, so `pnpm db:migrate` succeeds and the
+  operator's extension views/functions are preserved. Never drop operator
+  extensions (`DROP EXTENSION pg_stat_statements`); the baseline never touches
+  them. Also do NOT reach for `prisma migrate reset` here: the one-time reset
+  script expressly refuses when any extension is installed in the `public`
+  schema (section 1.4), so for a fresh PGO baseline use `pnpm db:migrate` +
+  `pnpm db:seed` instead of the reset.

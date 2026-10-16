@@ -5,10 +5,17 @@
 -- Because it is a from-scratch baseline (not an incremental ALTER), it must only
 -- ever run against a database that has NOT been migrated before. The DO block
 -- below is that guard: it runs BEFORE any CREATE, and if it finds a non-empty
--- Prisma migration history (an old-chain database) or ANY pre-existing user
--- object in the public schema other than the Prisma tracking table, it aborts
--- with a clear message. It never drops anything - an old-chain or partially
--- migrated database is simply left untouched.
+-- Prisma migration history (an old-chain database) or ANY pre-existing
+-- non-extension object in the public schema other than the Prisma tracking
+-- table, it aborts with a clear message. Objects that belong to a Postgres
+-- extension are identified by dependency (pg_depend deptype='e'), never by a
+-- hard-coded name allow-list, so a database where Crunchy PGO (or anything else)
+-- installs an extension such as pg_stat_statements into public is treated as
+-- empty. It never drops anything: an old-chain or partially-migrated database
+-- (one the guard refuses) is left untouched, while a database that merely
+-- carries a Postgres extension (e.g. pg_stat_statements installed into public
+-- by Crunchy PGO) is not refused - the extension's objects are preserved, and
+-- the baseline still creates the full application schema around them.
 
 DO $$
 DECLARE
@@ -35,11 +42,15 @@ BEGIN
     END IF;
   END IF;
 
-  -- 2. Reject any pre-existing user object in the public schema other than the
-  --    Prisma tracking table (and its auto-created row type). This covers
-  --    tables, views, materialized views, foreign tables, partitioned tables and
-  --    user-defined types. A database that already holds app objects (the
-  --    0001..0023 chain leaves 11 tables) fails here without dropping anything.
+  -- 2. Reject any pre-existing NON-extension object in the public schema other
+  --    than the Prisma tracking table (and its auto-created row type). This
+  --    covers tables, views, materialized views, foreign tables, partitioned
+  --    tables and user-defined types. Objects that are members of a Postgres
+  --    extension (detected via pg_depend deptype='e', NOT by name) are ignored,
+  --    so a database that has an extension installed into public - for example
+  --    pg_stat_statements on a Crunchy PGO database - is treated as empty. A
+  --    database that still holds app objects (the 0001..0023 chain leaves 11
+  --    tables) fails here without dropping anything.
   SELECT count(*) INTO foreign_objects
   FROM (
     SELECT c.relname AS name
@@ -48,6 +59,17 @@ BEGIN
     WHERE n.nspname = 'public'
       AND c.relkind IN ('r', 'v', 'm', 'f', 'p')
       AND c.relname <> '_prisma_migrations'
+      -- Skip relations that are members of a Postgres extension (deptype='e' in
+      -- pg_depend). This is how we ignore an extension-installed view such as
+      -- pg_stat_statements without hard-coding any name allow-list.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_depend d
+        WHERE d.classid = 'pg_class'::regclass
+          AND d.objid = c.oid
+          AND d.deptype = 'e'
+          AND d.refclassid = 'pg_extension'::regclass
+      )
     UNION ALL
     SELECT t.typname
     FROM pg_catalog.pg_type t
@@ -56,10 +78,31 @@ BEGIN
       AND t.typtype IN ('e', 'c', 'd', 'b', 'r', 'm')
       AND t.typcategory <> 'A'
       AND t.typname <> '_prisma_migrations'
+      -- Skip a type that is itself a member of a Postgres extension ...
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_depend d
+        WHERE d.classid = 'pg_type'::regclass
+          AND d.objid = t.oid
+          AND d.deptype = 'e'
+          AND d.refclassid = 'pg_extension'::regclass
+      )
+      -- ... and skip the COMPOSITE ROW TYPE that an extension-owned relation
+      -- (e.g. the pg_stat_statements view) automatically carries, whose typrelid
+      -- points at an extension-owned pg_class. A user-created view's row type is
+      -- NOT extension-owned, so it is still counted and refuses.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_depend d
+        WHERE d.classid = 'pg_class'::regclass
+          AND d.objid = t.typrelid
+          AND d.deptype = 'e'
+          AND d.refclassid = 'pg_extension'::regclass
+      )
   ) obj;
   IF foreign_objects > 0 THEN
     RAISE EXCEPTION
-      'prisma-0.1.0-baseline: public schema already contains % non-migration object(s); refusing to re-create. Run migrate deploy on an empty database, or reset this database.',
+      'prisma-0.1.0-baseline: public schema already contains % non-extension object(s); refusing to re-create. Run migrate deploy on an empty database, or reset this database.',
       foreign_objects;
   END IF;
 END $$;
