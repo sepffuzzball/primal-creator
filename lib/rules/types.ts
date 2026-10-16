@@ -184,6 +184,37 @@ export function bandForGrade(
   return table.find((b) => b.grade === grade)
 }
 
+/**
+ * The grade entry point used by the skill-choice milestone schedule. Unlike the
+ * grade band `entryLevel` (which is 10 for F because of the G/F overlap), the
+ * skill-choice entry for F is 0: an F-grade track is eligible from level 1.
+ * G intentionally has no entry - G grades never earn a skill-choice credit.
+ */
+export const SKILL_CHOICE_ENTRY: Partial<Record<Grade, number>> = {
+  F: 0,
+  E: 25,
+  D: 100,
+  C: 200,
+  B: 350,
+  A: 500,
+  S: 750,
+}
+
+/**
+ * The configurable number of levels between skill-choice CREDITS, per grade.
+ * G is intentionally absent: G grades earn no skill-choice credits. Each value is
+ * an integer 1..250 (validated by `houseRulesConfigSchema`).
+ */
+export interface SkillChoiceIntervals {
+  F: number
+  E: number
+  D: number
+  C: number
+  B: number
+  A: number
+  S: number
+}
+
 /* ------------------------------------------------------------------ *
  * Tracks (class / profession) and race
  * ------------------------------------------------------------------ */

@@ -132,6 +132,20 @@ export interface AdminHouseRulesConfig {
    * association add, and on backup import - not just in the UI.
    */
   maxTranscendentSkills: number
+  /**
+   * The configurable number of levels between skill-choice CREDITS, per grade
+   * (default F:5, E:5, D:20, C:30, B:40, A:50, S:60). G is intentionally absent
+   * (G grades earn no credits). Each value is an integer 1..250.
+   */
+  skillChoiceIntervals: {
+    F: number
+    E: number
+    D: number
+    C: number
+    B: number
+    A: number
+    S: number
+  }
 }
 
 /** GET /api/admin/rules - current validated house rules plus the CAS version. */
@@ -479,6 +493,18 @@ export interface SkillOfferView {
   canceledAt: string | null
   options: SkillOfferOptionView[]
   selectedDefinitionId: string | null
+  /**
+   * Schedule-credit provenance: the grade whose skill-choice interval awarded this
+   * offer. Present (with `trackDefinitionStableId`) only on a scheduled/milestone
+   * offer; `null` when the offer predates provenance.
+   */
+  earnedGrade?: string | null
+  /**
+   * The selected track's catalog stableId captured at the moment the credit was
+   * earned. Present (with `earnedGrade`) only on a scheduled/milestone offer;
+   * `null` on a legacy offer.
+   */
+  trackDefinitionStableId?: string | null
 }
 
 /**
@@ -883,6 +909,16 @@ export type SkillUpgradeRequest = {
 }
 
 export interface SkillUpgradeResponse {
+  character: CharacterDetail
+}
+
+/**
+ * POST /api/characters/[id]/skills/refresh - the reloaded character detail after
+ * appending any newly eligible skill options to still-pending scheduled offers.
+ * The character version and journal are not bumped (refresh only appends snapshot
+ * rows), so the detail reflects the new option rows without a CAS advance.
+ */
+export interface SkillRefreshResponse {
   character: CharacterDetail
 }
 

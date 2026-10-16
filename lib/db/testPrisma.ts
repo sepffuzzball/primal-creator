@@ -98,6 +98,10 @@ export interface TestSkillOfferRow {
   selectedDefinition?: TestCatalogRow | null
   offeredAt: Date
   selectedAt: Date | null
+  // Schedule-credit provenance: the grade whose interval awarded this offer and
+  // the selected track's catalog stableId. Null on legacy/imported offers.
+  earnedGrade?: string | null
+  trackDefinitionStableId?: string | null
   // Relational options, only set on the object returned by findUnique/findMany.
   options?: TestSkillOfferOptionRow[]
 }
@@ -187,6 +191,10 @@ export interface TestPrismaInstance {
       cb: (tx: Transaction) => Promise<unknown>,
       options?: { isolationLevel?: unknown }
     ) => Promise<unknown>
+    $queryRaw: (
+      strings: TemplateStringsArray,
+      ...values: unknown[]
+    ) => Promise<unknown[]>
     user: {
       findUnique: (args: {
         where: { id: string } | { email: string }
@@ -318,6 +326,10 @@ export interface TestPrismaInstance {
           choiceGroup?: string
           generation?: number
           canceledAt?: Date | null
+          earnedGrade?: { not?: null }
+          trackDefinitionStableId?: { not?: null }
+          selectedDefinitionId?: null
+          selectedAt?: null
         }
         include?: unknown
       }) => Promise<TestSkillOfferRow[]>
@@ -325,6 +337,12 @@ export interface TestPrismaInstance {
         where: { id: string }
         data: Record<string, unknown>
       }) => Promise<TestSkillOfferRow>
+    }
+    skillOfferOption: {
+      createMany: (args: {
+        data: Array<Record<string, unknown>>
+        skipDuplicates?: boolean
+      }) => Promise<{ count: number }>
     }
     houseRules: {
       findUnique: (args: {
@@ -383,6 +401,18 @@ export interface TestPrismaInstance {
 }
 
 interface Transaction {
+  /**
+   * Raw query support. The service acquires a `FOR UPDATE` row lock on
+   * `skill_offers` via `$queryRaw` before reading/validating a pending offer in
+   * both `skillCharacter` (selection) and `refreshPendingSkillOffers`. The mock
+   * runs transactions strictly serially so it never models real row-lock
+   * contention; it only needs the query to be callable and to address nothing
+   * (the lock result is unused), which this no-op satisfies.
+   */
+  $queryRaw: (
+    _strings: TemplateStringsArray,
+    ..._values: unknown[]
+  ) => Promise<unknown[]>
   user: {
     findUnique: (args: {
       where: { id: string } | { email: string }
@@ -531,6 +561,10 @@ interface Transaction {
         choiceGroup?: string
         generation?: number
         canceledAt?: Date | null
+        earnedGrade?: { not?: null }
+        trackDefinitionStableId?: { not?: null }
+        selectedDefinitionId?: null
+        selectedAt?: null
       }
       include?: unknown
     }) => Promise<TestSkillOfferRow[]>
@@ -538,6 +572,12 @@ interface Transaction {
       where: { id: string }
       data: Record<string, unknown>
     }) => Promise<TestSkillOfferRow>
+  }
+  skillOfferOption: {
+    createMany: (args: {
+      data: Array<Record<string, unknown>>
+      skipDuplicates?: boolean
+    }) => Promise<{ count: number }>
   }
   houseRules: {
     findUnique: (args: {
@@ -702,6 +742,14 @@ export function createTestPrisma(): TestPrismaInstance {
   }
 
   const tx: Transaction = {
+    $queryRaw: async (
+      _strings: TemplateStringsArray,
+      ..._values: unknown[]
+    ) => {
+      void _strings
+      void _values
+      return []
+    },
     user: {
       findUnique: async ({ where }) => {
         const key =
@@ -1206,6 +1254,9 @@ export function createTestPrisma(): TestPrismaInstance {
             (data.selectedDefinitionId as string | null) ?? null,
           offeredAt: (data.offeredAt as Date | undefined) ?? now,
           selectedAt: (data.selectedAt as Date | null) ?? null,
+          earnedGrade: (data.earnedGrade as string | null) ?? null,
+          trackDefinitionStableId:
+            (data.trackDefinitionStableId as string | null) ?? null,
         }
         skillOffers.push(offer)
         const nestedOptions = (
@@ -1243,15 +1294,31 @@ export function createTestPrisma(): TestPrismaInstance {
           results = results.filter((o) => o.choiceGroup === where.choiceGroup)
         if (where?.generation != null)
           results = results.filter((o) => o.generation === where.generation)
-        if (where?.canceledAt != null) {
-          if (where.canceledAt instanceof Date) {
+        // `canceledAt` may be a Date (exact match) or null (active-only). A bare
+        // `null` MUST be honored: it selects rows where canceledAt is null.
+        if ("canceledAt" in (where ?? {})) {
+          if (where?.canceledAt == null) {
+            results = results.filter((o) => o.canceledAt == null)
+          } else if (where.canceledAt instanceof Date) {
             results = results.filter(
               (o) => o.canceledAt?.getTime() === where.canceledAt!.getTime()
             )
-          } else {
-            results = results.filter((o) => o.canceledAt == null)
           }
         }
+        // `earnedGrade: { not: null }` / `trackDefinitionStableId: { not: null }`
+        // select rows whose provenance is set.
+        if (where?.earnedGrade?.not === null)
+          results = results.filter((o) => o.earnedGrade != null)
+        if (where?.trackDefinitionStableId?.not === null)
+          results = results.filter((o) => o.trackDefinitionStableId != null)
+        // A bare `null` on a nullable column selects rows where it is null.
+        if (
+          "selectedDefinitionId" in (where ?? {}) &&
+          where?.selectedDefinitionId === null
+        )
+          results = results.filter((o) => o.selectedDefinitionId == null)
+        if ("selectedAt" in (where ?? {}) && where?.selectedAt === null)
+          results = results.filter((o) => o.selectedAt == null)
         return results.map((o) => attachOffer(o))
       },
       update: async ({ where, data }) => {
@@ -1267,6 +1334,47 @@ export function createTestPrisma(): TestPrismaInstance {
           offer.canceledAt = data.canceledAt as Date | null
         }
         return attachOffer(offer)
+      },
+    },
+    skillOfferOption: {
+      createMany: async ({
+        data,
+        skipDuplicates,
+      }: {
+        data: Array<Record<string, unknown>>
+        skipDuplicates?: boolean
+      }) => {
+        // Mirror the DB unique (offerId, definitionId) constraint: with
+        // `skipDuplicates` a colliding row is silently skipped (the service relies
+        // on this for idempotent refresh); without it a collision is a P2002.
+        let created = 0
+        for (const d of data) {
+          const offerId = d.offerId as string
+          const definitionId = d.definitionId as string
+          const duplicated = skillOfferOptions.some(
+            (opt) =>
+              opt.offerId === offerId && opt.definitionId === definitionId
+          )
+          if (duplicated) {
+            if (skipDuplicates) continue
+            throw {
+              name: "PrismaClientKnownRequestError",
+              code: "P2002",
+              meta: { target: ["offerId", "definitionId"] },
+            }
+          }
+          const id = (d.id as string | undefined) ?? `opt-${++optionCounter}`
+          skillOfferOptions.push({
+            id,
+            offerId,
+            definitionId,
+            nameSnapshot: d.nameSnapshot as string,
+            configSnapshot: d.configSnapshot,
+            definition: catalog.get(definitionId) ?? null,
+          })
+          created++
+        }
+        return { count: created }
       },
     },
     houseRules: {
@@ -1396,6 +1504,7 @@ export function createTestPrisma(): TestPrismaInstance {
       )
       return run
     },
+    $queryRaw: tx.$queryRaw,
     catalogDefinition: {
       findUnique: async ({
         where,
@@ -1502,6 +1611,7 @@ export function createTestPrisma(): TestPrismaInstance {
     characterInventoryItem: tx.characterInventoryItem,
     progressionEvent: tx.progressionEvent,
     skillOffer: tx.skillOffer,
+    skillOfferOption: tx.skillOfferOption,
     houseRules: tx.houseRules,
   }
 

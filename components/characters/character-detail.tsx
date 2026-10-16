@@ -1501,6 +1501,11 @@ export function CharacterDetail({
     definitionId: string
     name: string
   } | null>(null)
+  const [levelUpOfferId, setLevelUpOfferId] = React.useState<string | null>(
+    null
+  )
+  const [skillRefreshError, setSkillRefreshError] = React.useState(false)
+  const refreshOnOpen = React.useRef<string | null>(null)
   const [grantOpen, setGrantOpen] = React.useState(false)
   const [grantSkillId, setGrantSkillId] = React.useState("")
   const [grantReason, setGrantReason] = React.useState("")
@@ -1528,29 +1533,304 @@ export function CharacterDetail({
   // onNameChange only when the successfully fetched name actually changes,
   // never on every render.
   const lastReportedName = React.useRef<string | null>(null)
+  const currentCharacter = React.useRef(character)
+  // Tracks whether the editable notes/profile form has unsaved edits, so an
+  // unrelated same-version refresh does not reset an in-progress draft.
+  const notesDirty = React.useRef(false)
+  // The latest route id, kept in a ref so an async callback that started for a
+  // previous route (e.g. a slow refresh for character A) can detect the route
+  // changed to B and ignore its response instead of reverting the sheet.
+  const activeCharacterIdRef = React.useRef(id)
+  // Monotonic sequence per async operation. A response only applies when it is
+  // still the latest request for the active route, so a late response from a
+  // superseded request (or a stale route) cannot overwrite a newer one.
+  const refreshRequestRef = React.useRef(0)
+  const reloadRequestRef = React.useRef(0)
+  // Cross-request monotonic sequence shared by character GET/reload and
+  // skills/refresh. Each request stamps a start sequence (requestSeqRef); the
+  // sequence of the last successfully applied snapshot (lastAppliedSeqRef) is
+  // recorded so a same-version response from a request that began BEFORE a newer
+  // snapshot was applied - a stale GET/refresh - cannot roll back live mutable
+  // metadata such as an offer option's `archived` flag. The request counter never
+  // resets (it stays monotonic for the component's lifetime); only the recorded
+  // last-applied sequence is reset to 0 when the route id changes, so a value
+  // from character A can never mark character B's snapshots as stale.
+  const requestSeqRef = React.useRef(0)
+  const lastAppliedSeqRef = React.useRef(0)
+
+  // Set the notes/profile form from a server snapshot only when it is safe to do
+  // so: never with a stale (older) snapshot, never for a different character id
+  // (treated as fresh), and never while the user has an unsaved edit on an
+  // unrelated same-version refresh. `currentRef` must be the accepted ref read
+  // BEFORE applyCharacter mutates it, otherwise a stale response can pass its own
+  // version check and clobber notes.
+  const applyNotesIfFresh = React.useCallback(
+    (
+      currentRef: CharacterDetail | null,
+      incoming: CharacterDetail,
+      requestSeq: number
+    ) => {
+      // A snapshot is fresh only if it is newer (version), for a different
+      // character id (route change, treated as fresh), or a same-version snapshot
+      // that is NOT stale - i.e. its request began at or after the last applied
+      // snapshot. A stale same-version request must not clobber the profile form
+      // with older values.
+      const fresh =
+        !currentRef ||
+        currentRef.id !== incoming.id ||
+        incoming.version > currentRef.version ||
+        (incoming.version === currentRef.version &&
+          !notesDirty.current &&
+          requestSeq >= lastAppliedSeqRef.current)
+      if (!fresh) return
+      notesDirty.current = false
+      setNotes({
+        name: incoming.name,
+        description: incoming.description ?? "",
+        nickname: incoming.nickname ?? "",
+        pronouns: incoming.pronouns ?? "",
+        ageDescription: incoming.ageDescription ?? "",
+        appearance: incoming.appearance ?? "",
+        biography: incoming.biography ?? "",
+        notes: incoming.notes ?? "",
+      })
+    },
+    []
+  )
+
+  // A single notes/profile field edit marks the form dirty (so an unrelated
+  // same-version refresh does not reset it) and applies the patch.
+  const updateNotes = React.useCallback((patch: Partial<typeof notes>) => {
+    notesDirty.current = true
+    setNotes((n) => ({ ...n, ...patch }))
+  }, [])
+
+  // Ignore older snapshots from refreshes that resolve after a mutation. A
+  // snapshot for a different character id is always treated as fresh (the
+  // component is reused across route params, so the ref/state can otherwise
+  // hold the previous character).
+  const applyCharacter = React.useCallback(
+    (incoming: CharacterDetail, requestSeq: number) => {
+      const current = currentCharacter.current
+      // A same-version snapshot is stale when its request began BEFORE the last
+      // successfully applied snapshot (it was issued while an even newer GET or
+      // refresh was still in flight). Such a response must not roll back live
+      // mutable metadata, e.g. an offer option's `archived` flag. Unlike the
+      // previous behavior it is not discarded outright: it may still contribute
+      // append-only offer/option additions, so it is merged rather than ignored.
+      const staleSameVersion =
+        current != null &&
+        current.id === incoming.id &&
+        incoming.version === current.version &&
+        requestSeq < lastAppliedSeqRef.current
+      // Apply the snapshot when there is no baseline, the route id differs
+      // (treated as fresh), the version strictly increases (apply regardless of
+      // ordering), or it is a same-version request (whether stale or not - a
+      // stale same-version response contributes only append-only additions
+      // rather than being ignored).
+      const shouldApply =
+        current == null ||
+        current.id !== incoming.id ||
+        incoming.version > current.version ||
+        incoming.version === current.version
+      if (!shouldApply) return
+      // Only a non-stale snapshot replaces the authoritative ref and advances the
+      // last-applied sequence. A stale same-version response is append-only: it
+      // must neither clobber the ref with an (possibly older) snapshot nor
+      // regress the sequence counter.
+      if (!staleSameVersion) {
+        currentCharacter.current = incoming
+        lastAppliedSeqRef.current = requestSeq
+      }
+      setCharacter((current) => {
+        if (!current || current.id !== incoming.id) return incoming
+        if (incoming.version > current.version) return incoming
+        if (incoming.version < current.version) return current
+        if (staleSameVersion) {
+          // Stale same-version snapshot: preserve every current field, the
+          // existing offer's mutable flags / terminal status / immutable
+          // snapshot(s), and option state. Append ONLY offer ids and options
+          // absent from the current state from the incoming snapshot
+          // (append-only additions). Never overwrite an existing option's
+          // `archived` flag from a stale response; a newly seen option may carry
+          // its archived value.
+          const currentOffers = current.skillOffers ?? []
+          const incomingOffers = incoming.skillOffers ?? []
+          const currentOfferById = new Map(
+            currentOffers.map((offer) => [offer.id, offer])
+          )
+          const merged = [...currentOffers]
+          for (const offer of incomingOffers) {
+            const prior = currentOfferById.get(offer.id)
+            if (!prior) {
+              merged.push(offer)
+              continue
+            }
+            const priorOptions = prior.options ?? []
+            const priorOptionIds = new Set(
+              priorOptions.map((option) => option.definitionId)
+            )
+            const additions = (offer.options ?? []).filter(
+              (option) => !priorOptionIds.has(option.definitionId)
+            )
+            if (additions.length === 0) continue
+            const index = merged.findIndex((entry) => entry.id === offer.id)
+            merged[index] = {
+              ...prior,
+              options: [...priorOptions, ...additions],
+            }
+          }
+          const unchanged =
+            merged.length === currentOffers.length &&
+            merged.every((offer, index) => offer === currentOffers[index])
+          if (unchanged) return current
+          return { ...current, skillOffers: merged }
+        }
+        // Non-stale same-version snapshot, keep the current merge policy: adopt
+        // the incoming mutable metadata (archived / grade) for options already
+        // held, keep the immutable old snapshots (nameSnapshot), and preserve
+        // live note and terminal state.
+        const currentOffers = current.skillOffers ?? []
+        const incomingOffers = incoming.skillOffers ?? []
+        const priorById = new Map(
+          currentOffers.map((offer) => [offer.id, offer])
+        )
+        const offers = incomingOffers.map((offer) => {
+          const prior = priorById.get(offer.id)
+          if (!prior) return offer
+          const needTerminal =
+            Boolean(prior.selectedDefinitionId) || Boolean(prior.canceledAt)
+          // Merge options by definitionId. A duplicate id keeps the prior
+          // immutable snapshot fields (nameSnapshot / configSnapshot) but adopts
+          // the incoming mutable live metadata (archived, grade) so a same-version
+          // archive/re-enable toggle is reflected without creating a duplicate
+          // option. A new option id from the incoming snapshot is appended; an
+          // option the incoming snapshot omits (a delayed refresh that predates an
+          // append) keeps its prior option unchanged.
+          const priorOptions = prior.options ?? []
+          const incomingOptions = offer.options ?? []
+          const priorOptionById = new Map(
+            priorOptions.map((option) => [option.definitionId, option])
+          )
+          const mergedOptions = incomingOptions.map((option) => {
+            const priorOption = priorOptionById.get(option.definitionId)
+            if (!priorOption) return option
+            // Spreading prior first keeps any extra immutable snapshot field
+            // (e.g. configSnapshot) that is not part of the view type; spreading
+            // the incoming option then adopts its mutable archived/grade flags.
+            // Only nameSnapshot is re-pinned from the prior so the captured name
+            // survives even if the incoming definition row was already renamed.
+            return {
+              ...priorOption,
+              ...option,
+              nameSnapshot: priorOption.nameSnapshot,
+            }
+          })
+          // Keep prior options whose ids the incoming snapshot omitted, so a stale
+          // same-version snapshot cannot drop options appended after it was read.
+          for (const priorOption of priorOptions) {
+            if (
+              !mergedOptions.some(
+                (merged) => merged.definitionId === priorOption.definitionId
+              )
+            ) {
+              mergedOptions.push(priorOption)
+            }
+          }
+          return {
+            ...(needTerminal
+              ? {
+                  ...offer,
+                  selectedDefinitionId: prior.selectedDefinitionId,
+                  canceledAt: prior.canceledAt,
+                }
+              : offer),
+            options: mergedOptions,
+          }
+        })
+        const mergedIds = new Set(offers.map((offer) => offer.id))
+        const merged = [
+          ...offers,
+          ...currentOffers.filter((offer) => !mergedIds.has(offer.id)),
+        ]
+        const unchanged =
+          merged.length === incomingOffers.length &&
+          merged.every((offer, index) => offer === incomingOffers[index])
+        if (unchanged) return incoming === current ? current : incoming
+        return { ...incoming, skillOffers: merged }
+      })
+    },
+    []
+  )
 
   const reload = React.useCallback(async () => {
     if (!id) return
+    const requestId = reloadRequestRef.current + 1
+    reloadRequestRef.current = requestId
+    const requestSeq = ++requestSeqRef.current
     try {
       const res = await apiFetch<CharacterResponse>(`/api/characters/${id}`)
-      setCharacter(res.character)
-      setNotes({
-        name: res.character.name,
-        description: res.character.description ?? "",
-        nickname: res.character.nickname ?? "",
-        pronouns: res.character.pronouns ?? "",
-        ageDescription: res.character.ageDescription ?? "",
-        appearance: res.character.appearance ?? "",
-        biography: res.character.biography ?? "",
-        notes: res.character.notes ?? "",
-      })
+      // Ignore a stale response: it may belong to a previous route id, or to a
+      // reload that was superseded before it resolved. This prevents a slow
+      // reload for character A from reverting the sheet after the route changed
+      // to character B.
+      if (
+        activeCharacterIdRef.current !== id ||
+        reloadRequestRef.current !== requestId
+      )
+        return
+      // Compare against the accepted current ref BEFORE applyCharacter mutates
+      // it, so a stale (older) reload cannot pass its own version check and
+      // clobber notes.
+      applyNotesIfFresh(currentCharacter.current, res.character, requestSeq)
+      applyCharacter(res.character, requestSeq)
       setError(null)
     } catch (err) {
+      if (
+        activeCharacterIdRef.current !== id ||
+        reloadRequestRef.current !== requestId
+      )
+        return
       setError(err instanceof Error ? err.message : "Failed to load character.")
     } finally {
-      setLoading(false)
+      if (
+        activeCharacterIdRef.current === id &&
+        reloadRequestRef.current === requestId
+      ) {
+        setLoading(false)
+      }
     }
-  }, [id])
+  }, [id, applyCharacter, applyNotesIfFresh])
+
+  const refreshSkills = React.useCallback(async () => {
+    if (!id) return
+    const requestId = refreshRequestRef.current + 1
+    refreshRequestRef.current = requestId
+    const requestSeq = ++requestSeqRef.current
+    try {
+      const result = await apiFetch<{ character: CharacterDetail }>(
+        `/api/characters/${id}/skills/refresh`,
+        { method: "POST" }
+      )
+      // A refresh started for character A must not apply its snapshot (or clear
+      // the skill error) once the route id has changed to B - a stale-route
+      // guard, plus a request-id guard so only the latest refresh wins.
+      if (
+        activeCharacterIdRef.current !== id ||
+        refreshRequestRef.current !== requestId
+      )
+        return
+      applyCharacter(result.character, requestSeq)
+      setSkillRefreshError(false)
+    } catch {
+      if (
+        activeCharacterIdRef.current !== id ||
+        refreshRequestRef.current !== requestId
+      )
+        return
+      setSkillRefreshError(true)
+    }
+  }, [id, applyCharacter])
 
   // Invalidate and reload cached export events after a mutation that refreshes
   // the character only when the history/track data is already on screen or
@@ -1701,26 +1981,42 @@ export function CharacterDetail({
   }, [id])
 
   React.useEffect(() => {
+    if (!id || refreshOnOpen.current === id) return
+    refreshOnOpen.current = id
+    void refreshSkills()
+  }, [id, refreshSkills])
+
+  React.useEffect(() => {
+    activeCharacterIdRef.current = id
+    // Reset the per-route last-applied sequence when the route id changes. The
+    // sequence refs are only meaningful within a single route; carrying
+    // character A's last-applied sequence into character B would mark B's first
+    // snapshots as stale and incorrectly keep them from applying. The request
+    // counter is NOT reset - it stays globally monotonic so no two requests ever
+    // share a sequence within the component's lifetime.
+    lastAppliedSeqRef.current = 0
+  }, [id])
+
+  React.useEffect(() => {
     if (!id) return
     let active = true
+    const requestSeq = ++requestSeqRef.current
     apiFetch<CharacterResponse>(`/api/characters/${id}`)
       .then((res) => {
         if (!active) return
-        setCharacter(res.character)
-        setNotes({
-          name: res.character.name,
-          description: res.character.description ?? "",
-          nickname: res.character.nickname ?? "",
-          pronouns: res.character.pronouns ?? "",
-          ageDescription: res.character.ageDescription ?? "",
-          appearance: res.character.appearance ?? "",
-          biography: res.character.biography ?? "",
-          notes: res.character.notes ?? "",
-        })
+        // Stale-route guard: if the route id changed after this request was
+        // issued, ignore the response so a previous id cannot revert the sheet.
+        if (activeCharacterIdRef.current !== id) return
+        // Same guard as reload: compare against the accepted ref BEFORE
+        // applyCharacter mutates it, and ignore a stale response from a previous
+        // character id (the `active` flag plus the cross-id fresh check).
+        applyNotesIfFresh(currentCharacter.current, res.character, requestSeq)
+        applyCharacter(res.character, requestSeq)
         setError(null)
       })
       .catch((err) => {
         if (!active) return
+        if (activeCharacterIdRef.current !== id) return
         setError(
           err instanceof Error ? err.message : "Failed to load character."
         )
@@ -1731,7 +2027,7 @@ export function CharacterDetail({
     return () => {
       active = false
     }
-  }, [id])
+  }, [id, applyCharacter, applyNotesIfFresh])
 
   // Report the character name upstream (to the breadcrumb) only when the
   // successfully fetched name changes, not on every render. The ref guard
@@ -1850,6 +2146,14 @@ export function CharacterDetail({
           setJournalOpen(true)
         }
         await reload()
+        if (
+          res.journal.leveledUp &&
+          (track === "class" || track === "profession") &&
+          res.journal.skillOfferIds?.length
+        ) {
+          await refreshSkills()
+          setLevelUpOfferId(res.journal.skillOfferIds[0] ?? null)
+        }
         await refreshEvents()
       } catch (err) {
         setExperienceDrafts((drafts) => {
@@ -1865,7 +2169,7 @@ export function CharacterDetail({
         setBusy(false)
       }
     },
-    [character, reload, refreshEvents]
+    [character, reload, refreshEvents, refreshSkills]
   )
 
   const allocate = React.useCallback(
@@ -2578,6 +2882,7 @@ export function CharacterDetail({
         onValueChange={(v) => {
           if (!v) return
           setActiveTab(v)
+          if (v === "skills") void refreshSkills()
           if (v === "inventory") {
             if (equipmentCatalog.length === 0) void loadCatalog("equipment")
             if (itemsCatalog.length === 0) void loadCatalog("items")
@@ -2605,6 +2910,33 @@ export function CharacterDetail({
           <TabsTrigger value="history">History</TabsTrigger>
           <TabsTrigger value="notes">Notes</TabsTrigger>
         </TabsList>
+        <p
+          className="flex gap-3 text-xs text-muted-foreground"
+          aria-label="Pending skill choices"
+        >
+          <span>
+            Class:{" "}
+            {
+              character.skillOffers.filter(
+                (o) =>
+                  o.track === "class" &&
+                  !o.selectedDefinitionId &&
+                  !o.canceledAt
+              ).length
+            }
+          </span>
+          <span>
+            Profession:{" "}
+            {
+              character.skillOffers.filter(
+                (o) =>
+                  o.track === "profession" &&
+                  !o.selectedDefinitionId &&
+                  !o.canceledAt
+              ).length
+            }
+          </span>
+        </p>
 
         <TabsContent value="inventory" className="pt-3">
           <Card>
@@ -3464,7 +3796,7 @@ export function CharacterDetail({
                                   return (
                                     <span
                                       key={`${phase.phase}-${track}`}
-                                      className="flex justify-between pl-3 text-[0.6875rem] text-muted-foreground"
+                                      className="flex justify-between text-[0.6875rem] text-muted-foreground"
                                     >
                                       <span>{label}</span>
                                       <span className="tabular-nums">
@@ -4346,9 +4678,7 @@ export function CharacterDetail({
                   <Input
                     id="note-name"
                     value={notes.name}
-                    onChange={(e) =>
-                      setNotes((n) => ({ ...n, name: e.target.value }))
-                    }
+                    onChange={(e) => updateNotes({ name: e.target.value })}
                   />
                 </div>
                 <div className="flex flex-col gap-1.5">
@@ -4357,7 +4687,7 @@ export function CharacterDetail({
                     id="note-description"
                     value={notes.description}
                     onChange={(e) =>
-                      setNotes((n) => ({ ...n, description: e.target.value }))
+                      updateNotes({ description: e.target.value })
                     }
                     className="min-h-28 w-full rounded-md border border-input bg-input/20 px-2 py-1.5 text-xs/relaxed outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
                   />
@@ -4380,7 +4710,7 @@ export function CharacterDetail({
                         maxLength={maxLength}
                         value={notes[field]}
                         onChange={(e) =>
-                          setNotes((n) => ({ ...n, [field]: e.target.value }))
+                          updateNotes({ [field]: e.target.value })
                         }
                       />
                     ) : (
@@ -4389,7 +4719,7 @@ export function CharacterDetail({
                         maxLength={maxLength}
                         value={notes[field]}
                         onChange={(e) =>
-                          setNotes((n) => ({ ...n, [field]: e.target.value }))
+                          updateNotes({ [field]: e.target.value })
                         }
                         className="min-h-28 w-full rounded-md border border-input bg-input/20 px-2 py-1.5 text-xs/relaxed"
                       />
@@ -4518,6 +4848,68 @@ export function CharacterDetail({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        open={levelUpOfferId !== null}
+        onOpenChange={(open) => {
+          if (!open) setLevelUpOfferId(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Choose a skill</DialogTitle>
+            <DialogDescription>
+              Choose one skill for this level-up, or decide later.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2">
+            {character.skillOffers
+              .find((offer) => offer.id === levelUpOfferId)
+              ?.options.filter((option) => !option.archived)
+              .map((option) => (
+                <Button
+                  key={option.definitionId}
+                  variant="outline"
+                  disabled={skillBusy}
+                  onClick={() => {
+                    const offerId = levelUpOfferId
+                    setLevelUpOfferId(null)
+                    if (offerId) void selectSkill(offerId, option.definitionId)
+                  }}
+                >
+                  {option.nameSnapshot}
+                </Button>
+              ))}
+            {character.skillOffers
+              .find((offer) => offer.id === levelUpOfferId)
+              ?.options.filter((option) => !option.archived).length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                Awaiting eligible skills
+              </p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setLevelUpOfferId(null)}>
+              Decide later
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {skillRefreshError ? (
+        <div
+          role="status"
+          className="flex items-center gap-2 text-xs text-muted-foreground"
+        >
+          <span>Skill options could not be refreshed.</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refreshSkills()}
+          >
+            Retry skill options
+          </Button>
+        </div>
+      ) : null}
 
       <Dialog
         open={!!selectConfirm}

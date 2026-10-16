@@ -160,6 +160,81 @@ entries that remain readable/editable as metadata-only):
   higher-rarity variant with no prior same-group link; only a genuine same-group
   collision is rejected (`import_link_collision`), as before.
 
+## Skill-choice credit schedule (per grade)
+
+In addition to the per-skill `milestone` entries, a class/profession track level-up
+may award a skill-choice **credit** on a **grade-keyed configurable schedule**, even
+when the catalog contains zero matching skills at that level. House rules
+`skillChoiceIntervals` map each grade (F/E/D/C/B/A/S) to the number of levels
+between credits (each an integer `1..250`; G earns no credits). When a track levels
+up, the service consults the pure helper
+`isSkillChoiceMilestone(grade, level, intervals)`; on a milestone it creates exactly
+one `choiceGroup: "standard"` offer for that `(track, level)`, even with zero
+eligible skills.
+
+The schedule uses the **stored track grade** when present (authoritative); a legacy
+ungraded track falls back to its **race grade**. Entries:
+
+| Grade | Skill-choice entry | Default interval |
+| ----- | ------------------ | ---------------- |
+| F     | 0                  | 5                |
+| E     | 25                 | 5                |
+| D     | 100                | 20               |
+| C     | 200                | 30               |
+| B     | 350                | 40               |
+| A     | 500                | 50               |
+| S     | 750                | 60               |
+| G     | (none)             | (no credits)     |
+
+A credit is earned only when ALL of these hold: `level > entry`;
+`(level - entry) % interval === 0`; and `level` is within the grade's applicable
+band, whose upper bound is EXCLUSIVE of the next grade's skill-choice entry (for a
+non-S grade) or the grade's own inclusive band max (999, for the top grade S). The
+grade's own entry never counts. A grade never awards merely for reaching its own
+entry, and never awards at or past the next grade's entry - so an E-grade level-100
+(whose next grade D begins at 100) does not earn an E credit, and a D-grade
+level-200 (C begins at 200) does not earn a D credit.
+
+At a credit milestone the offer options come only from unarchived skills whose
+config `track` equals the advanced track, whose `milestone` equals the reached
+level, whose catalog `grade` (when set) equals the earned grade, and whose
+`eligibleDefinitionStableIds` (when present) includes the track's definition
+stableId. The skill's own `choiceGroup` is **ignored** at a credit milestone: every
+surviving skill collapses into the single `"standard"` offer (which is created even
+when the list is empty). Credits are never multiplied per matching skill.
+
+## Refreshing a pending scheduled credit (POST /api/characters/[id]/skills/refresh)
+
+A scheduled (milestone) credit offer may be created at a level-up when the catalog
+already contains zero matching skills (a zero-option credit). If a matching skill is
+**authored later**, that offer does not automatically learn about it - the option set
+was snapshotted at award time and the service never rewrites history. A refresh
+exists to close that gap: it re-queries the unarchived `skills` catalog and appends
+**only genuinely new eligible options** to each still-**pending scheduled** offer.
+
+- **Which offers.** Only offers with schedule-credit provenance (`earnedGrade` and
+  `trackDefinitionStableId` both set) that are still active (not selected, not
+  canceled) are considered. A legacy offer lacking provenance is left untouched.
+- **Eligibility is identical to the original credit** (shared helper,
+  `skillDefMatchesScheduledOffer`): the config `track` is exact, the `milestone`
+  equals the offer level, the catalog `grade` (when set) equals the saved earned
+  grade exactly, and `eligibleDefinitionStableIds` (when present) includes the saved
+  track stableId. The skill's own `choiceGroup` is ignored, and archived skills never
+  appear.
+- **Immutability.** Existing option snapshots are never modified, even if the skill
+  has since been edited or archived. Only new rows are appended; the DB unique
+  `(offerId, definitionId)` plus `createMany({ skipDuplicates: true })` make a
+  repeated refresh idempotent (no duplicates accumulate).
+- **No CAS bump / no journal.** Refreshing only appends snapshot rows - it does NOT
+  increment the character `version`, does not write a `progressionEvent`, and returns
+  the reloaded character detail. It is owner/admin-only.
+- **Concurrency with selection.** The refresh runs SERIALIZABLE. A selection that
+  commits between the refresh's pending-offer read and its append can surface as a
+  retryable 409 `serialization_conflict` (the transaction is rolled back, so no
+  stray options are left behind). Appending to an offer that was selected mid-race is
+  also harmless - it is an extra immutable snapshot; a retry filters the now-selected
+  offer out, so options are never appended after a selection.
+
 ## Offer cancellation (append-only) and re-offer
 
 A pending skill offer is **append-only**: it is never deleted or rewritten. It may
@@ -198,16 +273,23 @@ history of what was offered (and when) is preserved.
 
 The current backup schema is `primal-character/7`, and every exported skill offer
 carries the full append-only offer state: a non-negative `generation` and a
-nullable `canceledAt`. A legacy v6 backup (`primal-character/6`) carries the same
-append-only offer state, while a v3/v4/v5 backup omits both and the importer
-defaults them to `0`/`null`. A current backup is never "rewound": the importer
-preserves every offered option snapshot verbatim and restores canceled offers as
-canceled (so a restore does not re-activate a canceled offer or restamp its
-cancellation time). Legacy `primal-character/3` through `/6` backups are still
-accepted, but only when they carry no `blessing` association - the legacy
-`blessings` catalog kind was retired, so a legacy doc with an old blessing link
-is rejected with an actionable 400 migration notice even when it would otherwise
-resolve. The importer rejects:
+nullable `canceledAt`. A scheduled offer additionally carries the schedule-credit
+provenance pair `earnedGrade` (the grade whose skill-choice interval awarded the
+offer) and `trackDefinitionStableId` (the selected track's catalog stableId at the
+moment the credit was earned) - the two are emitted **together**, so a legacy offer
+(both null) omits both and its backup shape is unchanged. The importer persists
+both columns and validates the pair: a malformed grade, an empty stableId, or one
+present without the other is rejected. A legacy v6 backup
+(`primal-character/6`) carries the same append-only offer state (but no provenance,
+which reads back as null), while a v3/v4/v5 backup omits both `generation` and
+`canceledAt` and the importer defaults them to `0`/`null`. A current backup is never
+"rewound": the importer preserves every offered option snapshot verbatim and
+restores canceled offers as canceled (so a restore does not re-activate a canceled
+offer or restamp its cancellation time). Legacy `primal-character/3` through `/6`
+backups are still accepted, but only when they carry no `blessing` association - the
+legacy `blessings` catalog kind was retired, so a legacy doc with an old blessing
+link is rejected with an actionable 400 migration notice even when it would
+otherwise resolve. The importer rejects:
 
 - a **duplicate** `(track, level, choiceGroup, generation)` key
   (`import_duplicate_offer`),

@@ -17,8 +17,12 @@ import { CharacterDetail } from "@/components/characters/character-detail"
 
 // --- Module mocks --------------------------------------------------------- //
 
+// The route id the component reads via useParams. Tests that simulate a route
+// change mutate this value and rerender the same component instance.
+let mockRouteId = "chr-1"
+
 vi.mock("next/navigation", () => ({
-  useParams: () => ({ id: "chr-1" }),
+  useParams: () => ({ id: mockRouteId }),
 }))
 
 vi.mock("sonner", () => ({
@@ -62,6 +66,24 @@ vi.mock("@/lib/api", () => {
   ] as const
   return { ApiError, jsonInit, apiFetch: vi.fn(), ATTRIBUTE_KEYS }
 })
+
+// --- Deferred promise helper ---------------------------------------------- //
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 // Mock the shadcn UI primitives to plain elements so the client component renders
 // deterministically in jsdom without Radix portals / observers.
@@ -442,6 +464,34 @@ let advancePosts: Array<Record<string, unknown>> = []
 let experiencePosts: Array<Record<string, unknown>> = []
 let experienceError: unknown = null
 let experienceJournal: Record<string, unknown> = { leveledUp: false, notes: [] }
+let skillRefreshPosts = 0
+let skillSelectPosts: Array<Record<string, unknown>> = []
+let skillRefreshErrorForTest: unknown = null
+let skillRefreshCharacter: import("@/lib/api").CharacterDetail | null = null
+/** When set, the first POST to /api/characters/chr-1/skills/refresh returns this
+ * deferred promise instead of resolving at once, letting a test resolve (or
+ * reject) it later to simulate a slow/out-of-order refresh response. */
+let skillRefreshDeferred: Deferred<{
+  character: import("@/lib/api").CharacterDetail
+}> | null = null
+/** When set, the next GET to /api/characters/chr-1 returns this deferred promise
+ * instead of resolving at once, letting a test resolve (or reject) it later to
+ * simulate a slow/out-of-order character-detail GET response. */
+let characterGetDeferred: Deferred<{
+  character: import("@/lib/api").CharacterDetail
+}> | null = null
+/** Second character served when the route id is chr-2 (route-change race tests). */
+let characterB: import("@/lib/api").CharacterDetail | null = null
+/** When set, the next GET to /api/characters/chr-2 returns this deferred promise. */
+let characterGetDeferredB: Deferred<{
+  character: import("@/lib/api").CharacterDetail
+}> | null = null
+/** When set, the next POST to /api/characters/chr-2/skills/refresh returns this
+ * deferred promise instead of resolving at once, letting a test resolve (or
+ * reject) it later to simulate a slow character-B refresh. */
+let skillRefreshDeferredB: Deferred<{
+  character: import("@/lib/api").CharacterDetail
+}> | null = null
 let professionCatalog: import("@/lib/api").CatalogItem[] = []
 let historyEvents: import("@/lib/api").ExportResponse["events"] = []
 let professionPostError: unknown = null
@@ -697,6 +747,15 @@ function setupMock(options?: {
     leveledUp: false,
     notes: [],
   }
+  skillRefreshPosts = 0
+  skillSelectPosts = []
+  skillRefreshErrorForTest = null
+  skillRefreshCharacter = null
+  skillRefreshDeferred = null
+  characterGetDeferred = null
+  characterB = null
+  characterGetDeferredB = null
+  skillRefreshDeferredB = null
   professionCatalog = options?.professions ?? []
   historyEvents = options?.events ?? []
   professionPostError = options?.professionError ?? null
@@ -727,7 +786,16 @@ function setupMock(options?: {
       return { maxTranscendentSkills }
     }
     if (url === "/api/characters/chr-1" && method === "GET") {
+      const deferred = characterGetDeferred
+      characterGetDeferred = null
+      if (deferred) return deferred.promise
       return { character: activeCharacter }
+    }
+    if (url === "/api/characters/chr-2" && method === "GET") {
+      const deferred = characterGetDeferredB
+      characterGetDeferredB = null
+      if (deferred) return deferred.promise
+      return { character: characterB ?? activeCharacter }
     }
     if (url === "/api/characters/chr-1" && method === "PATCH") {
       if (profileSaveError) throw profileSaveError
@@ -740,7 +808,33 @@ function setupMock(options?: {
       return { character: activeCharacter }
     }
     if (url === "/api/characters/chr-1/portrait") return { portrait: null }
+    if (url === "/api/characters/chr-2/portrait") return { portrait: null }
     if (url === "/api/characters/chr-1/export") return { events: historyEvents }
+    if (url === "/api/characters/chr-2/export") return { events: historyEvents }
+    if (url === "/api/characters/chr-1/skills/refresh" && method === "POST") {
+      skillRefreshPosts += 1
+      const deferred = skillRefreshDeferred
+      skillRefreshDeferred = null
+      if (deferred) return deferred.promise
+      if (skillRefreshErrorForTest) throw skillRefreshErrorForTest
+      return { character: skillRefreshCharacter ?? activeCharacter }
+    }
+    if (url === "/api/characters/chr-2/skills/refresh" && method === "POST") {
+      skillRefreshPosts += 1
+      const deferred = skillRefreshDeferredB
+      skillRefreshDeferredB = null
+      if (deferred) return deferred.promise
+      if (skillRefreshErrorForTest) throw skillRefreshErrorForTest
+      return { character: characterB ?? activeCharacter }
+    }
+    if (url === "/api/characters/chr-1/skills" && method === "POST") {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      skillSelectPosts.push(body)
+      return { character: activeCharacter }
+    }
     if (url === "/api/catalog/professions")
       return { kind: "catalog", items: professionCatalog }
     if (url === "/api/characters/chr-1/profession" && method === "POST") {
@@ -921,6 +1015,7 @@ async function renderDetail() {
 
 beforeEach(() => {
   evolutionsError = null
+  mockRouteId = "chr-1"
 })
 
 afterEach(() => {
@@ -929,6 +1024,1054 @@ afterEach(() => {
 })
 
 // --- Tests ---------------------------------------------------------------- //
+
+describe("scheduled skill choice prompts", () => {
+  const pendingOffer = (overrides: Record<string, unknown> = {}) => ({
+    id: "offer-class-1",
+    track: "class",
+    level: 25,
+    choiceGroup: "milestone",
+    generation: 0,
+    canceledAt: null,
+    selectedDefinitionId: null,
+    options: [
+      { definitionId: "skill-1", nameSnapshot: "Quick Shot", archived: false },
+    ],
+    ...overrides,
+  })
+
+  it("prompts only for a newly generated scheduled credit, selects through the skill API, and does not repeat on load", async () => {
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    expect(skillRefreshPosts).toBe(1)
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Quick Shot" }))
+    await flush()
+    expect(skillSelectPosts).toEqual([
+      expect.objectContaining({
+        operation: "select",
+        offerId: "offer-class-1",
+        definitionId: "skill-1",
+        version: 3,
+      }),
+    ])
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+  })
+
+  it("defers empty-option prompts and counts pending offers per track excluding selected/canceled", async () => {
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({ options: [] }),
+          pendingOffer({ id: "selected", selectedDefinitionId: "skill-x" }),
+          pendingOffer({ id: "canceled", canceledAt: "now" }),
+          pendingOffer({ id: "profession", track: "profession" }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+    expect(screen.getByText("Class: 1")).toBeTruthy()
+    expect(screen.getByText("Profession: 1")).toBeTruthy()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.getByText("Awaiting eligible skills")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Decide later" }))
+    await flush()
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+    expect(skillSelectPosts).toHaveLength(0)
+  })
+
+  it("refreshes on Skills tab entry and keeps fixed Stats rows unindented", async () => {
+    setupMock()
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(skillRefreshPosts).toBe(2)
+    fireEvent.click(screen.getByRole("tab", { name: "Stats" }))
+    await flush()
+    expect(document.querySelectorAll(".pl-3")).toHaveLength(0)
+  })
+
+  it("does not prompt on a level-up without a newly created scheduled credit", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: true, notes: [], skillOfferIds: [] },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+  })
+
+  it("prompts for a new milestone credit when setting EXP to 100%", async () => {
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    const slider = screen.getByRole("slider", { name: "Experience slider" })
+    fireEvent.change(slider, { target: { value: "100" } })
+    fireEvent.mouseUp(slider, { target: { value: "100" } })
+    await flush()
+    expect(experiencePosts).toEqual([
+      expect.objectContaining({
+        operation: "set",
+        track: "class",
+        percent: 100,
+      }),
+    ])
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+  })
+
+  it("does not prompt when setting EXP to 100% does not level up", async () => {
+    setupMock({ experienceJournal: { leveledUp: false, notes: [] } })
+    await renderDetail()
+    const slider = screen.getByRole("slider", { name: "Experience slider" })
+    fireEvent.change(slider, { target: { value: "100" } })
+    fireEvent.mouseUp(slider, { target: { value: "100" } })
+    await flush()
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+  })
+
+  it("offers retry after refresh failure and applies newly eligible choices on retry", async () => {
+    setupMock()
+    skillRefreshErrorForTest = new Error("refresh unavailable")
+    await renderDetail()
+    expect(
+      screen.getByText("Skill options could not be refreshed.")
+    ).toBeTruthy()
+    skillRefreshErrorForTest = null
+    skillRefreshCharacter = {
+      ...character,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "late",
+              nameSnapshot: "Late Skill",
+              archived: false,
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+    fireEvent.click(screen.getByRole("button", { name: "Retry skill options" }))
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText("Late Skill")).toBeTruthy()
+    expect(skillRefreshPosts).toBeGreaterThanOrEqual(2)
+  })
+
+  it("does not let a delayed refresh with an older version clobber the newer state after a level-up", async () => {
+    // A refresh fired on open resolves only after the level-up has produced a
+    // newer character. The obsolete snapshot must not overwrite the newer state.
+    const refreshDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    skillRefreshDeferred = refreshDeferred
+    await renderDetail()
+
+    // The server now holds a NEWER version plus the offer.
+    activeCharacter = {
+      ...activeCharacter,
+      version: 4,
+      skillOffers: [pendingOffer()],
+    } as typeof activeCharacter
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+
+    // The stale refresh from before the level-up resolves late with a LOWER
+    // version and an empty offer set; it must be ignored.
+    refreshDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [],
+      } as typeof character,
+    })
+    await flush()
+
+    // The dialog and its offer stay, and the pending count is untouched.
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Quick Shot" })).toBeTruthy()
+    expect(screen.getByText("Class: 1")).toBeTruthy()
+
+    // A subsequent action still carries the current (newer) version.
+    fireEvent.click(screen.getByRole("button", { name: "Quick Shot" }))
+    await flush()
+    expect(skillSelectPosts).toEqual([
+      expect.objectContaining({ operation: "select", version: 4 }),
+    ])
+  })
+
+  it("does not resurrect a pending offer when a delayed refresh resolves after a selection", async () => {
+    const refreshDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    skillRefreshDeferred = refreshDeferred
+    await renderDetail()
+
+    activeCharacter = {
+      ...activeCharacter,
+      version: 4,
+      skillOffers: [pendingOffer()],
+    } as typeof activeCharacter
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+
+    // Selecting terminalizes the offer (selected) and bumps the version.
+    activeCharacter = {
+      ...activeCharacter,
+      version: 5,
+      skillOffers: [pendingOffer({ selectedDefinitionId: "skill-1" })],
+    } as typeof activeCharacter
+    fireEvent.click(screen.getByRole("button", { name: "Quick Shot" }))
+    await flush()
+    expect(screen.queryByText("Choose a skill")).toBeNull()
+
+    // The obsolete refresh arrives late with a lower version and the offer still
+    // pending; it must not turn the selected offer back into a pending one.
+    refreshDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await flush()
+
+    expect(screen.getByText("Class: 0")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText("Selected")).toBeTruthy()
+    expect(screen.queryByText("Pending")).toBeNull()
+  })
+
+  it("does not let a delayed same-version refresh omit offer details that still exist", async () => {
+    // A mutation can leave the version unchanged while still adding an offer
+    // (e.g. the snapshot predates a bump). A delayed refresh that omits the
+    // pending offer must not drop it from the live state.
+    const refreshDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    skillRefreshDeferred = refreshDeferred
+    await renderDetail()
+    // No version bump: the level-up keeps version 3.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+    // The delayed snapshot reports the same version but omits the offer.
+    refreshDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [],
+      } as typeof character,
+    })
+    await flush()
+    expect(screen.getByText("Choose a skill")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Quick Shot" })).toBeTruthy()
+    expect(screen.getByText("Class: 1")).toBeTruthy()
+  })
+
+  it("retains selected/canceled terminal status when a same-version refresh returns pending offers", async () => {
+    setupMock({
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({ id: "offer-a", selectedDefinitionId: "skill-1" }),
+          pendingOffer({ id: "offer-b", canceledAt: "now" }),
+        ],
+      } as typeof character,
+    })
+    // A same-version snapshot that (incorrectly) reports both offers as pending
+    // must not wipe the terminal status from the live state.
+    skillRefreshCharacter = {
+      ...character,
+      skillOffers: [
+        pendingOffer({ id: "offer-a" }),
+        pendingOffer({ id: "offer-b" }),
+      ],
+    } as typeof character
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText("Selected")).toBeTruthy()
+    expect(screen.getByText("Canceled")).toBeTruthy()
+  })
+
+  it("retains same-version offer options appended after a captured GET snapshot was read", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: false, notes: [] },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    expect(screen.getByText("Quick Shot")).toBeTruthy()
+
+    // Capture the reload GET fired by the upcoming level-up as deferred.
+    const getDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    characterGetDeferred = getDeferred
+
+    // While that GET is in flight, a skill refresh appends a second option on the
+    // same version.
+    skillRefreshCharacter = {
+      ...character,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Quick Shot",
+              archived: false,
+            },
+            {
+              definitionId: "skill-2",
+              nameSnapshot: "Aim Shot",
+              archived: false,
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText("Quick Shot")).toBeTruthy()
+    expect(screen.getByText("Aim Shot")).toBeTruthy()
+
+    // The stale GET snapshot resolves late with the SAME version but only the
+    // original option; the appended option must survive the merge.
+    getDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await flush()
+
+    expect(screen.getByText("Quick Shot")).toBeTruthy()
+    expect(screen.getByText("Aim Shot")).toBeTruthy()
+  })
+
+  it("keeps notes, selected state, and version newer when a captured GET resolves after a later mutation", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: false, notes: [] },
+      character: {
+        ...character,
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await renderDetail()
+    expect(screen.getByText("v3")).toBeTruthy()
+
+    // Start an in-progress editable note draft.
+    fireEvent.click(screen.getByRole("tab", { name: "Notes" }))
+    await flush()
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Draft" },
+    })
+    await flush()
+
+    // Capture the reload GET fired by the upcoming level-up as deferred.
+    const getDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    characterGetDeferred = getDeferred
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+
+    // The later mutation terminalizes the offer, bumps the version, and renames
+    // the character; its refresh applies that newer state.
+    activeCharacter = {
+      ...activeCharacter,
+      version: 5,
+      name: "Newest",
+      skillOffers: [pendingOffer({ selectedDefinitionId: "skill-1" })],
+    } as typeof activeCharacter
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+
+    // The stale GET from before the mutation resolves last with an older
+    // snapshot; it must not clobber the newer version, selected state, or notes.
+    getDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        name: "Test",
+        skillOffers: [pendingOffer()],
+      } as typeof character,
+    })
+    await flush()
+
+    expect(screen.getByText("v5")).toBeTruthy()
+    expect(screen.getByText("Selected")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("tab", { name: "Notes" }))
+    await flush()
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe(
+      "Draft"
+    )
+  })
+
+  it("does not reset an in-progress note draft when a same-version refresh occurs", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: false, notes: [] },
+      character: { ...character } as typeof character,
+    })
+    await renderDetail()
+
+    fireEvent.click(screen.getByRole("tab", { name: "Notes" }))
+    await flush()
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Draft" },
+    })
+    await flush()
+
+    const getDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    characterGetDeferred = getDeferred
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+
+    // A same-version refresh resolves while the user has an unsaved edit; it
+    // must not clobber the draft even though it reports the same version.
+    getDeferred.resolve({
+      character: { ...character, version: 3 } as typeof character,
+    })
+    await flush()
+
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe(
+      "Draft"
+    )
+  })
+
+  it("toggles an offer option archived flag on the same version without duplicating the option or changing the snapshot", async () => {
+    setupMock({
+      experienceJournal: {
+        leveledUp: true,
+        notes: [],
+        skillOfferIds: ["offer-class-1"],
+      },
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+                grade: "C",
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    expect(screen.getByRole("button", { name: "Quick Shot" })).toBeTruthy()
+
+    // The catalog archives the offer's definition (same version). The mutable
+    // `archived` flag flips, but the incoming snapshot's different name does NOT
+    // overwrite the immutable prior nameSnapshot, and no duplicate option is
+    // created.
+    skillRefreshCharacter = {
+      ...character,
+      version: 3,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Renamed Shot",
+              archived: true,
+              grade: "C",
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText("Awaiting eligible skills")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Quick Shot" })).toBeNull()
+
+    // The catalog is re-enabled (same version): archived flips back to false, the
+    // immutable prior snapshot (nameSnapshot "Quick Shot") still wins over the
+    // incoming rename, and there is still exactly one option - no duplicate.
+    skillRefreshCharacter = {
+      ...character,
+      version: 3,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Renamed Shot",
+              archived: false,
+              grade: "C",
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getAllByRole("button", { name: "Quick Shot" })).toHaveLength(
+      1
+    )
+    expect(screen.queryByRole("button", { name: "Renamed Shot" })).toBeNull()
+  })
+
+  it("does not let a deferred same-version GET roll back archive state that a newer refresh applied", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: true, notes: [], skillOfferIds: [] },
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+
+    // Capture the reload GET fired by the upcoming level-up as deferred. It read
+    // (and will return) the same-version UNARCHIVED snapshot.
+    const getDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    characterGetDeferred = getDeferred
+
+    // While that GET is in flight, a skills/refresh archives the offer's option.
+    skillRefreshCharacter = {
+      ...character,
+      version: 3,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Quick Shot",
+              archived: true,
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+
+    // The refresh archived the option; it must no longer be selectable.
+    expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
+
+    // The stale GET resolves LAST with the same version but UNARCHIVED; it must
+    // NOT roll the option back to a selectable (unarchived) offer.
+    getDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await flush()
+
+    expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
+  })
+
+  it("does not let a deferred same-version GET re-archive an option that a newer refresh re-enabled", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: true, notes: [], skillOfferIds: [] },
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+
+    // Archive the option first via a refresh (same version).
+    skillRefreshCharacter = {
+      ...character,
+      version: 3,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Quick Shot",
+              archived: true,
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
+
+    // Capture the reload GET fired by the upcoming level-up as deferred. It read
+    // (and will return) the ARCHIVED snapshot.
+    const getDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    characterGetDeferred = getDeferred
+
+    // While that GET is in flight, a newer refresh re-enables the option.
+    skillRefreshCharacter = {
+      ...character,
+      version: 3,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Quick Shot",
+              archived: false,
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+
+    // The refresh re-enabled the option; it is selectable again.
+    expect(screen.getByRole("button", { name: "Select" })).toBeTruthy()
+    expect(screen.queryByText("Archived")).toBeNull()
+
+    // The stale GET resolves LAST with archived:true (same version); it must NOT
+    // re-archive the re-enabled option.
+    getDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: true,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await flush()
+
+    expect(screen.getByRole("button", { name: "Select" })).toBeTruthy()
+    expect(screen.queryByText("Archived")).toBeNull()
+  })
+
+  it("appends a new skill option from an older-started refresh that resolves after a faster empty GET", async () => {
+    const refreshDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({
+      experienceJournal: { leveledUp: false, notes: [] },
+      character: { ...character, skillOffers: [] } as typeof character,
+    })
+    // Hold the on-open refresh in flight so it starts BEFORE the initial GET and
+    // resolves AFTER it. It began first but is last to resolve.
+    skillRefreshDeferred = refreshDeferred
+    await renderDetail()
+    // The initial GET has resolved with no offers; the refresh is still pending.
+    // Resolve it with a NEW skill appended on the same version.
+    refreshDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-x",
+                nameSnapshot: "Late Skill",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByText("Late Skill")).toBeTruthy()
+  })
+
+  it("still does not let a stale older-started GET roll back an archived flag that a refresh applied", async () => {
+    setupMock({
+      experienceJournal: { leveledUp: true, notes: [], skillOfferIds: [] },
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+
+    // Capture the reload GET fired by the upcoming level-up as deferred. It read
+    // (and will return) the same-version UNARCHIVED snapshot and started BEFORE
+    // the archival refresh.
+    const getDeferred = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    characterGetDeferred = getDeferred
+
+    // While that GET is in flight, a skills/refresh archives the option.
+    skillRefreshCharacter = {
+      ...character,
+      version: 3,
+      skillOffers: [
+        pendingOffer({
+          options: [
+            {
+              definitionId: "skill-1",
+              nameSnapshot: "Quick Shot",
+              archived: true,
+            },
+          ],
+        }),
+      ],
+    } as typeof character
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Increase class level" })
+    )
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
+
+    // The stale GET resolves LAST with the same version but UNARCHIVED; it must
+    // NOT roll the option back to a selectable (unarchived) offer.
+    getDeferred.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await flush()
+
+    expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
+  })
+
+  it("does not roll back an archived flag from a stale refresh but appends a new option it carries", async () => {
+    const staleRefresh = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({
+      experienceJournal: { leveledUp: false, notes: [] },
+      character: {
+        ...character,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: true,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    // The on-open refresh starts BEFORE the initial GET. It resolves LAST, so it
+    // is now stale relative to the GET that already applied an archived:true
+    // option. Because it is still the latest refresh request (no later refresh
+    // has superseded it), it is applied append-only.
+    skillRefreshDeferred = staleRefresh
+    await renderDetail()
+
+    // The stale refresh resolves last with the OLD archived flag for skill-1 plus
+    // a NEW option. It must not un-archive skill-1, but must append the new
+    // option.
+    staleRefresh.resolve({
+      character: {
+        ...character,
+        version: 3,
+        skillOffers: [
+          pendingOffer({
+            options: [
+              {
+                definitionId: "skill-1",
+                nameSnapshot: "Quick Shot",
+                archived: false,
+              },
+              {
+                definitionId: "skill-2",
+                nameSnapshot: "Aim Shot",
+                archived: false,
+              },
+            ],
+          }),
+        ],
+      } as typeof character,
+    })
+    await flush()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+
+    expect(screen.getAllByText("Archived").length).toBeGreaterThan(0)
+    expect(screen.getByRole("button", { name: "Select" })).toBeTruthy()
+    expect(screen.getByText("Aim Shot")).toBeTruthy()
+  })
+
+  it("does not revert the sheet to character A when a deferred refresh resolves after the route changes to B", async () => {
+    const refreshDeferredA = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({ character: { ...character } })
+    characterB = {
+      ...character,
+      id: "chr-2",
+      name: "Bee",
+      version: 1,
+    } as unknown as import("@/lib/api").CharacterDetail
+    // Defer ONLY the refresh for chr-1; its GET resolves at once with A.
+    skillRefreshDeferred = refreshDeferredA
+    mockRouteId = "chr-1"
+
+    const view = render(<CharacterDetail />)
+    await flush()
+    // The character name appears both as the top-level heading and the overview
+    // profile heading, so match by role heading and assert none of the other id.
+    expect(
+      screen.getAllByRole("heading", { name: "Test" }).length
+    ).toBeGreaterThan(0)
+
+    // The route changes to B while A's refresh is still in flight. B's GET and
+    // refresh resolve at once, so the sheet shows B.
+    mockRouteId = "chr-2"
+    view.rerender(<CharacterDetail />)
+    await flush()
+    expect(
+      screen.getAllByRole("heading", { name: "Bee" }).length
+    ).toBeGreaterThan(0)
+    expect(screen.queryAllByRole("heading", { name: "Test" })).toHaveLength(0)
+    expect(
+      screen.queryByText("Skill options could not be refreshed.")
+    ).toBeNull()
+
+    // A's stale refresh resolves late; it must NOT revert the sheet to A nor
+    // surface an old skill-refresh error from a previous route.
+    refreshDeferredA.resolve({
+      character: { ...character } as typeof character,
+    })
+    await flush()
+    expect(
+      screen.getAllByRole("heading", { name: "Bee" }).length
+    ).toBeGreaterThan(0)
+    expect(screen.queryAllByRole("heading", { name: "Test" })).toHaveLength(0)
+    expect(
+      screen.queryByText("Skill options could not be refreshed.")
+    ).toBeNull()
+  })
+
+  it("does not apply a deferred character A GET to the sheet after the route changes to B", async () => {
+    const getDeferredA = createDeferred<{
+      character: import("@/lib/api").CharacterDetail
+    }>()
+    setupMock({ character: { ...character } })
+    characterB = {
+      ...character,
+      id: "chr-2",
+      name: "Bee",
+      version: 1,
+    } as unknown as import("@/lib/api").CharacterDetail
+    // Defer ONLY the GET for chr-1; its refresh resolves at once with A.
+    characterGetDeferred = getDeferredA
+    mockRouteId = "chr-1"
+
+    const view = render(<CharacterDetail />)
+    await flush()
+    // A's refresh resolved the sheet to A even though its GET is deferred.
+    expect(
+      screen.getAllByRole("heading", { name: "Test" }).length
+    ).toBeGreaterThan(0)
+
+    // The route changes to B while A's GET is still in flight. B's GET and
+    // refresh resolve at once, so the sheet shows B.
+    mockRouteId = "chr-2"
+    view.rerender(<CharacterDetail />)
+    await flush()
+    expect(
+      screen.getAllByRole("heading", { name: "Bee" }).length
+    ).toBeGreaterThan(0)
+    expect(screen.queryAllByRole("heading", { name: "Test" })).toHaveLength(0)
+
+    // A's stale GET resolves late; it must NOT revert the sheet to A.
+    getDeferredA.resolve({
+      character: { ...character } as typeof character,
+    })
+    await flush()
+    expect(
+      screen.getAllByRole("heading", { name: "Bee" }).length
+    ).toBeGreaterThan(0)
+    expect(screen.queryAllByRole("heading", { name: "Test" })).toHaveLength(0)
+  })
+})
 
 describe("CharacterDetail overview summary", () => {
   it("shows all nine server-calculated attributes and available track levels", async () => {

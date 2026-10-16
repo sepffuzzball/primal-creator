@@ -57,7 +57,8 @@ export async function PATCH(req: Request) {
         "Provide {version, config} with the full house-rules shape " +
           "(equipmentIndividualCapPercent and equipmentCombinedCapPercent 0..100; " +
           "consumableGradeRates.F/E/D/C each 0..100000; " +
-          "maxTranscendentSkills 0..8)"
+          "maxTranscendentSkills 0..8; " +
+          "skillChoiceIntervals.F/E/D/C/B/A/S each 1..250)"
       )
     }
     const { version, config } = parsed.data

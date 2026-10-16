@@ -18,6 +18,7 @@
 
 import { z } from "zod"
 import { ApiError } from "@/lib/server/errors"
+import type { SkillChoiceIntervals } from "@/lib/rules"
 
 /** The singleton key. The application reads/writes only this row. */
 export const HOUSE_RULES_ID = "active" as const
@@ -40,6 +41,14 @@ export interface HouseRulesConfig {
    * association edits and backup import, never relaxed.
    */
   maxTranscendentSkills: number
+  /**
+   * The configurable number of levels between skill-choice CREDITS, per grade.
+   * G is intentionally absent (G grades earn no skill-choice credits). Each value
+   * is an integer 1..250. Used to determine whether a class/profession level-up
+   * awards a skill-choice milestone credit; edits after a credit is earned never
+   * alter already-earned offers (see `isSkillChoiceMilestone`).
+   */
+  skillChoiceIntervals: SkillChoiceIntervals
 }
 
 /**
@@ -60,6 +69,17 @@ export const houseRulesConfigSchema = z
       })
       .strict(),
     maxTranscendentSkills: z.number().int().min(0).max(8),
+    skillChoiceIntervals: z
+      .object({
+        F: z.number().int().min(1).max(250),
+        E: z.number().int().min(1).max(250),
+        D: z.number().int().min(1).max(250),
+        C: z.number().int().min(1).max(250),
+        B: z.number().int().min(1).max(250),
+        A: z.number().int().min(1).max(250),
+        S: z.number().int().min(1).max(250),
+      })
+      .strict(),
   })
   .strict()
 
@@ -73,6 +93,7 @@ export const DEFAULT_HOUSE_RULES_CONFIG: HouseRulesConfig = {
   equipmentCombinedCapPercent: 15,
   consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
   maxTranscendentSkills: 3,
+  skillChoiceIntervals: { F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 },
 }
 
 /** A loaded (validated) house-rules row. */

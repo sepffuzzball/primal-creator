@@ -62,7 +62,11 @@
  */
 
 import { z } from "zod"
-import { blessingTierSchema, characterStateSchema } from "@/lib/server/schemas"
+import {
+  blessingTierSchema,
+  characterStateSchema,
+  gradeSchema,
+} from "@/lib/server/schemas"
 
 export const IMPORT_SCHEMA_V3 = "primal-character/3" as const
 export const IMPORT_SCHEMA_V4 = "primal-character/4" as const
@@ -281,6 +285,34 @@ const skillOfferSchemaV6 = z.object({
   options: z.array(skillOfferOptionSchema).max(MAX_IMPORT_ASSOCIATIONS),
 })
 
+/**
+ * The v7 skill-offer shape. It is the v6 shape plus the schedule-credit
+ * provenance pair, both optional nullable for backward compatibility with a
+ * legacy backup that predates provenance (a v3/v4/v5/v6 offer omits both and
+ * reads back as null on import). For a SCHEDULED offer both must be present
+ * together: `earnedGrade` is the grade whose skill-choice interval awarded the
+ * offer, and `trackDefinitionStableId` is the selected track's catalog stableId
+ * at the moment the credit was earned. The superRefine rejects a malformed
+ * grade, an empty stableId, and a mismatched pair (one set without the other).
+ */
+const skillOfferSchemaV7 = skillOfferSchemaV6
+  .extend({
+    earnedGrade: gradeSchema.nullable().optional(),
+    trackDefinitionStableId: z.string().min(1).nullable().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const hasGrade = data.earnedGrade != null
+    const hasTrack = data.trackDefinitionStableId != null
+    if (hasGrade !== hasTrack) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "A scheduled skill offer must carry both earnedGrade and trackDefinitionStableId together (or neither)",
+        path: ["earnedGrade"],
+      })
+    }
+  })
+
 /** A raw exported progression event, stored as provenance (never a live id). */
 const importedEventSchema = z.object({
   kind: z.string().optional(),
@@ -412,16 +444,19 @@ const inventoryRefSchemaV7 = z.object({
  * The current v7 trusted-backup document. Everything v6 carries (the strict v6
  * skill-offer shape, inventory, ring positions) plus the god + tier blessing
  * model: a blessing association references a `gods` definition and carries a
- * REQUIRED `tier`. This is the ONLY schema `exportCharacter` emits; legacy v3-v6
- * documents still parse and are accepted unless they carry a blessing association
- * (the service layer rejects those with a migration notice).
+ * REQUIRED `tier`. A v7 skill offer may additionally carry the schedule-credit
+ * provenance pair (`earnedGrade` + `trackDefinitionStableId`, optional nullable
+ * and validated together). This is the ONLY schema `exportCharacter` emits;
+ * legacy v3-v6 documents still parse and are accepted unless they carry a
+ * blessing association (the service layer rejects those with a migration
+ * notice).
  */
 const v7DocumentSchema = z.object({
   schema: z.literal(IMPORT_SCHEMA_V7),
   ...documentBase,
   associations: z.array(v7AssociationSchema).max(MAX_IMPORT_ASSOCIATIONS),
   inventory: z.array(inventoryRefSchemaV7).max(MAX_IMPORT_INVENTORY),
-  skillOffers: z.array(skillOfferSchemaV6).max(MAX_IMPORT_SKILL_OFFERS),
+  skillOffers: z.array(skillOfferSchemaV7).max(MAX_IMPORT_SKILL_OFFERS),
 })
 
 /**

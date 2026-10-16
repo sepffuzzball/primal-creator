@@ -4,10 +4,22 @@ import {
   HOUSE_RULES_ID,
   houseRulesConfigSchema,
   loadHouseRules,
+  type HouseRulesConfig,
   type HouseRulesDbClient,
 } from "./ruleset"
 
 describe("houseRulesConfigSchema", () => {
+  // A complete, valid config; each test overrides only the field it exercises.
+  // `overrides` is intentionally loose (`Record<string, unknown>`) so a test that
+  // rejects an unknown top-level key or an unknown consumable grade key can still
+  // pass that key through to the strict schema without a type error.
+  function cfg(overrides: Record<string, unknown> = {}) {
+    return {
+      ...DEFAULT_HOUSE_RULES_CONFIG,
+      ...overrides,
+    } as HouseRulesConfig
+  }
+
   it("accepts the documented default shape", () => {
     const parsed = houseRulesConfigSchema.parse(DEFAULT_HOUSE_RULES_CONFIG)
     expect(parsed).toEqual(DEFAULT_HOUSE_RULES_CONFIG)
@@ -15,134 +27,124 @@ describe("houseRulesConfigSchema", () => {
 
   it("rejects a percentage below 0", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: -1,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-      })
+      houseRulesConfigSchema.parse(cfg({ equipmentIndividualCapPercent: -1 }))
     ).toThrow()
   })
 
   it("rejects a percentage above 100", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 101,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-      })
+      houseRulesConfigSchema.parse(cfg({ equipmentIndividualCapPercent: 101 }))
     ).toThrow()
   })
 
   it("rejects a non-integer percentage", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20.5,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-      })
+      houseRulesConfigSchema.parse(cfg({ equipmentIndividualCapPercent: 20.5 }))
     ).toThrow()
   })
 
   it("rejects a maxTranscendentSkills below 0", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-        maxTranscendentSkills: -1,
-      })
+      houseRulesConfigSchema.parse(cfg({ maxTranscendentSkills: -1 }))
     ).toThrow()
   })
 
   it("rejects a maxTranscendentSkills above 8", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-        maxTranscendentSkills: 9,
-      })
+      houseRulesConfigSchema.parse(cfg({ maxTranscendentSkills: 9 }))
     ).toThrow()
   })
 
   it("rejects a non-integer maxTranscendentSkills", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-        maxTranscendentSkills: 2.5,
-      })
+      houseRulesConfigSchema.parse(cfg({ maxTranscendentSkills: 2.5 }))
     ).toThrow()
   })
 
   it("accepts the documented default maxTranscendentSkills", () => {
-    const parsed = houseRulesConfigSchema.parse({
-      equipmentIndividualCapPercent: 20,
-      equipmentCombinedCapPercent: 15,
-      consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-      maxTranscendentSkills: 3,
-    })
+    const parsed = houseRulesConfigSchema.parse(cfg({}))
     expect(parsed.maxTranscendentSkills).toBe(3)
   })
 
   it("rejects a grade rate above 100000", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 100001, E: 5, D: 15, C: 45 },
-      })
+      houseRulesConfigSchema.parse(
+        cfg({ consumableGradeRates: { F: 100001, E: 5, D: 15, C: 45 } })
+      )
     ).toThrow()
   })
 
   it("rejects a negative grade rate", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: -1, D: 15, C: 45 },
-      })
+      houseRulesConfigSchema.parse(
+        cfg({ consumableGradeRates: { F: 3, E: -1, D: 15, C: 45 } })
+      )
     ).toThrow()
   })
 
   it("rejects an unknown top-level key (strict)", () => {
-    expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-        futureKnob: 1,
-      })
-    ).toThrow()
+    expect(() => houseRulesConfigSchema.parse(cfg({ futureKnob: 1 }))).toThrow()
   })
 
   it("rejects an unknown consumable grade key (strict)", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45, B: 1 },
-      })
+      houseRulesConfigSchema.parse(
+        cfg({ consumableGradeRates: { F: 3, E: 5, D: 15, C: 45, B: 1 } })
+      )
     ).toThrow()
   })
 
   it("rejects a missing required key", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        consumableGradeRates: { F: 3, E: 5, D: 15, C: 45 },
-      })
+      houseRulesConfigSchema.parse(
+        cfg({ equipmentCombinedCapPercent: undefined as never })
+      )
     ).toThrow()
   })
 
   it("rejects a missing consumable grade key", () => {
     expect(() =>
-      houseRulesConfigSchema.parse({
-        equipmentIndividualCapPercent: 20,
-        equipmentCombinedCapPercent: 15,
-        consumableGradeRates: { F: 3, E: 5, D: 45 },
-      })
+      houseRulesConfigSchema.parse(
+        cfg({ consumableGradeRates: { F: 3, E: 5, C: 45 } })
+      )
+    ).toThrow()
+  })
+
+  it("rejects a skill-choice interval below 1", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse(
+        cfg({ skillChoiceIntervals: { ...cfg({}).skillChoiceIntervals, F: 0 } })
+      )
+    ).toThrow()
+  })
+
+  it("rejects a skill-choice interval above 250", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse(
+        cfg({
+          skillChoiceIntervals: { ...cfg({}).skillChoiceIntervals, S: 251 },
+        })
+      )
+    ).toThrow()
+  })
+
+  it("rejects a non-integer skill-choice interval", () => {
+    expect(() =>
+      houseRulesConfigSchema.parse(
+        cfg({
+          skillChoiceIntervals: { ...cfg({}).skillChoiceIntervals, D: 20.5 },
+        })
+      )
+    ).toThrow()
+  })
+
+  it("rejects a missing skill-choice interval key", () => {
+    const intervals: Partial<HouseRulesConfig["skillChoiceIntervals"]> = {
+      ...cfg({}).skillChoiceIntervals,
+    }
+    delete intervals.F
+    expect(() =>
+      houseRulesConfigSchema.parse(cfg({ skillChoiceIntervals: intervals }))
     ).toThrow()
   })
 })

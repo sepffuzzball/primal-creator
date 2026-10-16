@@ -17,6 +17,8 @@ import {
   type RulesConfig,
   type TrackDefinition,
   type TrackId,
+  SKILL_CHOICE_ENTRY,
+  type SkillChoiceIntervals,
   bandForGrade,
   gradeForLevel,
   gradeOrderIndex,
@@ -25,6 +27,71 @@ import {
   vectorSum,
   zeroVector,
 } from "./types"
+
+/* ------------------------------------------------------------------ *
+ * Skill-choice milestone schedule
+ * ------------------------------------------------------------------ */
+
+/**
+ * Whether a class/profession track level-up to `level` awards a skill-choice
+ * credit for `grade` under the configured `intervals` schedule.
+ *
+ * A credit is earned when ALL of these hold:
+ *   - `grade` has a skill-choice entry point (G has none -> never a credit);
+ *   - `level` is strictly ABOVE the grade's entry point;
+ *   - `(level - entry) % interval === 0` (a whole number of intervals above the
+ *     entry point);
+ *   - `level` is within the grade's applicable band, where the upper bound is
+ *     EXCLUSIVE of the NEXT grade's skill-choice entry (so reaching that boundary
+ *     level, e.g. 100 for E, does NOT credit this grade), while the grade's own
+ *     entry point never counts. The top grade S has no next entry and caps at its
+ *     own inclusive band max (999).
+ *
+ * The "applicable band" uses the published grade table bands, but the upper bound
+ * for a non-S grade is exclusive of the next grade's skill-choice entry, so a
+ * credit is awarded only strictly below that boundary (never at the next grade's
+ * own entry). This prevents an E-grade level-100 from awarding an E credit and a
+ * D-grade level-200 from awarding a D credit. A grade never awards merely for
+ * reaching its own entry point (`level > entry` is required), and never awards at
+ * or past the next grade's entry point.
+ *
+ * This is a pure read of `grade`, `level`, and `intervals`; it never consults
+ * state or a database.
+ */
+export function isSkillChoiceMilestone(
+  grade: Grade,
+  level: number,
+  intervals: SkillChoiceIntervals
+): boolean {
+  if (!Number.isInteger(level) || level < 0) return false
+  const entry = SKILL_CHOICE_ENTRY[grade]
+  if (entry == null) return false // G has no skill-choice credits.
+  // At this point `grade` is never "G" (only G has no skill-choice entry), so the
+  // index is safe; cast past the union so TS knows the key exists.
+  const interval = intervals[grade as keyof SkillChoiceIntervals]
+  if (
+    typeof interval !== "number" ||
+    !Number.isInteger(interval) ||
+    interval < 1 ||
+    interval > 250
+  ) {
+    return false
+  }
+  if (level <= entry) return false
+  if ((level - entry) % interval !== 0) return false
+  // "Within the applicable grade band": the upper bound is EXCLUSIVE of the next
+  // grade's skill-choice entry, so reaching that boundary level belongs to the
+  // next grade (E-level-100 / D-level-200 never credit this grade). The top grade
+  // S has no next entry and instead caps at its own inclusive band max (999).
+  const next = nextGrade(grade)
+  const hi =
+    next != null
+      ? (SKILL_CHOICE_ENTRY[next] ?? Infinity)
+      : bandForGrade(grade)?.max
+  if (hi == null) return false
+  if (next != null ? level >= hi : level > hi) return false
+  return true
+}
 
 /* ------------------------------------------------------------------ *
  * Race level derivation

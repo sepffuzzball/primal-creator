@@ -456,3 +456,71 @@ describe("import document state equipment derived bonuses", () => {
     }
   })
 })
+
+describe("import document v7 skill-offer schedule provenance pair", () => {
+  function v7Offer(
+    overrides: Record<string, unknown> = {}
+  ): Record<string, unknown> {
+    return {
+      track: "class",
+      level: 4,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
+      offeredAt: "2026-03-03T12:00:00.000Z",
+      selectedStableId: null,
+      selectedAt: null,
+      options: [],
+      ...overrides,
+    }
+  }
+
+  function parse(offers: unknown[]) {
+    return characterImportDocumentSchema.safeParse(
+      baseDoc(IMPORT_SCHEMA_V7, offers)
+    )
+  }
+
+  it("accepts a scheduled offer carrying both provenance fields", () => {
+    const parsed = parse([
+      v7Offer({ earnedGrade: "F", trackDefinitionStableId: "archer" }),
+    ])
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a legacy offer that omits both provenance fields", () => {
+    const parsed = parse([v7Offer()])
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a scheduled offer with both provenance fields explicitly null (normalized legacy)", () => {
+    const parsed = parse([
+      v7Offer({ earnedGrade: null, trackDefinitionStableId: null }),
+    ])
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects a malformed grade even when the pair is otherwise complete", () => {
+    const parsed = parse([
+      v7Offer({ earnedGrade: "X", trackDefinitionStableId: "archer" }),
+    ])
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects an empty trackDefinitionStableId even when the pair is otherwise complete", () => {
+    const parsed = parse([
+      v7Offer({ earnedGrade: "F", trackDefinitionStableId: "" }),
+    ])
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a mismatched pair: earnedGrade set without trackDefinitionStableId", () => {
+    const parsed = parse([v7Offer({ earnedGrade: "F" })])
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a mismatched pair: trackDefinitionStableId set without earnedGrade", () => {
+    const parsed = parse([v7Offer({ trackDefinitionStableId: "archer" })])
+    expect(parsed.success).toBe(false)
+  })
+})

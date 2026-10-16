@@ -10,6 +10,7 @@ import {
   experiencePercentFor,
   gradeLevelUpBlockReason,
   gradeLevelUpBlockers,
+  isSkillChoiceMilestone,
   levelUpFromExperience,
   setExperiencePercent,
 } from "./progression"
@@ -20,6 +21,7 @@ import {
   createCharacterState,
   type CharacterState,
   type Grade,
+  type SkillChoiceIntervals,
   zeroVector,
 } from "./types"
 
@@ -1326,5 +1328,98 @@ describe("grade ceiling level-up blockers", () => {
     )
     expect(reason).toContain("21")
     expect(reason).toContain("F->E")
+  })
+})
+
+describe("isSkillChoiceMilestone (skill-choice credit schedule)", () => {
+  const intervals: SkillChoiceIntervals = {
+    F: 5,
+    E: 5,
+    D: 20,
+    C: 30,
+    B: 40,
+    A: 50,
+    S: 60,
+  }
+
+  it("covers every graded band's first milestone above its entry", () => {
+    expect(isSkillChoiceMilestone("F", 5, intervals)).toBe(true) // entry 0 + 5
+    expect(isSkillChoiceMilestone("E", 30, intervals)).toBe(true) // 25 + 5
+    expect(isSkillChoiceMilestone("D", 120, intervals)).toBe(true) // 100 + 20
+    expect(isSkillChoiceMilestone("C", 230, intervals)).toBe(true) // 200 + 30
+    expect(isSkillChoiceMilestone("B", 390, intervals)).toBe(true) // 350 + 40
+    expect(isSkillChoiceMilestone("A", 550, intervals)).toBe(true) // 500 + 50
+    expect(isSkillChoiceMilestone("S", 810, intervals)).toBe(true) // 750 + 60
+  })
+
+  it("awards F credits only at configured intervals above the entry", () => {
+    expect(isSkillChoiceMilestone("F", 5, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("F", 10, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("F", 25, intervals)).toBe(false) // E entry excluded
+    expect(isSkillChoiceMilestone("F", 6, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("F", 24, intervals)).toBe(false) // 24 is not a multiple of 5
+  })
+
+  it("never awards at a grade's own entry point", () => {
+    expect(isSkillChoiceMilestone("F", 0, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("E", 25, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("D", 100, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("C", 200, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("B", 350, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("A", 500, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("S", 750, intervals)).toBe(false)
+  })
+
+  it("excludes the next grade's entry from this grade (boundary level does not credit)", () => {
+    expect(isSkillChoiceMilestone("F", 25, intervals)).toBe(false) // E entry (25)
+    expect(isSkillChoiceMilestone("E", 100, intervals)).toBe(false) // D entry (100)
+    expect(isSkillChoiceMilestone("D", 200, intervals)).toBe(false) // C entry (200)
+  })
+
+  it("stops awarding past the next grade's entry point", () => {
+    expect(isSkillChoiceMilestone("F", 30, intervals)).toBe(false) // 30 > E entry 25
+    expect(isSkillChoiceMilestone("E", 105, intervals)).toBe(false) // > D entry 100
+    expect(isSkillChoiceMilestone("D", 210, intervals)).toBe(false) // > C entry 200
+  })
+
+  it("honors per-grade configurable intervals", () => {
+    const custom: SkillChoiceIntervals = {
+      F: 3,
+      E: 7,
+      D: 25,
+      C: 15,
+      B: 12,
+      A: 30,
+      S: 40,
+    }
+    expect(isSkillChoiceMilestone("F", 3, custom)).toBe(true)
+    expect(isSkillChoiceMilestone("F", 4, custom)).toBe(false)
+    // E entry 25, interval 7: 25 + 7 = 32 is a milestone; 33 is not.
+    expect(isSkillChoiceMilestone("E", 32, custom)).toBe(true)
+    expect(isSkillChoiceMilestone("E", 33, custom)).toBe(false)
+  })
+
+  it("G grades never earn a credit, regardless of level or interval", () => {
+    expect(isSkillChoiceMilestone("G", 1, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("G", 10, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("G", 250, intervals)).toBe(false)
+  })
+
+  it("rejects invalid (non 1..250) intervals by returning false", () => {
+    expect(isSkillChoiceMilestone("F", 5, { ...intervals, F: 0 })).toBe(false)
+    expect(isSkillChoiceMilestone("F", 5, { ...intervals, F: 251 })).toBe(false)
+    expect(isSkillChoiceMilestone("F", 5, { ...intervals, F: 2.5 })).toBe(false)
+  })
+
+  it("rejects a non-integer or negative level", () => {
+    expect(isSkillChoiceMilestone("F", 5.5, intervals)).toBe(false)
+    expect(isSkillChoiceMilestone("F", -1, intervals)).toBe(false)
+  })
+
+  it("caps the top grade S at its own band max (no next grade)", () => {
+    // S entry 750, interval 60: 810, 870, 930, 990 within band max 999.
+    expect(isSkillChoiceMilestone("S", 810, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("S", 990, intervals)).toBe(true)
+    expect(isSkillChoiceMilestone("S", 1000, intervals)).toBe(false) // past band max
   })
 })

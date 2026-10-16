@@ -389,6 +389,13 @@ model SkillOffer {
   // createSkillOffersForAdvance and runSkillOfferInvariants on import).
   canceledAt           DateTime?
   options              SkillOfferOption[]
+  // Provenance of a schedule (milestone) credit: the grade whose skill-choice
+  // interval awarded this offer. Null on legacy/imported offers that predate
+  // schedule-credit provenance. Never backfilled.
+  earnedGrade           String?
+  // Catalog stableId of the selected track (class or profession) at the moment
+  // the credit was earned. Null on legacy/imported offers. Never backfilled.
+  trackDefinitionStableId String?
 
   @@unique([characterId, track, level, choiceGroup, generation])
   @@index([characterId])

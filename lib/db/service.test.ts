@@ -24,6 +24,7 @@ import {
   listCatalog,
   listCharacters,
   raceGradeBandBlockers,
+  refreshPendingSkillOffers,
   resolveTrackDefinition,
   serializeState,
   setCharacterProfession,
@@ -9732,11 +9733,16 @@ describe("skill offers (milestone choice model)", () => {
   function classState(
     level: number,
     quarter: number,
-    grade: Grade = "F"
+    grade: Grade = "F",
+    raceLevel = 10
   ): unknown {
     const state = createInitialState("integrated", null, null)
     state.tracks.class = { level, quarter, definitionId: "archer:F" }
-    state.race = { ...state.race, level: 10, grade }
+    // The default race level (10) is deliberately high so a class level-up never
+    // raises the derived race (which would require a race definition this describe
+    // does not seed). Pass an explicit race level when the test needs a consistent
+    // derived-race value for an undo.
+    state.race = { ...state.race, level: raceLevel, grade }
     return serializeState(state)
   }
 
@@ -9753,14 +9759,15 @@ describe("skill offers (milestone choice model)", () => {
   function seedCharacterForSkill(
     level: number,
     quarter: number,
-    grade: Grade = "F"
+    grade: Grade = "F",
+    raceLevel = 10
   ): unknown {
     return dbMock.store.addCharacter({
       id: "chr-1",
       ownerId: user.id,
       name: "Test",
       classId: "cls-1",
-      state: classState(level, quarter, grade),
+      state: classState(level, quarter, grade, raceLevel),
       version: 0,
     })
   }
@@ -9845,17 +9852,17 @@ describe("skill offers (milestone choice model)", () => {
     expect(dbMock.store.skillOffers).toHaveLength(0)
   })
 
-  it("offers a single choice group with multiple options once on a level-up", async () => {
+  it("offers a single choice group with multiple options once on a milestone level-up", async () => {
     seedClassCatalog()
-    seedCharacterForSkill(3, 3)
+    seedCharacterForSkill(4, 3)
     seedSkill("sk-1", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
     })
     seedSkill("sk-2", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { agility: 2 }, stacking: "stack" }],
     })
     const res = await advanceCharacter(
@@ -9865,12 +9872,12 @@ describe("skill offers (milestone choice model)", () => {
     )
     const journal = res.journal as { leveledUp: boolean; levelAfter: number }
     expect(journal.leveledUp).toBe(true)
-    expect(journal.levelAfter).toBe(4)
+    expect(journal.levelAfter).toBe(5)
     expect(dbMock.store.skillOffers).toHaveLength(1)
     expect(res.character.skillOffers).toHaveLength(1)
     const offer = res.character.skillOffers[0]
     expect(offer.track).toBe("class")
-    expect(offer.level).toBe(4)
+    expect(offer.level).toBe(5)
     expect(offer.choiceGroup).toBe("standard")
     expect(offer.options).toHaveLength(2)
     expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
@@ -9881,27 +9888,27 @@ describe("skill offers (milestone choice model)", () => {
 
   it("offers only skills matching the advanced track and the selected class", async () => {
     seedClassCatalog("archer")
-    seedCharacterForSkill(3, 3)
+    seedCharacterForSkill(4, 3)
     seedSkill("sk-class-any", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
     })
     seedSkill("sk-class-archer", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       eligibleDefinitionStableIds: ["archer"],
       effects: [{ phase: "flat", amount: { strength: 2 }, stacking: "stack" }],
     })
     seedSkill("sk-class-mage", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       eligibleDefinitionStableIds: ["mage"],
       effects: [{ phase: "flat", amount: { strength: 3 }, stacking: "stack" }],
     })
     seedSkill("sk-prof", {
       track: "profession",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 4 }, stacking: "stack" }],
     })
     const res = await advanceCharacter(
@@ -10330,16 +10337,16 @@ describe("skill offers (milestone choice model)", () => {
 
   it("re-offers at the next generation after a cancellation, preserving the canceled record", async () => {
     seedClassCatalog("archer")
-    seedCharacterForSkill(3, 3)
+    seedCharacterForSkill(4, 3)
     seedSkill("sk-1", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 } }],
     })
     // A prior offer sharing the base key was canceled. It must not block a
     // re-offer, and it must never be deleted or rewritten (append-only).
     seedOffer("off-canceled", {
-      level: 4,
+      level: 5,
       canceledAt: new Date(),
       generation: 0,
       options: [{ definitionId: "sk-1" }],
@@ -10365,6 +10372,193 @@ describe("skill offers (milestone choice model)", () => {
     const stored = dbMock.store.skillOffers.find((o) => o.id === reoffer.id)!
     expect(stored.generation).toBe(1)
     expect(stored.canceledAt).toBeNull()
+  })
+
+  it("creates a zero-option milestone offer at a configured schedule credit", async () => {
+    seedClassCatalog()
+    seedCharacterForSkill(4, 3)
+    // No matching skills at level 5, yet the schedule credit still awards an offer.
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    expect(res.character.skillOffers).toHaveLength(1)
+    const offer = res.character.skillOffers[0]
+    expect(offer.level).toBe(5)
+    expect(offer.choiceGroup).toBe("standard")
+    expect(offer.options).toHaveLength(0)
+    expect(dbMock.store.skillOffers[0].earnedGrade).toBe("F")
+    expect(dbMock.store.skillOffers[0].level).toBe(5)
+  })
+
+  it("collapses authored skill choices across choice groups into ONE standard offer", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(4, 3)
+    seedSkill("sk-a", {
+      track: "class",
+      milestone: 5,
+      choiceGroup: "a",
+      eligibleDefinitionStableIds: ["archer"],
+      effects: [],
+    })
+    seedSkill("sk-b", {
+      track: "class",
+      milestone: 5,
+      choiceGroup: "b",
+      eligibleDefinitionStableIds: ["archer"],
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    const offer = res.character.skillOffers[0]
+    expect(offer.choiceGroup).toBe("standard")
+    expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
+      "sk-a",
+      "sk-b",
+    ])
+  })
+
+  it("does not credit an off-schedule level even when matching skills exist", async () => {
+    seedClassCatalog()
+    seedCharacterForSkill(3, 3)
+    // Level 4 is NOT a milestone under the default F schedule (F:5 -> 5,10,...).
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    expect(res.character.skillOffers).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+  })
+
+  it("does not credit an E-grade class at level 100 (next grade D entry excluded)", async () => {
+    seedClassCatalog()
+    // Class at 99 (quarter 3), race grade E, race level 50 so the derived race
+    // stays at 50 (floor((100+0)/2)) and never gains (no race definition needed).
+    seedCharacterForSkill(99, 3, "E", 50)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 100,
+      effects: [],
+    })
+    // 100 - 25 = 75, which is a whole multiple of the E interval (5), so the level
+    // WOULD be a milestone; but 100 is D's skill-choice entry, and that boundary
+    // belongs to D, not E. Advancing to 100 must produce NO E offer.
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    const journal = res.journal as { leveledUp: boolean; levelAfter: number }
+    expect(journal.leveledUp).toBe(true)
+    expect(journal.levelAfter).toBe(100)
+    expect(res.character.skillOffers).toHaveLength(0)
+    expect(dbMock.store.skillOffers).toHaveLength(0)
+  })
+
+  it("credits a class milestone without creating a profession offer for the same level", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(4, 3)
+    seedSkill("sk-prof", {
+      track: "profession",
+      milestone: 5,
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    expect(res.character.skillOffers[0].track).toBe("class")
+    expect(
+      res.character.skillOffers[0].options.some(
+        (o) => o.definitionId === "sk-prof"
+      )
+    ).toBe(false)
+  })
+
+  it("persists schedule-credit provenance (earnedGrade + trackDefinitionStableId)", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(4, 3)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 5,
+      effects: [],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    const stored = dbMock.store.skillOffers.find(
+      (o) => o.id === res.character.skillOffers[0].id
+    )!
+    expect(stored.earnedGrade).toBe("F")
+    expect(stored.trackDefinitionStableId).toBe("archer")
+  })
+
+  it("undo cancels an empty milestone offer and a re-earned level re-offers at the next generation", async () => {
+    seedClassCatalog("archer")
+    // Seed a consistent derived race (class 4 -> derived race 2, no profession).
+    // This keeps the undo race-level verification quiet (4 -> 5 leaves the derived
+    // race at 2).
+    seedCharacterForSkill(4, 3, "F", 2)
+    const first = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    const firstId = dbMock.store.skillOffers[0].id
+    // Undo cancels the generated offer (append-only).
+    const undone = await experienceCharacter(
+      "chr-1",
+      { operation: "undo", track: "class", version: first.character.version },
+      user
+    )
+    const canceled = dbMock.store.skillOffers.find((o) => o.id === firstId)!
+    expect(canceled.canceledAt).toBeInstanceOf(Date)
+    // Re-advancing re-earns the credit at the next generation.
+    await advanceCharacter(
+      "chr-1",
+      { track: "class", version: undone.character.version },
+      user
+    )
+    const reoffer = dbMock.store.skillOffers.find((o) => o.id !== firstId)!
+    expect(reoffer.generation).toBe(1)
+    expect(reoffer.canceledAt).toBeNull()
+    expect(reoffer.earnedGrade).toBe("F")
+  })
+
+  it("preserves a pre-existing active offer on a milestone credit instead of duplicating", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(4, 3)
+    // A pre-existing active offer already covers level 5.
+    seedOffer("off-pre", {
+      level: 5,
+      options: [{ definitionId: "sk-1" }],
+    })
+    const res = await advanceCharacter(
+      "chr-1",
+      { track: "class", version: 0 },
+      user
+    )
+    expect(dbMock.store.skillOffers).toHaveLength(1)
+    expect(dbMock.store.skillOffers[0].id).toBe("off-pre")
+    expect(res.character.skillOffers).toHaveLength(1)
+    const journal = res.journal as { skillOffers?: unknown }
+    expect(journal.skillOffers).toBeUndefined()
   })
 })
 
@@ -15071,13 +15265,13 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
     expect(events[1].kind).toBe("experience_set")
   })
 
-  it("levels up on a 75->100 set, snapshots the award and generates offers once", async () => {
+  it("levels up on a 75->100 set, snapshots the award and generates a milestone offer once", async () => {
     seedHumanRace()
     seedClassCatalog()
-    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    seedCharacter(classState(4, 3, 75), { raceId: "race-e" })
     seedSkill("sk-1", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
     })
     const res = await experienceCharacter(
@@ -15092,13 +15286,13 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
       characterVersionAfter?: number
     }
     expect(journal.leveledUp).toBe(true)
-    expect(journal.levelAfter).toBe(4)
+    expect(journal.levelAfter).toBe(5)
     expect(journal.award).toBeDefined()
     expect(journal.characterVersionAfter).toBe(1)
     expect(res.character.version).toBe(1)
-    // Exactly one offer, at the new level.
+    // Exactly one offer, at the new (milestone) level.
     expect(dbMock.store.skillOffers).toHaveLength(1)
-    expect(dbMock.store.skillOffers[0].level).toBe(4)
+    expect(dbMock.store.skillOffers[0].level).toBe(5)
     expect(experienceEvents()).toHaveLength(1)
     expect(dbMock.store.events[0].kind).toBe("advance")
   })
@@ -15592,10 +15786,10 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
     seedClassCatalog()
     seedSkill("sk-1", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
     })
-    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    seedCharacter(classState(4, 3, 75), { raceId: "race-e" })
     const leveled = await experienceCharacter(
       "chr-1",
       { operation: "set", track: "class", percent: 100, version: 0 },
@@ -15743,10 +15937,10 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
     seedClassCatalog()
     seedSkill("sk-1", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
     })
-    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    seedCharacter(classState(4, 3, 75), { raceId: "race-e" })
     const a = await experienceCharacter(
       "chr-1",
       { operation: "set", track: "class", percent: 100, version: 0 },
@@ -16043,14 +16237,14 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
     seedClassCatalog()
     seedSkill("sk-1", {
       track: "class",
-      milestone: 4,
+      milestone: 5,
       effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
     })
-    seedCharacter(classState(3, 3, 75), { raceId: "race-e" })
+    seedCharacter(classState(4, 3, 75), { raceId: "race-e" })
     // An unrelated pending offer in a different choice group at the same level is
     // NOT one of the offers generated by this level-up, so it must stay.
     seedOffer("off-other", {
-      level: 4,
+      level: 5,
       choiceGroup: "unrelated",
       options: [{ definitionId: "sk-other" }],
     })
@@ -17424,5 +17618,384 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
       stableId: "sk-free-2",
     })
     expect(item.stableId).toBe("sk-free-2")
+  })
+})
+
+describe("refresh pending scheduled skill offers", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharacterForRefresh(raceId?: string, classId?: string): void {
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(createInitialState("integrated", null, null)),
+      raceId: raceId ?? null,
+      classId: classId ?? null,
+      version: 0,
+    })
+  }
+
+  function seedHumanRace(): void {
+    dbMock.store.addCatalog({
+      id: "race-human",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: allEqual(1), freePerLevel: 5 },
+        },
+      },
+    })
+  }
+
+  function seedArcherClass(): void {
+    dbMock.store.addCatalog({
+      id: "cls-archer",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  function seedSkill(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{
+      name: string
+      grade: string
+      archived: boolean
+    }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: extra.name ?? `Skill ${id}`,
+      config,
+      ...(extra.grade ? { grade: extra.grade } : {}),
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedScheduledOffer(
+    id: string,
+    opts: {
+      characterId?: string
+      track?: string
+      level?: number
+      earnedGrade: string
+      trackDefinitionStableId: string
+      options?: Array<{
+        definitionId: string
+        nameSnapshot?: string
+        configSnapshot?: unknown
+      }>
+      selectedDefinitionId?: string | null
+      canceledAt?: Date | null
+    }
+  ): void {
+    const characterId = opts.characterId ?? "chr-1"
+    dbMock.store.skillOffers.push({
+      id,
+      characterId,
+      track: opts.track ?? "class",
+      level: opts.level ?? 4,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: opts.canceledAt ?? null,
+      selectedDefinitionId: opts.selectedDefinitionId ?? null,
+      offeredAt: new Date(),
+      selectedAt: opts.selectedDefinitionId ? new Date() : null,
+      earnedGrade: opts.earnedGrade,
+      trackDefinitionStableId: opts.trackDefinitionStableId,
+    })
+    for (const o of opts.options ?? []) {
+      dbMock.store.skillOfferOptions.push({
+        id: `opt-${id}-${o.definitionId}`,
+        offerId: id,
+        definitionId: o.definitionId,
+        nameSnapshot: o.nameSnapshot ?? `Skill ${o.definitionId}`,
+        configSnapshot: o.configSnapshot ?? {},
+      })
+    }
+  }
+
+  function seedLegacyOffer(
+    id: string,
+    opts: {
+      level?: number
+      options?: Array<{ definitionId: string }>
+    }
+  ): void {
+    dbMock.store.skillOffers.push({
+      id,
+      characterId: "chr-1",
+      track: "class",
+      level: opts.level ?? 4,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
+      selectedDefinitionId: null,
+      offeredAt: new Date(),
+      selectedAt: null,
+    })
+    for (const o of opts.options ?? []) {
+      dbMock.store.skillOfferOptions.push({
+        id: `opt-${id}-${o.definitionId}`,
+        offerId: id,
+        definitionId: o.definitionId,
+        nameSnapshot: `Skill ${o.definitionId}`,
+        configSnapshot: {},
+      })
+    }
+  }
+
+  it("appends a newly authored eligible skill to an empty pending credit; the selection then works", async () => {
+    seedCharacterForRefresh()
+    // A scheduled credit awarded before any matching skill was authored.
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [],
+    })
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      effects: [{ phase: "flat", amount: { strength: 1 }, stacking: "stack" }],
+    })
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    expect(offer.options.map((o) => o.definitionId)).toEqual(["sk-1"])
+    expect(offer.earnedGrade).toBe("F")
+    expect(offer.trackDefinitionStableId).toBe("archer")
+
+    const selected = await skillCharacter(
+      "chr-1",
+      {
+        operation: "select",
+        offerId: "off-1",
+        definitionId: "sk-1",
+        version: 0,
+      },
+      user
+    )
+    expect(
+      selected.character.associations.some(
+        (a) => a.definitionId === "sk-1" && a.kind === "skill"
+      )
+    ).toBe(true)
+  })
+
+  it("appends only genuinely new eligible options and never rewrites existing snapshots", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [{ definitionId: "sk-old", nameSnapshot: "Old Name" }],
+    })
+    // The existing option's definition has since been edited, but the offer's
+    // immutable snapshot must not be rewritten.
+    seedSkill(
+      "sk-old",
+      { track: "class", milestone: 4, effects: [] },
+      { name: "New Name" }
+    )
+    seedSkill("sk-new", { track: "class", milestone: 4, effects: [] })
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    const oldOpt = offer.options.find((o) => o.definitionId === "sk-old")!
+    expect(oldOpt.nameSnapshot).toBe("Old Name")
+    expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
+      "sk-new",
+      "sk-old",
+    ])
+  })
+
+  it("is idempotent across repeated refreshes", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [{ definitionId: "sk-1" }],
+    })
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    seedSkill("sk-2", { track: "class", milestone: 4, effects: [] })
+    await refreshPendingSkillOffers("chr-1", user)
+    const second = await refreshPendingSkillOffers("chr-1", user)
+    const offer = second.character.skillOffers.find((o) => o.id === "off-1")!
+    expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
+      "sk-1",
+      "sk-2",
+    ])
+    // The DB unique (offerId, definitionId) + skipDuplicates means no duplicate
+    // option rows accumulate.
+    expect(
+      dbMock.store.skillOfferOptions.filter((o) => o.offerId === "off-1")
+    ).toHaveLength(2)
+  })
+
+  it("respects the earned grade and eligibleDefinitionStableIds when matching", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [],
+    })
+    // Wrong earned grade -> excluded.
+    seedSkill(
+      "sk-wrong-grade",
+      { track: "class", milestone: 4, effects: [] },
+      { grade: "E" }
+    )
+    // Correct grade but restricted to a different track's stableId -> excluded.
+    seedSkill("sk-mage", {
+      track: "class",
+      milestone: 4,
+      eligibleDefinitionStableIds: ["mage"],
+      effects: [],
+    })
+    // Correct grade and correct stableId restriction -> included.
+    seedSkill("sk-archer", {
+      track: "class",
+      milestone: 4,
+      eligibleDefinitionStableIds: ["archer"],
+      effects: [],
+    })
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    expect(offer.options.map((o) => o.definitionId)).toEqual(["sk-archer"])
+  })
+
+  it("excludes archived skills from a refresh even when they would otherwise match", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [],
+    })
+    seedSkill(
+      "sk-archived",
+      { track: "class", milestone: 4, effects: [] },
+      { archived: true }
+    )
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    expect(res.character.skillOffers[0].options).toHaveLength(0)
+  })
+
+  it("leaves a legacy offer lacking provenance untouched by a refresh", async () => {
+    seedCharacterForRefresh()
+    seedLegacyOffer("off-1", { level: 4, options: [] })
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const offer = res.character.skillOffers.find((o) => o.id === "off-1")!
+    expect(offer.options).toHaveLength(0)
+  })
+
+  it("never appends an option to an already-selected or canceled offer", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-sel", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [],
+      selectedDefinitionId: "sk-1",
+    })
+    seedScheduledOffer("off-canceled", {
+      level: 5,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [],
+      canceledAt: new Date(),
+    })
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    seedSkill("sk-2", { track: "class", milestone: 5, effects: [] })
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    const sel = res.character.skillOffers.find((o) => o.id === "off-sel")!
+    expect(sel.options).toHaveLength(0)
+    const canc = res.character.skillOffers.find((o) => o.id === "off-canceled")!
+    expect(canc.options).toHaveLength(0)
+  })
+
+  it("rejects a refresh from a non-owner (403)", async () => {
+    seedCharacterForRefresh()
+    const other = { id: "user-2", email: "other@example.com", isAdmin: false }
+    await expect(
+      refreshPendingSkillOffers("chr-1", other)
+    ).rejects.toMatchObject({ status: 403, code: "forbidden" })
+  })
+
+  it("does not bump the character version or append a journal event on refresh", async () => {
+    seedCharacterForRefresh()
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [],
+    })
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    const before = await getCharacter("chr-1", user)
+    const res = await refreshPendingSkillOffers("chr-1", user)
+    expect(res.character.version).toBe(before.version)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("exports the provenance pair for a scheduled offer and omits it for a legacy offer", async () => {
+    seedCharacterForRefresh()
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [{ definitionId: "sk-1" }],
+    })
+    seedLegacyOffer("off-legacy", {
+      level: 5,
+      options: [{ definitionId: "sk-1" }],
+    })
+    const portable = await exportCharacter("chr-1", user)
+    const offers = portable.skillOffers as Array<Record<string, unknown>>
+    const scheduled = offers.find((o) => o.level === 4)!
+    expect(scheduled).toMatchObject({
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+    })
+    const legacy = offers.find((o) => o.level === 5)!
+    expect("earnedGrade" in legacy).toBe(false)
+    expect("trackDefinitionStableId" in legacy).toBe(false)
+  })
+
+  it("re-imports a v7 document and persists the provenance pair; a selected offer stays immutable", async () => {
+    seedHumanRace()
+    seedArcherClass()
+    seedCharacterForRefresh("race-human", "cls-archer")
+    seedSkill("sk-1", { track: "class", milestone: 4, effects: [] })
+    seedScheduledOffer("off-1", {
+      level: 4,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+      options: [{ definitionId: "sk-1" }],
+      selectedDefinitionId: "sk-1",
+    })
+    const portable = await exportCharacter("chr-1", user)
+    const imported = await importCharacter(
+      portable as unknown as CharacterImportDocument,
+      user
+    )
+    const importedOffer = dbMock.store.skillOffers.find(
+      (o) => o.characterId === imported.id
+    )!
+    expect(importedOffer.earnedGrade).toBe("F")
+    expect(importedOffer.trackDefinitionStableId).toBe("archer")
+    expect(importedOffer.selectedDefinitionId).toBe("sk-1")
   })
 })

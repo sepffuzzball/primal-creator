@@ -31,6 +31,7 @@ import {
   experiencePercentFor,
   gradeLevelUpBlockers,
   gradeOrderIndex,
+  isSkillChoiceMilestone,
   levelUpFromExperience,
   makeVector,
   nextGrade,
@@ -49,6 +50,7 @@ import {
   type RaceDefinition,
   type RaceType,
   type RulesConfig,
+  type SkillChoiceIntervals,
   type StatusResult,
   type TrackDefinition,
   type TrackId,
@@ -256,6 +258,16 @@ export interface SkillOfferView {
   canceledAt: string | null
   options: SkillOfferOptionView[]
   selectedDefinitionId: string | null
+  /**
+   * Provenance of a schedule (milestone) credit: the grade whose skill-choice
+   * interval awarded this offer. Null on legacy/imported offers.
+   */
+  earnedGrade?: string | null
+  /**
+   * Catalog stableId of the selected track at the moment the credit was earned.
+   * Null on legacy/imported offers.
+   */
+  trackDefinitionStableId?: string | null
 }
 
 export interface CharacterDetail {
@@ -1562,6 +1574,8 @@ function skillOfferView(
       ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
     })),
     selectedDefinitionId: offer.selectedDefinitionId,
+    earnedGrade: offer.earnedGrade,
+    trackDefinitionStableId: offer.trackDefinitionStableId,
   }
 }
 
@@ -2570,27 +2584,91 @@ export async function archiveCharacter(
 }
 
 /**
- * Create ONE skill offer per choice group for a character that just leveled a
- * track. It queries the unarchived `skills` catalog and keeps only the entries
- * whose config `track` / `milestone` exactly match the advanced track/level, whose
- * explicit `grade` (when set) equals the OFFER grade (no inferred compatibility).
- * For a graded class/profession track the offer grade is the TRACK's own grade;
- * the caller falls back to the character's race grade only for an ungraded
- * legacy track. `eligibleDefinitionStableIds` (when present)
- * includes the character's selected track catalog stableId. The surviving
- * entries are grouped by `choiceGroup ?? "standard"`; a single offer with
- * read-only option snapshots is created per group. A pre-existing offer for the
- * same (character, track, level, choiceGroup) is left untouched (unique guard).
- * Returns the created offers (id + choiceGroup) so the caller can surface them.
+ * Whether an unarchived `skills` catalog definition matches a schedule-credit
+ * (milestone) offer by the SAME eligibility rules the offer was (or would be)
+ * generated under: the config `track` is EXACT, the `milestone` equals the offer
+ * level, the catalog `grade` (when set) equals the earned grade exactly, and
+ * `eligibleDefinitionStableIds` (when present) includes the track's catalog
+ * stableId. The skill's own `choiceGroup` is deliberately ignored for a schedule
+ * credit - all matches collapse into the single "standard" offer. Shared by the
+ * initial credit offer AND by `refreshPendingSkillOffers`, so a refresh never
+ * appends an option the original credit would have rejected.
+ */
+function skillDefMatchesScheduledOffer(
+  def: { grade: string | null; config: unknown },
+  offer: {
+    track: string
+    level: number
+    earnedGrade: string
+    trackDefinitionStableId: string
+  }
+): boolean {
+  const config = parseCatalogConfig("skills", def.config ?? {})
+  if (config.track !== offer.track) return false
+  const milestone = Number(config.milestone)
+  if (!Number.isFinite(milestone) || milestone !== offer.level) return false
+  // Grade, when specified, must match the earned grade exactly. For a graded
+  // class/profession track this is the TRACK's own grade (independent of the race
+  // grade); for an ungraded legacy track it falls back to the race grade.
+  if (def.grade && def.grade !== offer.earnedGrade) return false
+  // Filter to the selected track's catalog stableId when the skill constrains its
+  // eligible class/profession definitions. When `eligibleDefinitionStableIds` is
+  // present - even as an empty array - the restriction applies via `includes`:
+  // an empty list skips the skill (no selected stableId can be included), while
+  // an absent list imposes no restriction.
+  const stableIds = config.eligibleDefinitionStableIds
+  if (
+    Array.isArray(stableIds) &&
+    !stableIds.includes(offer.trackDefinitionStableId)
+  ) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Create the SINGLE skill-choice credit offer for a character that just leveled a
+ * class/profession track to a MILESTONE level.
+ *
+ * A credit is generated only when the track's authoritative grade (passed as
+ * `offerGrade`) is a skill-choice MILESTONE at `newLevel` under the transaction's
+ * `intervals` schedule (G never credits). Non-milestone level-ups produce no
+ * offer, even when skills are configured for that level.
+ *
+ * When a credit IS due, exactly ONE offer is created with choiceGroup
+ * `"standard"` - regardless of any skill config `choiceGroup` - and it is created
+ * even when zero unarchived skills match (a zero-option milestone credit). The
+ * offer options are the unarchived `skills` catalog entries whose config `track` /
+ * `milestone` exactly match the advanced track/level, whose catalog `grade` (when
+ * set) equals the earned grade (no inferred compatibility), and whose
+ * `eligibleDefinitionStableIds` (when present) includes the selected track's
+ * catalog stableId. Provenance (`earnedGrade`, `trackDefinitionStableId`) is
+ * persisted on the offer; legacy/imported offers are never backfilled.
+ *
+ * A pre-existing ACTIVE (canceledAt null) offer for the same
+ * (character, track, level, "standard") is left untouched (never duplicated); a
+ * canceled offer does not block a re-offer, which is created at the next
+ * generation (max existing generation + 1) without deleting or rewriting the
+ * canceled record (append-only). A concurrent insert of the same generation
+ * between the check and the create surfaces as a unique-variant that aborts the
+ * whole transaction (no silent skip, no half-applied advance).
+ *
+ * Returns the created offer (id + choiceGroup), or an empty array when no credit
+ * is due or a pre-existing active offer already covers the key.
  */
 async function createSkillOffersForAdvance(
   tx: DbClient,
   characterId: string,
   track: "class" | "profession",
   newLevel: number,
-  offerGrade: string,
-  trackStableId: string | undefined
+  offerGrade: Grade,
+  trackStableId: string | undefined,
+  intervals: SkillChoiceIntervals
 ): Promise<Array<{ id: string; choiceGroup: string }>> {
+  // Only a configured skill-choice milestone credits. "Other level-ups no offers
+  // even if skills configured; G no credits."
+  if (!isSkillChoiceMilestone(offerGrade, newLevel, intervals)) return []
+
   const skillDefs = await tx.catalogDefinition.findMany({
     where: { kind: "skills", archived: false },
   })
@@ -2601,87 +2679,67 @@ async function createSkillOffersForAdvance(
       grade: string | null
       config: unknown
     }
-    choiceGroup: string
   }> = []
 
   for (const def of skillDefs) {
-    const config = parseCatalogConfig("skills", def.config ?? {})
-    if (config.track !== track) continue
-    const milestone = Number(config.milestone)
-    if (!Number.isFinite(milestone) || milestone !== newLevel) continue
-    // Grade, when specified, must match the offer grade exactly. For a graded
-    // class/profession track this is the TRACK's own grade (independent of the
-    // race grade); for an ungraded legacy track it falls back to the race grade.
-    if (def.grade && def.grade !== offerGrade) continue
-    // Filter to the selected track's catalog stableId when the skill constrains
-    // its eligible class/profession definitions. When `eligibleDefinitionStableIds`
-    // is present - even as an empty array - the restriction applies via `includes`:
-    // an empty list offers nothing (no selected stableId can be included), while an
-    // absent list imposes no restriction.
-    const stableIds = config.eligibleDefinitionStableIds
+    // The skill config `choiceGroup` is deliberately IGNORED for a schedule
+    // credit: all matching options collapse into a single "standard" offer so a
+    // credit is never multiplied. The track/milestone/grade/stableId eligibility
+    // is shared with `refreshPendingSkillOffers` so a refresh never inserts an
+    // option the original credit would have rejected.
     if (
-      Array.isArray(stableIds) &&
-      (!trackStableId || !stableIds.includes(trackStableId))
+      !skillDefMatchesScheduledOffer(
+        { grade: def.grade, config: def.config },
+        {
+          track,
+          level: newLevel,
+          earnedGrade: offerGrade,
+          trackDefinitionStableId: trackStableId ?? "",
+        }
+      )
     ) {
       continue
     }
-    const group =
-      typeof config.choiceGroup === "string" && config.choiceGroup.length > 0
-        ? config.choiceGroup
-        : "standard"
     eligible.push({
       def: { id: def.id, name: def.name, grade: def.grade, config: def.config },
-      choiceGroup: group,
     })
   }
 
-  const byGroup = new Map<string, typeof eligible>()
-  for (const e of eligible) {
-    const arr = byGroup.get(e.choiceGroup)
-    if (arr) arr.push(e)
-    else byGroup.set(e.choiceGroup, [e])
-  }
-
-  const created: Array<{ id: string; choiceGroup: string }> = []
-  for (const [choiceGroup, entries] of byGroup) {
-    // Enforce the active-offer invariant by checking for a pre-existing ACTIVE
-    // (canceledAt null) offer BEFORE creating, inside this live transaction. A
-    // pre-existing active offer (e.g. a prior advance) is left untouched and never
-    // duplicated, so a re-advance produces no duplicate. A canceled offer does NOT
-    // block a re-offer: the new offer is created as the next generation (max
-    // existing generation + 1), superseding the canceled one WITHOUT deleting it
-    // or rewriting its snapshots (append-only). If a concurrent request inserts
-    // the same generation between this check and the create, the resulting unique
-    // violation is NOT swallowed here - it propagates and aborts the entire
-    // transaction (no silent skip, no half-applied advance).
-    const existingOffers = await tx.skillOffer.findMany({
-      where: { characterId, track, level: newLevel, choiceGroup },
-    })
-    if (existingOffers.some((o) => o.canceledAt == null)) continue
-    const maxGeneration = existingOffers.reduce(
-      (m, o) => Math.max(m, o.generation),
-      -1
-    )
-    const generation = maxGeneration === -1 ? 0 : maxGeneration + 1
-    const offer = await tx.skillOffer.create({
-      data: {
-        characterId,
-        track,
-        level: newLevel,
-        choiceGroup,
-        generation,
-        options: {
-          create: entries.map((e) => ({
-            definitionId: e.def.id,
-            nameSnapshot: e.def.name,
-            configSnapshot: (e.def.config ?? {}) as Prisma.InputJsonValue,
-          })),
-        },
+  // EXACTLY ONE offer per (character, track, level), always choiceGroup
+  // "standard", even when zero skills match (a zero-option milestone credit).
+  // Enforce the active-offer invariant by checking for a pre-existing ACTIVE
+  // (canceledAt null) offer BEFORE creating, inside this live transaction. A
+  // pre-existing active offer is left untouched and never duplicated; a canceled
+  // offer does NOT block a re-offer (created as max generation + 1, superseding
+  // the canceled one WITHOUT deleting it or rewriting its snapshots).
+  const existingOffers = await tx.skillOffer.findMany({
+    where: { characterId, track, level: newLevel, choiceGroup: "standard" },
+  })
+  if (existingOffers.some((o) => o.canceledAt == null)) return []
+  const maxGeneration = existingOffers.reduce(
+    (m, o) => Math.max(m, o.generation),
+    -1
+  )
+  const generation = maxGeneration === -1 ? 0 : maxGeneration + 1
+  const offer = await tx.skillOffer.create({
+    data: {
+      characterId,
+      track,
+      level: newLevel,
+      choiceGroup: "standard",
+      generation,
+      earnedGrade: offerGrade,
+      trackDefinitionStableId: trackStableId ?? null,
+      options: {
+        create: eligible.map((e) => ({
+          definitionId: e.def.id,
+          nameSnapshot: e.def.name,
+          configSnapshot: (e.def.config ?? {}) as Prisma.InputJsonValue,
+        })),
       },
-    })
-    created.push({ id: offer.id, choiceGroup })
-  }
-  return created
+    },
+  })
+  return [{ id: offer.id, choiceGroup: "standard" }]
 }
 
 export async function advanceCharacter(
@@ -2780,7 +2838,8 @@ export async function advanceCharacter(
         body.track,
         newLevel,
         trackGrade,
-        trackStableId ?? undefined
+        trackStableId ?? undefined,
+        houseRules.config.skillChoiceIntervals
       )
     }
 
@@ -3565,7 +3624,8 @@ export async function experienceCharacter(
           body.track,
           newLevel,
           trackGrade,
-          trackStableId ?? undefined
+          trackStableId ?? undefined,
+          houseRules.config.skillChoiceIntervals
         )
       }
 
@@ -4313,6 +4373,30 @@ type SkillActionInput = SkillSelectInput | SkillGrantInput
  * unarchived `skills` entry. It records provenance "manual" in the event, and
  * applies the same upgrade-group replacement as a select.
  */
+/**
+ * Acquire a Postgres row lock (`FOR UPDATE`) on the given skill-offer rows,
+ * in ascending id order, BEFORE reading/validating them. Both the selection
+ * (`skillCharacter`) and the pending-refresh (`refreshPendingSkillOffers`)
+ * transactions take this lock so a refresh can never append options to an
+ * offer that is concurrently selected, and a selection can never run while a
+ * refresh is mid-append to the same offer. Locking in sorted id order avoids a
+ * deadlock between concurrent refreshes that touch overlapping offer sets.
+ *
+ * The lock is held until the caller's transaction commits/rolls back. A
+ * stale-concurrency snapshot (the row was committed by a concurrent
+ * transaction after this transaction began) surfaces as a P2034 serialization
+ * failure, which the caller maps to a retryable 409.
+ */
+async function lockSkillOfferRows(db: DbClient, ids: string[]): Promise<void> {
+  if (ids.length === 0) return
+  const sorted = [...ids].sort()
+  await db.$queryRaw`
+    SELECT id FROM skill_offers
+    WHERE id IN (${Prisma.join(sorted)})
+    ORDER BY id
+    FOR UPDATE`
+}
+
 export async function skillCharacter(
   id: string,
   input: SkillActionInput,
@@ -4323,6 +4407,11 @@ export async function skillCharacter(
     const houseRules = await loadHouseRules(tx)
 
     if (input.operation === "select") {
+      // Lock the offer row BEFORE reading/validating it so a concurrent
+      // refresh cannot append options to this offer in the middle of the
+      // selection. The lock is held until this transaction commits, so a
+      // refresh that targets the same offer blocks behind it.
+      await lockSkillOfferRows(tx, [input.offerId])
       const offer = await tx.skillOffer.findUnique({
         where: { id: input.offerId },
         include: { options: { include: { definition: true } } },
@@ -4575,6 +4664,156 @@ export async function skillCharacter(
     }))!
     return { character: await detailFor(updated, houseRules, tx) }
   })
+}
+
+/**
+ * Refresh the pending SCHEDULED skill offers for a character, appending any newly
+ * authored unarchived skills that are now eligible for each pending scheduled
+ * credit - WITHOUT rewriting history.
+ *
+ * A pending scheduled offer is one with schedule-credit provenance (`earnedGrade`
+ * and `trackDefinitionStableId` both set) that is still active (not selected, not
+ * canceled). For each such offer the service queries the unarchived `skills`
+ * catalog and appends ONLY genuinely new eligible options via `createMany` with
+ * `skipDuplicates` (the DB unique `(offerId, definitionId)` is the last line of
+ * defense). Eligibility uses the exact same rules as the original credit
+ * (`skillDefMatchesScheduledOffer`): the config `track` is exact, the `milestone`
+ * equals the offer level, the catalog grade (when set) equals the earned grade,
+ * and `eligibleDefinitionStableIds` (when present) includes the saved track
+ * stableId. The skill's own `choiceGroup` is ignored. Existing option snapshots
+ * are never modified - even if the skill has since been archived or edited - and
+ * archived skills never appear.
+ *
+ * Legacy offers lacking provenance are untouched. The character CAS version and
+ * the journal are NOT bumped (this only appends snapshot rows); the reloaded
+ * detail is returned. Under SERIALIZABLE isolation a concurrent selection that
+ * commits between this read and write aborts this transaction (P2034), which is
+ * surfaced as a retryable 409 - the client retry is idempotent and, on retry, the
+ * now-selected offer is filtered out, so options are never appended after a
+ * selection.
+ */
+export async function refreshPendingSkillOffers(
+  id: string,
+  user: SessionUser
+): Promise<{ character: CharacterDetail }> {
+  return prisma
+    .$transaction(
+      async (tx) => {
+        // assertOwner enforces owner/admin + existence; the returned row is not
+        // needed here (the detail is re-read after the appends).
+        await assertOwner(tx, id, user)
+        const houseRules = await loadHouseRules(tx)
+
+        // Only pending SCHEDULED offers: provenance set, not selected, not canceled.
+        const pendingFilter = {
+          characterId: id,
+          earnedGrade: { not: null },
+          trackDefinitionStableId: { not: null },
+          selectedDefinitionId: null,
+          selectedAt: null,
+          canceledAt: null,
+        }
+
+        // First identify the candidate offer ids, then lock them (in sorted id
+        // order) BEFORE reading/validating them, so a concurrent selection that
+        // commits while this refresh is in flight cannot have options appended to
+        // its offer after the selection. The lock is held through the append.
+        const candidateIds = await tx.skillOffer.findMany({
+          where: pendingFilter,
+          select: { id: true },
+        })
+        await lockSkillOfferRows(
+          tx,
+          candidateIds.map((c) => c.id)
+        )
+
+        // Re-read the pending offers after locking. If a selection committed while
+        // this refresh was acquiring the lock, the offer is now excluded from this
+        // filter (a fresh snapshot) or, in a stale SERIALIZABLE snapshot, the
+        // locked row surfaces as a P2034 serialization failure handled below - so
+        // an already-selected offer is never appended to.
+        const pendingOffers = await tx.skillOffer.findMany({
+          where: pendingFilter,
+          include: { options: true },
+        })
+
+        if (pendingOffers.length === 0) {
+          const updated = (await tx.character.findUnique({
+            where: { id },
+            include: characterInclude,
+          }))!
+          return { character: await detailFor(updated, houseRules, tx) }
+        }
+
+        // Load the unarchived skills catalog ONCE for the whole refresh, so a skill
+        // authored after the original credit is eligible on the next refresh.
+        const skillDefs = await tx.catalogDefinition.findMany({
+          where: { kind: "skills", archived: false },
+        })
+
+        for (const offer of pendingOffers) {
+          // A scheduled offer always carries both provenance columns (filtered
+          // above); guard the narrow only defensively.
+          if (
+            offer.earnedGrade == null ||
+            offer.trackDefinitionStableId == null
+          )
+            continue
+          const existing = new Set(offer.options.map((o) => o.definitionId))
+          const newOptions: Array<{
+            definitionId: string
+            nameSnapshot: string
+            configSnapshot: Prisma.InputJsonValue
+          }> = []
+          for (const def of skillDefs) {
+            if (existing.has(def.id)) continue
+            if (
+              !skillDefMatchesScheduledOffer(
+                { grade: def.grade, config: def.config },
+                {
+                  track: offer.track,
+                  level: offer.level,
+                  earnedGrade: offer.earnedGrade,
+                  trackDefinitionStableId: offer.trackDefinitionStableId,
+                }
+              )
+            ) {
+              continue
+            }
+            newOptions.push({
+              definitionId: def.id,
+              nameSnapshot: def.name,
+              configSnapshot: (def.config ?? {}) as Prisma.InputJsonValue,
+            })
+          }
+          if (newOptions.length === 0) continue
+          await tx.skillOfferOption.createMany({
+            data: newOptions.map((o) => ({ ...o, offerId: offer.id })),
+            skipDuplicates: true,
+          })
+        }
+
+        const updated = (await tx.character.findUnique({
+          where: { id },
+          include: characterInclude,
+        }))!
+        return { character: await detailFor(updated, houseRules, tx) }
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      // A concurrent write (e.g. a selection that committed after our offer read)
+      // that cannot serialize surfaces as P2034; map it to a retryable 409 rather
+      // than a raw 500. The transaction has already rolled back, so no stray option
+      // rows are left behind.
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "serialization_conflict",
+          "Concurrent character write conflict; retry the skill refresh"
+        )
+      }
+      throw err
+    })
 }
 
 type SkillUpgradeInput = {
@@ -6739,6 +6978,17 @@ export async function exportCharacter(
         nameSnapshot: o.nameSnapshot,
         configSnapshot: (o.configSnapshot ?? {}) as Record<string, unknown>,
       })),
+      // Schedule-credit provenance: a scheduled offer carries BOTH the earned grade
+      // and the selected track's stableId. A legacy offer (both null) omits both so
+      // its backup shape is unchanged; a mismatched row is normalized to the pair
+      // (with null for the missing half) rather than dropped, so a re-import still
+      // validates against the schema's required-together rule.
+      ...(offer.earnedGrade != null || offer.trackDefinitionStableId != null
+        ? {
+            earnedGrade: offer.earnedGrade ?? null,
+            trackDefinitionStableId: offer.trackDefinitionStableId ?? null,
+          }
+        : {}),
     }
   })
   return {
@@ -7302,6 +7552,9 @@ type ResolvedOffer = {
   selectedDefinitionId: string | null
   selectedAt: Date | null
   options: ResolvedOfferOption[]
+  /** Schedule-credit provenance (nullable on legacy/imported offers). */
+  earnedGrade: string | null
+  trackDefinitionStableId: string | null
 }
 
 function parseOfferDate(value: string | number | null | undefined): Date {
@@ -7415,6 +7668,16 @@ async function resolveSkillOfferRefs(
       )!.definitionId
     }
 
+    // Schedule-credit provenance. Only a v7 offer carries these fields (validated
+    // to be present together by the schema); a legacy v3/v4/v5/v6 offer omits them
+    // and reads back as null, so a scheduled offer's provenance survives a backup
+    // round-trip exactly while an older offer stays unchanged.
+    const earnedGrade = "earnedGrade" in o ? (o.earnedGrade ?? null) : null
+    const trackDefinitionStableId =
+      "trackDefinitionStableId" in o
+        ? (o.trackDefinitionStableId ?? null)
+        : null
+
     result.push({
       track: o.track,
       level: o.level,
@@ -7430,6 +7693,8 @@ async function resolveSkillOfferRefs(
       selectedDefinitionId,
       selectedAt: selectedDefinitionId ? parseOfferDate(o.selectedAt) : null,
       options,
+      earnedGrade,
+      trackDefinitionStableId,
     })
   }
   return result
@@ -7964,6 +8229,9 @@ export async function importCharacter(
             offeredAt: o.offeredAt,
             selectedDefinitionId: o.selectedDefinitionId,
             selectedAt: o.selectedAt,
+            // Schedule-credit provenance (nullable on legacy/imported offers).
+            earnedGrade: o.earnedGrade,
+            trackDefinitionStableId: o.trackDefinitionStableId,
             options: {
               create: o.options.map((opt) => ({
                 definitionId: opt.definitionId,
@@ -8091,17 +8359,35 @@ function isBloodlinePartialIndexViolation(err: unknown): boolean {
 }
 
 /**
- * Detect a Prisma serialization/deadlock failure (P2034). Under SERIALIZABLE
- * isolation two concurrent catalog writes that race on the same row (e.g. two
- * concurrent blessing creates with the same stableId, or two concurrent god
- * stableId changes) cannot both commit; the loser surfaces as P2034 and we map
- * it to a 409 rather than a raw 500.
+ * Detect a Prisma serialization/deadlock failure (P2034) or a raw-query
+ * serialization failure (P2010 with SQLSTATE 40001). Under SERIALIZABLE isolation
+ * two concurrent catalog writes that race on the same row (e.g. two concurrent
+ * blessing creates with the same stableId, or two concurrent god stableId
+ * changes) cannot both commit; the loser surfaces as P2034 and we map it to a 409
+ * rather than a raw 500.
+ *
+ * The raw `$queryRaw ... FOR UPDATE` row lock in `lockSkillOfferRows` can also
+ * race a concurrent commit on the same offer row. PostgreSQL raises SQLSTATE
+ * 40001 ("could not serialize access due to concurrent update"), which Prisma
+ * surfaces as a `P2010` (raw query failed) carrying `meta.code = "40001"` - it
+ * does NOT translate raw-query serialization failures to P2034. Recognize that
+ * shape too so the retryable 409 contract holds for the offer-lock path as well.
  */
 function isSerializationFailure(err: unknown): boolean {
-  return (
+  if (
     !!err &&
     typeof err === "object" &&
     (err as { code?: string }).code === "P2034"
+  ) {
+    return true
+  }
+  const meta = (err as { meta?: { code?: string; message?: string } }).meta
+  return (
+    !!err &&
+    typeof err === "object" &&
+    (err as { code?: string }).code === "P2010" &&
+    (meta?.code === "40001" ||
+      meta?.message?.includes("could not serialize access") === true)
   )
 }
 

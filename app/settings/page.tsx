@@ -573,10 +573,12 @@ function HouseRulesCard() {
   const [version, setVersion] = React.useState<number>(0)
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
+  const [configRevision, setConfigRevision] = React.useState(0)
 
   const applyResponse = React.useCallback((res: AdminHouseRulesResponse) => {
     setConfig(res.config)
     setVersion(res.version)
+    setConfigRevision((revision) => revision + 1)
   }, [])
 
   const reload = React.useCallback(async () => {
@@ -635,9 +637,25 @@ function HouseRulesCard() {
     )
   }
 
+  const setSkillInterval =
+    (grade: "F" | "E" | "D" | "C" | "B" | "A" | "S") => (value: number) => {
+      setConfig((prev) =>
+        prev
+          ? {
+              ...prev,
+              skillChoiceIntervals: {
+                ...prev.skillChoiceIntervals,
+                [grade]: value,
+              },
+            }
+          : prev
+      )
+    }
+
   const onSave = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!config) return
+    if (!event.currentTarget.reportValidity()) return
     setSaving(true)
     try {
       const body: HouseRulesPatchRequest = { version, config }
@@ -681,7 +699,12 @@ function HouseRulesCard() {
             Loading house rules...
           </div>
         ) : config ? (
-          <form onSubmit={onSave} className="flex flex-col gap-4">
+          <form
+            key={configRevision}
+            onSubmit={onSave}
+            noValidate
+            className="flex flex-col gap-4"
+          >
             <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
               <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
               <span>
@@ -711,6 +734,29 @@ function HouseRulesCard() {
                 hint="Total bonus cap from all equipment on an attribute (default 15)."
               />
             </div>
+
+            <fieldset className="flex flex-col gap-3">
+              <legend className="text-xs font-medium text-muted-foreground">
+                Skill-choice credit intervals
+              </legend>
+              <p className="text-xs text-muted-foreground">
+                Levels between earned skill-choice credits. Changes apply only
+                to future-earned credits; G grants none.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {(["F", "E", "D", "C", "B", "A", "S"] as const).map((grade) => (
+                  <HouseRuleInput
+                    key={grade}
+                    label={`${grade} Class interval`}
+                    value={config.skillChoiceIntervals[grade]}
+                    onChange={setSkillInterval(grade)}
+                    min={1}
+                    max={250}
+                    hint={`Default ${{ F: 5, E: 5, D: 20, C: 30, B: 40, A: 50, S: 60 }[grade]}.`}
+                  />
+                ))}
+              </div>
+            </fieldset>
 
             <div>
               <div className="mb-1.5 text-xs font-medium text-muted-foreground">
@@ -798,19 +844,72 @@ function HouseRuleInput({
   max: number
   hint?: string
 }) {
+  const [rawValue, setRawValue] = React.useState(String(value))
+  const [error, setError] = React.useState("")
+  const validate = () => {
+    const parsed = Number(rawValue)
+    const invalid =
+      rawValue.trim() === "" ||
+      !Number.isInteger(parsed) ||
+      parsed < min ||
+      parsed > max
+    setError(invalid ? `Enter a whole number from ${min} to ${max}.` : "")
+    const input = document.getElementById(
+      `house-rule-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`
+    ) as HTMLInputElement | null
+    input?.setCustomValidity(
+      invalid ? `Enter a whole number from ${min} to ${max}.` : ""
+    )
+    if (!invalid) onChange(parsed)
+    return !invalid
+  }
   return (
     <div className="flex flex-col gap-1.5">
-      <Label>{label}</Label>
+      <Label
+        htmlFor={`house-rule-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
+      >
+        {label}
+      </Label>
       <Input
+        id={`house-rule-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
         type="number"
         min={min}
         max={max}
         step={1}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
+        required
+        value={rawValue}
+        aria-invalid={Boolean(error)}
+        aria-describedby={
+          error
+            ? `error-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`
+            : undefined
+        }
+        onChange={(e) => {
+          setRawValue(e.target.value)
+          setError("")
+          e.currentTarget.setCustomValidity("")
+          const n = Number(e.target.value)
+          if (
+            e.target.value.trim() !== "" &&
+            Number.isInteger(n) &&
+            n >= min &&
+            n <= max
+          )
+            onChange(n)
+        }}
+        onBlur={validate}
       />
       {hint ? (
         <div className="text-xs text-muted-foreground">{hint}</div>
+      ) : null}
+      {error ? (
+        <div
+          id={`error-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
+          role="alert"
+          className="text-xs text-destructive"
+        >
+          {error}
+        </div>
       ) : null}
     </div>
   )
