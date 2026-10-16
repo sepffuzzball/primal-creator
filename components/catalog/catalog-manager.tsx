@@ -242,9 +242,11 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [skillTrack, setSkillTrack] = React.useState("")
   const [skillTrackTouched, setSkillTrackTouched] = React.useState(false)
   const [classTie, setClassTie] = React.useState("")
+  const [classTieFilter, setClassTieFilter] = React.useState("")
   const [skillGrantGrade, setSkillGrantGrade] =
     React.useState<(typeof GRADES)[number]>("G")
   const [skillToGrant, setSkillToGrant] = React.useState("")
+  const [skillGrantFilter, setSkillGrantFilter] = React.useState("")
   const [descriptionGrade, setDescriptionGrade] =
     React.useState<(typeof GRADES)[number]>("G")
   const [blessingTier, setBlessingTier] =
@@ -2088,6 +2090,11 @@ export function CatalogManager({ kind }: { kind: string }) {
                           const selectable = skills.filter(
                             (skill) => !existing.includes(skill.stableId)
                           )
+                          const filteredSkills = selectable.filter((skill) =>
+                            `${skill.name} ${skill.stableId}`
+                              .toLocaleLowerCase()
+                              .includes(skillGrantFilter.toLocaleLowerCase())
+                          )
                           return (
                             <>
                               <ul className="flex flex-col gap-1">
@@ -2118,6 +2125,19 @@ export function CatalogManager({ kind }: { kind: string }) {
                                 })}
                               </ul>
                               <div className="flex flex-wrap items-center gap-2">
+                                <div className="flex w-full flex-col gap-1">
+                                  <Label htmlFor="skill-grant-filter">
+                                    Filter skills by name or ID
+                                  </Label>
+                                  <Input
+                                    id="skill-grant-filter"
+                                    value={skillGrantFilter}
+                                    onChange={(event) =>
+                                      setSkillGrantFilter(event.target.value)
+                                    }
+                                    placeholder="Search skills"
+                                  />
+                                </div>
                                 <Label
                                   className="sr-only"
                                   htmlFor="skill-grant-choice"
@@ -2127,14 +2147,29 @@ export function CatalogManager({ kind }: { kind: string }) {
                                 <select
                                   id="skill-grant-choice"
                                   aria-label="Skill to grant"
-                                  className="h-9 min-w-48 rounded-md border bg-background px-3 text-sm"
+                                  className="h-auto max-h-48 min-w-48 overflow-y-auto rounded-md border bg-background px-3 text-sm"
+                                  size={Math.min(
+                                    8,
+                                    Math.max(2, filteredSkills.length + 1)
+                                  )}
                                   value={skillToGrant}
                                   onChange={(event) =>
                                     setSkillToGrant(event.target.value)
                                   }
                                 >
                                   <option value="">Choose a skill</option>
-                                  {selectable.map((skill) => (
+                                  {skillToGrant &&
+                                  !filteredSkills.some(
+                                    (skill) => skill.stableId === skillToGrant
+                                  ) ? (
+                                    <option value={skillToGrant}>
+                                      {selectable.find(
+                                        (skill) =>
+                                          skill.stableId === skillToGrant
+                                      )?.name ?? skillToGrant}
+                                    </option>
+                                  ) : null}
+                                  {filteredSkills.map((skill) => (
                                     <option
                                       key={skill.stableId}
                                       value={skill.stableId}
@@ -2616,20 +2651,66 @@ export function CatalogManager({ kind }: { kind: string }) {
                             </Button>
                           </Alert>
                         ) : null}
+                        <Label htmlFor="skill-class-tie-filter">
+                          Filter classes by name or ID
+                        </Label>
+                        <Input
+                          id="skill-class-tie-filter"
+                          value={classTieFilter}
+                          onChange={(event) =>
+                            setClassTieFilter(event.target.value)
+                          }
+                          placeholder="Search classes"
+                        />
                         <select
                           id="skill-class-tie"
                           aria-label="Class tie"
-                          className="h-9 rounded-md border bg-background px-3 text-sm"
+                          className="h-auto max-h-48 overflow-y-auto rounded-md border bg-background px-3 text-sm"
                           value={classTie}
                           disabled={classChoices === null}
+                          size={Math.min(
+                            8,
+                            Math.max(
+                              2,
+                              (classChoices ?? []).filter((entry) =>
+                                `${entry.name} ${entry.stableId}`
+                                  .toLocaleLowerCase()
+                                  .includes(classTieFilter.toLocaleLowerCase())
+                              ).length + 1
+                            )
+                          )}
                           onChange={(event) => setClassTie(event.target.value)}
                         >
                           <option value="">No class</option>
-                          {classChoices?.map((entry) => (
-                            <option key={entry.stableId} value={entry.stableId}>
-                              {entry.name}
+                          {classTie &&
+                          !classChoices?.some(
+                            (entry) =>
+                              entry.stableId === classTie &&
+                              `${entry.name} ${entry.stableId}`
+                                .toLocaleLowerCase()
+                                .includes(classTieFilter.toLocaleLowerCase())
+                          ) ? (
+                            <option value={classTie}>
+                              {classChoices?.find(
+                                (entry) => entry.stableId === classTie
+                              )?.name ?? classTie}{" "}
+                              (selected)
                             </option>
-                          ))}
+                          ) : null}
+                          {classChoices
+                            ?.filter((entry) =>
+                              `${entry.name} ${entry.stableId}`
+                                .toLocaleLowerCase()
+                                .includes(classTieFilter.toLocaleLowerCase())
+                            )
+                            .map((entry) => (
+                              <option
+                                key={entry.stableId}
+                                value={entry.stableId}
+                              >
+                                {entry.name}
+                              </option>
+                            ))}
                           {classTie &&
                           !classChoices?.some(
                             (entry) => entry.stableId === classTie

@@ -93,9 +93,44 @@ describe("inventory route", () => {
     expect(data.version).toBe(4)
   })
 
+  it("POST hands a valid use payload to the service and returns the refreshed detail", async () => {
+    const res = await POST(
+      req("POST", {
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 3,
+      }),
+      ctx()
+    )
+    expect(res.status).toBe(200)
+    expect(adjustMock).toHaveBeenCalledWith(
+      "chr-1",
+      {
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 3,
+      },
+      user
+    )
+    const data = (await res.json()) as { inventory: unknown[]; version: number }
+    expect(data.inventory).toEqual([item])
+    expect(data.version).toBe(4)
+  })
+
   it("POST returns 400 for a payload that fails schema validation", async () => {
     const res = await POST(
       req("POST", { operation: "add", definitionId: "gear-1", quantity: 0 }),
+      ctx()
+    )
+    expect(res.status).toBe(400)
+    expect(adjustMock).not.toHaveBeenCalled()
+  })
+
+  it("POST returns 400 for a use whose quantity is not exactly 1", async () => {
+    const res = await POST(
+      req("POST", { operation: "use", definitionId: "pot-1", quantity: 2 }),
       ctx()
     )
     expect(res.status).toBe(400)

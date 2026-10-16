@@ -331,6 +331,307 @@ function payloadRecord(payload: unknown): Record<string, unknown> {
     : {}
 }
 
+/**
+ * Normalize a source event timestamp for skill history. Accepts either a valid
+ * ISO date string or a finite numeric Unix epoch in MILLISECONDS that falls
+ * within the JS Date range, and returns a UTC ISO string for display/sort.
+ * Returns null (so the caller falls back to the inherited date) when the value
+ * is missing, not a parseable date, NaN/non-finite, or outside the JS Date
+ * range. A numeric `sourceCreatedAt` is permitted by the import schema
+ * (z.union string/number), so a trusted backup time must survive to the screen.
+ */
+function normalizeSourceDate(value: unknown): string | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null
+    // JS Date valid range is +/- 8.64e15 ms relative to the Unix epoch; outside
+    // of it `new Date` yields an Invalid Date that cannot be sorted/displayed.
+    if (Math.abs(value) > 8640000000000000) return null
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) return null
+    return date.toISOString()
+  }
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = Date.parse(value)
+    if (Number.isNaN(parsed)) return null
+    return new Date(parsed).toISOString()
+  }
+  return null
+}
+
+function humanizeStableId(value: string): string {
+  return value
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+const ROMAN_NUMERALS = new Map<string, number>([
+  ["I", 1],
+  ["V", 5],
+  ["X", 10],
+  ["L", 50],
+  ["C", 100],
+  ["D", 500],
+  ["M", 1000],
+])
+
+function romanNumeralToNumber(value: string): number | null {
+  let total = 0
+  let previous = 0
+  for (const char of value.split("").reverse()) {
+    const numeral = ROMAN_NUMERALS.get(char)
+    if (numeral == null) return null
+    if (numeral < previous) total -= numeral
+    else total += numeral
+    previous = numeral
+  }
+  return total
+}
+
+/**
+ * Strip a trailing rank suffix (a space then a Roman numeral or Arabic number
+ * token) from a title name when that token equals the given rank. Returns the
+ * base name, or null when the name carries no safely recognizable rank suffix.
+ */
+function stripRankSuffix(name: string, rank: number): string | null {
+  const trimmed = name.trim()
+  const match = trimmed.match(/^(.*\S)\s+(\d+|[IVXLCDM]+)$/)
+  if (!match) return null
+  const [, base, token] = match
+  const suffixValue = /^\d+$/.test(token)
+    ? Number(token)
+    : romanNumeralToNumber(token)
+  if (suffixValue == null || suffixValue !== rank) return null
+  return base
+}
+
+/**
+ * Derive a human-facing label for a ranked title series directly from its
+ * catalog entries, without hardcoding any series id. It takes the lowest-rank
+ * entry name and strips its trailing rank suffix (e.g. "Dungeon Pioneer I" ->
+ * "Dungeon Pioneer"); when the lowest rank carries no safely recognizable rank
+ * suffix it falls back to a humanized stable id.
+ */
+function rankedSeriesLabel(seriesId: string, sorted: CatalogItem[]): string {
+  const lowest = sorted[0]
+  if (lowest) {
+    const rank = Number(
+      (lowest.config?.improvement as { rank?: unknown } | undefined)?.rank
+    )
+    if (Number.isInteger(rank)) {
+      const stripped = stripRankSuffix(lowest.name, rank)
+      if (stripped) return stripped
+    }
+  }
+  return humanizeStableId(seriesId)
+}
+
+function SkillOfferOptionDetails({
+  option,
+}: {
+  option: CharacterDetail["skillOffers"][number]["options"][number]
+}) {
+  return (
+    <div className="mt-1">
+      <div className="flex flex-wrap gap-1">
+        {option.rarity ? (
+          <Badge variant="outline">{option.rarity}</Badge>
+        ) : null}
+        {option.skillType ? (
+          <Badge variant="outline">
+            {option.skillType[0]!.toUpperCase() + option.skillType.slice(1)}
+          </Badge>
+        ) : null}
+        {option.classStableId ? (
+          <Badge variant="outline">
+            Class tie: {humanizeStableId(option.classStableId)}
+          </Badge>
+        ) : null}
+      </div>
+      <details className="text-xs text-muted-foreground">
+        <summary className="w-fit cursor-pointer underline underline-offset-2">
+          Description for {option.nameSnapshot}
+        </summary>
+        <p className="mt-1 whitespace-pre-wrap">
+          {option.description || "No description available"}
+        </p>
+      </details>
+    </div>
+  )
+}
+
+/**
+ * Humanize a single skill reference's name, falling back to a snapshot
+ * stableId / id / definitionId when the name is absent. Used for upgrade
+ * `from`/`to` refs and for the `definition` snapshot on select/grant payloads.
+ */
+function refSkillName(ref: Record<string, unknown>): string | undefined {
+  if (typeof ref.name === "string" && ref.name.length > 0) return ref.name
+  if (typeof ref.stableId === "string" && ref.stableId.length > 0)
+    return humanizeStableId(ref.stableId)
+  const id = typeof ref.id === "string" ? ref.id : ref.definitionId
+  if (typeof id === "string" && id.length > 0) return humanizeStableId(id)
+  return undefined
+}
+
+/**
+ * The human-facing name for a direct skill_select / skill_grant event payload.
+ * The service snapshots the selected/granted definition under `definition`
+ * (name / stableId / id); when the name is absent the snapshot stableId or id is
+ * humanized as a meaningful fallback.
+ */
+function definitionSkillName(
+  payload: Record<string, unknown>
+): string | undefined {
+  return refSkillName(payloadRecord(payload.definition))
+}
+
+/**
+ * The acquired-skill name for a grade-grant journal entry. A `granted` entry
+ * carries `name`; an `upgraded` entry carries `toName` (the newly acquired
+ * target). Falls back to the snapshot stableId.
+ */
+function journalSkillName(
+  item: Record<string, unknown>,
+  field: "granted" | "upgraded"
+): string | undefined {
+  if (field === "upgraded") {
+    if (typeof item.toName === "string" && item.toName.length > 0)
+      return item.toName
+    if (typeof item.toStableId === "string" && item.toStableId.length > 0)
+      return humanizeStableId(item.toStableId)
+  }
+  if (typeof item.name === "string" && item.name.length > 0) return item.name
+  if (typeof item.stableId === "string" && item.stableId.length > 0)
+    return humanizeStableId(item.stableId)
+  return undefined
+}
+
+/**
+ * Build the history label for a skill_select / skill_grant / skill_upgrade
+ * event. select/grant read the definition name from `definition`; an upgrade
+ * reads the from -> to names. "Skill" is used only when neither a name nor a
+ * snapshot identifier is available.
+ */
+function skillEventLabel(
+  kind: "skill_select" | "skill_grant" | "skill_upgrade",
+  payload: Record<string, unknown>
+): string {
+  if (kind === "skill_upgrade") {
+    const fromName = refSkillName(payloadRecord(payload.from)) ?? "Skill"
+    const toName = refSkillName(payloadRecord(payload.to)) ?? "Skill"
+    return `Skill upgraded: ${fromName} -> ${toName}`
+  }
+  const name = definitionSkillName(payload) ?? "Skill"
+  return `${kind === "skill_select" ? "Skill selected" : "Skill granted"}: ${name}`
+}
+
+function skillHistoryEvents(events: ExportResponse["events"]) {
+  const found: Array<{ date: string; label: string; key: string }> = []
+  const addGrant = (
+    payload: Record<string, unknown>,
+    date: string,
+    key: string
+  ) => {
+    // An import_history wrapper records the time the event was imported (`date`,
+    // the wrapper's own createdAt) alongside the original event timestamp under
+    // `sourceCreatedAt`. At each recursion level a valid `sourceCreatedAt`
+    // supersedes the inherited date; a missing, invalid, or out-of-range one
+    // falls back to it. A numeric `sourceCreatedAt` (epoch ms) is normalized to
+    // UTC ISO. This keeps imported history sorted by the ORIGINAL event time,
+    // never the import wrapper time.
+    const effectiveDate = normalizeSourceDate(payload.sourceCreatedAt) ?? date
+    const journal = payloadRecord(payload.journal)
+    const grants = payloadRecord(payload.skillGrants ?? journal.skillGrants)
+    for (const [field, label] of [
+      ["granted", "Skill granted"],
+      ["upgraded", "Skill upgraded"],
+    ] as const) {
+      const values = grants[field]
+      if (Array.isArray(values))
+        values.forEach((value, index) => {
+          const item = payloadRecord(value)
+          if (
+            item.noop === true ||
+            item.skipped === true ||
+            item.superseded === true ||
+            ["noop", "skipped", "superseded"].includes(String(item.status))
+          )
+            return
+          const name = journalSkillName(item, field) ?? "Skill"
+          found.push({
+            date: effectiveDate,
+            label: `${label}: ${name}`,
+            key: `${key}-${field}-${index}`,
+          })
+        })
+    }
+    if (
+      payload.sourceKind === "import_history" ||
+      ["create", "profession_set", "evolve"].includes(
+        String(payload.sourceKind)
+      )
+    )
+      addGrant(
+        payloadRecord(payload.sourcePayload),
+        effectiveDate,
+        `${key}-source`
+      )
+    else if (
+      ["skill_select", "skill_grant", "skill_upgrade"].includes(
+        String(payload.sourceKind)
+      )
+    ) {
+      const imported = payloadRecord(payload.sourcePayload)
+      if (
+        imported.noop === true ||
+        imported.skipped === true ||
+        imported.superseded === true ||
+        ["noop", "skipped", "superseded"].includes(String(imported.status))
+      )
+        return
+      const sourceKind = String(payload.sourceKind) as
+        "skill_select" | "skill_grant" | "skill_upgrade"
+      found.push({
+        date: effectiveDate,
+        label: skillEventLabel(sourceKind, imported),
+        key: `${key}-source-event`,
+      })
+    }
+  }
+  for (const [eventIndex, event] of events.entries()) {
+    const payload = payloadRecord(event.payload)
+    const status = payload.status
+    if (
+      payload.noop === true ||
+      payload.skipped === true ||
+      payload.superseded === true ||
+      status === "noop" ||
+      status === "skipped" ||
+      status === "superseded"
+    )
+      continue
+    if (
+      event.kind === "skill_select" ||
+      event.kind === "skill_grant" ||
+      event.kind === "skill_upgrade"
+    ) {
+      found.push({
+        date: event.createdAt,
+        label: skillEventLabel(
+          event.kind as "skill_select" | "skill_grant" | "skill_upgrade",
+          payload
+        ),
+        key: `${event.kind}-${eventIndex}`,
+      })
+    }
+    if (["create", "profession_set", "evolve"].includes(event.kind))
+      addGrant(payload, event.createdAt, `${event.kind}-${eventIndex}`)
+    if (event.kind === "import_history" && payload.sourceKind)
+      addGrant(payload, event.createdAt, `import-${eventIndex}`)
+  }
+  return found.sort((a, b) => b.date.localeCompare(a.date))
+}
+
 function eventsForTrack(
   events: ExportResponse["events"],
   track: "race" | "class" | "profession"
@@ -504,6 +805,11 @@ function AssociationSheet({
   const [blessingTier, setBlessingTier] = React.useState("Minor")
   const [rankedClaim, setRankedClaim] = React.useState<CatalogItem | null>(null)
   const [rankedReason, setRankedReason] = React.useState("")
+  const [titleSearch, setTitleSearch] = React.useState("")
+  const [skillSearch, setSkillSearch] = React.useState("")
+  const [expandedTitleSeries, setExpandedTitleSeries] = React.useState<
+    Set<string>
+  >(() => new Set())
   const [ringPositions, setRingPositions] = React.useState<
     Record<string, "Ring 1" | "Ring 2">
   >({})
@@ -576,6 +882,23 @@ function AssociationSheet({
       a.definitionArchived &&
       !titleIds.has(a.definitionId)
   )
+
+  const titleSeries = React.useMemo(() => {
+    const groups = new Map<string, CatalogItem[]>()
+    for (const item of titles) {
+      const improvement = item.config?.improvement as
+        { seriesId?: unknown; rank?: unknown } | undefined
+      if (
+        typeof improvement?.seriesId !== "string" ||
+        !Number.isInteger(improvement.rank)
+      )
+        continue
+      const group = groups.get(improvement.seriesId) ?? []
+      group.push(item)
+      groups.set(improvement.seriesId, group)
+    }
+    return groups
+  }, [titles])
   const archivedLinkedEquipment = character.associations.filter(
     (a) =>
       a.kind === "equipment" &&
@@ -609,6 +932,21 @@ function AssociationSheet({
           }) as CatalogItem
       ),
   ]
+
+  // Archived linked titles honour the title search too: matching is
+  // case-insensitive on the linked name plus any upgradeGroup / series id,
+  // and an empty search keeps every archived row visible. The same predicate
+  // drives both the rendered rows and the "No titles match" check so they
+  // can never disagree about whether an archived row is on screen.
+  function archivedLinkedTitleMatchesSearch(
+    a: CharacterAssociationView
+  ): boolean {
+    const query = titleSearch.trim().toLocaleLowerCase()
+    if (!query) return true
+    return `${a.name} ${a.upgradeGroup ?? ""} ${a.improvement?.seriesId ?? ""}`
+      .toLocaleLowerCase()
+      .includes(query)
+  }
 
   function archivedLinkedRow(a: CharacterAssociationView) {
     return (
@@ -912,9 +1250,17 @@ function AssociationSheet({
       .filter((rank): rank is number => Number.isInteger(rank))
       .sort((a, b) => b - a)[0]
     const nextRank = currentRank == null ? 1 : currentRank + 1
+    // A legacy trusted import can link MULTIPLE titles in the same ranked
+    // series (e.g. an archived prior rank beside an active one). The server
+    // enforces an exactly-one-prior rule for a next-rank claim, so the claim is
+    // ambiguous while more than one series link exists - even when the highest
+    // rank is known. Keep the per-rank "Claim next rank" CTA inert in that case
+    // instead of firing a doomed POST.
+    const multipleLinkedRanks = seriesLinks.length > 1
     const rankIsNext =
       isRanked &&
       !unknownLinkedRank &&
+      !multipleLinkedRanks &&
       improvement.rank === nextRank &&
       !isLinked
     return (
@@ -938,10 +1284,16 @@ function AssociationSheet({
             <div className="text-[0.6875rem] text-muted-foreground">
               Rank {String(improvement.rank)} / minimum race grade{" "}
               {String(improvement.minRaceGrade)}
+              {multipleLinkedRanks
+                ? " - Multiple linked ranks; resolve conflicting titles first"
+                : null}
               {unknownLinkedRank
                 ? " - linked prior rank details unavailable; retry catalog before claiming"
                 : null}
-              {!unknownLinkedRank && !rankIsNext && !isLinked
+              {!unknownLinkedRank &&
+              !rankIsNext &&
+              !isLinked &&
+              !multipleLinkedRanks
                 ? ` - ${gradeBlocked ? `Locked: race grade ${character.state.race.grade} is below ${String(improvement.minRaceGrade)}` : `Locked: only rank ${nextRank} is next`}`
                 : null}
             </div>
@@ -985,6 +1337,170 @@ function AssociationSheet({
           </Button>
         )}
       </div>
+    )
+  }
+
+  function rankedSeriesRow(seriesId: string, items: CatalogItem[]) {
+    const sorted = [...items].sort((a, b) => {
+      const ar = Number((a.config?.improvement as { rank?: number })?.rank)
+      const br = Number((b.config?.improvement as { rank?: number })?.rank)
+      return ar - br || a.name.localeCompare(b.name)
+    })
+    const links = character.associations.filter((a) => {
+      if (a.kind !== "title") return false
+      const catalog = titles.find((t) => t.id === a.definitionId)
+      const imp =
+        a.improvement ??
+        (catalog?.config?.improvement as { seriesId?: string } | undefined)
+      return (
+        imp?.seriesId === seriesId ||
+        (!a.improvement && !catalog && a.upgradeGroup === seriesId)
+      )
+    })
+    // A legacy trusted import can link multiple titles in the SAME ranked series
+    // (e.g. an archived prior rank beside an active one). The server enforces an
+    // exactly-one-prior rule for a next-rank claim, so with more than one linked
+    // rank the claim is ambiguous - even when the highest rank is known. Disable
+    // the summary next-rank claim and explain instead of firing a doomed POST.
+    const multipleLinked = links.length > 1
+    const ranks = links.map((a) => {
+      const catalog = titles.find((t) => t.id === a.definitionId)
+      return (
+        a.improvement?.rank ??
+        (catalog?.config?.improvement as { rank?: number } | undefined)?.rank
+      )
+    })
+    const unknown = ranks.some((rank) => !Number.isInteger(rank))
+    const owned = ranks.filter((rank): rank is number => Number.isInteger(rank))
+    const highest = owned.length ? Math.max(...owned) : 0
+    const nextRank = highest + 1
+    const nextItems = sorted.filter(
+      (item) =>
+        (item.config?.improvement as { rank?: number })?.rank === nextRank
+    )
+    const searchable =
+      `${seriesId} ${sorted.map((item) => item.name).join(" ")}`.toLocaleLowerCase()
+    if (
+      titleSearch.trim() &&
+      !searchable.includes(titleSearch.trim().toLocaleLowerCase())
+    )
+      return null
+    const open =
+      expandedTitleSeries.has(seriesId) || Boolean(titleSearch.trim())
+    const displayItems = nextItems.length ? nextItems : sorted.slice(0, 1)
+    const match = displayItems.length === 1 ? displayItems[0] : undefined
+    const minGrade = match?.config?.improvement as
+      { minRaceGrade?: string } | undefined
+    const canClaim = Boolean(
+      match &&
+      !multipleLinked &&
+      !linked.has(match.id) &&
+      (match.config?.improvement as { rank?: number })?.rank === nextRank &&
+      !unknown &&
+      !gradeBlockedFor(match, character.state.race.grade)
+    )
+    return (
+      <section key={seriesId} className="rounded-lg border bg-input/20 p-2">
+        <div className="flex items-center justify-between gap-3">
+          <button
+            type="button"
+            aria-expanded={open}
+            onClick={() =>
+              setExpandedTitleSeries((current) => {
+                const next = new Set(current)
+                if (next.has(seriesId)) next.delete(seriesId)
+                else next.add(seriesId)
+                return next
+              })
+            }
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <ChevronRightIcon
+              aria-hidden="true"
+              className={cn(
+                "size-4 shrink-0 transition-transform",
+                open && "rotate-90"
+              )}
+            />
+            <span className="truncate font-medium">
+              {rankedSeriesLabel(seriesId, sorted)}
+            </span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {highest ? `Rank ${highest}` : "No ranks"} / {sorted.length}
+            </span>
+          </button>
+          {highest >=
+          Math.max(
+            ...sorted.map((item) =>
+              Number((item.config?.improvement as { rank?: number })?.rank)
+            )
+          ) ? (
+            <Badge variant="outline">Complete</Badge>
+          ) : nextItems.length > 1 ? (
+            <span className="text-xs text-muted-foreground">
+              Expand and choose
+            </span>
+          ) : match ? (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">
+                {multipleLinked
+                  ? "Multiple linked ranks; resolve conflicting titles first"
+                  : unknown
+                    ? "linked prior rank details unavailable; retry catalog before claiming"
+                    : `Rank ${String((match.config?.improvement as { rank?: number })?.rank)} / minimum race grade ${minGrade?.minRaceGrade ?? "?"}`}
+                {!multipleLinked && !canClaim
+                  ? gradeBlockedFor(match, character.state.race.grade)
+                    ? ` - Locked: race grade ${character.state.race.grade} is below ${minGrade?.minRaceGrade}`
+                    : unknown
+                      ? ""
+                      : ` - Locked: only rank ${nextRank} is next`
+                  : ""}
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy || !canClaim}
+                title={
+                  !canClaim
+                    ? multipleLinked
+                      ? "Multiple linked ranks for this series; resolve conflicting titles before claiming the next rank"
+                      : "Next rank is unavailable until grade and prior-rank requirements are met"
+                    : undefined
+                }
+                onClick={() => {
+                  setRankedReason("")
+                  setRankedClaim(match)
+                }}
+              >
+                Claim next rank
+              </Button>
+            </div>
+          ) : null}
+        </div>
+        {open ? (
+          <div className="mt-2 flex flex-col gap-2 border-l pl-3">
+            {sorted
+              .filter(
+                (item) =>
+                  !titleSearch.trim() ||
+                  `${item.name} ${seriesId}`
+                    .toLocaleLowerCase()
+                    .includes(titleSearch.trim().toLocaleLowerCase())
+              )
+              .map(titleRow)}
+          </div>
+        ) : null}
+      </section>
+    )
+  }
+
+  function gradeBlockedFor(item: CatalogItem, grade: Grade) {
+    const improvement = item.config?.improvement as
+      { minRaceGrade?: string } | undefined
+    return (
+      GRADE_ORDER.indexOf(grade) < 0 ||
+      GRADE_ORDER.indexOf(grade) <
+        GRADE_ORDER.indexOf(improvement?.minRaceGrade as Grade)
     )
   }
 
@@ -1044,9 +1560,63 @@ function AssociationSheet({
                     No titles in the catalog yet.
                   </p>
                 ) : (
-                  <div className="flex flex-col gap-2">
-                    {titles.map(titleRow)}
-                    {archivedLinkedTitles.map(archivedLinkedRow)}
+                  <div className="flex max-h-[65dvh] flex-col gap-2 overflow-y-auto pr-1">
+                    <Label htmlFor="title-search" className="sr-only">
+                      Search titles
+                    </Label>
+                    <Input
+                      id="title-search"
+                      aria-label="Search titles by series or name"
+                      placeholder="Search titles by series or name"
+                      value={titleSearch}
+                      onChange={(event) => setTitleSearch(event.target.value)}
+                    />
+                    {titles
+                      .filter((item) => {
+                        const improvement = item.config?.improvement as
+                          { seriesId?: unknown; rank?: unknown } | undefined
+                        return !(
+                          typeof improvement?.seriesId === "string" &&
+                          Number.isInteger(improvement.rank)
+                        )
+                      })
+                      .filter(
+                        (item) =>
+                          !titleSearch.trim() ||
+                          item.name
+                            .toLocaleLowerCase()
+                            .includes(titleSearch.trim().toLocaleLowerCase())
+                      )
+                      .map(titleRow)}
+                    {[...titleSeries].map(([seriesId, items]) =>
+                      rankedSeriesRow(seriesId, items)
+                    )}
+                    {titleSearch.trim() &&
+                    !titles.some((item) => {
+                      const improvement = item.config?.improvement as
+                        { seriesId?: unknown; rank?: unknown } | undefined
+                      return typeof improvement?.seriesId !== "string" ||
+                        !Number.isInteger(improvement.rank)
+                        ? item.name
+                            .toLocaleLowerCase()
+                            .includes(titleSearch.trim().toLocaleLowerCase())
+                        : `${improvement.seriesId} ${item.name}`
+                            .toLocaleLowerCase()
+                            .includes(titleSearch.trim().toLocaleLowerCase())
+                    }) &&
+                    !archivedLinkedTitles.some(
+                      archivedLinkedTitleMatchesSearch
+                    ) ? (
+                      <p
+                        role="status"
+                        className="text-xs text-muted-foreground"
+                      >
+                        No titles match your search.
+                      </p>
+                    ) : null}
+                    {archivedLinkedTitles
+                      .filter(archivedLinkedTitleMatchesSearch)
+                      .map(archivedLinkedRow)}
                   </div>
                 )}
               </TabsContent>
@@ -1055,6 +1625,18 @@ function AssociationSheet({
               <TabsContent value="skills" className="pt-3">
                 <div className="flex flex-col gap-3">
                   <h2 className="font-medium">Skill choices</h2>
+                  <div className="flex flex-col gap-1">
+                    <Label htmlFor="offered-skills-search">
+                      Search offered skills
+                    </Label>
+                    <Input
+                      id="offered-skills-search"
+                      type="search"
+                      value={skillSearch}
+                      onChange={(event) => setSkillSearch(event.target.value)}
+                      placeholder="Name, rarity, type, or class"
+                    />
+                  </div>
                   <div
                     className="flex flex-wrap gap-2"
                     aria-label="Unspent skill selections"
@@ -1076,11 +1658,7 @@ function AssociationSheet({
                   </div>
                   {skillOffers.filter(
                     (offer) => !offer.selectedDefinitionId && !offer.canceledAt
-                  ).length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No pending skill offers.
-                    </p>
-                  ) : (
+                  ).length > 0 ? (
                     <div className="flex flex-col gap-2">
                       {skillOffers
                         .filter(
@@ -1121,48 +1699,108 @@ function AssociationSheet({
                                   </Button>
                                 </div>
                               ) : null}
-                              {offer.options.map((option) => (
-                                <div
-                                  key={option.definitionId}
-                                  className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-2"
-                                >
-                                  <div className="flex flex-wrap items-center gap-1.5 font-medium">
-                                    <span>{option.nameSnapshot}</span>
-                                    {option.grade ? (
-                                      <Badge variant="outline">
-                                        {option.grade}
-                                      </Badge>
-                                    ) : null}
-                                    {option.classPriority ? (
-                                      <Badge variant="outline">
-                                        Class match
-                                      </Badge>
-                                    ) : null}
-                                    {option.archived ? (
-                                      <Badge variant="outline">Archived</Badge>
-                                    ) : null}
-                                  </div>
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={busy || option.archived}
-                                    onClick={() =>
-                                      onSelectSkill(
-                                        offer.id,
-                                        option.definitionId,
-                                        option.nameSnapshot
+                              <div
+                                className="max-h-[min(20rem,50vh)] overflow-y-auto overscroll-contain"
+                                tabIndex={0}
+                                aria-label="Skill offer options"
+                              >
+                                {offer.options
+                                  .filter((option) => {
+                                    const query = skillSearch
+                                      .trim()
+                                      .toLocaleLowerCase()
+                                    return (
+                                      !query ||
+                                      [
+                                        option.nameSnapshot,
+                                        option.rarity,
+                                        option.skillType,
+                                        option.classStableId,
+                                      ]
+                                        .filter(Boolean)
+                                        .some((value) =>
+                                          value!
+                                            .toLocaleLowerCase()
+                                            .includes(query)
+                                        )
+                                    )
+                                  })
+                                  .map((option) => (
+                                    <div
+                                      key={option.definitionId}
+                                      className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-2"
+                                    >
+                                      <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                                        <span>{option.nameSnapshot}</span>
+                                        {option.grade ? (
+                                          <Badge variant="outline">
+                                            {option.grade}
+                                          </Badge>
+                                        ) : null}
+                                        {option.classPriority ? (
+                                          <Badge variant="outline">
+                                            Class match
+                                          </Badge>
+                                        ) : null}
+                                        {option.archived ? (
+                                          <Badge variant="outline">
+                                            Archived
+                                          </Badge>
+                                        ) : null}
+                                      </div>
+                                      <SkillOfferOptionDetails
+                                        option={option}
+                                      />
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={busy || option.archived}
+                                        onClick={() =>
+                                          onSelectSkill(
+                                            offer.id,
+                                            option.definitionId,
+                                            option.nameSnapshot
+                                          )
+                                        }
+                                      >
+                                        Select
+                                      </Button>
+                                    </div>
+                                  ))}
+                                {offer.options.length > 0 &&
+                                !offer.options.some((option) => {
+                                  const query = skillSearch
+                                    .trim()
+                                    .toLocaleLowerCase()
+                                  return (
+                                    !query ||
+                                    [
+                                      option.nameSnapshot,
+                                      option.rarity,
+                                      option.skillType,
+                                      option.classStableId,
+                                    ]
+                                      .filter(Boolean)
+                                      .some((value) =>
+                                        value!
+                                          .toLocaleLowerCase()
+                                          .includes(query)
                                       )
-                                    }
+                                  )
+                                }) ? (
+                                  <p
+                                    role="status"
+                                    className="py-2 text-xs text-muted-foreground"
                                   >
-                                    Select
-                                  </Button>
-                                </div>
-                              ))}
+                                    No offered skills match your search.
+                                  </p>
+                                ) : null}
+                              </div>
                             </section>
                           )
                         })}
                     </div>
-                  )}
+                  ) : null}
                 </div>
               </TabsContent>
             ) : null}
@@ -1618,6 +2256,9 @@ export function CharacterDetail({
   const [events, setEvents] = React.useState<ExportResponse["events"] | null>(
     null
   )
+  const [eventsError, setEventsError] = React.useState(false)
+  const [eventsLoading, setEventsLoading] = React.useState(false)
+  const [eventsRetry, setEventsRetry] = React.useState(0)
   const [notes, setNotes] = React.useState({
     name: "",
     description: "",
@@ -1667,6 +2308,7 @@ export function CharacterDetail({
   const [upgradeSource, setUpgradeSource] =
     React.useState<CharacterAssociationView | null>(null)
   const [upgradeTargetId, setUpgradeTargetId] = React.useState("")
+  const [upgradeSearch, setUpgradeSearch] = React.useState("")
   const [upgradeReason, setUpgradeReason] = React.useState("")
   const [selectConfirm, setSelectConfirm] = React.useState<{
     offerId: string
@@ -1691,7 +2333,11 @@ export function CharacterDetail({
   const [inventoryRemoveItem, setInventoryRemoveItem] = React.useState<
     NonNullable<CharacterDetail["inventory"]>[number] | null
   >(null)
+  const [inventoryUseItem, setInventoryUseItem] = React.useState<
+    NonNullable<CharacterDetail["inventory"]>[number] | null
+  >(null)
   const [inventoryDefinitionId, setInventoryDefinitionId] = React.useState("")
+  const [inventorySearch, setInventorySearch] = React.useState("")
   const [inventoryQuantity, setInventoryQuantity] = React.useState("")
   const [inventorySourceNote, setInventorySourceNote] = React.useState("")
   const [inventoryBusy, setInventoryBusy] = React.useState(false)
@@ -2013,13 +2659,18 @@ export function CharacterDetail({
   // we leave it untouched and the lazy-load effect fetches it on demand.
   const refreshEvents = React.useCallback(async () => {
     if (!id) return
-    const trackContext = ["history", "race", "class", "profession"].includes(
-      activeTab
-    )
+    const trackContext = [
+      "history",
+      "race",
+      "class",
+      "profession",
+      "skills",
+    ].includes(activeTab)
     if (!events && !trackContext) return
     try {
       const res = await apiFetch<ExportResponse>(`/api/characters/${id}/export`)
       setEvents(res.events)
+      setEventsError(false)
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to refresh history."
@@ -2028,7 +2679,7 @@ export function CharacterDetail({
   }, [id, events, activeTab])
 
   const submitInventory = async (
-    operation: "add" | "remove",
+    operation: "add" | "remove" | "use",
     definitionId: string,
     quantity: number,
     sourceNote: string,
@@ -2044,7 +2695,7 @@ export function CharacterDetail({
           definitionId,
           quantity,
           version: character.version,
-          sourceNote: sourceNote.trim(),
+          ...(operation === "use" ? {} : { sourceNote: sourceNote.trim() }),
         }),
       })
       onSuccess()
@@ -2219,19 +2870,30 @@ export function CharacterDetail({
   // Load the immutable journal when the History tab is first opened.
   React.useEffect(() => {
     if (
-      ["history", "race", "class", "profession"].includes(activeTab) &&
+      ["history", "race", "class", "profession", "skills"].includes(
+        activeTab
+      ) &&
       !events &&
       id
     ) {
-      apiFetch<ExportResponse>(`/api/characters/${id}/export`)
-        .then((res) => setEvents(res.events))
-        .catch((err) =>
+      Promise.resolve()
+        .then(() => {
+          setEventsLoading(true)
+          return apiFetch<ExportResponse>(`/api/characters/${id}/export`)
+        })
+        .then((res) => {
+          setEvents(res.events)
+          setEventsError(false)
+        })
+        .catch((err) => {
+          setEventsError(true)
           toast.error(
             err instanceof Error ? err.message : "Failed to load history."
           )
-        )
+        })
+        .finally(() => setEventsLoading(false))
     }
-  }, [activeTab, events, id])
+  }, [activeTab, events, id, eventsRetry])
 
   React.useEffect(() => {
     if (activeTab !== "profession" || professionOptions.length) return
@@ -2980,6 +3642,19 @@ export function CharacterDetail({
                                 ) : null}
                               </div>
                               <div className="flex flex-wrap gap-2">
+                                {item.kind === "items" ? (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={inventoryBusy}
+                                    onClick={() => {
+                                      setInventoryError(null)
+                                      setInventoryUseItem(item)
+                                    }}
+                                  >
+                                    Use
+                                  </Button>
+                                ) : null}
                                 {item.kind === "equipment" ? (
                                   equipped ? (
                                     <Button
@@ -3099,6 +3774,7 @@ export function CharacterDetail({
                 className="self-start"
                 onClick={() => {
                   setInventoryDefinitionId("")
+                  setInventorySearch("")
                   setInventoryQuantity("")
                   setInventorySourceNote("")
                   setInventoryError(null)
@@ -3121,7 +3797,13 @@ export function CharacterDetail({
             </div>
           </CardContent>
         </Card>
-        <Dialog open={inventoryAddOpen} onOpenChange={setInventoryAddOpen}>
+        <Dialog
+          open={inventoryAddOpen}
+          onOpenChange={(nextOpen) => {
+            setInventoryAddOpen(nextOpen)
+            if (!nextOpen) setInventorySearch("")
+          }}
+        >
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Add stock</DialogTitle>
@@ -3131,6 +3813,13 @@ export function CharacterDetail({
               </DialogDescription>
             </DialogHeader>
             <div className="flex flex-col gap-3">
+              <Label htmlFor="inventory-add-search">Search stock catalog</Label>
+              <Input
+                id="inventory-add-search"
+                type="search"
+                value={inventorySearch}
+                onChange={(event) => setInventorySearch(event.target.value)}
+              />
               <Label htmlFor="inventory-add-item">Catalog item</Label>
               <Select
                 value={inventoryDefinitionId}
@@ -3140,26 +3829,53 @@ export function CharacterDetail({
                   <SelectValue placeholder="Choose an active item" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectGroup>
-                    <SelectLabel>Equipment</SelectLabel>
-                    {equipmentCatalog
-                      .filter((item) => !item.archived)
-                      .map((item) => (
-                        <SelectItem key={item.id} value={item.id}>
-                          {item.name}
-                        </SelectItem>
-                      ))}
-                  </SelectGroup>
-                  <SelectGroup>
-                    <SelectLabel>Items</SelectLabel>
-                    {itemsCatalog
-                      .filter((item) => !item.archived)
-                      .map((item) => (
-                        <SelectItem key={item.id} value={item.id}>
-                          {item.name}
-                        </SelectItem>
-                      ))}
-                  </SelectGroup>
+                  {(() => {
+                    const query = inventorySearch.trim().toLocaleLowerCase()
+                    const matches = (item: CatalogItem) =>
+                      !query ||
+                      `${item.name} ${item.stableId ?? ""} ${item.kind ?? ""}`
+                        .toLocaleLowerCase()
+                        .includes(query)
+                    const equipmentOptions = equipmentCatalog.filter(
+                      (item) =>
+                        !item.archived &&
+                        (matches(item) || item.id === inventoryDefinitionId)
+                    )
+                    const itemOptions = itemsCatalog.filter(
+                      (item) =>
+                        !item.archived &&
+                        (matches(item) || item.id === inventoryDefinitionId)
+                    )
+                    return (
+                      <>
+                        {equipmentOptions.length > 0 ? (
+                          <SelectGroup>
+                            <SelectLabel>Equipment</SelectLabel>
+                            {equipmentOptions.map((item) => (
+                              <SelectItem key={item.id} value={item.id}>
+                                {item.name}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        ) : null}
+                        {itemOptions.length > 0 ? (
+                          <SelectGroup>
+                            <SelectLabel>Items</SelectLabel>
+                            {itemOptions.map((item) => (
+                              <SelectItem key={item.id} value={item.id}>
+                                {item.name}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        ) : null}
+                        {equipmentOptions.length + itemOptions.length === 0 ? (
+                          <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                            No stock catalog items match your search.
+                          </p>
+                        ) : null}
+                      </>
+                    )
+                  })()}
                 </SelectContent>
               </Select>
               <Label htmlFor="inventory-add-quantity">Quantity</Label>
@@ -3209,7 +3925,10 @@ export function CharacterDetail({
                     inventoryDefinitionId,
                     Number(inventoryQuantity),
                     inventorySourceNote,
-                    () => setInventoryAddOpen(false)
+                    () => {
+                      setInventoryAddOpen(false)
+                      setInventorySearch("")
+                    }
                   )
                 }
               >
@@ -3580,8 +4299,92 @@ export function CharacterDetail({
             <div>
               <h3 className="font-medium">Owned inventory</h3>
               <p className="text-sm text-muted-foreground">
-                Review and manage the equipment and items this character owns.
+                Equipment and items currently in this character&apos;s
+                inventory.
               </p>
+            </div>
+            <div className="flex flex-col gap-4">
+              {(["equipment", "items"] as const).map((kind) => {
+                const rows = (character.inventory ?? []).filter(
+                  (item) => item.kind === kind
+                )
+                return (
+                  <section key={kind} aria-label={`Owned ${kind}`}>
+                    <h4 className="mb-2 text-sm font-medium capitalize">
+                      {kind}
+                    </h4>
+                    {rows.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">
+                        No owned {kind}.
+                      </p>
+                    ) : (
+                      <div className="flex flex-col gap-2">
+                        {rows.map((item) => {
+                          const equipment = equipmentCatalog.find(
+                            (entry) => entry.id === item.definitionId
+                          )
+                          const equipped = character.associations.find(
+                            (association) =>
+                              association.kind === "equipment" &&
+                              association.definitionId === item.definitionId
+                          )
+                          return (
+                            <div
+                              key={item.id}
+                              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3"
+                            >
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2 font-medium">
+                                  <span>{item.name}</span>
+                                  <Badge variant="outline">
+                                    Qty {item.quantity}
+                                  </Badge>
+                                  {item.archived ? (
+                                    <Badge variant="outline">
+                                      Archived - inert
+                                    </Badge>
+                                  ) : null}
+                                </div>
+                                <p className="text-xs text-muted-foreground">
+                                  {item.kind === "equipment"
+                                    ? [
+                                        item.rarity
+                                          ? `Rarity: ${item.rarity}`
+                                          : null,
+                                        item.slot ? `Slot: ${item.slot}` : null,
+                                        equipped
+                                          ? `Equipped${equipped.equipmentPosition ? ` in ${equipped.equipmentPosition}` : ""}`
+                                          : null,
+                                        equipment
+                                          ? `Bonus: ${bonusFor(equipment)}`
+                                          : null,
+                                      ]
+                                        .filter(Boolean)
+                                        .join(" - ")
+                                    : "Stock item"}
+                                </p>
+                              </div>
+                              {item.kind === "items" ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={inventoryBusy}
+                                  onClick={() => {
+                                    setInventoryError(null)
+                                    setInventoryUseItem(item)
+                                  }}
+                                >
+                                  Use
+                                </Button>
+                              ) : null}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </section>
+                )
+              })}
             </div>
             <Button
               variant="outline"
@@ -4308,141 +5111,123 @@ export function CharacterDetail({
           <Card>
             <CardContent>
               <div className="flex flex-col gap-4">
-                <div>
-                  <h3 className="font-heading text-sm font-medium">
-                    Skill offers
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    Skills are offered at class/profession milestones - never
-                    auto-awarded. Choose one option from a pending offer, or
-                    re-open the catalog to edit what is offered.
-                  </p>
-                </div>
+                {character.skillOffers.some(
+                  (offer) => !offer.selectedDefinitionId && !offer.canceledAt
+                ) ? (
+                  <div>
+                    <h3 className="font-heading text-sm font-medium">
+                      Skill offers
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      Skills are offered at class/profession milestones - never
+                      auto-awarded. Choose one option from a pending offer, or
+                      re-open the catalog to edit what is offered.
+                    </p>
+                  </div>
+                ) : null}
 
-                {character.skillOffers.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    No skill offers yet. Advance a class or profession to its
-                    milestone to be offered skills.
-                  </p>
-                ) : (
+                {character.skillOffers.some(
+                  (offer) => !offer.selectedDefinitionId && !offer.canceledAt
+                ) ? (
                   <div className="flex flex-col gap-2">
-                    {character.skillOffers.map((offer) => {
-                      const allArchived =
-                        offer.options.length > 0 &&
-                        offer.options.every((o) => o.archived)
-                      const selected = offer.selectedDefinitionId
-                      const selectedName = selected
-                        ? (offer.options.find(
-                            (o) => o.definitionId === selected
-                          )?.nameSnapshot ?? null)
-                        : null
-                      return (
-                        <div
-                          key={offer.id}
-                          className="rounded-lg border bg-input/20 p-2"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-medium">
-                              {offer.track === "race"
-                                ? "Race"
-                                : offer.track === "class"
-                                  ? "Class"
-                                  : "Profession"}{" "}
-                              level {offer.level} - {offer.choiceGroup}
-                            </span>
-                            {offer.canceledAt ? (
-                              <Badge variant="outline">Canceled</Badge>
-                            ) : selected ? (
-                              <Badge variant="outline">Selected</Badge>
-                            ) : allArchived ? (
-                              <Badge variant="outline">Blocked</Badge>
-                            ) : (
-                              <Badge variant="outline">Pending</Badge>
-                            )}
-                          </div>
-                          {offer.canceledAt ? (
-                            <div className="mt-1 flex flex-col gap-1.5">
-                              {offer.options.map((option) => (
-                                <div
-                                  key={option.definitionId}
-                                  className="rounded-md border bg-background/40 p-1.5 text-sm text-muted-foreground"
-                                >
-                                  {option.nameSnapshot}
-                                  {option.archived ? " (archived)" : ""}
-                                </div>
-                              ))}
-                              <p className="text-xs text-muted-foreground">
-                                This offer was canceled by undo and is kept in
-                                history.
-                              </p>
+                    {character.skillOffers
+                      .filter(
+                        (offer) =>
+                          !offer.selectedDefinitionId && !offer.canceledAt
+                      )
+                      .map((offer) => {
+                        const allArchived =
+                          offer.options.length > 0 &&
+                          offer.options.every((o) => o.archived)
+                        const selected = offer.selectedDefinitionId
+                        return (
+                          <div
+                            key={offer.id}
+                            className="rounded-lg border bg-input/20 p-2"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-medium">
+                                {offer.track === "race"
+                                  ? "Race"
+                                  : offer.track === "class"
+                                    ? "Class"
+                                    : "Profession"}{" "}
+                                level {offer.level} - {offer.choiceGroup}
+                              </span>
+                              {offer.canceledAt ? (
+                                <Badge variant="outline">Canceled</Badge>
+                              ) : selected ? (
+                                <Badge variant="outline">Selected</Badge>
+                              ) : allArchived ? (
+                                <Badge variant="outline">Blocked</Badge>
+                              ) : (
+                                <Badge variant="outline">Pending</Badge>
+                              )}
                             </div>
-                          ) : selected ? (
-                            <div className="text-xs text-muted-foreground">
-                              Selected: {selectedName ?? "?"}
-                            </div>
-                          ) : (
-                            <div className="mt-1 flex flex-col gap-1.5">
-                              {offer.options.map((opt) => (
-                                <div
-                                  key={opt.definitionId}
-                                  className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-1.5"
-                                >
-                                  <div className="min-w-0">
-                                    <div className="flex flex-wrap items-center gap-1.5">
-                                      <span className="truncate font-medium">
-                                        {opt.nameSnapshot}
-                                      </span>
-                                      {opt.grade ? (
-                                        <Badge variant="outline">
-                                          {opt.grade}
-                                        </Badge>
-                                      ) : null}
-                                      {opt.classPriority ? (
-                                        <Badge variant="outline">
-                                          Class match
-                                        </Badge>
-                                      ) : null}
+                            {!selected ? (
+                              <div className="mt-1 flex flex-col gap-1.5">
+                                {offer.options.map((opt) => (
+                                  <div
+                                    key={opt.definitionId}
+                                    className="flex items-center justify-between gap-3 rounded-md border bg-background/40 p-1.5"
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        <span className="truncate font-medium">
+                                          {opt.nameSnapshot}
+                                        </span>
+                                        {opt.grade ? (
+                                          <Badge variant="outline">
+                                            {opt.grade}
+                                          </Badge>
+                                        ) : null}
+                                        {opt.classPriority ? (
+                                          <Badge variant="outline">
+                                            Class match
+                                          </Badge>
+                                        ) : null}
+                                        {opt.archived ? (
+                                          <Badge variant="outline">
+                                            Archived
+                                          </Badge>
+                                        ) : null}
+                                      </div>
+                                      <SkillOfferOptionDetails option={opt} />
                                       {opt.archived ? (
-                                        <Badge variant="outline">
-                                          Archived
-                                        </Badge>
+                                        <div className="text-[0.6875rem] text-muted-foreground">
+                                          unavailable until re-enabled in the
+                                          catalog
+                                        </div>
                                       ) : null}
                                     </div>
-                                    {opt.archived ? (
-                                      <div className="text-[0.6875rem] text-muted-foreground">
-                                        unavailable until re-enabled in the
-                                        catalog
-                                      </div>
-                                    ) : null}
+                                    {opt.archived ? null : (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={skillBusy}
+                                        onClick={() =>
+                                          openAssociations("skill", offer.id)
+                                        }
+                                      >
+                                        Choose skill
+                                      </Button>
+                                    )}
                                   </div>
-                                  {opt.archived ? null : (
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={skillBusy}
-                                      onClick={() =>
-                                        openAssociations("skill", offer.id)
-                                      }
-                                    >
-                                      Choose skill
-                                    </Button>
-                                  )}
-                                </div>
-                              ))}
-                              {allArchived ? (
-                                <p className="text-xs text-muted-foreground">
-                                  Every offered choice is archived. An admin can
-                                  re-enable one in the catalog to unlock this
-                                  offer.
-                                </p>
-                              ) : null}
-                            </div>
-                          )}
-                        </div>
-                      )
-                    })}
+                                ))}
+                                {allArchived ? (
+                                  <p className="text-xs text-muted-foreground">
+                                    Every offered choice is archived. An admin
+                                    can re-enable one in the catalog to unlock
+                                    this offer.
+                                  </p>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        )
+                      })}
                   </div>
-                )}
+                ) : null}
 
                 <Separator />
 
@@ -4527,6 +5312,7 @@ export function CharacterDetail({
                               onClick={() => {
                                 setUpgradeSource(a)
                                 setUpgradeTargetId("")
+                                setUpgradeSearch("")
                                 setUpgradeReason("")
                               }}
                             >
@@ -4562,26 +5348,70 @@ export function CharacterDetail({
                           <p className="text-xs text-muted-foreground">
                             Current: {upgradeSource.rarity ?? "Unknown"}
                           </p>
+                          <Label htmlFor="skill-upgrade-search">
+                            Search upgrade skills
+                          </Label>
+                          <Input
+                            id="skill-upgrade-search"
+                            type="search"
+                            value={upgradeSearch}
+                            onChange={(event) =>
+                              setUpgradeSearch(event.target.value)
+                            }
+                          />
                           <Select
                             value={upgradeTargetId}
-                            onValueChange={(value) =>
+                            onValueChange={(value) => {
                               setUpgradeTargetId(value ?? "")
-                            }
+                              setUpgradeSearch("")
+                            }}
                           >
                             <SelectTrigger aria-label="Upgrade target">
                               <SelectValue placeholder="Select higher-rarity variant" />
                             </SelectTrigger>
                             <SelectContent>
                               <SelectGroup>
-                                {targets.map((target) => (
-                                  <SelectItem key={target.id} value={target.id}>
-                                    {target.name} -{" "}
-                                    {String(target.config.rarity)}
-                                    {target.description
-                                      ? ` - ${target.description}`
-                                      : ""}
-                                  </SelectItem>
-                                ))}
+                                {targets
+                                  .filter((target) => {
+                                    const query = upgradeSearch
+                                      .trim()
+                                      .toLocaleLowerCase()
+                                    return (
+                                      target.id === upgradeTargetId ||
+                                      !query ||
+                                      `${target.name} ${String(target.config.rarity ?? "")} ${target.description ?? ""}`
+                                        .toLocaleLowerCase()
+                                        .includes(query)
+                                    )
+                                  })
+                                  .map((target) => (
+                                    <SelectItem
+                                      key={target.id}
+                                      value={target.id}
+                                    >
+                                      {target.name} -{" "}
+                                      {String(target.config.rarity)}
+                                      {target.description
+                                        ? ` - ${target.description}`
+                                        : ""}
+                                    </SelectItem>
+                                  ))}
+                                {targets.filter((target) => {
+                                  const query = upgradeSearch
+                                    .trim()
+                                    .toLocaleLowerCase()
+                                  return (
+                                    target.id === upgradeTargetId ||
+                                    !query ||
+                                    `${target.name} ${String(target.config.rarity ?? "")} ${target.description ?? ""}`
+                                      .toLocaleLowerCase()
+                                      .includes(query)
+                                  )
+                                }).length === 0 ? (
+                                  <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                                    No upgrade skills match your search.
+                                  </p>
+                                ) : null}
                               </SelectGroup>
                             </SelectContent>
                           </Select>
@@ -4652,6 +5482,56 @@ export function CharacterDetail({
               </div>
             </CardContent>
           </Card>
+          <section
+            className="mt-4 flex flex-col gap-2"
+            aria-label="Skill history"
+          >
+            <h3 className="font-heading text-sm font-medium">Skill history</h3>
+            {eventsLoading ? (
+              <p className="text-xs text-muted-foreground" role="status">
+                Loading skill history...
+              </p>
+            ) : null}
+            {eventsError ? (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span>Could not load skill history.</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setEvents(null)
+                    setEventsError(false)
+                    setEventsRetry((value) => value + 1)
+                  }}
+                >
+                  Retry
+                </Button>
+              </div>
+            ) : null}
+            {events && skillHistoryEvents(events).length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No skill history yet.
+              </p>
+            ) : null}
+            {events ? (
+              <ol className="flex flex-col gap-1">
+                {skillHistoryEvents(events).map((entry) => (
+                  <li
+                    key={entry.key}
+                    className="flex flex-wrap items-baseline justify-between gap-2 rounded-md border px-2 py-1 text-xs"
+                  >
+                    <span>{entry.label}</span>
+                    <time
+                      className="text-muted-foreground"
+                      dateTime={entry.date}
+                    >
+                      {new Date(entry.date).toLocaleDateString()}
+                    </time>
+                  </li>
+                ))}
+              </ol>
+            ) : null}
+          </section>
         </TabsContent>
 
         <TabsContent value="titles" className="pt-3">
@@ -5139,6 +6019,52 @@ export function CharacterDetail({
         }
         onRetrySkills={() => void refreshSkills()}
       />
+
+      <Dialog
+        open={inventoryUseItem !== null}
+        onOpenChange={(open) => {
+          if (!open && !inventoryBusy) setInventoryUseItem(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Use {inventoryUseItem?.name}?</DialogTitle>
+            <DialogDescription>
+              This spends one {inventoryUseItem?.name} from stock. It has no
+              mechanical effect.
+            </DialogDescription>
+          </DialogHeader>
+          {inventoryError ? (
+            <p role="alert" className="text-sm text-destructive">
+              {inventoryError}
+            </p>
+          ) : null}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={inventoryBusy}
+              onClick={() => setInventoryUseItem(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={inventoryBusy || !inventoryUseItem}
+              onClick={() =>
+                inventoryUseItem &&
+                void submitInventory(
+                  "use",
+                  inventoryUseItem.definitionId,
+                  1,
+                  "",
+                  () => setInventoryUseItem(null)
+                )
+              }
+            >
+              {inventoryBusy ? "Using..." : "Confirm use"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={removePortraitOpen} onOpenChange={setRemovePortraitOpen}>
         <DialogContent>

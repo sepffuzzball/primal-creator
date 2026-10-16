@@ -541,19 +541,45 @@ export const professionSetSchema = z.object({
 
 /**
  * Manual inventory bookkeeping (add / remove owned equipment or consumable
- * quantity). `operation` is a literal add/remove, `quantity` is bounded 1..999999
- * (the same bound the migration's CHECK constraint enforces), `version` is the CAS
- * token, and `sourceNote` is a mandatory, at-most-500-character note recorded into
- * the `inventory_adjust` journal. Acquisition is manual here - no acquisition
- * economy is invented, so the note is the only provenance the client supplies.
+ * quantity) plus a distinct stock-only `use` action for owned Items.
+ *
+ * - `add` / `remove` are literal bookkeeping operations: `quantity` is bounded
+ *   1..999999 (the same bound the migration's CHECK constraint enforces),
+ *   `version` is the CAS token, and `sourceNote` is a mandatory, at-most-500-
+ *   character note recorded into the `inventory_adjust` journal. Acquisition is
+ *   manual here - no acquisition economy is invented, so the note is the only
+ *   provenance the client supplies.
+ * - `use` is a distinct stock-only action: it spends EXACTLY one owned unit of a
+ *   catalog `items` definition and applies no mechanical effect (no stat/current-
+ *   resource change, no recipe). `quantity` must be exactly 1, `sourceNote` is
+ *   optional and ignored (the service journals the automatic note "Used item"),
+ *   and the service records an explicit `inventory_use` progression event. An
+ *   `items` definition may be used even when archived (owned stock may still be
+ *   spent); an equipment definition cannot be used (400).
  */
-export const inventoryPostSchema = z.object({
-  operation: z.enum(["add", "remove"]),
-  definitionId: z.string().min(1),
-  quantity: z.number().int().min(1).max(999999),
-  version: z.number().int().nonnegative(),
-  sourceNote: z.string().min(1).max(500),
-})
+export const inventoryPostSchema = z.discriminatedUnion("operation", [
+  z.object({
+    operation: z.literal("add"),
+    definitionId: z.string().min(1),
+    quantity: z.number().int().min(1).max(999999),
+    version: z.number().int().nonnegative(),
+    sourceNote: z.string().min(1).max(500),
+  }),
+  z.object({
+    operation: z.literal("remove"),
+    definitionId: z.string().min(1),
+    quantity: z.number().int().min(1).max(999999),
+    version: z.number().int().nonnegative(),
+    sourceNote: z.string().min(1).max(500),
+  }),
+  z.object({
+    operation: z.literal("use"),
+    definitionId: z.string().min(1),
+    quantity: z.literal(1),
+    version: z.number().int().nonnegative(),
+    sourceNote: z.string().max(500).optional(),
+  }),
+])
 
 /**
  * A single evolution choice. Every track (race, class, profession) must be named

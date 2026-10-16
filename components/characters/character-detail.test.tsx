@@ -450,11 +450,11 @@ let titlesCatalog: import("@/lib/api").CatalogItem[] = []
 let itemsCatalog: import("@/lib/api").CatalogItem[] = []
 let inventoryError: unknown = null
 let inventoryPosts: Array<{
-  operation: "add" | "remove"
+  operation: "add" | "remove" | "use"
   definitionId: string
   quantity: number
   version: number
-  sourceNote: string
+  sourceNote?: string
 }> = []
 /** Captured PATCH /api/characters/chr-1 request bodies (profile saves). */
 let patchPosts: Array<Record<string, unknown>> = []
@@ -498,6 +498,8 @@ let skillRefreshDeferredB: Deferred<{
 }> | null = null
 let professionCatalog: import("@/lib/api").CatalogItem[] = []
 let historyEvents: import("@/lib/api").ExportResponse["events"] = []
+let exportErrorForTest: unknown = null
+let exportGetCount = 0
 let professionPostError: unknown = null
 let professionPosts: Array<Record<string, unknown>> = []
 let skillsCatalogForTest: import("@/lib/api").CatalogItem[] = []
@@ -591,7 +593,7 @@ function applyAssociation(
   body: {
     kind: "blessing" | "bloodline" | "transcendent"
     definitionId: string
-    operation: "add" | "remove"
+    operation: "add" | "remove" | "use"
     version: number
   }
 ): import("@/lib/api").CharacterDetail {
@@ -655,7 +657,7 @@ function applyInventory(
     definitionId: string
     quantity: number
     version: number
-    sourceNote: string
+    sourceNote?: string
   }
 ): import("@/lib/api").CharacterDetail {
   const prior = (current.inventory ?? []).find(
@@ -738,6 +740,7 @@ function setupMock(options?: {
   experienceJournal?: Record<string, unknown>
   professions?: import("@/lib/api").CatalogItem[]
   events?: import("@/lib/api").ExportResponse["events"]
+  exportError?: unknown
   professionError?: unknown
   skills?: import("@/lib/api").CatalogItem[]
   upgradeError?: unknown
@@ -762,6 +765,8 @@ function setupMock(options?: {
   skillRefreshDeferredB = null
   professionCatalog = options?.professions ?? []
   historyEvents = options?.events ?? []
+  exportErrorForTest = options?.exportError ?? null
+  exportGetCount = 0
   professionPostError = options?.professionError ?? null
   professionPosts = []
   skillsCatalogForTest = options?.skills ?? []
@@ -813,8 +818,16 @@ function setupMock(options?: {
     }
     if (url === "/api/characters/chr-1/portrait") return { portrait: null }
     if (url === "/api/characters/chr-2/portrait") return { portrait: null }
-    if (url === "/api/characters/chr-1/export") return { events: historyEvents }
-    if (url === "/api/characters/chr-2/export") return { events: historyEvents }
+    if (url === "/api/characters/chr-1/export") {
+      exportGetCount += 1
+      if (exportErrorForTest) throw exportErrorForTest
+      return { events: historyEvents }
+    }
+    if (url === "/api/characters/chr-2/export") {
+      exportGetCount += 1
+      if (exportErrorForTest) throw exportErrorForTest
+      return { events: historyEvents }
+    }
     if (url === "/api/characters/chr-1/skills/refresh" && method === "POST") {
       skillRefreshPosts += 1
       const deferred = skillRefreshDeferred
@@ -955,27 +968,37 @@ function setupMock(options?: {
       const body = JSON.parse((init?.body as string) ?? "{}") as {
         kind: "blessing" | "bloodline" | "transcendent" | "title" | "equipment"
         definitionId: string
-        operation: "add" | "remove"
+        operation: "add" | "remove" | "use"
         version: number
       }
       if (body.kind === "title") {
-        const item = titlesCatalog.find(
-          (title) => title.id === body.definitionId
-        )
-        activeCharacter = {
-          ...activeCharacter,
-          associations: [
-            ...activeCharacter.associations,
-            association({
-              id: `title-${body.definitionId}`,
-              kind: "title",
-              definitionId: body.definitionId,
-              name: item?.name ?? body.definitionId,
-              ...(typeof item?.config?.upgradeGroup === "string"
-                ? { upgradeGroup: item.config.upgradeGroup as string }
-                : {}),
-            }),
-          ],
+        if (body.operation === "remove") {
+          activeCharacter = {
+            ...activeCharacter,
+            associations: activeCharacter.associations.filter(
+              (a) =>
+                !(a.kind === "title" && a.definitionId === body.definitionId)
+            ),
+          }
+        } else {
+          const item = titlesCatalog.find(
+            (title) => title.id === body.definitionId
+          )
+          activeCharacter = {
+            ...activeCharacter,
+            associations: [
+              ...activeCharacter.associations,
+              association({
+                id: `title-${body.definitionId}`,
+                kind: "title",
+                definitionId: body.definitionId,
+                name: item?.name ?? body.definitionId,
+                ...(typeof item?.config?.upgradeGroup === "string"
+                  ? { upgradeGroup: item.config.upgradeGroup as string }
+                  : {}),
+              }),
+            ],
+          }
         }
       } else {
         activeCharacter = applyAssociation(
@@ -992,7 +1015,7 @@ function setupMock(options?: {
         definitionId: string
         quantity: number
         version: number
-        sourceNote: string
+        sourceNote?: string
       }
       inventoryPosts.push(body)
       activeCharacter = applyInventory(activeCharacter, body)
@@ -1184,6 +1207,58 @@ describe("scheduled skill choice prompts", () => {
     expect(
       within(sheet).getAllByRole("button", { name: "Select" })
     ).toHaveLength(2)
+  })
+
+  it("searches offered skills by snapshot fields, clears to restore options, and keeps the list scrollable", async () => {
+    const offer = pendingOffer({
+      options: [
+        {
+          definitionId: "s1",
+          nameSnapshot: "Quick Shot",
+          archived: false,
+          rarity: "Rare",
+          skillType: "active",
+          classStableId: "archer-class",
+        },
+        {
+          definitionId: "s2",
+          nameSnapshot: "Stone Skin",
+          archived: false,
+          rarity: "Common",
+          skillType: "passive",
+          classStableId: "mage-class",
+        },
+      ],
+    })
+    setupMock({
+      character: { ...character, skillOffers: [offer] } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("button", { name: "Manage skills" }))
+    const sheet = associationSheetContent("titlesSkills")
+    const search = within(sheet).getByRole("searchbox", {
+      name: "Search offered skills",
+    })
+    const options = within(sheet).getByLabelText("Skill offer options")
+    expect(options.className).toContain("overflow-y-auto")
+    expect(options.className).toContain("max-h-[min(20rem,50vh)]")
+    fireEvent.change(search, { target: { value: "ARCHER-CLASS" } })
+    expect(within(sheet).getByText("Quick Shot")).toBeTruthy()
+    expect(within(sheet).queryByText("Stone Skin")).toBeNull()
+    fireEvent.change(search, { target: { value: "unmatched" } })
+    expect(
+      within(sheet).getByText("No offered skills match your search.")
+    ).toBeTruthy()
+    fireEvent.change(search, { target: { value: "" } })
+    expect(within(sheet).getByText("Stone Skin")).toBeTruthy()
+    fireEvent.click(
+      within(sheet).getAllByRole("button", { name: "Select" })[0]!
+    )
+    fireEvent.click(screen.getAllByRole("button", { name: "Select" }).at(-1)!)
+    await flush()
+    expect(skillSelectPosts.at(-1)).toEqual(
+      expect.objectContaining({ definitionId: "s1" })
+    )
   })
 
   it("counts pending monster Race offers on the sheet", async () => {
@@ -1533,7 +1608,7 @@ describe("scheduled skill choice prompts", () => {
     await flush()
     const skillsPanel = skillSheet
     expect(within(skillsPanel).getByText("Class: 0 pending")).toBeTruthy()
-    expect(screen.getByText("Selected")).toBeTruthy()
+    expect(screen.queryByText("Selected")).toBeNull()
     expect(within(skillsPanel).queryByText("Pending")).toBeNull()
   })
 
@@ -1603,8 +1678,8 @@ describe("scheduled skill choice prompts", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getByText("Selected")).toBeTruthy()
-    expect(screen.getByText("Canceled")).toBeTruthy()
+    expect(screen.queryByText("Selected")).toBeNull()
+    expect(screen.queryByText("Canceled")).toBeNull()
   })
 
   it("retains same-version offer options appended after a captured GET snapshot was read", async () => {
@@ -1723,7 +1798,7 @@ describe("scheduled skill choice prompts", () => {
     await flush()
 
     expect(screen.getByText("v5")).toBeTruthy()
-    expect(screen.getByText("Selected")).toBeTruthy()
+    expect(screen.queryByText("Selected")).toBeNull()
 
     fireEvent.click(screen.getByRole("tab", { name: "Notes" }))
     await flush()
@@ -2301,6 +2376,807 @@ describe("scheduled skill choice prompts", () => {
   })
 })
 
+describe("skill offer details and acquisition history", () => {
+  const offer = (
+    options = [
+      {
+        definitionId: "skill-live",
+        nameSnapshot: "Quick Shot",
+        archived: false,
+        description: "Current grade-specific prose",
+        rarity: "Rare",
+        skillType: "class" as const,
+        classStableId: "archer-class",
+        classPriority: true,
+      },
+    ]
+  ) => ({
+    id: "offer-live",
+    track: "class",
+    level: 25,
+    choiceGroup: "milestone",
+    canceledAt: null,
+    selectedDefinitionId: null,
+    options,
+  })
+  const event = (kind: string, payload: unknown, day: string) => ({
+    kind,
+    payload,
+    createdAt: `2026-01-${day}T12:00:00.000Z`,
+  })
+
+  it("hides offers when none are pending while retaining acquired skills and history", async () => {
+    setupMock({
+      character: {
+        ...character,
+        skillOffers: [
+          { ...offer(), selectedDefinitionId: "skill-live" },
+          { ...offer(), id: "canceled", canceledAt: "2026-01-01T00:00:00Z" },
+        ],
+        associations: [
+          association({
+            id: "acquired",
+            kind: "skill",
+            definitionId: "skill-live",
+            name: "Quick Shot",
+          }),
+        ],
+      } as typeof character,
+      events: [
+        event(
+          "skill_select",
+          { definition: { name: "Quick Shot", stableId: "quick-shot" } },
+          "02"
+        ),
+      ],
+    })
+    await renderDetail()
+    expect(exportGetCount).toBe(0)
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(exportGetCount).toBe(1)
+    expect(screen.queryByText("Skill offers")).toBeNull()
+    expect(screen.getByText("Quick Shot")).toBeTruthy()
+    expect(screen.getByText("Skill selected: Quick Shot")).toBeTruthy()
+  })
+
+  it("shows pending offers with initially collapsed accessible live description and snapshot badges", async () => {
+    setupMock({
+      character: { ...character, skillOffers: [offer()] } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    const summary = screen.getByText("Description for Quick Shot")
+    const details = summary.closest("details")!
+    const optionDetails = within(details.parentElement!)
+    expect(details.open).toBe(false)
+    expect(optionDetails.getByText("Rare")).toBeTruthy()
+    expect(optionDetails.getByText("Class")).toBeTruthy()
+    expect(optionDetails.getByText("Class tie: Archer Class")).toBeTruthy()
+    const description = within(details).getByText(
+      "Current grade-specific prose"
+    )
+    expect(details.contains(description)).toBe(true)
+    fireEvent.click(summary)
+    expect(details.open).toBe(true)
+    expect(
+      within(details).getByText("Current grade-specific prose")
+    ).toBeTruthy()
+    expect(optionDetails.getAllByText("Rare")).toHaveLength(1)
+    expect(optionDetails.getAllByText("Class")).toHaveLength(1)
+    expect(optionDetails.getAllByText("Class tie: Archer Class")).toHaveLength(
+      1
+    )
+  })
+
+  it("renders direct and wrapped skill event kinds newest-first and excludes noop outcomes", async () => {
+    setupMock({
+      events: [
+        event(
+          "skill_select",
+          {
+            definition: {
+              id: "skill-sel",
+              stableId: "sel-stable",
+              name: "Selected",
+              grade: "G",
+            },
+          },
+          "01"
+        ),
+        event(
+          "skill_grant",
+          {
+            definition: {
+              id: "skill-man",
+              stableId: "man-stable",
+              name: "Manual",
+              grade: "G",
+            },
+          },
+          "02"
+        ),
+        event(
+          "skill_upgrade",
+          {
+            from: {
+              definitionId: "skill-old",
+              stableId: "old-stable",
+              name: "Old",
+            },
+            to: {
+              definitionId: "skill-up",
+              stableId: "up-stable",
+              name: "Upgraded",
+            },
+          },
+          "03"
+        ),
+        event(
+          "create",
+          {
+            skillGrants: {
+              granted: [
+                { stableId: "created-stable", name: "Created", grade: "G" },
+              ],
+            },
+          },
+          "04"
+        ),
+        event(
+          "evolve",
+          {
+            journal: {
+              skillGrants: {
+                upgraded: [
+                  {
+                    fromStableId: "evol-from",
+                    fromName: "EvolFrom",
+                    toStableId: "evol-to",
+                    toName: "Evolved",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "05"
+        ),
+        event(
+          "profession_set",
+          {
+            skillGrants: {
+              granted: [
+                { stableId: "prof-stable", name: "Profession", grade: "G" },
+              ],
+            },
+          },
+          "06"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  { stableId: "imported-stable", name: "Imported", grade: "G" },
+                ],
+              },
+            },
+          },
+          "07"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_select",
+            sourcePayload: {
+              definition: { name: "Imported Sel", stableId: "imported-sel" },
+            },
+          },
+          "08"
+        ),
+        event(
+          "skill_grant",
+          { definition: { name: "Noop" }, noop: true },
+          "09"
+        ),
+        event(
+          "skill_grant",
+          { definition: { name: "Skipped" }, status: "skipped" },
+          "10"
+        ),
+        event(
+          "skill_upgrade",
+          {
+            from: { name: "Sup" },
+            to: { name: "Serseded" },
+            status: "superseded",
+          },
+          "11"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const text = within(list)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent)
+    expect(text.slice(0, 8).map((item) => item?.split("2026")[0])).toEqual([
+      "Skill selected: Imported Sel1/8/",
+      "Skill granted: Imported1/7/",
+      "Skill granted: Profession1/6/",
+      "Skill upgraded: Evolved1/5/",
+      "Skill granted: Created1/4/",
+      "Skill upgraded: Old -> Upgraded1/3/",
+      "Skill granted: Manual1/2/",
+      "Skill selected: Selected1/1/",
+    ])
+    expect(within(list).queryByText(/Noop|Skipped|Superseded/)).toBeNull()
+  })
+
+  it("orders an imported select by its original sourceCreatedAt, not the wrapper's recorded time", async () => {
+    setupMock({
+      events: [
+        event(
+          "skill_select",
+          { definition: { name: "Fresh Sel", stableId: "fresh-sel" } },
+          "01"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_select",
+            sourceCreatedAt: "2022-01-15T12:00:00.000Z",
+            sourcePayload: {
+              definition: { name: "Imported Sel", stableId: "imported-sel" },
+            },
+          },
+          "02"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    // The direct 2026 selection sorts first; the imported 2022 selection is
+    // ordered by its original source time, not the wrapper's 2026 record time.
+    expect(times).toEqual([
+      "2026-01-01T12:00:00.000Z",
+      "2022-01-15T12:00:00.000Z",
+    ])
+    const imported = within(list).getByText("Skill selected: Imported Sel")
+    expect(
+      imported.parentElement!.querySelector("time")!.getAttribute("dateTime")
+    ).toBe("2022-01-15T12:00:00.000Z")
+  })
+
+  it("lets a nested import_history wrapper's own sourceCreatedAt supersede the outer one", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "import_history",
+            sourceCreatedAt: "2020-01-01T12:00:00.000Z",
+            sourcePayload: {
+              sourceKind: "skill_select",
+              sourceCreatedAt: "2019-06-01T12:00:00.000Z",
+              sourcePayload: {
+                definition: {
+                  name: "Nested Sel",
+                  stableId: "nested-sel",
+                },
+              },
+            },
+          },
+          "03"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Fresh", stableId: "fresh" } },
+          "01"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    // The 2026 direct sorts first; the nested wrapper's own 2019 source time
+    // supersedes the outer 2020 (which never surfaces as an entry on its own).
+    expect(times).toEqual([
+      "2026-01-01T12:00:00.000Z",
+      "2019-06-01T12:00:00.000Z",
+    ])
+    expect(within(list).getByText("Skill selected: Nested Sel")).toBeTruthy()
+  })
+
+  it("uses sourceCreatedAt for an imported grade-grant event and falls back to the inherited date when missing or invalid", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: "2021-03-10T12:00:00.000Z",
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "imported-grant",
+                    name: "Imported Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "04"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: "not-a-date",
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "invalid-grant",
+                    name: "Invalid Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "05"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "missing-grant",
+                    name: "Missing Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "06"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Fresh", stableId: "fresh" } },
+          "01"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    // The valid imported grant keeps its original 2021 time; both the invalid
+    // and the missing sourceCreatedAt fall back to the wrapper's own created time.
+    expect(times).toEqual([
+      "2026-01-06T12:00:00.000Z",
+      "2026-01-05T12:00:00.000Z",
+      "2026-01-01T12:00:00.000Z",
+      "2021-03-10T12:00:00.000Z",
+    ])
+    expect(within(list).getByText("Skill granted: Imported Grant")).toBeTruthy()
+    expect(within(list).getByText("Skill granted: Invalid Grant")).toBeTruthy()
+    expect(within(list).getByText("Skill granted: Missing Grant")).toBeTruthy()
+  })
+
+  it("normalizes a numeric sourceCreatedAt (epoch ms) to UTC ISO for an imported skill_select", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_select",
+            sourceCreatedAt: Date.UTC(2022, 0, 15, 12, 0, 0),
+            sourcePayload: {
+              definition: { name: "Numeric Sel", stableId: "numeric-sel" },
+            },
+          },
+          "02"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Fresh", stableId: "fresh" } },
+          "01"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    // The direct 2026 selection sorts first; the numeric 2022 epoch is converted
+    // to UTC ISO for display/sort rather than falling back to the wrapper's 2026
+    // record time.
+    expect(times).toEqual([
+      "2026-01-01T12:00:00.000Z",
+      "2022-01-15T12:00:00.000Z",
+    ])
+    const imported = within(list).getByText("Skill selected: Numeric Sel")
+    expect(
+      imported.parentElement!.querySelector("time")!.getAttribute("dateTime")
+    ).toBe("2022-01-15T12:00:00.000Z")
+  })
+
+  it("normalizes a numeric sourceCreatedAt for an imported grade-grant and treats epoch 0 as a valid date", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: Date.UTC(2021, 2, 10, 12, 0, 0),
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "numeric-grant",
+                    name: "Numeric Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "04"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: 0,
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "epoch-grant",
+                    name: "Epoch Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "05"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Fresh", stableId: "fresh" } },
+          "01"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    expect(times).toEqual([
+      "2026-01-01T12:00:00.000Z",
+      "2021-03-10T12:00:00.000Z",
+      "1970-01-01T00:00:00.000Z",
+    ])
+    expect(within(list).getByText("Skill granted: Numeric Grant")).toBeTruthy()
+    expect(within(list).getByText("Skill granted: Epoch Grant")).toBeTruthy()
+  })
+
+  it("falls back to the inherited wrapper date for non-finite or out-of-range numeric sourceCreatedAt", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: Infinity,
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "inf-grant",
+                    name: "Infinity Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "06"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: Number.NaN,
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "nan-grant",
+                    name: "NaN Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "07"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: 1e30,
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "big-grant",
+                    name: "Big Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "08"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "create",
+            sourceCreatedAt: -1e30,
+            sourcePayload: {
+              skillGrants: {
+                granted: [
+                  {
+                    stableId: "neg-grant",
+                    name: "Negative Grant",
+                    grade: "G",
+                  },
+                ],
+              },
+            },
+          },
+          "09"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Fresh", stableId: "fresh" } },
+          "01"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    // None of these are usable dates, so each falls back to the wrapper's own
+    // created time and is ordered newest-first by that wrapper date.
+    expect(times).toEqual([
+      "2026-01-09T12:00:00.000Z",
+      "2026-01-08T12:00:00.000Z",
+      "2026-01-07T12:00:00.000Z",
+      "2026-01-06T12:00:00.000Z",
+      "2026-01-01T12:00:00.000Z",
+    ])
+  })
+
+  it("orders direct events, string-timestamped imports, and numeric-timestamped imports chronologically", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_select",
+            sourceCreatedAt: "2023-05-05T08:30:00.000Z",
+            sourcePayload: {
+              definition: { name: "String Sel", stableId: "string-sel" },
+            },
+          },
+          "03"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_select",
+            sourceCreatedAt: Date.UTC(2021, 6, 4, 6, 0, 0),
+            sourcePayload: {
+              definition: { name: "Numeric Sel", stableId: "numeric-sel" },
+            },
+          },
+          "04"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Latest Fresh", stableId: "latest" } },
+          "05"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    expect(times).toEqual([
+      "2026-01-05T12:00:00.000Z",
+      "2023-05-05T08:30:00.000Z",
+      "2021-07-04T06:00:00.000Z",
+    ])
+  })
+
+  it("lets a nested import_history wrapper's numeric sourceCreatedAt supersede the outer one", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "import_history",
+            sourceCreatedAt: "2020-01-01T12:00:00.000Z",
+            sourcePayload: {
+              sourceKind: "skill_select",
+              sourceCreatedAt: Date.UTC(2019, 5, 1, 12, 0, 0),
+              sourcePayload: {
+                definition: {
+                  name: "Nested Sel",
+                  stableId: "nested-sel",
+                },
+              },
+            },
+          },
+          "03"
+        ),
+        event(
+          "skill_select",
+          { definition: { name: "Fresh", stableId: "fresh" } },
+          "01"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const times = Array.from(list.querySelectorAll("time")).map((time) =>
+      time.getAttribute("dateTime")
+    )
+    // The nested wrapper's own numeric 2019 source time supersedes the outer
+    // 2020 (which never surfaces as an entry on its own).
+    expect(times).toEqual([
+      "2026-01-01T12:00:00.000Z",
+      "2019-06-01T12:00:00.000Z",
+    ])
+    expect(within(list).getByText("Skill selected: Nested Sel")).toBeTruthy()
+  })
+
+  it("excludes noop/skipped/superseded imported source events while preserving names", async () => {
+    setupMock({
+      events: [
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_grant",
+            sourceCreatedAt: "2023-01-01T12:00:00.000Z",
+            sourcePayload: {
+              definition: { name: "Noop Imported", stableId: "noop-imp" },
+              noop: true,
+            },
+          },
+          "07"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_grant",
+            sourceCreatedAt: "2023-01-02T12:00:00.000Z",
+            sourcePayload: {
+              definition: { name: "Skipped Imported", stableId: "skip-imp" },
+              status: "skipped",
+            },
+          },
+          "08"
+        ),
+        event(
+          "import_history",
+          {
+            sourceKind: "skill_select",
+            sourceCreatedAt: "2023-01-03T12:00:00.000Z",
+            sourcePayload: {
+              definition: { name: "Kept Sel", stableId: "kept-sel" },
+            },
+          },
+          "09"
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    const section = screen.getByRole("region", { name: "Skill history" })
+    const list = section.querySelector("ol")!
+    const text = within(list)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent)
+    expect(text.map((value) => value?.split("2023")[0])).toEqual([
+      "Skill selected: Kept Sel1/3/",
+    ])
+    expect(
+      within(list).queryByText(/Noop Imported|Skipped Imported/)
+    ).toBeNull()
+  })
+
+  it("offers retry after lazy history loading fails and refreshes events after a skill selection", async () => {
+    setupMock({
+      exportError: new Error("History unavailable"),
+      character: { ...character, skillOffers: [offer()] } as typeof character,
+    })
+    await renderDetail()
+    expect(exportGetCount).toBe(0)
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(exportGetCount).toBe(1)
+    expect(screen.getByText("Could not load skill history.")).toBeTruthy()
+    exportErrorForTest = null
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }))
+    await flush()
+    expect(exportGetCount).toBe(2)
+    expect(screen.getByText("No skill history yet.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Manage skills" }))
+    const sheet = associationSheetContent()
+    fireEvent.click(within(sheet).getByRole("button", { name: "Select" }))
+    fireEvent.click(screen.getAllByRole("button", { name: "Select" }).at(-1)!)
+    await flush()
+    expect(exportGetCount).toBeGreaterThanOrEqual(3)
+  })
+})
+
 describe("CharacterDetail overview summary", () => {
   it("shows all nine server-calculated attributes and available track levels", async () => {
     setupMock({
@@ -2567,21 +3443,154 @@ describe("CharacterDetail ranked title claims", () => {
     id: string,
     name: string,
     rank: number,
-    minRaceGrade: string = "G"
+    minRaceGrade: string = "G",
+    seriesId: string = "dungeon-pioneer"
   ) =>
     catalogItem({
       id,
       name,
       kind: "titles",
       config: {
-        improvement: { seriesId: "pioneer", rank, minRaceGrade },
-        upgradeGroup: "pioneer",
+        improvement: { seriesId, rank, minRaceGrade },
+        upgradeGroup: seriesId,
         flat: { strength: rank },
       },
     })
 
+  it("keeps a ranked series collapsed, exposes its next claim, and expands child ranks", async () => {
+    setupMock({
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+        rankedTitle("pioneer-3", "Dungeon Pioneer III", 3),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+    expect(screen.getByText("Dungeon Pioneer")).toBeTruthy()
+    expect(screen.queryByText("Dungeon Pioneer I")).toBeNull()
+    expect(screen.getByRole("button", { name: "Claim next rank" })).toBeTruthy()
+    const toggle = screen.getByRole("button", { name: /Dungeon Pioneer/ })
+    expect(toggle.getAttribute("aria-expanded")).toBe("false")
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute("aria-expanded")).toBe("true")
+    expect(screen.getByText("Dungeon Pioneer I")).toBeTruthy()
+    expect(screen.getByText("Dungeon Pioneer II")).toBeTruthy()
+    expect(screen.getByText("Dungeon Pioneer III")).toBeTruthy()
+  })
+
+  it("labels an unrelated ranked series from its own entries, not a hardcoded id", async () => {
+    setupMock({
+      titles: [
+        rankedTitle("warden-1", "Warden I", 1, "G", "warden"),
+        rankedTitle("warden-2", "Warden II", 2, "G", "warden"),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+    expect(screen.getByText("Warden")).toBeTruthy()
+  })
+
+  it("falls back to a humanized series id when the lowest rank name has no recognizable suffix", async () => {
+    setupMock({
+      titles: [rankedTitle("keeper", "Keeper of the Gate", 1, "G", "keeper")],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+    expect(screen.getByText("Keeper")).toBeTruthy()
+  })
+
+  it("searches by child title, auto-expands matching series, and reports no matches", async () => {
+    setupMock({
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+    const search = screen.getByRole("textbox", {
+      name: "Search titles by series or name",
+    })
+    fireEvent.change(search, { target: { value: "Dungeon Pioneer II" } })
+    expect(
+      screen
+        .getByRole("button", { name: /Dungeon Pioneer/ })
+        .getAttribute("aria-expanded")
+    ).toBe("true")
+    expect(screen.getByText("Dungeon Pioneer II")).toBeTruthy()
+    expect(screen.queryByText("Dungeon Pioneer I")).toBeNull()
+    fireEvent.change(search, { target: { value: "no such title" } })
+    expect(
+      screen
+        .getAllByRole("status")
+        .some((status) => status.textContent?.includes("No titles match"))
+    ).toBe(true)
+  })
+
+  it("requires choosing between multiple authored entries at the next rank", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "linked-one",
+            kind: "title",
+            definitionId: "pioneer-1",
+            name: "Dungeon Pioneer I",
+            improvement: {
+              seriesId: "dungeon-pioneer",
+              rank: 1,
+              minRaceGrade: "G",
+            },
+            upgradeGroup: "dungeon-pioneer",
+          }),
+        ],
+      },
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2a", "Dungeon Pioneer II A", 2),
+        rankedTitle("pioneer-2b", "Dungeon Pioneer II B", 2),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+    expect(screen.getByText("Expand and choose")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Claim next rank" })).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /Dungeon Pioneer/ }))
+    expect(screen.getByText("Dungeon Pioneer II A")).toBeTruthy()
+    expect(screen.getByText("Dungeon Pioneer II B")).toBeTruthy()
+  })
+
+  it("advances the compact action to rank 2 after a successful rank 1 claim", async () => {
+    setupMock({
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Claim next rank" }))
+    fireEvent.change(screen.getByLabelText("Qualifying first-clear details"), {
+      target: { value: "Cleared rank one." },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Confirm claim" }))
+    await flush()
+    expect(screen.getByText("Rank 2 / minimum race grade G")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Claim next rank" })).toBeTruthy()
+  })
+
   it("requires a self-reported first-clear detail and sends it with version", async () => {
-    setupMock({ titles: [rankedTitle("pioneer-1", "Pioneer I", 1)] })
+    setupMock({
+      titles: [rankedTitle("pioneer-1", "Dungeon Pioneer I", 1)],
+    })
     await renderDetail()
     fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
@@ -2617,7 +3626,9 @@ describe("CharacterDetail ranked title claims", () => {
   })
 
   it("blocks below-grade claims and skipped ranks", async () => {
-    setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2, "C")] })
+    setupMock({
+      titles: [rankedTitle("pioneer-2", "Dungeon Pioneer II", 2, "C")],
+    })
     await renderDetail()
     fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
@@ -2632,7 +3643,9 @@ describe("CharacterDetail ranked title claims", () => {
   })
 
   it("does not offer rank 2 when no rank 1 is linked", async () => {
-    setupMock({ titles: [rankedTitle("pioneer-2", "Pioneer II", 2)] })
+    setupMock({
+      titles: [rankedTitle("pioneer-2", "Dungeon Pioneer II", 2)],
+    })
     await renderDetail()
     fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
@@ -2661,16 +3674,22 @@ describe("CharacterDetail ranked title claims", () => {
             definitionId: "old",
             name: "Old Pioneer",
             definitionArchived: true,
-            upgradeGroup: "pioneer",
-            improvement: { seriesId: "pioneer", rank: 3, minRaceGrade: "G" },
+            upgradeGroup: "dungeon-pioneer",
+            improvement: {
+              seriesId: "dungeon-pioneer",
+              rank: 3,
+              minRaceGrade: "G",
+            },
           }),
         ],
       },
-      titles: [rankedTitle("pioneer-4", "Pioneer IV", 4, "E")],
+      titles: [rankedTitle("pioneer-4", "Dungeon Pioneer IV", 4, "E")],
     })
     await renderDetail()
     fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
     await flush()
+    expect(screen.getAllByText("Old Pioneer").length).toBeGreaterThan(0)
+    expect(screen.getByRole("button", { name: "Remove" })).toBeTruthy()
     expect(screen.getByText("Rank 4 / minimum race grade E")).toBeTruthy()
     expect(
       screen.queryByText(/linked prior rank details unavailable/)
@@ -2695,11 +3714,11 @@ describe("CharacterDetail ranked title claims", () => {
             definitionId: "old",
             name: "Old Pioneer",
             definitionArchived: true,
-            upgradeGroup: "pioneer",
+            upgradeGroup: "dungeon-pioneer",
           }),
         ],
       },
-      titles: [rankedTitle("pioneer-2", "Pioneer II", 2)],
+      titles: [rankedTitle("pioneer-2", "Dungeon Pioneer II", 2)],
     })
     await renderDetail()
     fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
@@ -2747,7 +3766,7 @@ describe("CharacterDetail ranked title claims", () => {
     cleanup()
     setupMock({
       associationsError: new Error("title_rank_conflict"),
-      titles: [rankedTitle("pioneer-1", "Pioneer I", 1)],
+      titles: [rankedTitle("pioneer-1", "Dungeon Pioneer I", 1)],
     })
     await renderDetail()
     fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
@@ -2760,6 +3779,285 @@ describe("CharacterDetail ranked title claims", () => {
     await flush()
     expect(toast.error).toHaveBeenCalledWith("title_rank_conflict")
     expect(screen.getByRole("button", { name: "Claim next rank" })).toBeTruthy()
+  })
+
+  it("disables the next-rank claim while multiple titles are linked in the same ranked series", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "archived-prior",
+            kind: "title",
+            definitionId: "pioneer-1",
+            name: "Dungeon Pioneer I",
+            definitionArchived: true,
+            upgradeGroup: "dungeon-pioneer",
+            improvement: {
+              seriesId: "dungeon-pioneer",
+              rank: 1,
+              minRaceGrade: "G",
+            },
+          }),
+          association({
+            id: "linked-two",
+            kind: "title",
+            definitionId: "pioneer-2",
+            name: "Dungeon Pioneer II",
+            upgradeGroup: "dungeon-pioneer",
+            improvement: {
+              seriesId: "dungeon-pioneer",
+              rank: 2,
+              minRaceGrade: "G",
+            },
+          }),
+        ],
+      },
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+        rankedTitle("pioneer-3", "Dungeon Pioneer III", 3),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+
+    // Even though the highest linked rank is known, more than one linked rank
+    // makes the exactly-one-prior claim ambiguous: the summary CTA is inert and
+    // points the user at the conflict instead.
+    expect(
+      screen.getByText(
+        /Multiple linked ranks; resolve conflicting titles first/
+      )
+    ).toBeTruthy()
+    const summaryClaim = screen.getByRole("button", {
+      name: "Claim next rank",
+    }) as HTMLButtonElement
+    expect(summaryClaim.disabled).toBe(true)
+
+    // The expanded per-rank child claim for the next rank is inert too, so it
+    // never presents an active-but-doomed CTA.
+    fireEvent.click(screen.getByRole("button", { name: /Dungeon Pioneer/ }))
+    expect(screen.getByText("Dungeon Pioneer III")).toBeTruthy()
+    const claimButtons = screen.getAllByRole("button", {
+      name: "Claim next rank",
+    }) as HTMLButtonElement[]
+    expect(claimButtons.length).toBe(2)
+    expect(claimButtons.every((button) => button.disabled)).toBe(true)
+
+    // Clicking the inert summary CTA must not fire a doomed association POST.
+    const postsBefore = (
+      apiFetch as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.filter(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    ).length
+    fireEvent.click(summaryClaim)
+    await flush()
+    const postsAfter = (
+      apiFetch as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.filter(
+      ([url, init]) =>
+        url === "/api/characters/chr-1/associations" &&
+        (init as RequestInit | undefined)?.method === "POST"
+    ).length
+    expect(postsAfter).toBe(postsBefore)
+    expect(postsAfter).toBe(0)
+  })
+
+  it("restores the next-rank claim after one of the conflicting linked titles is removed", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "archived-prior",
+            kind: "title",
+            definitionId: "pioneer-1",
+            name: "Dungeon Pioneer I",
+            definitionArchived: true,
+            upgradeGroup: "dungeon-pioneer",
+            improvement: {
+              seriesId: "dungeon-pioneer",
+              rank: 1,
+              minRaceGrade: "G",
+            },
+          }),
+          association({
+            id: "linked-two",
+            kind: "title",
+            definitionId: "pioneer-2",
+            name: "Dungeon Pioneer II",
+            upgradeGroup: "dungeon-pioneer",
+            improvement: {
+              seriesId: "dungeon-pioneer",
+              rank: 2,
+              minRaceGrade: "G",
+            },
+          }),
+        ],
+      },
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+        rankedTitle("pioneer-3", "Dungeon Pioneer III", 3),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+    await flush()
+
+    expect(
+      screen.getByText(
+        /Multiple linked ranks; resolve conflicting titles first/
+      )
+    ).toBeTruthy()
+
+    // Expand and remove the active rank-2 link, leaving only the archived prior
+    // rank (still a single prior, so a next-rank claim is valid again).
+    fireEvent.click(screen.getByRole("button", { name: /Dungeon Pioneer/ }))
+    const sheetContent = associationSheetContent()
+    const pioneerTwoRow =
+      within(sheetContent).getByText("Dungeon Pioneer II").parentElement!
+        .parentElement!
+    fireEvent.click(
+      within(pioneerTwoRow).getByRole("button", { name: "Remove" })
+    )
+    await flush()
+
+    expect(
+      screen.queryByText(
+        /Multiple linked ranks; resolve conflicting titles first/
+      )
+    ).toBeNull()
+    // After removing one conflicting link the exactly-one-prior constraint is
+    // satisfied again, so the next-rank claim is restored: at least one CTA is
+    // active (the summary or the current next-rank child). The remaining rank-3
+    // child stays disabled because it is no longer the next rank.
+    const claimButtons = screen.getAllByRole("button", {
+      name: "Claim next rank",
+    }) as HTMLButtonElement[]
+    expect(claimButtons.some((button) => !button.disabled)).toBe(true)
+  })
+})
+
+describe("CharacterDetail archived linked title search", () => {
+  const rankedTitle = (
+    id: string,
+    name: string,
+    rank: number,
+    seriesId: string = "dungeon-pioneer"
+  ) =>
+    catalogItem({
+      id,
+      name,
+      kind: "titles",
+      config: {
+        improvement: { seriesId, rank, minRaceGrade: "G" },
+        upgradeGroup: seriesId,
+        flat: { strength: rank },
+      },
+    })
+
+  const archivedLinkedTitle = association({
+    id: "archived-warden",
+    kind: "title",
+    definitionId: "archived-warden-def",
+    name: "Ancient Warden",
+    definitionArchived: true,
+    upgradeGroup: "ancient-warden",
+    improvement: {
+      seriesId: "ancient-warden",
+      rank: 1,
+      minRaceGrade: "G",
+    },
+  })
+
+  function openTitlesTab() {
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage titles" })[0])
+  }
+
+  it("hides archived linked titles and reports no matches when the search matches nothing", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [archivedLinkedTitle],
+      },
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+      ],
+    })
+    await renderDetail()
+    openTitlesTab()
+    await flush()
+    const sheet = associationSheetContent("titlesSkills")
+    const search = within(sheet).getByRole("textbox", {
+      name: "Search titles by series or name",
+    })
+    fireEvent.change(search, { target: { value: "unrelated term" } })
+    expect(within(sheet).queryByText("Ancient Warden")).toBeNull()
+    expect(
+      within(sheet)
+        .getAllByRole("status")
+        .some((status) => status.textContent?.includes("No titles match"))
+    ).toBe(true)
+  })
+
+  it("shows an archived linked title by name with its Remove action, restores it on clear, and leaves ranked search unchanged", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [archivedLinkedTitle],
+      },
+      titles: [
+        rankedTitle("pioneer-1", "Dungeon Pioneer I", 1),
+        rankedTitle("pioneer-2", "Dungeon Pioneer II", 2),
+      ],
+    })
+    await renderDetail()
+    openTitlesTab()
+    await flush()
+    const sheet = associationSheetContent("titlesSkills")
+    const search = within(sheet).getByRole("textbox", {
+      name: "Search titles by series or name",
+    })
+
+    // Searching the archived linked title name reveals it with a Remove action.
+    fireEvent.change(search, { target: { value: "Ancient Warden" } })
+    expect(within(sheet).getByText("Ancient Warden")).toBeTruthy()
+    expect(within(sheet).getByRole("button", { name: "Remove" })).toBeTruthy()
+
+    // Ranked series search is unaffected by the archived-linked filter.
+    fireEvent.change(search, { target: { value: "Dungeon Pioneer II" } })
+    expect(within(sheet).queryByText("Ancient Warden")).toBeNull()
+    expect(within(sheet).getByText("Dungeon Pioneer II")).toBeTruthy()
+
+    // Clearing the search restores every archived linked title.
+    fireEvent.change(search, { target: { value: "" } })
+    expect(within(sheet).getByText("Ancient Warden")).toBeTruthy()
+    expect(within(sheet).queryByText("No titles match your search")).toBeNull()
+  })
+
+  it("matches archived linked titles by upgrade group and series id as well as name", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [archivedLinkedTitle],
+      },
+      titles: [rankedTitle("pioneer-1", "Dungeon Pioneer I", 1)],
+    })
+    await renderDetail()
+    openTitlesTab()
+    await flush()
+    const sheet = associationSheetContent("titlesSkills")
+    const search = within(sheet).getByRole("textbox", {
+      name: "Search titles by series or name",
+    })
+    fireEvent.change(search, { target: { value: "ancient-warden" } })
+    expect(within(sheet).getByText("Ancient Warden")).toBeTruthy()
   })
 })
 
@@ -2819,6 +4117,49 @@ describe("equipment eligibility and skill upgrades", () => {
         ([url]) => url === "/api/characters/chr-1"
       ).length
     ).toBeGreaterThan(1)
+  })
+
+  it("searches eligible upgrade targets without widening rarity or archived guards", async () => {
+    setupMock({
+      character: sourceCharacter("Common"),
+      skills: [
+        skill("eligible", "Ember Adept", "Rare"),
+        skill("archived", "Archived Ember", "Mythical", true),
+        skill("lower", "Lower Ember", "Common"),
+        ...Array.from({ length: 15 }, (_, index) =>
+          skill(`extra-${index}`, `Ember Variant ${index}`, "Rare")
+        ),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    const search = screen.getByRole("searchbox", {
+      name: "Search upgrade skills",
+    })
+    fireEvent.change(search, { target: { value: "ADEPT" } })
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    expect(screen.getByText(/Ember Adept - Rare/)).toBeTruthy()
+    expect(screen.queryByText(/Archived Ember/)).toBeNull()
+    expect(screen.queryByText(/Lower Ember/)).toBeNull()
+    expect(
+      screen.queryByText("No upgrade skills match your search.")
+    ).toBeNull()
+    fireEvent.change(search, { target: { value: "no result" } })
+    expect(
+      screen.getByText("No upgrade skills match your search.")
+    ).toBeTruthy()
+    fireEvent.change(search, { target: { value: "ADEPT" } })
+    fireEvent.click(screen.getByText(/Ember Adept - Rare/))
+    fireEvent.change(screen.getByLabelText("Reason"), {
+      target: { value: "Training" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Confirm upgrade" }))
+    await flush()
+    expect(upgradePostsForTest).toEqual([
+      { definitionId: "eligible", version: 3, reason: "Training" },
+    ])
   })
 
   it("blocks Unique, lower/equal, and missing source rarity; archived source metadata remains upgradeable", async () => {
@@ -3212,9 +4553,9 @@ describe("CharacterDetail race-only progression", () => {
     setupMock({ character: canceled })
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
-    expect(screen.getByText("Canceled")).toBeTruthy()
+    expect(screen.queryByText("Canceled")).toBeNull()
     expect(screen.queryByRole("button", { name: "Select" })).toBeNull()
-    expect(screen.getByText("Quick Shot")).toBeTruthy()
+    expect(screen.queryByText("Quick Shot")).toBeNull()
   })
 
   it("includes experience set and undo events only in their track history, including derived Race changes", async () => {
@@ -4242,6 +5583,90 @@ describe("CharacterDetail transcendent skills", () => {
 })
 
 describe("CharacterDetail inventory", () => {
+  it("shows grouped owned stock and confirms one-item use outside management", async () => {
+    setupMock({
+      character: {
+        ...character,
+        inventory: [
+          inventoryItem({
+            id: "inv-potion",
+            definitionId: "item-potion",
+            name: "Healing Tonic",
+            kind: "items",
+            quantity: 1,
+          }),
+          inventoryItem({
+            id: "inv-sword",
+            definitionId: "eq-sword",
+            name: "Iron Sword",
+            kind: "equipment",
+            quantity: 2,
+            slot: "Weapon",
+          }),
+        ],
+      },
+    })
+    await renderDetail()
+    expect(screen.getByLabelText("Owned equipment")).toBeTruthy()
+    expect(screen.getByText("Iron Sword")).toBeTruthy()
+    expect(screen.getByText("Slot: Weapon")).toBeTruthy()
+    expect(screen.getByLabelText("Owned items")).toBeTruthy()
+    expect(screen.getByText("Qty 1")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Use" }))
+    expect(screen.getByText(/spends one Healing Tonic/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await flush()
+    expect(inventoryPosts).toHaveLength(0)
+
+    fireEvent.click(screen.getByRole("button", { name: "Use" }))
+    fireEvent.click(screen.getByRole("button", { name: "Confirm use" }))
+    await flush()
+    expect(inventoryPosts).toEqual([
+      {
+        operation: "use",
+        definitionId: "item-potion",
+        quantity: 1,
+        version: 3,
+      },
+    ])
+    expect(screen.queryByText("Healing Tonic")).toBeNull()
+    expect(screen.getByText("Iron Sword")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Use" })).toBeNull()
+  })
+
+  it("allows using archived item stock and exposes a retry after a stale write", async () => {
+    setupMock({
+      character: {
+        ...character,
+        inventory: [
+          inventoryItem({
+            id: "inv-token",
+            definitionId: "old-token",
+            name: "Old Token",
+            kind: "items",
+            quantity: 2,
+            archived: true,
+          }),
+        ],
+      },
+    })
+    await renderDetail()
+    expect(screen.getByText("Archived - inert")).toBeTruthy()
+    const useButton = screen.getByRole("button", { name: "Use" })
+    fireEvent.click(useButton)
+    inventoryError = new Error("Version conflict")
+    fireEvent.click(screen.getByRole("button", { name: "Confirm use" }))
+    await flush()
+    expect(screen.getByRole("alert").textContent).toContain("Version conflict")
+    expect(screen.getByRole("button", { name: "Confirm use" })).toBeTruthy()
+    inventoryError = null
+    fireEvent.click(screen.getByRole("button", { name: "Confirm use" }))
+    await flush()
+    expect(inventoryPosts).toHaveLength(1)
+    expect(inventoryPosts[0]).toMatchObject({ operation: "use", quantity: 1 })
+    expect(screen.getByText("Qty 1")).toBeTruthy()
+  })
+
   it("Inventory tab Add stock saves an add POST and refreshes the owned quantity", async () => {
     setupMock({
       equipmentCatalog: [
@@ -4251,6 +5676,13 @@ describe("CharacterDetail inventory", () => {
           kind: "equipment",
           config: { slot: "weapon" },
         }),
+        ...Array.from({ length: 15 }, (_, index) =>
+          catalogItem({
+            id: `eq-extra-${index}`,
+            name: `Catalog Blade ${index}`,
+            kind: "equipment",
+          })
+        ),
       ],
     })
 
@@ -4280,9 +5712,32 @@ describe("CharacterDetail inventory", () => {
     // Nothing selected / no quantity / no note: submit is disabled.
     expect(save().disabled).toBe(true)
 
-    // Pick an active catalog equipment item.
+    // Search a large catalog, handle empty results, then select the match.
+    fireEvent.change(
+      within(dialog).getByRole("searchbox", { name: "Search stock catalog" }),
+      {
+        target: { value: "no such stock" },
+      }
+    )
+    expect(
+      within(dialog).getByText("No stock catalog items match your search.")
+    ).toBeTruthy()
+    fireEvent.change(
+      within(dialog).getByRole("searchbox", { name: "Search stock catalog" }),
+      {
+        target: { value: "IRON SWORD" },
+      }
+    )
+    expect(within(dialog).queryByText("Catalog Blade 0")).toBeNull()
     fireEvent.click(within(dialog).getByText("Iron Sword"))
     await flush()
+    fireEvent.change(
+      within(dialog).getByRole("searchbox", { name: "Search stock catalog" }),
+      {
+        target: { value: "no match now" },
+      }
+    )
+    expect(within(dialog).getByText("Iron Sword")).toBeTruthy()
 
     // A quantity alone still leaves submit disabled (source note required).
     fireEvent.change(within(dialog).getByLabelText("Quantity"), {
@@ -4328,7 +5783,7 @@ describe("CharacterDetail inventory", () => {
 
     // The dialog closes and the reload reflects the fresh owned stock.
     expect(screen.queryByRole("heading", { name: "Add stock" })).toBeNull()
-    expect(screen.getByText("Qty 2")).toBeTruthy()
+    expect(screen.getAllByText("Qty 2").length).toBeGreaterThan(0)
   })
 
   it("an archived item inventory row shows stock quantity without consume controls", async () => {

@@ -58,18 +58,29 @@ never from the live inventory quantity.
 
 - Manual acquisition is the only acquisition path in this stage (no crafted-drop
   or economy is invented). `POST /api/characters/[id]/inventory` with
-  `operation: add | remove`, `quantity` 1..999999, a mandatory `sourceNote`
-  (nonempty, <= 500 chars), and the CAS `version`. An `add` only accepts active
-  (unarchived) `items` catalog entries; a `remove` is permitted for archived
-  entries (owned stock may still be spent). The write runs under SERIALIZABLE
-  isolation, CASes the character version, and appends an `inventory_adjust`
-  journal event recording the prior/new quantity, the definition snapshot, the
-  source note, and the acting user id. A P2034 (cannot serialize) or a stale
-  version is a 409 that rolls back the change.
+  `operation: add | remove | use`. For `add` / `remove`, `quantity` is 1..999999
+  with a mandatory `sourceNote` (nonempty, <= 500 chars), and the CAS `version`.
+  An `add` only accepts active (unarchived) `items` catalog entries; a `remove`
+  is permitted for archived entries (owned stock may still be spent). The write
+  runs under SERIALIZABLE isolation, CASes the character version, and appends an
+  `inventory_adjust` journal event recording the prior/new quantity, the
+  definition snapshot, the source note, and the acting user id. A P2034 (cannot
+  serialize) or a stale version is a 409 that rolls back the change.
 - Removing the final unit (quantity to 0) deletes the row - an absent row means
   zero owned stock (the DB CHECK constraint forbids quantity 0). Adding beyond
   999999 is rejected (`inventory_cap_exceeded`); removing beyond owned stock is
   rejected (`inventory_insufficient`).
+- `use` is a distinct stock-only action for owned `items` (consumable) catalog
+  entries. It spends EXACTLY one owned unit (`quantity` must be `1`), applies no
+  mechanical effect (no stat/current-resource change, no recipe), and is allowed
+  for archived entries (owned stock may still be spent). An equipment definition
+  cannot be used (400). A use with zero owned stock is rejected
+  (`inventory_insufficient`) before any event/version change; the final unit
+  deletes the row exactly like a remove. `sourceNote` is optional and ignored:
+  the service journals the automatic note `Used item` and records an explicit
+  `inventory_use` progression event with the definition snapshot, prior/new
+  quantity (new = prior - 1), the acting user id, and `usedAt`. Use never
+  triggers the equipped-stock guard (only equipment is equipment-linked).
 - Inventory quantity alone never changes a character's live status; only the
   applied permanent/temporary effect does.
 

@@ -721,6 +721,9 @@ describe("grade skill grants", () => {
     expect(screen.getByText("Skill Two")).toBeTruthy()
     fireEvent.click(screen.getByText("Save"))
     await flush()
+    expect(screen.queryByRole("alert")?.textContent ?? "no alert").toBe(
+      "no alert"
+    )
     const config = savedConfig(mock)
     expect(config.gradeGrantedSkillStableIds).toEqual({
       F: ["skill-one", "skill-two"],
@@ -750,12 +753,120 @@ describe("grade skill grants", () => {
     addGrant("skill-two")
     fireEvent.click(screen.getByText("Save"))
     await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+      )
+    ).toBe(true)
+    expect(
+      mock.mock.calls.map(([url, init]) => [
+        url,
+        (init as RequestInit | undefined)?.method,
+      ])
+    ).toContainEqual([
+      "/api/catalog/professions/professions-record-id",
+      "PATCH",
+    ])
     const config = savedConfig(mock)
     expect(config.gradeGrantedSkillStableIds).toEqual({ G: ["skill-two"] })
     expect(JSON.stringify(config.gradeGrantedSkillStableIds)).not.toContain(
       "db-skill"
     )
     expect(config.grades).toEqual(gains)
+  })
+
+  it("filters a large grant list by name and stable ID, clears filters, and saves hidden grants intact", async () => {
+    const existingIds = ["hidden-skill"]
+    const mock = setupStructuredEdit("classes", {
+      grades: { G: { fixed: {}, free: 0 } },
+      gradeGrantedSkillStableIds: { G: existingIds, F: ["other-grade-grant"] },
+    })
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/classes")
+        return {
+          items: [
+            {
+              ...item,
+              id: "class-record",
+              kind: "classes",
+              grade: "G",
+              stableId: "test-class",
+              name: "Test class",
+              config: {
+                grades: { G: { fixed: {}, free: 0 } },
+                gradeGrantedSkillStableIds: {
+                  G: existingIds,
+                  F: ["other-grade-grant"],
+                },
+              },
+            },
+          ],
+        }
+      if (url === "/api/catalog/skills")
+        return {
+          items: [
+            ...Array.from({ length: 18 }, (_, index) => ({
+              ...item,
+              id: `db-${index}`,
+              stableId: `skill-${index}`,
+              name: `Skill ${index}`,
+              archived: false,
+            })),
+            {
+              ...item,
+              id: "db-target",
+              stableId: "rare-stable-id",
+              name: "Celestial Blade",
+              archived: false,
+            },
+            {
+              ...item,
+              id: "db-hidden",
+              stableId: "hidden-skill",
+              name: "Hidden Grant",
+              archived: false,
+            },
+          ],
+        }
+      if (init?.method === "PATCH") return { item }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    const filter = screen.getByLabelText("Filter skills by name or ID")
+    const select = screen.getByLabelText("Skill to grant") as HTMLSelectElement
+    expect(select.size).toBeLessThanOrEqual(8)
+    expect(select.size).toBe(8)
+    expect(select.className).toContain("h-auto")
+    expect(select.className).not.toContain("h-9")
+    expect(select.className).toContain("max-h-48")
+    expect(select.className).toContain("overflow-y-auto")
+    fireEvent.change(filter, { target: { value: "cELESTIAL" } })
+    expect(screen.getByRole("option", { name: "Celestial Blade" })).toBeTruthy()
+    expect(screen.queryByRole("option", { name: "Skill 1" })).toBeNull()
+    fireEvent.change(filter, { target: { value: "RARE-STABLE-ID" } })
+    expect(screen.getByRole("option", { name: "Celestial Blade" })).toBeTruthy()
+    fireEvent.change(filter, { target: { value: "no-match" } })
+    expect(select.options.length).toBe(1)
+    fireEvent.change(filter, { target: { value: "" } })
+    fireEvent.change(select, { target: { value: "rare-stable-id" } })
+    fireEvent.click(screen.getByText("Add skill"))
+    fireEvent.change(filter, { target: { value: "celestial" } })
+    expect((screen.getByText("Save") as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+      )
+    ).toBe(true)
+    const config = savedConfig(mock)
+    expect(config.gradeGrantedSkillStableIds).toEqual({
+      G: ["hidden-skill", "rare-stable-id"],
+      F: ["other-grade-grant"],
+    })
   })
 })
 
@@ -1202,7 +1313,23 @@ describe("skill type and class priority", () => {
     ).toBe(false)
     expect(screen.getByText("Choose a skill type before saving.")).toBeTruthy()
     fireEvent.click(screen.getByRole("option", { name: "Profession" }))
-    fireEvent.change(screen.getByLabelText("Class tie"), {
+    await flush()
+    const classFilter = screen.getByLabelText("Filter classes by name or ID")
+    const classSelect = screen.getByLabelText("Class tie") as HTMLSelectElement
+    expect(classSelect.size).toBeLessThanOrEqual(8)
+    expect(classSelect.className).toContain("h-auto")
+    expect(classSelect.className).not.toContain("h-9")
+    expect(classSelect.className).toContain("max-h-48")
+    expect(classSelect.className).toContain("overflow-y-auto")
+    fireEvent.change(classFilter, { target: { value: "WARR" } })
+    expect(screen.getByRole("option", { name: "Warrior" })).toBeTruthy()
+    fireEvent.change(classSelect, { target: { value: "warrior" } })
+    fireEvent.change(classFilter, { target: { value: "no-match" } })
+    expect(
+      screen.getByRole("option", { name: /Warrior \(selected\)/ })
+    ).toBeTruthy()
+    fireEvent.change(classFilter, { target: { value: "" } })
+    fireEvent.change(classSelect, {
       target: { value: "warrior" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))

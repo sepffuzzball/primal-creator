@@ -10913,6 +10913,220 @@ describe("skill offers (milestone choice model)", () => {
       "sk-untied-prof": false,
     })
   })
+
+  it("reflects live catalog description and grade-description edits after earn", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(0, 0)
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Skill One",
+      description: "original description",
+      gradeDescriptions: {},
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    dbMock.store.skillOffers.push({
+      id: "off-1",
+      characterId: "chr-1",
+      track: "class",
+      level: 5,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
+      selectedDefinitionId: null,
+      offeredAt: new Date(),
+      selectedAt: null,
+      earnedGrade: "F",
+      trackDefinitionStableId: "archer",
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-1",
+      offerId: "off-1",
+      definitionId: "sk-1",
+      nameSnapshot: "Skill One",
+      configSnapshot: { track: "class", rarity: "Common" },
+    })
+
+    let option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.description).toBe("original description")
+
+    // A live catalog description edit is reflected in the read view.
+    await updateCatalogItem("skills", "sk-1", {
+      description: "edited description",
+    })
+    option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.description).toBe("edited description")
+
+    // Authored grade prose at the offer's earn grade wins over the legacy prose.
+    await updateCatalogItem("skills", "sk-1", {
+      gradeDescriptions: { F: "grade prose" },
+    })
+    option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.description).toBe("grade prose")
+
+    // A missing authored grade entry falls back to the legacy description.
+    await updateCatalogItem("skills", "sk-1", { gradeDescriptions: {} })
+    option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.description).toBe("edited description")
+  })
+
+  it("keeps the rarity, type and class tie on the earned snapshot despite a live catalog edit", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(0, 0)
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Skill One",
+      description: "prose",
+      config: {
+        track: "class",
+        rarity: "Common",
+        classStableId: "archer",
+        effects: [],
+      },
+    })
+    // A second, active class so the live edit can re-tie the skill to it without a
+    // catalog-reference rejection.
+    dbMock.store.addCatalog({
+      id: "cls-mage",
+      kind: "classes",
+      stableId: "mage",
+      name: "Mage",
+      config: { grades: { F: { fixed: { wisdom: 2 }, free: 1 } } },
+    })
+    dbMock.store.skillOffers.push({
+      id: "off-1",
+      characterId: "chr-1",
+      track: "class",
+      level: 5,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
+      selectedDefinitionId: null,
+      offeredAt: new Date(),
+      selectedAt: null,
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-1",
+      offerId: "off-1",
+      definitionId: "sk-1",
+      nameSnapshot: "Skill One",
+      configSnapshot: {
+        track: "class",
+        rarity: "Common",
+        classStableId: "archer",
+      },
+    })
+
+    let option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.rarity).toBe("Common")
+    expect(option.skillType).toBe("class")
+    expect(option.classStableId).toBe("archer")
+
+    // The live catalog now reties the skill to another class, changes its track and
+    // rarity. The offered option's snapshotted badges must not move.
+    await updateCatalogItem("skills", "sk-1", {
+      config: {
+        track: "profession",
+        rarity: "Rare",
+        classStableId: "mage",
+        effects: [],
+      },
+    })
+    option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.rarity).toBe("Common")
+    expect(option.skillType).toBe("class")
+    expect(option.classStableId).toBe("archer")
+  })
+
+  it("reads a legacy option with an empty snapshot safely (falls back, never throws)", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(0, 0)
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Skill One",
+      description: "legacy prose",
+      config: { track: "class", effects: [] },
+    })
+    // A legacy option with no snapshotted track/rarity/class tie.
+    dbMock.store.skillOffers.push({
+      id: "off-1",
+      characterId: "chr-1",
+      track: "class",
+      level: 5,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
+      selectedDefinitionId: null,
+      offeredAt: new Date(),
+      selectedAt: null,
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-1",
+      offerId: "off-1",
+      definitionId: "sk-1",
+      nameSnapshot: "Skill One",
+      configSnapshot: {},
+    })
+    const option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
+    expect(option.rarity).toBeNull()
+    // A missing snapshotted type falls back to the offer's own track.
+    expect(option.skillType).toBe("class")
+    expect(option.classStableId).toBeNull()
+    expect(option.description).toBe("legacy prose")
+  })
+
+  it("still shows the live description of an archived offered skill and null on a missing definition", async () => {
+    seedClassCatalog("archer")
+    seedCharacterForSkill(0, 0)
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Skill One",
+      description: "archived prose",
+      archived: true,
+      config: { track: "class", effects: [] },
+    })
+    dbMock.store.skillOffers.push({
+      id: "off-1",
+      characterId: "chr-1",
+      track: "class",
+      level: 5,
+      choiceGroup: "standard",
+      generation: 0,
+      canceledAt: null,
+      selectedDefinitionId: null,
+      offeredAt: new Date(),
+      selectedAt: null,
+    })
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-1",
+      offerId: "off-1",
+      definitionId: "sk-1",
+      nameSnapshot: "Skill One",
+      configSnapshot: { track: "class", rarity: "Common" },
+    })
+    // An option whose linked definition no longer exists in the catalog.
+    dbMock.store.skillOfferOptions.push({
+      id: "opt-2",
+      offerId: "off-1",
+      definitionId: "ghost",
+      nameSnapshot: "Ghost Skill",
+      configSnapshot: {},
+    })
+
+    const options = (await getCharacter("chr-1", user)).skillOffers[0].options
+    const archivedOpt = options.find((o) => o.definitionId === "sk-1")!
+    expect(archivedOpt.description).toBe("archived prose")
+    expect(archivedOpt.skillType).toBe("class")
+    const ghostOpt = options.find((o) => o.definitionId === "ghost")!
+    expect(ghostOpt.description).toBeNull()
+  })
 })
 
 describe("monster race skill offers (milestone choice model)", () => {
@@ -12567,6 +12781,16 @@ describe("character inventory (owner-managed quantities)", () => {
     }
   }
 
+  function useBody(overrides: Record<string, unknown> = {}) {
+    return {
+      operation: "use" as const,
+      definitionId: "pot-1" as const,
+      quantity: 1,
+      version: 0,
+      ...overrides,
+    }
+  }
+
   it("lets an owner add and remove inventory, and rejects a non-owner", async () => {
     seedState()
     seedEquipment("gear-1", { slot: "head" })
@@ -13019,6 +13243,137 @@ describe("character inventory (owner-managed quantities)", () => {
     expect(res.character.status?.attributes).toEqual(before.status?.attributes)
     expect(res.character.state).toEqual(before.state)
     expect(res.character.inventory).toHaveLength(1)
+  })
+
+  it("uses an owned item unit and journals an inventory_use event with the automatic note", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 3)
+    const res = await adjustCharacterInventory("chr-1", useBody(), user)
+    expect(res.version).toBe(1)
+    expect(res.inventory).toHaveLength(1)
+    expect(res.inventory[0]).toMatchObject({
+      definitionId: "pot-1",
+      quantity: 2,
+      kind: "items",
+    })
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("inventory_use")
+    expect(event.payload).toMatchObject({
+      operation: "use",
+      definitionId: "pot-1",
+      quantity: 1,
+      priorQuantity: 3,
+      newQuantity: 2,
+      sourceNote: "Used item",
+      actorId: user.id,
+    })
+    expect(
+      (event.payload as { definition: { name: string } }).definition.name
+    ).toBe("items pot-1")
+  })
+
+  it("records an inventory_use event payload with the definition snapshot and usedAt", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 2)
+    await adjustCharacterInventory("chr-1", useBody(), user)
+    const event = dbMock.store.events[0]
+    expect(event.kind).toBe("inventory_use")
+    const payload = event.payload as Record<string, unknown>
+    expect(payload.usedAt).toBeTypeOf("string")
+    const def = payload.definition as Record<string, unknown>
+    expect(def.id).toBe("pot-1")
+    expect(def.stableId).toBe("pot-1")
+    expect(def.name).toBe("items pot-1")
+    expect(def.kind).toBe("items")
+  })
+
+  it("rejects a use whose quantity is not exactly 1 (validation, no event/version change)", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 3)
+    await expect(
+      adjustCharacterInventory("chr-1", useBody({ quantity: 2 }), user)
+    ).rejects.toMatchObject({ status: 400, code: "validation" })
+    expect(dbMock.store.inventory[0].quantity).toBe(3)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("allows using an archived item (owned stock may still be spent)", async () => {
+    seedState()
+    seedConsumable(
+      "pot-1",
+      { type: "permanent", amount: { strength: 1 } },
+      { archived: true }
+    )
+    seedStock("pot-1", 2)
+    const res = await adjustCharacterInventory("chr-1", useBody(), user)
+    expect(res.inventory).toHaveLength(1)
+    expect(res.inventory[0].quantity).toBe(1)
+  })
+
+  it("rejects using an equipment definition (wrong_kind)", async () => {
+    seedState()
+    seedEquipment("gear-1", { slot: "head" })
+    seedStock("gear-1", 2)
+    await expect(
+      adjustCharacterInventory(
+        "chr-1",
+        useBody({ definitionId: "gear-1" }),
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "wrong_kind" })
+    expect(dbMock.store.inventory[0].quantity).toBe(2)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("using the last owned unit deletes the stock row", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 1)
+    const res = await adjustCharacterInventory("chr-1", useBody(), user)
+    expect(res.inventory).toHaveLength(0)
+    expect(dbMock.store.inventory).toHaveLength(0)
+  })
+
+  it("rejects a use with zero owned stock without event or version change", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    await expect(
+      adjustCharacterInventory("chr-1", useBody(), user)
+    ).rejects.toMatchObject({ status: 400, code: "inventory_insufficient" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a stale version (409) and rolls back the use", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 3)
+    const first = await adjustCharacterInventory("chr-1", useBody(), user)
+    expect(first.inventory[0].quantity).toBe(2)
+    expect(dbMock.store.events).toHaveLength(1)
+    await expect(
+      adjustCharacterInventory("chr-1", useBody({ version: 0 }), user)
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.inventory[0].quantity).toBe(2)
+    expect(dbMock.store.events).toHaveLength(1)
+  })
+
+  it("using an item changes only inventory quantity, not live state or status", async () => {
+    seedState()
+    seedConsumable("pot-1", { type: "permanent", amount: { strength: 1 } })
+    seedStock("pot-1", 2)
+    const before = await getCharacter("chr-1", user)
+    const res = await adjustCharacterInventory("chr-1", useBody(), user)
+    expect(res.character.status?.attributes).toEqual(before.status?.attributes)
+    expect(res.character.state).toEqual(before.state)
+    expect(res.character.inventory).toHaveLength(1)
+    expect(res.character.inventory[0].quantity).toBe(1)
   })
 })
 

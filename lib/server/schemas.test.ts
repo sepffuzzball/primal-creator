@@ -393,6 +393,77 @@ describe("inventoryPostSchema", () => {
     })
     expect(parsed.success).toBe(false)
   })
+
+  it("parses a valid use payload with quantity exactly 1", () => {
+    const parsed = inventoryPostSchema.safeParse({
+      operation: "use",
+      definitionId: "pot-1",
+      quantity: 1,
+      version: 0,
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data).toEqual({
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+      })
+    }
+  })
+
+  it("rejects a use with quantity other than exactly 1", () => {
+    for (const quantity of [0, 2, -1]) {
+      const parsed = inventoryPostSchema.safeParse({
+        operation: "use",
+        definitionId: "pot-1",
+        quantity,
+        version: 0,
+      })
+      expect(parsed.success).toBe(false)
+    }
+  })
+
+  it("accepts a use with an optional (ignored) sourceNote", () => {
+    // An omitted sourceNote is valid.
+    expect(
+      inventoryPostSchema.safeParse({
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+      }).success
+    ).toBe(true)
+    // A supplied sourceNote (even an empty one) is accepted and ignored.
+    expect(
+      inventoryPostSchema.safeParse({
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "",
+      }).success
+    ).toBe(true)
+    expect(
+      inventoryPostSchema.safeParse({
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "x".repeat(500),
+      }).success
+    ).toBe(true)
+    // But an over-long sourceNote is still rejected.
+    expect(
+      inventoryPostSchema.safeParse({
+        operation: "use",
+        definitionId: "pot-1",
+        quantity: 1,
+        version: 0,
+        sourceNote: "x".repeat(501),
+      }).success
+    ).toBe(false)
+  })
 })
 
 describe("professionSetSchema", () => {

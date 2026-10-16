@@ -126,6 +126,14 @@ for offers):
   created (unique on character/track/level/choiceGroup) and carries read-only option
   snapshots (name + config), so a later catalog edit never rewrites what the
   character was actually offered. Quarter-only advances produce no offers.
+- At read time each snapped option is exposed with a **live** `description` (the
+  current catalog definition's authored grade prose at the offer's `earnedGrade`
+  when nonempty, else the legacy `description`, and `null` when no linked definition
+  resolves) alongside **snapshot-only** `rarity`, `skillType` and `classStableId`
+  badges (each read from the immutable `configSnapshot`, never the live catalog
+  config; a legacy snapshot's `skillType` falls back to the offer's own track). A
+  later catalog edit therefore never relabels the badges of what the character was
+  actually offered, while the freshest authored prose is still surfaced.
 - The player (or an admin) **selects** one option from a pending offer; that links
   the skill as a character association (kind `SKILL`) and stamps the offer
   `selected`. Administrators can also **grant** a skill manually (provenance

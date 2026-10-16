@@ -521,15 +521,72 @@ ${missingItemWarnings.join("\n")}`
     // and that panel carries an ISOLATED inner tab list (the Inventory and
     // equipment panel exposes only Inventory/Equipment, never the titles/skills
     // tabs, and so on). This block drives each entry point and asserts the
-    // panel's structure/state only, then closes it with Escape. It never
-    // submits, so it performs no DB mutation - it only renders the character
-    // that was just created.
+    // panel's structure/state, then closes it with Escape. The Inventory panel
+    // is exercised end-to-end: it seeds a unique ACTIVE item, adds one owned
+    // unit through the real Add stock dialog (keyboard-selected), then spends
+    // that unit through the stock-only Use dialog, so the Inventory block DOES
+    // mutate the character (unlike the other panels, which only render).
     // ------------------------------------------------------------------ //
+
+    // ------------------------------------------------------------------ //
+    // Seed a unique ACTIVE inventory item (catalog `items`) for this run.
+    //
+    // The seed creates no items, so the items catalog starts empty; we create a
+    // uniquely stableId'd, unarchived item exactly as the class-skill block
+    // below creates its skill, never touching a pre-existing fixture. It is
+    // never archived or deleted, so repeated runs cannot collide: a leftover
+    // item from a prior run never matches our unique stableId.
+    // `page.request` does not attach a browser Origin header, so an unsafe
+    // (state-changing) request would be rejected by the app's CSRF origin guard
+    // (403 bad_origin) - send the current page origin explicitly (same pattern
+    // as the class-skill POST below).
+    // ------------------------------------------------------------------ //
+    const itemStableId = `e2e-item-${Date.now()}`
+    const itemName = `E2E Potion ${itemStableId}`
+    const itemRes = await page.request.post("/api/catalog/items", {
+      headers: { origin: new URL(page.url()).origin },
+      data: {
+        name: itemName,
+        stableId: itemStableId,
+        description: "E2E stock-only consumable.",
+        config: {},
+      },
+    })
+    expect(itemRes.status()).toBe(201)
+
+    // The item is ACTIVE (not archived) and reachable through the authenticated
+    // items catalog - the Add stock dialog searches this catalog, so the seed
+    // must produce a live entry, not an archived one (an archived item cannot be
+    // added as new stock).
+    const itemsCatalogRes = await page.request.get("/api/catalog/items")
+    expect(itemsCatalogRes.ok()).toBeTruthy()
+    const itemsCatalogBody = (await itemsCatalogRes.json()) as {
+      kind: string
+      items: Array<{
+        id: string
+        name: string
+        stableId: string
+        archived: boolean
+      }>
+    }
+    expect(itemsCatalogBody.kind).toBe("items")
+    const seededItem = itemsCatalogBody.items.find(
+      (entry) => entry.stableId === itemStableId
+    )
+    expect(seededItem).toBeTruthy()
+    expect(seededItem?.name).toBe(itemName)
+    expect(seededItem?.archived).toBe(false)
+    const itemDefinitionId = seededItem!.id
+    expect(itemDefinitionId).toBeTruthy()
 
     // Inventory: the Inventory and equipment panel exposes only the Inventory
     // and Equipment tabs, and the Inventory tab offers "Add stock". The panel
     // defaults to the inventory tab on this entry point, but we click it
     // explicitly so the assertion does not depend on that default.
+    //
+    // Opening this sheet (and the Inventory main tab behind it) lazily loads
+    // the items catalog - the seed has none, so it is empty until we created
+    // the item above - and that fresh fetch includes the item we just created.
     await page.getByRole("tab", { name: "Inventory", exact: true }).click()
     await page.getByRole("button", { name: "Manage inventory" }).click()
     let sheet = associationSheet(page, "Inventory and equipment")
@@ -538,8 +595,133 @@ ${missingItemWarnings.join("\n")}`
     await expect(sheet.getByRole("tab", { name: "Equipment" })).toBeVisible()
     await sheet.getByRole("tab", { name: "Inventory" }).click()
     await expect(sheet.getByRole("button", { name: "Add stock" })).toBeVisible()
-    await page.keyboard.press("Escape")
+    await sheet.getByRole("button", { name: "Add stock" }).click()
+    const stockDialog = page.getByRole("dialog", { name: "Add stock" })
+    const stockSearch = stockDialog.getByRole("searchbox", {
+      name: "Search stock catalog",
+    })
+    await expect(stockSearch).toBeVisible()
+    const stockSelect = stockDialog.getByRole("combobox", {
+      name: "Catalog item",
+    })
+    await expect(stockSelect).toBeVisible()
+
+    // Filter the catalog to our unique item, then keyboard-open the combobox
+    // popup (focus + Enter) exactly as the old smoke asserted - the filtered
+    // list now contains only our item under its "Items" group label.
+    await stockSearch.fill(itemName)
+    await stockSelect.focus()
+    await page.keyboard.press("Enter")
+    const selectPopup = page.locator('[data-slot="select-content"]')
+    await expect(selectPopup).toBeVisible()
+    await expect(selectPopup).toHaveClass(
+      /max-h-\[min\(18rem,var\(--available-height\)\)\]/
+    )
+    await expect(selectPopup).toHaveClass(/overflow-y-auto/)
+
+    // The popup cap/scroll classes (asserted above) prove the list is capped
+    // and scrollable rather than clipped flat. The filtered popup offers our
+    // item and only our item. Give the option a generous wait: on a cold
+    // `next dev --webpack` compile the items catalog route may need to compile
+    // before the option can exist, exactly as waitForCatalogOption does.
+    await expect(
+      selectPopup.getByRole("option", { name: itemName })
+    ).toBeVisible({ timeout: 45_000 })
+    await expect(
+      selectPopup.getByRole("option", { name: itemName })
+    ).toHaveCount(1)
+
+    // Keyboard-select the matching option. Base UI's combobox supports
+    // ArrowDown to highlight an option and Enter to commit; because the search
+    // already filtered the list to the single unique item, the highlighted
+    // option is ours.
+    //
+    // Note: this Base UI build's `SelectValue` renders the selected item's raw
+    // `value` (the catalog definition id), not its label, so the trigger shows
+    // the id after a real commit - we therefore assert on the id. (This is the
+    // pure-keyboard path; a pointer-click fallback is not needed on this build.)
+    await page.keyboard.press("ArrowDown")
+    await page.keyboard.press("Enter")
+    // The trigger now displays the chosen item's value (its catalog id).
+    await expect(stockSelect).toContainText(itemDefinitionId)
+
+    // A quantity of exactly 1 and a required source note enable Save.
+    await stockDialog.getByLabel("Quantity").fill("1")
+    await stockDialog.getByLabel("Source note").fill("E2E seeded stock")
+    await stockDialog.getByRole("button", { name: "Save" }).click()
+    // The Add stock dialog closes on save.
+    await expect(stockDialog).toBeHidden()
+
+    // Close the side panel, then assert the MAIN Inventory tab now shows the
+    // owned unit. The background tab is hidden from the accessibility tree
+    // while the sheet is open, so the sheet must be closed before asserting.
+    await sheet.getByRole("button", { name: "Close" }).click()
     await expect(sheet).toBeHidden()
+
+    const ownedItems = page.getByLabel("Owned items")
+    const ownedItemRow = ownedItems.filter({ hasText: itemName })
+    await expect(ownedItemRow.getByText("Qty 1", { exact: true })).toBeVisible()
+
+    // Stock-only Use: click the owned unit's Use button.
+    await ownedItemRow.getByRole("button", { name: "Use" }).click()
+    const useDialog = page.getByRole("dialog", { name: `Use ${itemName}?` })
+    await expect(useDialog).toBeVisible()
+    await expect(
+      useDialog.getByText(
+        /This spends one .+ from stock\. It has no mechanical effect\./
+      )
+    ).toBeVisible()
+    await useDialog.getByRole("button", { name: "Confirm use" }).click()
+    await expect(useDialog).toBeHidden()
+
+    // The single unit is spent: the item no longer appears as owned stock and
+    // the items section reports no owned items.
+    await expect(ownedItems.getByText(itemName, { exact: true })).toBeHidden()
+    await expect(
+      ownedItems.getByText("No owned items.", { exact: true })
+    ).toBeVisible()
+
+    // The character's inventory no longer lists the item.
+    const inventoryAfterRes = await page.request.get(
+      `/api/characters/${characterId}`
+    )
+    expect(inventoryAfterRes.ok()).toBeTruthy()
+    const inventoryAfter = (await inventoryAfterRes.json()) as {
+      character: {
+        inventory: Array<{
+          definitionId: string
+          name: string
+          quantity: number
+        }>
+      }
+    }
+    expect(
+      inventoryAfter.character.inventory.some(
+        (entry) => entry.definitionId === itemDefinitionId
+      )
+    ).toBe(false)
+
+    // The stock-only use recorded an explicit `inventory_use` progression event
+    // with the automatic "Used item" note and a quantity of exactly 1.
+    const exportAfterUseRes = await page.request.get(
+      `/api/characters/${characterId}/export`
+    )
+    expect(exportAfterUseRes.ok()).toBeTruthy()
+    const exportAfterUse = (await exportAfterUseRes.json()) as {
+      events: Array<{ kind: string; payload: Record<string, unknown> }>
+    }
+    const inventoryUseEvent = exportAfterUse.events.find(
+      (event) => event.kind === "inventory_use"
+    )
+    expect(inventoryUseEvent).toBeTruthy()
+    const inventoryUsePayload = inventoryUseEvent?.payload as {
+      quantity?: number
+      sourceNote?: string
+      definition?: { name?: string; stableId?: string }
+    }
+    expect(inventoryUsePayload.quantity).toBe(1)
+    expect(inventoryUsePayload.sourceNote).toBe("Used item")
+    expect(inventoryUsePayload.definition?.name).toBe(itemName)
 
     // Equipment: the same Inventory and equipment panel opened from the
     // Equipment tab selects the Equipment subtab.
@@ -752,10 +934,16 @@ ${missingItemWarnings.join("\n")}`
     await expect(
       offerSection.getByText(skillName, { exact: true })
     ).toBeVisible()
+    // The offer can list more than one eligible option (repeated runs leave
+    // previous runs' class skills active in the catalog), so scope the option
+    // row to the one carrying the unique skill name AND a Select button, and
+    // take the innermost such row - never the containing list, which can hold
+    // multiple Select buttons and would strict-violate.
     const myOption = offerSection
       .locator("div")
       .filter({ hasText: skillName })
-      .first()
+      .filter({ has: page.getByRole("button", { name: "Select" }) })
+      .last()
     await myOption.getByRole("button", { name: "Select" }).click()
 
     // The existing Select confirm dialog appears; confirm the selection.

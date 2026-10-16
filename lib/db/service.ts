@@ -240,6 +240,33 @@ export interface SkillOfferOptionView {
   nameSnapshot: string
   /** Whether the offered option's catalog definition is currently archived. */
   archived: boolean
+  /**
+   * Live prose for the offered option, read from the CURRENT catalog definition
+   * (never the immutable `nameSnapshot`). The authored grade-specific text at the
+   * offer's snapshotted `earnedGrade` is preferred when it is nonempty; otherwise
+   * the definition's legacy `description` is used. `null` when the linked
+   * definition is missing (no catalog match) or carries no prose at all.
+   */
+  description: string | null
+  /**
+   * Rarity tier, read from the option's IMMUTABLE earned `configSnapshot` (never
+   * the live catalog config). `null` when the snapshot declares none or a
+   * non-string value.
+   */
+  rarity: string | null
+  /**
+   * Skill track type, read from the option's IMMUTABLE earned `configSnapshot`
+   * (never the live catalog config). A legacy snapshot that omits the type falls
+   * back to the offer's own track; `null` only when neither carries a recognized
+   * `"race" | "class" | "profession"` value.
+   */
+  skillType: "race" | "class" | "profession" | null
+  /**
+   * Catalog stableId of the class the option ties to, read from the option's
+   * IMMUTABLE earned `configSnapshot` (never the live catalog config). `null`
+   * when the snapshot declares none.
+   */
+  classStableId: string | null
   /** Catalog tier grade of the offered definition, when set. */
   grade?: string
   /**
@@ -1644,6 +1671,29 @@ function compareSkillOfferOptions(
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 
+/**
+ * Resolve the LIVE prose for a skill-offer option from its current catalog
+ * definition. The authored grade-specific text at the offer's snapshotted
+ * `earnedGrade` is preferred when nonempty; otherwise the definition's legacy
+ * `description` is used. `null` when the definition is missing (no catalog match)
+ * or carries no prose at all. Never the immutable `nameSnapshot`.
+ */
+function skillOptionLiveDescription(
+  definition:
+    | { description?: string | null; gradeDescriptions?: unknown }
+    | null
+    | undefined,
+  earnedGrade: string | null | undefined
+): string | null {
+  if (definition == null) return null
+  if (earnedGrade != null) {
+    const map = normalizeGradeDescriptions(definition.gradeDescriptions)
+    const authored = map[earnedGrade as Grade]
+    if (authored != null) return authored
+  }
+  return definition.description ?? null
+}
+
 /** Build the read-time skill-offer view with the current archived status of each option. */
 function skillOfferView(
   offer: CharacterWithCatalog["skillOffers"][number]
@@ -1697,16 +1747,41 @@ function skillOfferView(
     choiceGroup: offer.choiceGroup,
     generation: offer.generation,
     canceledAt: offer.canceledAt ? offer.canceledAt.toISOString() : null,
-    options: sortedOptions.map((o) => ({
-      definitionId: o.definitionId,
-      nameSnapshot: o.nameSnapshot,
-      archived: o.definition?.archived ?? false,
-      ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
-      classPriority: skillOptionClassPriority(
-        (o.configSnapshot ?? {}) as Record<string, unknown>,
-        classSnapshot
-      ),
-    })),
+    options: sortedOptions.map((o) => {
+      const cs = (o.configSnapshot ?? {}) as Record<string, unknown>
+      const rawRarity = cs.rarity
+      const rarity =
+        typeof rawRarity === "string" && rawRarity.length > 0 ? rawRarity : null
+      const rawTrack = cs.track
+      let skillType: "race" | "class" | "profession" | null = null
+      if (
+        rawTrack === "race" ||
+        rawTrack === "class" ||
+        rawTrack === "profession"
+      ) {
+        skillType = rawTrack
+      } else if (
+        offer.track === "race" ||
+        offer.track === "class" ||
+        offer.track === "profession"
+      ) {
+        skillType = offer.track as "race" | "class" | "profession"
+      }
+      return {
+        definitionId: o.definitionId,
+        nameSnapshot: o.nameSnapshot,
+        archived: o.definition?.archived ?? false,
+        description: skillOptionLiveDescription(
+          o.definition,
+          offer.earnedGrade
+        ),
+        rarity,
+        skillType,
+        classStableId: skillClassStableIdOf(cs),
+        ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
+        classPriority: skillOptionClassPriority(cs, classSnapshot),
+      }
+    }),
     selectedDefinitionId: offer.selectedDefinitionId,
     earnedGrade: offer.earnedGrade,
     trackDefinitionStableId: offer.trackDefinitionStableId,
@@ -5946,30 +6021,40 @@ export async function getCharacterInventory(
 }
 
 /**
- * Add or remove owned inventory quantity for a character.
+ * Add or remove owned inventory quantity for a character, or spend exactly one
+ * owned unit of an `items` definition.
  *
  * This is the user's manual bookkeeping path for acquisition (no acquisition
  * economy is invented here): the client states how many units were obtained or
  * spent and a mandatory source note, and the service records the prior/new
  * quantity in the `inventory_adjust` journal along with a definition snapshot and
- * the acting user id.
+ * the acting user id. `use` is a distinct stock-only action that spends exactly
+ * one owned unit of a catalog `items` definition and applies no mechanical
+ * effect; it records an explicit `inventory_use` progression event with the
+ * automatic note "Used item" and no source note.
  *
  * - Only `equipment` / `items` definitions may be inventoried. Adding
- *   requires an ACTIVE (unarchived) definition; removing is permitted for
+ *   requires an ACTIVE (unarchived) definition; removing/using is permitted for
  *   archived definitions (owned stock may be spent even when new stock cannot be
  *   acquired).
- * - `quantity` is bounded 1..999999. A remove down to zero deletes the row (an
- *   absent row means zero stock); a remove beyond owned stock is rejected. A new
- *   distinct definition can be added only while the character owns fewer than
- *   MAX_IMPORT_INVENTORY distinct definitions (the trusted-backup roundtrip cap);
- *   exceeding it is a 409.
+ * - `add` / `remove` accept `quantity` bounded 1..999999; `use` requires
+ *   `quantity === 1`. A remove/use down to zero deletes the row (an absent row
+ *   means zero stock); a remove beyond owned stock and a use with zero owned
+ *   stock are rejected. A new distinct definition can be added only while the
+ *   character owns fewer than MAX_IMPORT_INVENTORY distinct definitions (the
+ *   trusted-backup roundtrip cap); exceeding it is a 409.
+ * - `use` is only legal for an `items` definition - an equipment definition
+ *   cannot be used (400). It never changes live state or status (no stat/current-
+ *   resource effect, no recipe), so only the inventory quantity and the journal
+ *   change.
  * - Ownership invariant: a removal that would take an equipped item's stock to
  *   zero is rejected with a 409 `inventory_equipped` (no auto-unequip). This
  *   applies to any EQUIPMENT association for the definition (legacyUnowned true
  *   or false, and including archived linked definitions) that currently owns
  *   stock; a grandfathered link already at zero stock has no inventory row to
  *   remove, so it never hits this branch and stays equipped. A removal that
- *   leaves at least one unit is always allowed.
+ *   leaves at least one unit is always allowed. Use never triggers this guard
+ *   (it only applies to items, which are never equipment-linked).
  * - The write runs under SERIALIZABLE isolation, CASes the character version, and
  *   maps a P2034 (cannot-serialize concurrent write) to a 409. A stale version
  *   409s and rolls back the inventory change and the journal.
@@ -5977,11 +6062,11 @@ export async function getCharacterInventory(
 export async function adjustCharacterInventory(
   id: string,
   body: {
-    operation: "add" | "remove"
+    operation: "add" | "remove" | "use"
     definitionId: string
     quantity: number
     version: number
-    sourceNote: string
+    sourceNote?: string
   },
   user: SessionUser
 ): Promise<{
@@ -6019,6 +6104,23 @@ export async function adjustCharacterInventory(
             "Catalog entry is archived and cannot be added to inventory"
           )
         }
+        // `use` is a stock-only action for catalog `items` only. An equipment
+        // definition cannot be used (400). Archived `items` are permitted - owned
+        // stock may still be spent - so no archived guard applies here, unlike
+        // `add`. The quantity is enforced to be exactly 1 by the schema and again
+        // here for direct service callers.
+        if (body.operation === "use" && definition.kind !== "items") {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind for a use (expected "items")`
+          )
+        }
+        if (body.operation === "use" && body.quantity !== 1) {
+          throw badRequest(
+            "validation",
+            `A use spends exactly one unit (got quantity ${body.quantity})`
+          )
+        }
 
         const existing = await tx.characterInventoryItem.findUnique({
           where: {
@@ -6038,6 +6140,17 @@ export async function adjustCharacterInventory(
               `Inventory of "${definition.name}" would exceed the 999999 cap`
             )
           }
+        } else if (body.operation === "use") {
+          // A use spends exactly one owned unit. Zero/insufficient stock is
+          // rejected BEFORE the CAS version is bumped and BEFORE any event is
+          // written, so a failed use never advances the version.
+          if (prior < 1) {
+            throw badRequest(
+              "inventory_insufficient",
+              `You own no "${definition.name}" to use`
+            )
+          }
+          next = prior - 1
         } else {
           if (prior < body.quantity) {
             throw badRequest(
@@ -6112,31 +6225,53 @@ export async function adjustCharacterInventory(
           )
         }
 
-        await tx.progressionEvent.create({
-          data: {
-            characterId: id,
-            kind: "inventory_adjust",
-            payload: {
-              operation: body.operation,
-              definitionId: definition.id,
-              definition: {
-                id: definition.id,
-                name: definition.name,
-                kind: definition.kind,
-                stableId: definition.stableId,
-                grade: definition.grade,
-
-                archived: definition.archived,
-              },
-              quantity: body.quantity,
-              priorQuantity: prior,
-              newQuantity: next,
-              sourceNote: body.sourceNote,
-              actorId: user.id,
-              at: new Date().toISOString(),
-            } as Prisma.InputJsonValue,
-          },
-        })
+        const definitionSnapshot = {
+          id: definition.id,
+          name: definition.name,
+          kind: definition.kind,
+          stableId: definition.stableId,
+          grade: definition.grade,
+          archived: definition.archived,
+        }
+        if (body.operation === "use") {
+          await tx.progressionEvent.create({
+            data: {
+              characterId: id,
+              kind: "inventory_use",
+              payload: {
+                operation: "use",
+                definitionId: definition.id,
+                definition: definitionSnapshot,
+                // A use always spends exactly one unit; the client-supplied
+                // sourceNote is ignored in favor of the automatic note.
+                quantity: 1,
+                priorQuantity: prior,
+                newQuantity: next,
+                sourceNote: "Used item",
+                actorId: user.id,
+                usedAt: new Date().toISOString(),
+              } as Prisma.InputJsonValue,
+            },
+          })
+        } else {
+          await tx.progressionEvent.create({
+            data: {
+              characterId: id,
+              kind: "inventory_adjust",
+              payload: {
+                operation: body.operation,
+                definitionId: definition.id,
+                definition: definitionSnapshot,
+                quantity: body.quantity,
+                priorQuantity: prior,
+                newQuantity: next,
+                sourceNote: body.sourceNote,
+                actorId: user.id,
+                at: new Date().toISOString(),
+              } as Prisma.InputJsonValue,
+            },
+          })
+        }
 
         const updated = (await tx.character.findUnique({
           where: { id },

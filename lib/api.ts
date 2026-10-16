@@ -476,6 +476,33 @@ export interface SkillOfferOptionView {
   nameSnapshot: string
   /** Whether the offered option's catalog definition is currently archived. */
   archived: boolean
+  /**
+   * Live prose for the offered option, read from the CURRENT catalog definition
+   * (never the immutable `nameSnapshot`). The authored grade-specific text at the
+   * offer's snapshotted `earnedGrade` is preferred when it is nonempty; otherwise
+   * the definition's legacy `description` is used. `null` when the linked
+   * definition is missing (no catalog match) or carries no prose at all.
+   */
+  description: string | null
+  /**
+   * Rarity tier, read from the option's IMMUTABLE earned `configSnapshot` (never
+   * the live catalog config). `null` when the snapshot declares none or a
+   * non-string value.
+   */
+  rarity: string | null
+  /**
+   * Skill track type, read from the option's IMMUTABLE earned `configSnapshot`
+   * (never the live catalog config). A legacy snapshot that omits the type falls
+   * back to the offer's own track; `null` only when neither carries a recognized
+   * `"race" | "class" | "profession"` value.
+   */
+  skillType: "race" | "class" | "profession" | null
+  /**
+   * Catalog stableId of the class the option ties to, read from the option's
+   * IMMUTABLE earned `configSnapshot` (never the live catalog config). `null`
+   * when the snapshot declares none.
+   */
+  classStableId: string | null
   /** Catalog tier grade of the offered definition, when set. */
   grade?: string
   /**
@@ -568,16 +595,20 @@ export interface CharacterInventoryResponse {
 }
 
 /**
- * Manual inventory bookkeeping. `quantity` is bounded 1..999999 (the same bound
- * the migration CHECK enforces); `sourceNote` is mandatory and at most 500 chars,
- * recorded into the `inventory_adjust` journal. Acquisition is manual here.
+ * Manual inventory bookkeeping plus a distinct stock-only `use` action for owned
+ * Items. For `add` / `remove`, `quantity` is bounded 1..999999 (the same bound
+ * the migration CHECK enforces) and `sourceNote` is mandatory and at most 500
+ * chars, recorded into the `inventory_adjust` journal. Acquisition is manual
+ * here. For `use`, `quantity` must be exactly 1 and `sourceNote` is optional and
+ * ignored (the service journals the automatic note "Used item"); a use applies no
+ * mechanical effect and records an `inventory_use` progression event.
  */
 export interface InventoryAdjustRequest {
-  operation: "add" | "remove"
+  operation: "add" | "remove" | "use"
   definitionId: string
   quantity: number
   version: number
-  sourceNote: string
+  sourceNote?: string
 }
 
 /** POST /api/characters/[id]/inventory - refreshed detail plus inventory/version. */
