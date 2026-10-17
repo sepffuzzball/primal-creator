@@ -1213,6 +1213,87 @@ describe("structured catalog editors", () => {
     expect(body.config.grantedSkillStableIds).toEqual(["skill-two"])
   })
 
+  it("picks title skills, filters choices, drops stale refs before save and keeps ranked config", async () => {
+    const title = {
+      ...item,
+      kind: "titles",
+      id: "title-1",
+      name: "Ranked",
+      config: {
+        grantedSkillStableIds: ["stale-skill"],
+        improvement: { seriesId: "legend", rank: 2, minRaceGrade: "F" },
+        upgradeGroup: "legend",
+        note: "keep",
+      },
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/titles") return { items: [title] }
+      if (url === "/api/catalog/skills")
+        return {
+          items: [
+            {
+              ...item,
+              kind: "skills",
+              stableId: "skill-one",
+              name: "Blade",
+              archived: false,
+            },
+            {
+              ...item,
+              kind: "skills",
+              stableId: "skill-two",
+              name: "Ward",
+              archived: false,
+            },
+          ],
+        }
+      if (init?.method === "PATCH") return { item: title }
+      throw new Error(`unexpected url ${url}`)
+    })
+    render(<CatalogManager kind="titles" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Expand series legend"))
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit Ranked"))
+    await flush()
+    expect(screen.getByText("stale-skill")).toBeTruthy()
+    expect(screen.getByText("Unavailable (archived or missing)")).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Filter skills by name or ID"), {
+      target: { value: "ward" },
+    })
+    const picker = screen.getByLabelText(
+      "Title skill to grant"
+    ) as HTMLSelectElement
+    expect([...picker.options].map((option) => option.textContent)).toContain(
+      "Ward"
+    )
+    expect(
+      [...picker.options].map((option) => option.textContent)
+    ).not.toContain("Blade")
+    fireEvent.change(picker, { target: { value: "skill-two" } })
+    expect(screen.getByText("Ward")).toBeTruthy()
+    // The persisted config still references a now-archived/missing skill, so it
+    // is retained in the editor for the user to see, but a config-changing save
+    // that keeps that stale reference would be rejected server-side. Drop it
+    // before saving so the payload carries only valid references.
+    fireEvent.click(screen.getByRole("button", { name: "Remove stale-skill" }))
+    expect(screen.queryByText("stale-skill")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    const config = JSON.parse((call?.[1] as RequestInit).body as string).config
+    expect(config.grantedSkillStableIds).toEqual(["skill-two"])
+    expect(config).toMatchObject({
+      improvement: title.config.improvement,
+      upgradeGroup: "legend",
+      note: "keep",
+    })
+  })
+
   it("creates a class track row with all fixed stats and preserves explicit zero", async () => {
     const mock = useCreateMock("classes")
     render(<CatalogManager kind="classes" />)

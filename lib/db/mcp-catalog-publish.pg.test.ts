@@ -243,6 +243,48 @@ describe.skipIf(!gate.run)("mcp managed catalog publish (real PG)", () => {
     expect(equip).not.toBeNull()
   })
 
+  it("orders a title after a same-batch new skill it grants and applies atomically", async () => {
+    const titleStable = stable("t-title")
+    const skillStable = stable("t-skill")
+    const entries = managedEntries([
+      {
+        kind: "titles",
+        stableId: titleStable,
+        name: `Title ${titleStable}`,
+        config: { grantedSkillStableIds: [skillStable] },
+      },
+      {
+        kind: "skills",
+        stableId: skillStable,
+        name: `Skill ${skillStable}`,
+        config: {
+          track: "race",
+          rarity: "Common",
+          effects: [{ phase: "flat", amount: { strength: 5 } }],
+        },
+      },
+    ])
+    const preview = await previewManagedCatalog(entries)
+    expect(preview.changes).toHaveLength(2)
+    expect(preview.changes.every((c) => c.status === "create")).toBe(true)
+
+    const applied = await applyManagedCatalog(entries, preview.previewTicket)
+    for (const change of applied.changes) createdIds.push(change.after.id)
+
+    const skill = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "skills", stableId: skillStable } },
+    })
+    const title = await prisma.catalogDefinition.findUnique({
+      where: { kind_stableId: { kind: "titles", stableId: titleStable } },
+    })
+    expect(skill).not.toBeNull()
+    expect(title).not.toBeNull()
+    expect(skill?.archived).toBe(false)
+    expect(title?.config).toMatchObject({
+      grantedSkillStableIds: [skillStable],
+    })
+  })
+
   it("rejects an archived existing key with 409", async () => {
     const s = stable("archived")
     await seedGod(s, true)

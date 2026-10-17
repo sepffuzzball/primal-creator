@@ -953,6 +953,35 @@ function assertBulkEquipmentSkillRefs(
 }
 
 /**
+ * Verify that every title entry's granted-skill reference
+ * (`grantedSkillStableIds`) resolves to a skill that will exist unarchived after
+ * the upload: either an existing unarchived skill row, or a skill created by this
+ * same upload (import always creates rows with `archived: false`). A dangling or
+ * archived skill would render the granted passive permanently inert, so it is
+ * rejected up front before any write. No-op when the entry is not a title or
+ * grants no skill. An empty list (a narrative-only title) is valid.
+ */
+function assertBulkTitleSkillRefs(
+  entries: readonly BulkCatalogEntry[],
+  unarchivedSkillStableIds: ReadonlySet<string>
+): void {
+  for (const entry of entries) {
+    if (entry.kind !== "titles") continue
+    const granted = entry.config.grantedSkillStableIds
+    if (!Array.isArray(granted) || granted.length === 0) continue
+    for (const stableId of granted) {
+      if (typeof stableId !== "string" || stableId.length === 0) continue
+      if (!unarchivedSkillStableIds.has(stableId)) {
+        throw badRequest(
+          "invalid_config",
+          `Bulk row ${entry.row}: title entry grants skill "${stableId}" which is neither an unarchived catalog skill nor a skill created by this upload`
+        )
+      }
+    }
+  }
+}
+
+/**
  * Verify that every race/class/profession entry's grade-granted skill reference
  * (`gradeGrantedSkillStableIds`) resolves to a skill that will exist unarchived
  * after the upload: either an existing unarchived skill row, or a skill created by
@@ -1080,6 +1109,7 @@ export async function previewBulkImport(
   }
   assertBulkEquipmentGodRefs(newEntries, unarchivedGods)
   assertBulkEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
+  assertBulkTitleSkillRefs(newEntries, unarchivedSkillStableIds)
   assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
   assertBulkSkillClassRefs(newEntries, availableClassStableIds)
 
@@ -1191,6 +1221,7 @@ export async function applyBulkImport(
         }
         assertBulkEquipmentGodRefs(newEntries, unarchivedGods)
         assertBulkEquipmentSkillRefs(newEntries, unarchivedSkillStableIds)
+        assertBulkTitleSkillRefs(newEntries, unarchivedSkillStableIds)
         assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
         assertBulkSkillClassRefs(newEntries, availableClassStableIds)
 

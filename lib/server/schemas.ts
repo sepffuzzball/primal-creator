@@ -1430,20 +1430,45 @@ export const titleConfigSchema = z
     percentBasisPoints: nonnegativePartialVectorSchema.optional(),
     upgradeGroup: z.string().optional(),
     improvement: titleImprovementSchema.optional(),
+    // Optional title-granted passive skills. Each entry is the catalog `stableId`
+    // of a `skills` definition whose current `config.effects` are synthesized live
+    // while the character carries the unarchived TITLE link (`[]` is allowed: a
+    // title grants no passive). Every id must be nonempty and internally unique;
+    // the service layer resolves each id to an unarchived skill on a new /
+    // config-changing write and rejects a missing or archived reference.
+    grantedSkillStableIds: z.array(z.string().min(1)).optional(),
   })
   .passthrough()
   .superRefine((config, ctx) => {
-    if (config.improvement == null) return
     // A ranked title is progressed through its upgrade group; the group MUST be
     // the series id so the same-group removal path can atomically displace the
     // prior ranked link. A config that declares an improvement but not the
     // matching group cannot be progressed and is rejected on authoring.
-    if (config.upgradeGroup !== config.improvement.seriesId) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `ranked title improvement requires upgradeGroup to equal seriesId ("${config.improvement.seriesId}")`,
-        path: ["improvement"],
-      })
+    if (config.improvement != null) {
+      if (config.upgradeGroup !== config.improvement.seriesId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `ranked title improvement requires upgradeGroup to equal seriesId ("${config.improvement.seriesId}")`,
+          path: ["improvement"],
+        })
+      }
+    }
+    // Each granted skill stableId must be internally unique (mirroring the
+    // equipment `grantedSkillStableIds` refinement). A repeated id is rejected
+    // rather than silently double-granted.
+    if (config.grantedSkillStableIds != null) {
+      const seen = new Set<string>()
+      for (const id of config.grantedSkillStableIds) {
+        if (seen.has(id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `"${id}" is granted more than once in "grantedSkillStableIds"`,
+            path: ["grantedSkillStableIds"],
+          })
+          break
+        }
+        seen.add(id)
+      }
     }
   })
 

@@ -869,6 +869,45 @@ function appendDeclarativeEffects(
 }
 
 /**
+ * Synthesize the live `activeEffects` for every skill a catalog config grants via
+ * `grantedSkillStableIds`, using the shared unarchived-skill map (loading it on
+ * demand through `db` when first needed) and the shared dedup sets. A skill
+ * already linked as a SKILL association wins (skip); otherwise the first eligible,
+ * unarchived grant encountered across equipment AND title associations applies
+ * once and is never double counted. Returns the (possibly newly loaded) skill map
+ * so the caller keeps the in-request `sharedSkillMap` optimization.
+ */
+async function appendGrantedSkillEffects(
+  activeEffects: CharacterState["activeEffects"],
+  def: { id: string; name: string },
+  granted: string[] | undefined,
+  linkedSkillStableIds: Set<string>,
+  appliedSkillStableIds: Set<string>,
+  skillMap: Map<string, UnarchivedSkillDef> | null,
+  db: DbClient
+): Promise<Map<string, UnarchivedSkillDef> | null> {
+  if (!granted || granted.length === 0) return skillMap
+  for (const stableId of granted) {
+    if (linkedSkillStableIds.has(stableId)) continue
+    if (appliedSkillStableIds.has(stableId)) continue
+    if (skillMap == null) skillMap = await loadUnarchivedSkillMap(db)
+    const skillDef = skillMap.get(stableId)
+    if (!skillDef) continue
+    appliedSkillStableIds.add(stableId)
+    appendDeclarativeEffects(
+      activeEffects,
+      {
+        id: `${def.id}:granted:${stableId}`,
+        name: `${def.name} (${skillDef.name})`,
+      },
+      (skillDef.config.effects ?? []) as DeclarativeEffect[],
+      `${def.id}:granted:${stableId}`
+    )
+  }
+  return skillMap
+}
+
+/**
  * The character's authoritative race type for equipment ELIGIBILITY ONLY. An
  * explicit catalog `raceType` is always authoritative. For a LEGACY race config
  * with no `raceType`, resolve from the character's race mode instead:
@@ -1213,26 +1252,15 @@ async function liveState(
       // otherwise the first equipped grant applies. Archived skills never load and
       // are inert, and a resolvable-but-archived-after-equip skill is likewise inert.
       if (eligible) {
-        const granted = config.grantedSkillStableIds as string[] | undefined
-        if (granted && granted.length > 0) {
-          for (const stableId of granted) {
-            if (linkedSkillStableIds.has(stableId)) continue
-            if (appliedSkillStableIds.has(stableId)) continue
-            if (skillMap == null) skillMap = await loadUnarchivedSkillMap(db)
-            const skillDef = skillMap.get(stableId)
-            if (!skillDef) continue
-            appliedSkillStableIds.add(stableId)
-            appendDeclarativeEffects(
-              activeEffects,
-              {
-                id: `${def.id}:granted:${stableId}`,
-                name: `${def.name} (${skillDef.name})`,
-              },
-              (skillDef.config.effects ?? []) as DeclarativeEffect[],
-              `${def.id}:granted:${stableId}`
-            )
-          }
-        }
+        skillMap = await appendGrantedSkillEffects(
+          activeEffects,
+          def,
+          config.grantedSkillStableIds as string[] | undefined,
+          linkedSkillStableIds,
+          appliedSkillStableIds,
+          skillMap,
+          db
+        )
       }
     } else if (def.kind === "titles") {
       const flat = config.flat as PartialVector | undefined
@@ -1257,6 +1285,26 @@ async function liveState(
           stacking: "stack",
         })
       }
+      // Title-granted passive skills. While the unarchived TITLE association
+      // survives, each `grantedSkillStableIds` entry resolves to a `skills` catalog
+      // definition whose CURRENT `config.effects` are synthesized live - sourced to
+      // this title + skill, never persisted as a CharacterAssociation SKILL link and
+      // never offered as a milestone. A skill also linked as a SKILL association
+      // wins (skip the title grant, the linked association already applied it);
+      // otherwise the first surviving grant across titles AND equipment applies.
+      // Archived skills never load and are inert, and an archived title is skipped
+      // earlier. Ranked replacement uses only the current linked rank: the
+      // same-series displacement at link time deletes the superseded rank, so no
+      // earlier-ranked title's grants accumulate (surviving TITLE links only).
+      skillMap = await appendGrantedSkillEffects(
+        activeEffects,
+        def,
+        config.grantedSkillStableIds as string[] | undefined,
+        linkedSkillStableIds,
+        appliedSkillStableIds,
+        skillMap,
+        db
+      )
     } else if (def.kind === "skills") {
       // Synthesize each declarative passive effect from the current catalog
       // config. History stays immutable; editing a skill's effects recalculates
@@ -9046,6 +9094,8 @@ export async function createCatalogItemInTransaction(
   if (kind === "equipment") await assertEquipmentGodRef(tx, config)
   // A NEW equipment write must not grant a missing/archived passive skill.
   if (kind === "equipment") await assertEquipmentGrantedSkillsRefs(tx, config)
+  // A NEW title write must not grant a missing/archived passive skill.
+  if (kind === "titles") await assertTitleGrantedSkillsRefs(tx, config)
   // A NEW race/class/profession write must not reference a missing/archived
   // grade-granted skill.
   if (kind === "races" || kind === "classes" || kind === "professions") {
@@ -9340,6 +9390,44 @@ async function assertEquipmentGrantedSkillsRefs(
 }
 
 /**
+ * Verify that a title config's title-granted passive-skill references
+ * (`grantedSkillStableIds`) all resolve to an existing, unarchived `skills`
+ * catalog definition. Used on a NEW / config-changing title write so a config
+ * never references a skill that does not exist (or is archived, which would render
+ * the title's granted passives permanently inert). No-op when the config grants no
+ * skill. A skill created by the same write is not considered here (import paths
+ * build their own allow-set); this helper only checks the live catalog.
+ */
+async function assertTitleGrantedSkillsRefs(
+  tx: DbClient,
+  config: Record<string, unknown>
+): Promise<void> {
+  const granted = config.grantedSkillStableIds
+  if (!Array.isArray(granted) || granted.length === 0) return
+  const rows = await tx.catalogDefinition.findMany({
+    where: { kind: "skills" },
+  })
+  const unarchivedStableIds = new Set(
+    rows.filter((r) => !r.archived).map((r) => r.stableId)
+  )
+  const allStableIds = new Set(rows.map((r) => r.stableId))
+  for (const stableId of granted) {
+    if (typeof stableId !== "string" || stableId.length === 0) continue
+    if (unarchivedStableIds.has(stableId)) continue
+    if (allStableIds.has(stableId)) {
+      throw badRequest(
+        "invalid_config",
+        `Title config grants skill "${stableId}" which is archived`
+      )
+    }
+    throw badRequest(
+      "invalid_config",
+      `Title config grants skill "${stableId}" which does not exist in the catalog`
+    )
+  }
+}
+
+/**
  * Verify that a race/class/profession config's grade-granted skill references
  * (`gradeGrantedSkillStableIds`) all resolve to an existing, unarchived `skills`
  * catalog definition. Used on a NEW / config-changing race/class/profession write
@@ -9468,6 +9556,28 @@ async function assertSkillStableIdRename(
     throw conflict(
       "skill_stable_id_in_use",
       `Skill "${existingStableId}" is granted by ${gradeRefs.length} race/class/profession grade entr${gradeRefs.length === 1 ? "y" : "ies"} (${labels}); renaming it would leave those grants dangling`
+    )
+  }
+  // A skill rename must ALSO be blocked while any TITLE config's
+  // `grantedSkillStableIds` (for ANY entry, including archived title rows) names
+  // the old id - otherwise the title-granted passive silently dangles and is
+  // skipped at read. Read every row (including archived) so a config that still
+  // references an archived definition is protected.
+  const titleRows = await tx.catalogDefinition.findMany({
+    where: { kind: "titles" },
+  })
+  const titleRefs: string[] = []
+  for (const row of titleRows) {
+    const cfg = parseCatalogConfig("titles", row.config ?? {})
+    const granted = cfg.grantedSkillStableIds
+    if (Array.isArray(granted) && granted.includes(existingStableId)) {
+      titleRefs.push(row.stableId)
+    }
+  }
+  if (titleRefs.length > 0) {
+    throw conflict(
+      "skill_stable_id_in_use",
+      `Skill "${existingStableId}" is granted by ${titleRefs.length} title entr${titleRefs.length === 1 ? "y" : "ies"} (${titleRefs.join(", ")}); renaming it would leave those grants dangling`
     )
   }
 }
@@ -9799,6 +9909,9 @@ export async function updateCatalogItemInTransaction(
     // A config-changing equipment write must not grant a missing/archived
     // passive skill.
     if (kind === "equipment") await assertEquipmentGrantedSkillsRefs(tx, config)
+    // A config-changing title write must not grant a missing/archived passive
+    // skill.
+    if (kind === "titles") await assertTitleGrantedSkillsRefs(tx, config)
     // A config-changing race/class/profession write must not reference a
     // missing/archived grade-granted skill.
     if (kind === "races" || kind === "classes" || kind === "professions") {

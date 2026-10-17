@@ -36,7 +36,8 @@
  * target. The reference set is exactly the in-batch identity edges the
  * transactional helpers validate (equipment `requiredGodStableId` /
  * `grantedSkillStableIds`; race/class/profession `gradeGrantedSkillStableIds`;
- * skill `classStableId`). A reference to an existing (or archived) row outside
+ * title `grantedSkillStableIds`; skill `classStableId`). A reference to an
+ * existing (or archived) row outside
  * the batch is validated by the helper itself, which already rejects a missing or
  * archived target. A cycle is impossible to satisfy and is rejected with a 400
  * `catalog_dependency_cycle` BEFORE any write; a valid forward reference is
@@ -468,6 +469,16 @@ function refsOf(entry: ManagedCatalogEntry): Array<[string, string]> {
     for (const stableId of allGradeGrantedSkillStableIds(config)) {
       if (typeof stableId === "string" && stableId.length > 0) {
         out.push(["skills", stableId])
+      }
+    }
+  }
+  if (entry.kind === "titles") {
+    const granted = config.grantedSkillStableIds
+    if (Array.isArray(granted)) {
+      for (const stableId of granted) {
+        if (typeof stableId === "string" && stableId.length > 0) {
+          out.push(["skills", stableId])
+        }
       }
     }
   }

@@ -16474,6 +16474,713 @@ describe("listCharacters shares the unarchived-skill map across items", () => {
   })
 })
 
+describe("title-granted passive skills (live synthesis, dedup, inert states)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharacter(baseStrength = 100, grade: Grade = "G"): void {
+    const state = createInitialState("integrated", null, null)
+    state.race = { ...state.race, grade }
+    state.baseAttributes = {
+      ...state.baseAttributes,
+      strength: baseStrength,
+    }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+    })
+  }
+
+  function seedSkill(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: extra.name ?? `Skill ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedTitle(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "titles",
+      stableId: id,
+      name: extra.name ?? `Title ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedRankedTitle(
+    id: string,
+    rank: number,
+    minRaceGrade: Grade,
+    grantedSkillStableIds: string[]
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "titles",
+      stableId: id,
+      name: `Pioneer ${rank}`,
+      config: {
+        upgradeGroup: "dungeon-pioneer",
+        improvement: {
+          seriesId: "dungeon-pioneer",
+          rank,
+          minRaceGrade,
+        },
+        grantedSkillStableIds,
+      },
+    })
+  }
+
+  function seedEquipment(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "equipment",
+      stableId: id,
+      name: extra.name ?? `Gear ${id}`,
+      config,
+    })
+  }
+
+  function strengthFlatDelta(status: unknown): number {
+    const traces = (
+      status as {
+        traces: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces
+    const strength = traces.find((t) => t.attribute === "strength")
+    if (!strength) return 0
+    const flat = strength.phases.find((p) => p.phase === "flat")
+    return flat?.delta ?? 0
+  }
+
+  function attributeFlatDelta(status: unknown, attribute: string): number {
+    const traces = (
+      status as {
+        traces: Array<{
+          attribute: string
+          phases: Array<{ phase: string; delta: number }>
+        }>
+      }
+    ).traces
+    const trace = traces.find((t) => t.attribute === attribute)
+    if (!trace) return 0
+    const flat = trace.phases.find((p) => p.phase === "flat")
+    return flat?.delta ?? 0
+  }
+
+  it("synthesizes the granted skill's passive stat while the title link survives", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    const res = await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    expect(strengthFlatDelta(res.character.status)).toBe(5)
+    const detail = await getCharacter("chr-1", user)
+    // It is never persisted as a SKILL association and never written into state.
+    expect(detail.associations).toHaveLength(1)
+    expect(detail.associations[0]).toMatchObject({
+      kind: "title",
+      definitionId: "title-1",
+    })
+    expect(
+      (detail.state as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+  })
+
+  it("treats an archived skill as inert even while the granting title survives", async () => {
+    seedCharacter(100)
+    seedSkill(
+      "sk-1",
+      {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+      { archived: true }
+    )
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(detail.status)).toBe(0)
+  })
+
+  it("treats an archived title as inert even while its granted skill is unarchived", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle(
+      "title-1",
+      { grantedSkillStableIds: ["sk-1"] },
+      { archived: true }
+    )
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(detail.status)).toBe(0)
+  })
+
+  it("does not double count: a linked SKILL association wins, and duplicate title/equipment grants apply once", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    // Link the same skill as a SKILL association (the linked association wins).
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-1",
+      kind: "SKILL",
+    })
+    // A title AND an equipment item both grant sk-1.
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    seedEquipment("gear-1", {
+      slot: "Head",
+      rarity: "Common",
+      grantedSkillStableIds: ["sk-1"],
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "gear-1",
+      kind: "EQUIPMENT",
+    })
+    const detail = await getCharacter("chr-1", user)
+    // Applied once (via the linked skill), never counted three times.
+    expect(strengthFlatDelta(detail.status)).toBe(5)
+  })
+
+  it("applies a duplicate title grant only once (first surviving title wins)", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    seedTitle("title-2", { grantedSkillStableIds: ["sk-1"] })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-2",
+      kind: "TITLE",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(detail.status)).toBe(5)
+  })
+
+  it("grants multiple DISTINCT skills from one title concurrently (both effects live, neither persisted)", async () => {
+    seedCharacter(100)
+    seedSkill("sk-a", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedSkill("sk-b", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { agility: 3 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-a", "sk-b"] })
+    const res = await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    // BOTH distinct granted skills contribute to the live status - this is the
+    // multi-skill grant, not duplicate suppression collapsing one into the other.
+    expect(strengthFlatDelta(res.character.status)).toBe(5)
+    expect(attributeFlatDelta(res.character.status, "agility")).toBe(3)
+
+    // Two sourced effects are synthesized (title + each skill), never collapsed,
+    // never persisted as SKILL associations and never written into stored state.
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.associations).toHaveLength(1)
+    expect(detail.associations[0]).toMatchObject({
+      kind: "title",
+      definitionId: "title-1",
+    })
+    expect(
+      (detail.state as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+    const portable = await exportCharacter("chr-1", user)
+    const active = (
+      portable.liveState as {
+        activeEffects: Array<{
+          source: string
+          provenance: string
+          id: string
+        }>
+      }
+    ).activeEffects
+    expect(active).toHaveLength(2)
+    expect(active.map((e) => e.source).sort()).toEqual([
+      "Title title-1 (Skill sk-a)",
+      "Title title-1 (Skill sk-b)",
+    ])
+    expect(active.every((e) => e.provenance === "catalog")).toBe(true)
+    expect(new Set(active.map((e) => e.id)).size).toBe(2)
+
+    // Only the TITLE link exists in the store; no SKILL link was created.
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.associations[0]).toMatchObject({
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+
+    // Removing the title drops BOTH granted passives and every synthesized effect.
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "title-1",
+        operation: "remove",
+        version: 1,
+      },
+      user
+    )
+    const after = await getCharacter("chr-1", user)
+    expect(strengthFlatDelta(after.status)).toBe(0)
+    expect(attributeFlatDelta(after.status, "agility")).toBe(0)
+    expect(after.associations).toHaveLength(0)
+    const portableAfter = await exportCharacter("chr-1", user)
+    expect(
+      (portableAfter.liveState as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+    // The title link was removed; no SKILL orphan was left behind.
+    expect(dbMock.store.associations).toHaveLength(0)
+
+    // Exactly two associate events (add + remove); no acquisition/history event.
+    expect(dbMock.store.events).toHaveLength(2)
+    expect(dbMock.store.events.map((e) => e.kind)).toEqual([
+      "associate",
+      "associate",
+    ])
+    expect(dbMock.store.events[0].payload).toMatchObject({
+      operation: "add",
+      kind: "title",
+      definitionId: "title-1",
+    })
+    expect(dbMock.store.events[1].payload).toMatchObject({
+      operation: "remove",
+      kind: "title",
+      definitionId: "title-1",
+    })
+  })
+
+  it("removing the title drops the granted passive", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    expect(strengthFlatDelta((await getCharacter("chr-1", user)).status)).toBe(
+      5
+    )
+    await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "title-1",
+        operation: "remove",
+        version: 1,
+      },
+      user
+    )
+    expect(strengthFlatDelta((await getCharacter("chr-1", user)).status)).toBe(
+      0
+    )
+  })
+
+  it("ranked replacement uses only the current linked rank (no earlier-ranked accumulation)", async () => {
+    seedCharacter(100, "D")
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedSkill("sk-2", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedRankedTitle("dp-1", 1, "E", ["sk-1"])
+    seedRankedTitle("dp-2", 2, "E", ["sk-2"])
+    const first = await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-1",
+        operation: "add",
+        version: 0,
+        reason: "cleared rank 1",
+      },
+      user
+    )
+    expect(strengthFlatDelta(first.character.status)).toBe(5)
+    const second = await associateCharacter(
+      "chr-1",
+      {
+        kind: "title",
+        definitionId: "dp-2",
+        operation: "add",
+        version: 1,
+        reason: "cleared rank 2",
+      },
+      user
+    )
+    // Only the current linked rank's grant applies; the superseded rank's skill
+    // never accumulates.
+    expect(strengthFlatDelta(second.character.status)).toBe(5)
+    expect(second.character.associations).toHaveLength(1)
+    expect(second.character.associations[0].definitionId).toBe("dp-2")
+  })
+
+  it("reacts to a skill catalog effects edit (synthesized from the CURRENT config)", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    expect(strengthFlatDelta((await getCharacter("chr-1", user)).status)).toBe(
+      5
+    )
+    // Editing the skill's effects recalculates the live status without rewriting
+    // the stored state or the journal.
+    await updateCatalogItem("skills", "sk-1", {
+      config: {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 10 } }],
+      },
+    })
+    expect(strengthFlatDelta((await getCharacter("chr-1", user)).status)).toBe(
+      10
+    )
+  })
+
+  it("never persists a SKILL association or a history event for a title grant", async () => {
+    seedCharacter(100)
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.associations).toHaveLength(1)
+    expect(detail.associations[0]).toMatchObject({
+      kind: "title",
+      definitionId: "title-1",
+    })
+    expect(
+      (detail.state as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+    // Only the title link exists in the store; no SKILL link was created.
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.associations[0]).toMatchObject({
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    // A single associate event; no acquisition/history event for the granted skill.
+    expect(dbMock.store.events).toHaveLength(1)
+    expect(dbMock.store.events[0].payload).toMatchObject({
+      operation: "add",
+      kind: "title",
+      definitionId: "title-1",
+    })
+  })
+
+  it("rejects a new title config that grants a missing skill", async () => {
+    await expect(
+      createCatalogItem("titles", {
+        name: "TitleMissing",
+        config: { grantedSkillStableIds: ["no-such-skill"] },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("no-such-skill"),
+    })
+  })
+
+  it("rejects a new title config that grants an archived skill", async () => {
+    seedSkill(
+      "sk-arch",
+      {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+      { archived: true }
+    )
+    await expect(
+      createCatalogItem("titles", {
+        name: "TitleArch",
+        config: { grantedSkillStableIds: ["sk-arch"] },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("sk-arch"),
+    })
+  })
+
+  it("accepts a new title config that grants an existing unarchived skill", async () => {
+    seedSkill("sk-ok", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    const item = await createCatalogItem("titles", {
+      name: "TitleOK",
+      config: { grantedSkillStableIds: ["sk-ok"] },
+    })
+    expect(item.config).toMatchObject({ grantedSkillStableIds: ["sk-ok"] })
+  })
+
+  it("rejects a config-changing update that grants a missing / archived skill", async () => {
+    seedSkill(
+      "sk-arch",
+      {
+        track: "class",
+        milestone: 4,
+        rarity: "Common",
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+      { archived: true }
+    )
+    seedTitle("title-1", { grantedSkillStableIds: [] })
+    await expect(
+      updateCatalogItem("titles", "title-1", {
+        config: { grantedSkillStableIds: ["missing-skill"] },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("missing-skill"),
+    })
+    await expect(
+      updateCatalogItem("titles", "title-1", {
+        config: { grantedSkillStableIds: ["sk-arch"] },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+      message: expect.stringContaining("sk-arch"),
+    })
+    // The rejected update never applied; the row keeps its original config.
+    expect(
+      (dbMock.store.catalog.get("title-1")!.config as Record<string, unknown>)
+        .grantedSkillStableIds
+    ).toEqual([])
+  })
+
+  it("still allows metadata-only edits and archival when a referenced skill is later archived", async () => {
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    // Archive the referenced skill.
+    await updateCatalogItem("skills", "sk-1", { archived: true })
+    // Metadata-only title PATCH (no config) is allowed despite the archived skill.
+    const renamed = await updateCatalogItem("titles", "title-1", {
+      name: "Renamed Title",
+    })
+    expect(renamed.name).toBe("Renamed Title")
+    // Archiving the title is also allowed.
+    const archived = await updateCatalogItem("titles", "title-1", {
+      archived: true,
+    })
+    expect(archived.archived).toBe(true)
+  })
+
+  it("blocks a skill stableId rename while any title grants the old id (including archived titles)", async () => {
+    seedSkill("sk-r", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-ref", { grantedSkillStableIds: ["sk-r"] })
+    // An archived title that still references the old id also blocks the rename.
+    dbMock.store.addCatalog({
+      id: "title-arch",
+      kind: "titles",
+      stableId: "title-arch",
+      name: "Title Arch",
+      config: { grantedSkillStableIds: ["sk-r"] },
+      archived: true,
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-r", { stableId: "sk-r2" })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "skill_stable_id_in_use",
+      message: expect.stringContaining("sk-r"),
+    })
+  })
+
+  it("allows a skill stableId rename when no title grants the old id", async () => {
+    seedSkill("sk-free", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    const item = await updateCatalogItem("skills", "sk-free", {
+      stableId: "sk-free-2",
+    })
+    expect(item.stableId).toBe("sk-free-2")
+  })
+
+  it("survives an export/import round-trip (resolves the race so the import accepts it)", async () => {
+    // Seed the race + class an import needs to resolve (a character without a
+    // race cannot be imported).
+    dbMock.store.addCatalog({
+      id: "human",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: allEqual(1), freePerLevel: 5 },
+        },
+      },
+    })
+    dbMock.store.addCatalog({
+      id: "archer",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: { grades: { G: { fixed: {}, free: 0 } } },
+    })
+    const state = createInitialState("integrated", null, null)
+    state.baseAttributes = { ...state.baseAttributes, strength: 100 }
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+      raceId: "human",
+      classId: "archer",
+    })
+    seedSkill("sk-1", {
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedTitle("title-1", { grantedSkillStableIds: ["sk-1"] })
+    await associateCharacter(
+      "chr-1",
+      { kind: "title", definitionId: "title-1", operation: "add", version: 0 },
+      user
+    )
+    const portable = await exportCharacter("chr-1", user)
+    expect(portable.identity).toMatchObject({
+      race: { stableId: "human" },
+      class: { stableId: "archer" },
+    })
+    const imported = await importCharacter(
+      portable as CharacterImportDocument,
+      user
+    )
+    // The re-imported character re-synthesizes the title grant from the live
+    // catalog; the granted passive is never baked into the portable state.
+    expect(strengthFlatDelta(imported.status)).toBe(5)
+  })
+})
+
 describe("experienceCharacter (authoritative EXP percent)", () => {
   beforeEach(() => {
     dbMock.store.reset()

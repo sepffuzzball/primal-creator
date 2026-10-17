@@ -309,7 +309,11 @@ SKILL link is created, no milestone skill offer is produced, and removing the it
 - **No double counting.** A granted skill is applied once, even if it appears in
   multiple equipment items' `grantedSkillStableIds` and/or is already linked as a
   `CharacterAssociation` SKILL association: an existing linked SKILL association
-  takes priority, otherwise the first equipped item (association order) wins.
+  takes priority, otherwise the first equipped item (association order) wins. A
+  skill granted by an attached `titles` entry shares the SAME dedupe set, so a
+  skill granted by both an item and a title is still applied once (the first
+  surviving grant in association order); see `docs/rules/titles.md` for the title
+  side and its ranked replacement behavior.
 - While a NEW or config-changing write must resolve every granted id to an
   existing, unarchived skill (400 `invalid_config` otherwise), a trusted-backup
   import of an old equipped link may reference a skill that no longer exists; the

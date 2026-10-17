@@ -72,12 +72,104 @@ addition to the legacy `grade` / `grants` (which are preserved):
     ranked title must carry its `flat` bonus vector from the series catalog; the
     server does not invent one. A keepable title is created by omitting
     `improvement` (or by including only `flat` / `percentBasisPoints`).
+- `grantedSkillStableIds?: string[]` - optional list of catalog `stableId`s of
+  `skills` definitions whose **current** `config.effects` are granted as passive
+  effects **while the title is attached and unarchived** (see "Title-granted
+  passive skills" below). Each id must be nonempty and internally unique; an empty
+  `[]` is allowed (the title grants no passive). On a NEW or config-changing write
+  every id must resolve to an existing, unarchived `skills` entry; a missing or
+  archived id is rejected with a 400 (`invalid_config`).
 
 Title bonuses are **not** silently auto-granted: only titles a user explicitly
 attaches produce effects. Effects synthesized from a title carry the generic
 internal `provenance: "catalog"` value (the catalog provenance taxonomy no longer
 exists). A title with no numeric `flat` / `percentBasisPoints` contributes no
-effect (an unresolved placeholder), matching the wiki-uncertain note above.
+effect **of its own** (an unresolved placeholder), matching the wiki-uncertain
+note above - but it can still contribute an effect through `grantedSkillStableIds`,
+whose granted passives are synthesized while the title is attached (see
+"Title-granted passive skills" below).
+
+## Title-granted passive skills
+
+A `titles` catalog config may also declare `grantedSkillStableIds`: an array of
+`skills` catalog `stableId`s whose passive effects the title grants **while it is
+attached and unarchived**. This is **not** a permanent acquisition: no
+`CharacterAssociation` SKILL link is created, no milestone skill offer is produced,
+and no acquisition/history event is written. Removing the title (or losing its link
+through a ranked replacement) immediately stops the granted passives.
+
+- **Synthesis is live and current.** Each granted id resolves to a `skills`
+  catalog definition; the CURRENT `config.effects` of that skill are synthesized
+  live at read time (the same flat / percent synthesis as a linked SKILL
+  association or an equipment-granted passive), sourced to `"<title> (<skill>)"`
+  and never written into `Character.state`. Catalog skill stacking groups and
+  conditions are preserved verbatim; no stat is ever inferred from a skill's name,
+  and the skill's config name is used only when the catalog row actually exists.
+  Editing a granted skill's `effects` therefore recalculates the live status
+  without rewriting historical awards, exactly like any other catalog config.
+- **No persistence, no history.** Attaching a title that grants skills does not
+  store the skills in `Character.state` and creates no `skillOffer` and no skill
+  acquisition journal entry. A grant is a read-time computation over the current,
+  unarchived catalog config, mirroring how title/equipment effects are
+  synthesized; the attached title link is the only persisted record.
+- **Removal / ranked replacement.** Removing the title association removes its
+  grants. A ranked title replacement displaces (deletes) the superseded rank link,
+  so only the **current linked rank** survives; earlier-ranked titles' grants never
+  accumulate. See "Ranked title improvement (sequential)" below.
+- **Inert states.** An archived title is inert (it is skipped before its grants
+  are read); an archived granted skill is inert (it is not in the unarchived-skill
+  map, so it is skipped, never inferred). An unresolved grant is silently skipped
+  at read time, never invented.
+- **Linked skill priority and shared dedupe.** A skill already linked as a
+  `CharacterAssociation` SKILL association takes priority: the linked association
+  is applied, and the title grant for the same stableId is skipped. Otherwise a
+  granted skill is applied **once**, even if it appears in multiple titles'
+  `grantedSkillStableIds` and/or is granted by an equipped equipment item - the
+  first surviving grant encountered across title AND equipment associations (in
+  association order) wins, and no double stacking occurs. A granted-skill map is
+  loaded on demand (only when an eligible attached title or equipped item actually
+  grants a skill) and shared for the whole request, so a withStatus listing never
+  issues a per-character lookup.
+- **Write-time reference validation.** A NEW or config-changing title write must
+  resolve every granted id to an existing, **unarchived** `skills` entry; holding a
+  reference to a missing or archived skill is rejected with a 400
+  (`invalid_config`) before any write. The catalog editor exposes a Granted skills
+  control (listing active skills) for titles, and the same-batch reference rules
+  cover editors / bulk uploads / the MCP publisher (see below).
+- **Rename guard.** Renaming a `skills` catalog `stableId` is rejected with 409
+  `skill_stable_id_in_use` while ANY `titles` config's `grantedSkillStableIds` -
+  including an archived title row - still names the old id, otherwise the
+  title-granted passive silently dangles and is skipped at read. Archiving a skill
+  is always allowed (an archived granted skill is simply inert).
+- **Same-batch references.** The same-batch reference handling for title granted
+  skills differs by path:
+  - **Catalog editor / single-entity write**: each id is resolved against the live
+    catalog inside the write transaction; a missing or archived id is rejected with
+    a 400 `invalid_config`. There is no batch here, so a referenced skill must
+    already exist in the catalog (or be authored in the same bulk upload / MCP
+    batch, below).
+  - **MCP catalog publisher**: processes a whole batch atomically. A title that
+    references a `skills` entry authored in the same batch is satisfiable because
+    the batch is ordered by dependency topological ordering (an entry is written
+    only after any NEW batch key it references, so a `skills` entry referenced
+    by a title is written before that title), and the title's live validation
+    sees it. A reference to a missing or archived skill outside the batch is
+    rejected with a 400 `invalid_config` before any write.
+  - **Bulk catalog upload**: the allow-set is built from existing unarchived
+    `skills` rows plus any `skills` entry created by the same upload, so a title
+    may reference a skill it authors in the same batch; a reference that is neither
+    an unarchived existing skill nor a same-upload skill is rejected up front with
+    400 `invalid_config` before any write.
+  - **Trusted-backup character import path**: importing an old backup runs no
+    write-time reference validation on a title's granted-skill references. A
+    reference to a skill that no longer exists (or is archived) is simply skipped
+    at read time; the unresolved grant is never invented and never errors the
+    import.
+- **No migration required.** `grantedSkillStableIds` lives in the existing
+  `catalogDefinition.config` JSON blob and is read live; there is no new column,
+  no schema migration, and no backfill. A legacy title config that predates the
+  field reads back as `undefined` (the service treats it as granting nothing), and
+  no existing character association is rewritten on load.
 
 ## Ranked title improvement (sequential)
 
@@ -107,7 +199,9 @@ in order.
   in-series link of rank N-1 (an archived prior link still counts). A skipped or
   repeated rank, or a rank added when no prior rank is present, is rejected with
   400 `title_rank_conflict`. Because the old link is displaced, this is strictly
-  additive - no two series ranks coexist.
+  additive - no two series ranks coexist. A ranked title's `grantedSkillStableIds`
+  apply only for the current linked rank; the displaced prior rank's grants never
+  accumulate (see "Title-granted passive skills" above).
 - **A reason is required**: attaching a ranked title needs a nonempty `reason`
   (else 400 `title_reason_required`). The event snapshot carries the reason plus
   the title's `seriesId` / `rank` / `minRaceGrade`.

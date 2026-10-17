@@ -305,6 +305,81 @@ describe("title catalog config (improvement)", () => {
   })
 })
 
+describe("title granted passive skills (grantedSkillStableIds)", () => {
+  it("accepts an empty grantedSkillStableIds list (a narrative-only title)", () => {
+    const parsed = titleConfigSchema.safeParse({
+      flat: { strength: 3 },
+      grantedSkillStableIds: [],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.grantedSkillStableIds).toEqual([])
+    }
+  })
+
+  it("accepts a nonempty, internally unique grantedSkillStableIds list", () => {
+    const parsed = titleConfigSchema.safeParse({
+      flat: { strength: 3 },
+      grantedSkillStableIds: ["skill-a", "skill-b"],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.grantedSkillStableIds).toEqual(["skill-a", "skill-b"])
+    }
+  })
+
+  it("rejects a duplicate grantedSkillStableIds entry", () => {
+    const parsed = titleConfigSchema.safeParse({
+      flat: { strength: 3 },
+      grantedSkillStableIds: ["skill-a", "skill-a"],
+    })
+    expect(parsed.success).toBe(false)
+    if (!parsed.success) {
+      expect(
+        parsed.error.issues.some((i) => i.path[0] === "grantedSkillStableIds")
+      ).toBe(true)
+    }
+  })
+
+  it("rejects a blank grantedSkillStableIds entry", () => {
+    expect(
+      titleConfigSchema.safeParse({
+        flat: { strength: 3 },
+        grantedSkillStableIds: [""],
+      }).success
+    ).toBe(false)
+  })
+
+  it("reads a legacy title config without grantedSkillStableIds as undefined (no fabricated list)", () => {
+    const parsed = titleConfigSchema.safeParse({
+      flat: { strength: 3 },
+      improvement: {
+        seriesId: "dungeon-pioneer",
+        rank: 1,
+        minRaceGrade: "E",
+      },
+      upgradeGroup: "dungeon-pioneer",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.grantedSkillStableIds).toBeUndefined()
+    }
+  })
+
+  it("still rejects a ranked title whose upgradeGroup differs from improvement.seriesId when granting skills", () => {
+    const parsed = titleConfigSchema.safeParse({
+      upgradeGroup: "hero",
+      grantedSkillStableIds: ["skill-a"],
+      improvement: {
+        seriesId: "dungeon-pioneer",
+        rank: 1,
+        minRaceGrade: "E",
+      },
+    })
+    expect(parsed.success).toBe(false)
+  })
+})
+
 describe("inventoryPostSchema", () => {
   it("parses a valid add payload", () => {
     const parsed = inventoryPostSchema.safeParse({

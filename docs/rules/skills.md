@@ -22,6 +22,12 @@
 - Skills are attached to Starting Skills of classes/professions and to learned
   choices; some skills are granted through blessings and bloodlines (see
   `docs/rules/blessings.md` and `docs/rules/bloodlines.md`).
+- A skill may also be granted **as a passive effect only** by an equipped
+  `equipment` item or an attached `titles` entry via the joint
+  `grantedSkillStableIds` config (see `docs/rules/equipment.md` and
+  `docs/rules/titles.md`). This is not a permanent acquisition: no `SKILL`
+  association is created, no milestone offer is produced, and the grant ends the
+  moment the item/title is removed or loses eligibility.
 
 ## Wiki-uncertain
 

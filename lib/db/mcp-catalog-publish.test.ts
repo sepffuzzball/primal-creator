@@ -11,6 +11,11 @@ import {
 } from "@/lib/db/mcp-catalog-publish"
 import { issueMcpPreviewTicket } from "@/lib/server/mcp-catalog-auth"
 import * as mcpCatalogAuth from "@/lib/server/mcp-catalog-auth"
+import {
+  createInitialState,
+  getCharacter,
+  serializeState,
+} from "@/lib/db/service"
 
 // Real unit tests against the in-memory Prisma mock. The mock backs the
 // `@/lib/db/client` export so the publisher's Prisma calls (the SERIALIZABLE
@@ -83,6 +88,20 @@ function equipmentEntry(
   }
 }
 
+function titleEntry(
+  stableId: string,
+  config: Record<string, unknown>,
+  extra: Record<string, unknown> = {}
+) {
+  return {
+    kind: "titles" as const,
+    stableId,
+    name: `Title ${stableId}`,
+    config,
+    ...extra,
+  }
+}
+
 function classRow(stableId: string, config: Record<string, unknown>) {
   return {
     kind: "classes" as const,
@@ -135,6 +154,21 @@ function seedLinkedRankedTitle() {
 
 function findCatalog(id: string) {
   return dbMock.store.catalog.get(id)
+}
+
+function strengthFlatDelta(status: unknown): number {
+  const traces = (
+    status as {
+      traces: Array<{
+        attribute: string
+        phases: Array<{ phase: string; delta: number }>
+      }>
+    }
+  ).traces
+  const strength = traces.find((t) => t.attribute === "strength")
+  if (!strength) return 0
+  const flat = strength.phases.find((p) => p.phase === "flat")
+  return flat?.delta ?? 0
 }
 
 // ------------------------------------------------------------------ //
@@ -562,6 +596,105 @@ describe("dependency ordering", () => {
         }),
       ])
     ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+  })
+
+  it("orders a title after a same-batch new skill it grants and exposes the effect when linked", async () => {
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: "u-1",
+      name: "C",
+      state: serializeState(createInitialState("integrated", null, null)),
+    })
+    const titleStableId = "granting-title"
+    const skillStableId = "granted-skill"
+    // The title is submitted BEFORE the skill it grants, exactly to prove the
+    // publisher orders the new skill first so the shared live-catalog reference
+    // check inside the same transaction sees it.
+    const entries = [
+      titleEntry(titleStableId, { grantedSkillStableIds: [skillStableId] }),
+      skillRow(skillStableId, {
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      }),
+    ]
+    const preview = await previewManagedCatalog(entries)
+    expect(preview.changes).toHaveLength(2)
+    expect(preview.changes.every((c) => c.status === "create")).toBe(true)
+
+    const applied = await applyManagedCatalog(entries, preview.previewTicket)
+    expect(applied.changes).toHaveLength(2)
+    expect(applied.changes.every((c) => c.status === "create")).toBe(true)
+
+    const titleChange = applied.changes.find((c) => c.kind === "titles")!
+    const skillChange = applied.changes.find((c) => c.kind === "skills")!
+    expect(titleChange.after.config).toMatchObject({
+      grantedSkillStableIds: [skillStableId],
+    })
+    expect(skillChange.after.archived).toBe(false)
+
+    // Link the title and read the live effect: the granted skill's passive flat
+    // strength is synthesized while the unarchived TITLE link survives.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: titleChange.after.id,
+      kind: "TITLE",
+    })
+    const detail = await getCharacter("chr-1", {
+      id: "u-1",
+      email: "u@example.com",
+      isAdmin: false,
+    })
+    expect(strengthFlatDelta(detail.status)).toBe(5)
+  })
+
+  it("rejects a title referencing a missing skill outside the batch", async () => {
+    await expect(
+      previewManagedCatalog([
+        titleEntry("granting-title", {
+          grantedSkillStableIds: ["missing-skill"],
+        }),
+      ])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a title referencing an archived skill outside the batch", async () => {
+    dbMock.store.addCatalog({
+      id: "skill-1",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { track: "race", effects: [], rarity: "Common" },
+      archived: true,
+    })
+    await expect(
+      previewManagedCatalog([
+        titleEntry("granting-title", {
+          grantedSkillStableIds: ["arch-skill"],
+        }),
+      ])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rolls back the whole apply when a title references a missing skill (no partial rows)", async () => {
+    const entries = [
+      item("new-item", { name: "New Item" }),
+      titleEntry("granting-title", {
+        grantedSkillStableIds: ["missing-skill"],
+      }),
+    ]
+    const payloadDigest = computeManagedPayloadDigest(entries)
+    const rows = await prisma.catalogDefinition.findMany({})
+    const stateDigest = computeManagedStateDigest(rows)
+    const ticket = issueMcpPreviewTicket(payloadDigest, stateDigest)
+
+    await expect(applyManagedCatalog(entries, ticket)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+
+    // The item create rolled back with the failed title ref check: no partial rows.
+    expect(dbMock.store.catalog.size).toBe(0)
   })
 })
 

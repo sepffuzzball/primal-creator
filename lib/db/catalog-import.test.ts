@@ -101,6 +101,21 @@ function professionEntry(
   }
 }
 
+function titleEntry(
+  stableId: string,
+  config: Record<string, unknown>,
+  name = stableId
+): WikiReviewedEntry {
+  return {
+    kind: "titles",
+    stableId,
+    name,
+    description: `Description for ${name}`,
+    sourceUrl: `https://example.com/${stableId}`,
+    config,
+  }
+}
+
 /** A valid, canonical modern race config (raceType + naturalGrade). */
 function canonicalRaceConfig(
   extra: Record<string, unknown> = {}
@@ -850,6 +865,144 @@ describe("catalog import (unit, mocked db)", () => {
     )!
     expect(ring.config).toMatchObject({
       grantedSkillStableIds: ["existing-skill"],
+    })
+  })
+
+  it("accepts a title that grants an existing unarchived skill", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: false,
+    })
+    const good: WikiReviewedEntry[] = [
+      titleEntry("title-grant", {
+        flat: { strength: 10 },
+        grantedSkillStableIds: ["existing-skill"],
+      }),
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const title = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "title-grant"
+    )!
+    expect(title.config).toMatchObject({
+      grantedSkillStableIds: ["existing-skill"],
+    })
+  })
+
+  it("accepts a title that grants no skills (empty grantedSkillStableIds list)", async () => {
+    const good: WikiReviewedEntry[] = [
+      titleEntry("empty-grant-title", { grantedSkillStableIds: [] }),
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const title = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "empty-grant-title"
+    )!
+    expect(title.config).toMatchObject({ grantedSkillStableIds: [] })
+  })
+
+  it("accepts a title that grants a skill created by the same manifest", async () => {
+    // Import always creates rows with archived=false, so a skill created by this
+    // manifest satisfies the unarchived granted-skill resolution.
+    const good: WikiReviewedEntry[] = [
+      skillEntry("manifest-skill"),
+      titleEntry("title-grant", {
+        grantedSkillStableIds: ["manifest-skill"],
+      }),
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(2)
+    expect(result.skipCount).toBe(0)
+    const title = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "title-grant"
+    )!
+    expect(title.config).toMatchObject({
+      grantedSkillStableIds: ["manifest-skill"],
+    })
+  })
+
+  it("rejects a title that grants a missing skill (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      titleEntry("missing-skill-title", {
+        grantedSkillStableIds: ["no-such-skill"],
+      }),
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a title that grants an archived skill (preview and apply, no write)", async () => {
+    dbMock.store.addCatalog({
+      id: "archived-skill",
+      kind: "skills",
+      stableId: "archived-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const bad: WikiReviewedEntry[] = [
+      titleEntry("archived-skill-title", {
+        grantedSkillStableIds: ["archived-skill"],
+      }),
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("skips an already-existing title whose granted skill was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-title",
+      kind: "titles",
+      stableId: "existing-title",
+      name: "Existing Title",
+      config: { grantedSkillStableIds: ["arch-skill"] },
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      titleEntry("existing-title", {
+        grantedSkillStableIds: ["arch-skill"],
+      }),
+    ]
+    const preview = await previewWikiReviewedImport(manifest)
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    const applied = await applyWikiReviewedImport(manifest)
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
+    const titleRow = dbMock.store.catalog.get("existing-title")!
+    expect(titleRow.archived).toBe(false)
+    expect(titleRow.config).toMatchObject({
+      grantedSkillStableIds: ["arch-skill"],
     })
   })
 

@@ -37,8 +37,9 @@ touches the database. For those routes to work the deployment must already hold:
   the MCP routes; nothing auto-creates catalog content at startup.
 - **Auth configuration.** `AUTH_SECRET` (>= 32 chars, for preview-ticket signing)
   and `MCP_CATALOG_TOKEN_SHA256` (the SHA256 of the raw publisher token) must be
-  set on the server and the app restarted, and `PRIMAL_CATALOG_URL` /
-  `PRIMAL_CATALOG_TOKEN` must be set on the client (see below).
+  set on the server and the app restarted; on the client only the raw
+  `PRIMAL_CATALOG_TOKEN` must be set locally, since `PRIMAL_CATALOG_URL` is pinned
+  in `opencode.json` (see below).
 
 ## Endpoints
 
@@ -71,14 +72,27 @@ JSON is parsed with safe error messages that never echo a secret.
 
 ## Environment setup
 
-The client needs two environment variables set on the process that launches it
-(the OpenCode session environment - see `opencode.json` under `mcp.primal-catalog`
-which forwards `{env:PRIMAL_CATALOG_URL}` and `{env:PRIMAL_CATALOG_TOKEN}`):
+The client needs a bearer token and a target origin. The **only** variable you
+must set **locally** is the raw token. The origin is not a local requirement:
+`opencode.json` (under `mcp.servers.primal-catalog`) pins `PRIMAL_CATALOG_URL` to
+the configured deployed HTTPS origin (e.g. `https://primalcreator.fuzzball.enterprises`)
+and forwards it to the MCP process, while it forwards `PRIMAL_CATALOG_TOKEN` from
+the local `{env:PRIMAL_CATALOG_TOKEN}` placeholder - the only env placeholder in
+the config. Set `PRIMAL_CATALOG_TOKEN` in your local shell/agent config so that
+placeholder resolves; the raw token lives only in that local environment, never in
+the committed config:
 
 | Variable               | Requirement                                                                                         |
 | ---------------------- | --------------------------------------------------------------------------------------------------- |
-| `PRIMAL_CATALOG_URL`   | The deployed **production** origin. HTTPS only, origin only (no path, query, fragment or userinfo). |
-| `PRIMAL_CATALOG_TOKEN` | The raw bearer secret, base64url, **43-256 chars**.                                                 |
+| `PRIMAL_CATALOG_TOKEN` | The raw bearer secret, base64url, **43-256 chars**. Required locally.                                |
+
+`PRIMAL_CATALOG_URL` is optional to set locally - it defaults to the configured
+deployed HTTPS origin pinned in `opencode.json` (HTTPS only, origin only: no path,
+query, fragment or userinfo). If you need a different origin (a staging deployment,
+a local tunnel) change that literal in `opencode.json`; or, if you prefer not to
+hardcode it there, replace it with `{env:PRIMAL_CATALOG_URL}` and set that variable
+locally instead. Never hardcode a raw token in the config: the token is always the
+`{env:PRIMAL_CATALOG_TOKEN}` secret placeholder.
 
 The client validates these and **fails closed**: an invalid/missing value causes
 every tool call to return an error result and a diagnostic on STDERR (never on
@@ -111,9 +125,10 @@ printf '%s' "$PRIMAL_CATALOG_TOKEN" | sha256sum | cut -d' ' -f1
 ```
 
 Deploy that hash to the server env (and set `AUTH_SECRET` to a value of at
-least 32 chars), **restart the app**, then set the two client env vars in your
-shell/agent config. Never commit a production secret or a real production token
-as an example.
+least 32 chars), **restart the app**, then set the client-side raw
+`PRIMAL_CATALOG_TOKEN` in your shell/agent config (the `PRIMAL_CATALOG_URL` origin
+is already pinned in `opencode.json`). Never commit a production secret or a real
+production token as an example.
 
 > `openssl rand -base64 48` emits standard base64, which can include `+`, `/` and
 > `=` padding, but the client only accepts the base64url charset (`-`/`_`, no

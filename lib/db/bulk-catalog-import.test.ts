@@ -103,6 +103,18 @@ function professionRow(stableId: string, extra: Record<string, unknown> = {}) {
   }
 }
 
+function titleRow(stableId: string, extra: Record<string, unknown> = {}) {
+  return {
+    kind: "titles",
+    stableId,
+    name: `Title ${stableId}`,
+    description: `Title of ${stableId}`,
+    provenance: "house",
+    sourceUrl: "https://example.com/title/" + stableId,
+    config: { ...extra },
+  }
+}
+
 function jsonContent(objs: unknown[]): string {
   return JSON.stringify(objs)
 }
@@ -1066,6 +1078,172 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       (r) => r.stableId === "manifest-skill"
     )!
     expect(skillRow.archived).toBe(false)
+  })
+
+  it("accepts a title that grants an existing unarchived skill", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: false,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        titleRow("title-grant", {
+          flat: { strength: 10 },
+          grantedSkillStableIds: ["existing-skill"],
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(1)
+    expect(preview.entries[0].status).toBe("create")
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(1)
+    const title = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "title-grant"
+    )!
+    expect(title.config).toMatchObject({
+      grantedSkillStableIds: ["existing-skill"],
+    })
+  })
+
+  it("accepts a title that grants no skills (empty grantedSkillStableIds list)", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        titleRow("empty-grant-title", { grantedSkillStableIds: [] }),
+      ])
+    )
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(1)
+    expect(applied.skipCount).toBe(0)
+    const title = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "empty-grant-title"
+    )!
+    expect(title.config).toMatchObject({ grantedSkillStableIds: [] })
+  })
+
+  it("accepts a title that grants a skill created by the same upload", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "manifest-skill"),
+        titleRow("title-grant", {
+          grantedSkillStableIds: ["manifest-skill"],
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(2)
+    expect(preview.skipCount).toBe(0)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(2)
+    expect(applied.skipCount).toBe(0)
+    const title = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "title-grant"
+    )!
+    expect(title.config).toMatchObject({
+      grantedSkillStableIds: ["manifest-skill"],
+    })
+    const skillRow = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "manifest-skill"
+    )!
+    expect(skillRow.archived).toBe(false)
+  })
+
+  it("rejects a title that grants a missing skill and writes nothing", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        titleRow("missing-skill-title", {
+          grantedSkillStableIds: ["no-such-skill"],
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a title that grants an archived skill and writes nothing", async () => {
+    dbMock.store.addCatalog({
+      id: "archived-skill",
+      kind: "skills",
+      stableId: "archived-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        titleRow("archived-skill-title", {
+          grantedSkillStableIds: ["archived-skill"],
+        }),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    // The pre-existing archived skill is left untouched.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("skips an already-existing title whose granted skill was archived rather than rejecting the reference", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-title",
+      kind: "titles",
+      stableId: "existing-title",
+      name: "Existing Title",
+      config: { grantedSkillStableIds: ["arch-skill"] },
+      archived: false,
+    })
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        titleRow("existing-title", {
+          grantedSkillStableIds: ["arch-skill"],
+        }),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(0)
+    expect(preview.skipCount).toBe(1)
+    expect(preview.entries[0].status).toBe("skip_existing")
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(0)
+    expect(applied.skipCount).toBe(1)
+    expect(applied.createdIds).toHaveLength(0)
+    expect(dbMock.store.catalog.size).toBe(2)
+    const titleRowStored = dbMock.store.catalog.get("existing-title")!
+    expect(titleRowStored.archived).toBe(false)
+    expect(titleRowStored.config).toMatchObject({
+      grantedSkillStableIds: ["arch-skill"],
+    })
   })
 
   it("writes nothing when a valid row precedes an equipment entry with a dangling skill grant", async () => {

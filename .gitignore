@@ -48,6 +48,9 @@ next-env.d.ts
 # opencode OpenChamber screenshots
 .openchamber/
 
+# opencode config backup (may hold a raw bearer token, never commit it)
+opencode.json.openchamber.backup
+
 # generated knowledge graph / cache (graphify)
 graphify-out/
 

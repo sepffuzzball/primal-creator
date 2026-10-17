@@ -247,6 +247,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     React.useState<(typeof GRADES)[number]>("G")
   const [skillToGrant, setSkillToGrant] = React.useState("")
   const [skillGrantFilter, setSkillGrantFilter] = React.useState("")
+  const [titleSkillFilter, setTitleSkillFilter] = React.useState("")
   const [descriptionGrade, setDescriptionGrade] =
     React.useState<(typeof GRADES)[number]>("G")
   const [blessingTier, setBlessingTier] =
@@ -626,9 +627,9 @@ export function CatalogManager({ kind }: { kind: string }) {
 
   React.useEffect(() => {
     if (
-      !(["equipment", "races", "classes", "professions"] as string[]).includes(
-        kind
-      )
+      !(
+        ["equipment", "races", "classes", "professions", "titles"] as string[]
+      ).includes(kind)
     )
       return
     let active = true
@@ -869,6 +870,35 @@ export function CatalogManager({ kind }: { kind: string }) {
       }
     }
     if (kind === "titles") {
+      const granted = config.grantedSkillStableIds
+      const originalGranted = isRecord(editing?.config)
+        ? editing.config.grantedSkillStableIds
+        : undefined
+      if (
+        granted !== undefined &&
+        (!Array.isArray(granted) ||
+          granted.some((id) => typeof id !== "string" || !id.trim()) ||
+          new Set(granted).size !== granted.length)
+      ) {
+        setFormError(
+          "Choose granted skills from the catalog without duplicates."
+        )
+        return
+      }
+      if (
+        Array.isArray(granted) &&
+        stableStringify(granted) !== stableStringify(originalGranted ?? []) &&
+        granted.some(
+          (id) =>
+            !(Array.isArray(originalGranted) && originalGranted.includes(id)) &&
+            !skills.some((skill) => skill.stableId === id)
+        )
+      ) {
+        setFormError(
+          "Choose newly granted skills from the active skills catalog."
+        )
+        return
+      }
       const improvement = isRecord(config.improvement)
         ? config.improvement
         : null
@@ -2221,6 +2251,120 @@ export function CatalogManager({ kind }: { kind: string }) {
                     </SelectContent>
                   </Select>
                 </div>
+              ) : null}
+              {kind === "titles" ? (
+                <section
+                  aria-label="Granted title skills"
+                  className="flex flex-col gap-2 rounded-md border p-3"
+                >
+                  <h3 className="text-sm font-medium">Granted skills</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Optional skills granted by this title. Ranked titles grant
+                    skills for the current rank only.
+                  </p>
+                  <Label htmlFor="title-skill-filter">
+                    Filter skills by name or ID
+                  </Label>
+                  <Input
+                    id="title-skill-filter"
+                    value={titleSkillFilter}
+                    onChange={(event) =>
+                      setTitleSkillFilter(event.target.value)
+                    }
+                    placeholder="Search skills"
+                  />
+                  {(() => {
+                    const ids = Array.isArray(
+                      structuredConfig?.grantedSkillStableIds
+                    )
+                      ? structuredConfig.grantedSkillStableIds.filter(
+                          (id): id is string => typeof id === "string"
+                        )
+                      : []
+                    const add = (id: string) => {
+                      if (!id || ids.includes(id)) return
+                      setConfigValue("grantedSkillStableIds", [...ids, id])
+                    }
+                    const remove = (id: string) => {
+                      const next = ids.filter((current) => current !== id)
+                      if (next.length)
+                        setConfigValue("grantedSkillStableIds", next)
+                      else {
+                        const config = { ...(structuredConfig ?? {}) }
+                        delete config.grantedSkillStableIds
+                        setForm((current) => ({
+                          ...current,
+                          configText: JSON.stringify(config, null, 2),
+                        }))
+                      }
+                    }
+                    const choices = skills.filter(
+                      (skill) =>
+                        !ids.includes(skill.stableId) &&
+                        `${skill.name} ${skill.stableId}`
+                          .toLocaleLowerCase()
+                          .includes(titleSkillFilter.toLocaleLowerCase())
+                    )
+                    return (
+                      <>
+                        <select
+                          aria-label="Title skill to grant"
+                          className="h-auto max-h-48 min-w-48 overflow-y-auto rounded-md border bg-background px-3 text-sm"
+                          size={Math.min(8, Math.max(2, choices.length + 1))}
+                          value=""
+                          disabled={!structuredConfig}
+                          onChange={(event) => add(event.target.value)}
+                        >
+                          <option value="">Choose an active skill</option>
+                          {choices.map((skill) => (
+                            <option key={skill.stableId} value={skill.stableId}>
+                              {skill.name}
+                            </option>
+                          ))}
+                        </select>
+                        {ids.length ? (
+                          <ul className="flex flex-col gap-1">
+                            {ids.map((id) => {
+                              const skill = skills.find(
+                                (entry) => entry.stableId === id
+                              )
+                              return (
+                                <li
+                                  key={id}
+                                  className="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1.5 text-sm"
+                                >
+                                  <span>
+                                    {skill?.name ?? (
+                                      <>
+                                        {id}{" "}
+                                        <span className="text-destructive">
+                                          Unavailable (archived or missing)
+                                        </span>
+                                      </>
+                                    )}
+                                  </span>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    aria-label={`Remove ${skill?.name ?? id}`}
+                                    onClick={() => remove(id)}
+                                  >
+                                    Remove
+                                  </Button>
+                                </li>
+                              )
+                            })}
+                          </ul>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            No skills selected.
+                          </p>
+                        )}
+                      </>
+                    )
+                  })()}
+                </section>
               ) : null}
               {kind === "titles"
                 ? (() => {
