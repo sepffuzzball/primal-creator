@@ -379,17 +379,41 @@ test.describe("character lifecycle", () => {
     await choose(page, /^Human\b/i)
     await next(page)
 
-    // Step 5 - class: Archer. Dynamically loaded from the class catalog; see the
+    // Step 5 - initial stats (mandatory). Every stat starts at 1 and the
+    // enlightened branch requires distributing all 61 bonus points before the
+    // wizard advances. The step title renders as a `<legend>` (QuestionnaireTitle
+    // -> legend) labelling the step's `<fieldset>` group, so scope the heading
+    // assertion through the group role rather than a heading role. The Next
+    // button is disabled until the full budget is spent, so drive it to a valid
+    // allocation: put all 61 on Strength (62 = 1 base + 61 bonus), leave the
+    // other eight at 1, and confirm the budget is exhausted before advancing.
+    await expect(
+      page.getByRole("group", { name: "Initial Stats" })
+    ).toBeVisible()
+    await expect(page.getByText("Remaining points: 61")).toBeVisible()
+    // A partial spend leaves the Next button disabled (no premature advance).
+    await expect(
+      page.getByRole("button", { name: "Next", exact: true })
+    ).toBeDisabled()
+    await page.getByLabel(/^strength$/i).fill("62")
+    // The full 61-point spend exhausts the budget and enables Next.
+    await expect(page.getByText("Remaining points: 0")).toBeVisible()
+    await expect(
+      page.getByRole("button", { name: "Next", exact: true })
+    ).toBeEnabled()
+    await next(page)
+
+    // Step 6 - class: Archer. Dynamically loaded from the class catalog; see the
     // race step above for why this needs the generous 45s catalog wait.
     await waitForCatalogOption(page, /^Archer\b/i)
     await choose(page, /^Archer\b/i)
     await next(page)
 
-    // Step 6 - profession: None.
+    // Step 7 - profession: None.
     await choose(page, /^None\b/i)
     await next(page)
 
-    // Step 7 - special abilities. The gods catalog offers The Malefic Viper and
+    // Step 8 - special abilities. The gods catalog offers The Malefic Viper and
     // the bloodline catalog offers Bloodline of the
     // Primal Hunter) but no transcendent skill, so select the blessing +
     // bloodline and leave the transcendent section unselected. The wizard's
@@ -406,7 +430,7 @@ test.describe("character lifecycle", () => {
     await choose(page, /Bloodline of the Primal Hunter/)
     await next(page)
 
-    // Step 8 - review. Confirm and submit. There is no Next button on the
+    // Step 9 - review. Confirm and submit. There is no Next button on the
     // review step - it is replaced by the Submit button - so submit directly.
     await page.getByRole("button", { name: "Create character" }).click()
     // `new` also matches `[^/]+`, so exclude it explicitly: the create page keeps
@@ -856,11 +880,12 @@ ${missingItemWarnings.join("\n")}`
     // The attribute name cell is `text-transform: capitalize` (CSS) but the DOM
     // text is the lowercase attribute key, so match case-insensitively (the row
     // textContent is also concatenated without whitespace between cells). The
-    // sourced Archer F config grants `strength: 1` per level, so advancing the
-    // class track to level 1 leaves Strength at 1 before allocation; the single
-    // allocated free point brings the final value to 2.
+    // initial-stats step set Strength to 62 (all 61 bonus points on Strength),
+    // and the sourced Archer F config grants a fixed `strength: 1` per level, so
+    // advancing the class track to level 1 leaves Strength at 63 before
+    // allocation; the single allocated free point brings the final value to 64.
     const strengthRow = page.locator("tbody tr").filter({ hasText: "strength" })
-    await expect(strengthRow.locator("td").nth(1)).toHaveText("2")
+    await expect(strengthRow.locator("td").nth(1)).toHaveText("64")
 
     // ------------------------------------------------------------------ //
     // Earn and spend an F-grade class level-5 skill-choice credit.
