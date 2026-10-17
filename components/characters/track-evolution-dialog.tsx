@@ -15,6 +15,7 @@ import {
 } from "@/lib/api"
 import { Alert } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
+import { SemanticBadge } from "@/components/ui/semantic-badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -220,9 +221,11 @@ export function TrackEvolutionDialog({
                 >
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="font-medium">{option.name}</span>
-                    <Badge variant="outline">
-                      {option.fromGrade} {"->"} {option.toGrade}
-                    </Badge>
+                    <span className="inline-flex items-center gap-1.5">
+                      <SemanticBadge kind="grade" value={option.fromGrade} />
+                      <span aria-hidden="true">-&gt;</span>
+                      <SemanticBadge kind="grade" value={option.toGrade} />
+                    </span>
                     <TrackNameBadge option={option} />
                     {!selectable ? (
                       <Badge variant="outline">Blocked</Badge>

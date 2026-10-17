@@ -9,6 +9,10 @@ import {
   characterCreateSchema,
   characterStateSchema,
   characterUpdateSchema,
+  catalogKindSchema,
+  currencyConfigSchema,
+  currencyGradeDescriptionsForbidden,
+  currencyGradeForbidden,
   EQUIPMENT_RARITIES,
   EQUIPMENT_SLOTS,
   EQUIPMENT_UNIQUE_RARITY,
@@ -2040,6 +2044,83 @@ describe("requiredGradeNullForbidden (races/classes/professions never clear grad
     expect(requiredGradeNullForbidden("equipment", null)).toBe(false)
     expect(requiredGradeNullForbidden("skills", null)).toBe(false)
     expect(requiredGradeNullForbidden("gods", null)).toBe(false)
+  })
+})
+
+describe("currencies catalog kind invariants", () => {
+  it("treats currencies as a canonical catalog kind", () => {
+    expect(catalogKindSchema.safeParse("currencies").success).toBe(true)
+    // The legacy `consumables` alias is NOT a canonical kind (it normalizes to items).
+    expect(catalogKindSchema.safeParse("consumables").success).toBe(false)
+  })
+
+  describe("currencyGradeForbidden (currencies carry no catalog grade)", () => {
+    it("allows a currencies entry with a null grade and with a missing (undefined) grade", () => {
+      expect(currencyGradeForbidden("currencies", null)).toBe(false)
+      expect(currencyGradeForbidden("currencies", undefined)).toBe(false)
+    })
+
+    it("rejects a currencies entry with any non-null grade value", () => {
+      for (const grade of ["G", "F", "E", "D", "C", "B", "A", "S"]) {
+        expect(currencyGradeForbidden("currencies", grade)).toBe(true)
+      }
+    })
+
+    it("is only triggered for the currencies kind", () => {
+      // A graded race/class/profession (and all other graded kinds, incl. gods)
+      // never trips the currency invariant.
+      expect(currencyGradeForbidden("races", "S")).toBe(false)
+      expect(currencyGradeForbidden("classes", "B")).toBe(false)
+      expect(currencyGradeForbidden("professions", "A")).toBe(false)
+      expect(currencyGradeForbidden("gods", "C")).toBe(false)
+      expect(currencyGradeForbidden("items", null)).toBe(false)
+    })
+  })
+
+  describe("currencyGradeDescriptionsForbidden (currencies carry no grade ladder)", () => {
+    it("allows a currencies entry with omitted, null, or empty gradeDescriptions", () => {
+      expect(currencyGradeDescriptionsForbidden("currencies", undefined)).toBe(
+        false
+      )
+      expect(currencyGradeDescriptionsForbidden("currencies", null)).toBe(false)
+      expect(currencyGradeDescriptionsForbidden("currencies", {})).toBe(false)
+    })
+
+    it("rejects a currencies entry with a non-empty gradeDescriptions map", () => {
+      expect(
+        currencyGradeDescriptionsForbidden("currencies", { G: "text" })
+      ).toBe(true)
+      expect(
+        currencyGradeDescriptionsForbidden("currencies", { S: "top" })
+      ).toBe(true)
+    })
+
+    it("is only triggered for the currencies kind", () => {
+      expect(currencyGradeDescriptionsForbidden("gods", { G: "text" })).toBe(
+        false
+      )
+      expect(currencyGradeDescriptionsForbidden("titles", { A: "text" })).toBe(
+        false
+      )
+    })
+  })
+
+  describe("currencyConfigSchema (strict empty config)", () => {
+    it("accepts the empty object", () => {
+      expect(currencyConfigSchema.safeParse({}).success).toBe(true)
+    })
+
+    it("rejects any non-empty config", () => {
+      expect(currencyConfigSchema.safeParse({ rarity: "Common" }).success).toBe(
+        false
+      )
+      expect(currencyConfigSchema.safeParse({ grade: "S" }).success).toBe(false)
+    })
+
+    it("rejects a non-object config", () => {
+      expect(currencyConfigSchema.safeParse([]).success).toBe(false)
+      expect(currencyConfigSchema.safeParse(null).success).toBe(false)
+    })
   })
 })
 

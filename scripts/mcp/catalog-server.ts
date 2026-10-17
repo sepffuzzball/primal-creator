@@ -54,6 +54,7 @@ export const CATALOG_KINDS = [
   "items",
   "gods",
   "transcendent_skills",
+  "currencies",
 ] as const
 
 export type CatalogKind = (typeof CATALOG_KINDS)[number]

@@ -55,6 +55,19 @@ function god(stableId: string) {
   }
 }
 
+function currency(stableId: string, extra: Record<string, unknown> = {}) {
+  return {
+    kind: "currencies",
+    stableId,
+    name: `Currency ${stableId}`,
+    description: `A tender named ${stableId}`,
+    provenance: "house",
+    sourceUrl: "https://example.com/currency/" + stableId,
+    config: {},
+    ...extra,
+  }
+}
+
 function equipment(stableId: string, extra: Record<string, unknown> = {}) {
   return {
     kind: "equipment",
@@ -289,6 +302,44 @@ describe("bulk JSON parsing and validation", () => {
     const entries = parseBulkEntries("json", jsonContent([god("odin")]))
     expect(entries[0].kind).toBe("gods")
     expect(entries[0].grade).toBeNull()
+  })
+
+  it("accepts a currencies entry with an empty config and no grade", () => {
+    const entries = parseBulkEntries("json", jsonContent([currency("crowns")]))
+    expect(entries[0].kind).toBe("currencies")
+    expect(entries[0].grade).toBeNull()
+    expect(entries[0].config).toEqual({})
+  })
+
+  it("rejects a currencies entry that carries a non-null catalog grade", () => {
+    const bad = { ...currency("graded-crowns"), grade: "S" }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_grade" })
+    )
+  })
+
+  it("reports the row number for a graded currencies entry", () => {
+    const bad = { ...currency("graded-crowns"), grade: "A" }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: a currencies entry carries no catalog grade/i
+    )
+  })
+
+  it("rejects a currencies entry with a non-empty gradeDescriptions", () => {
+    const bad = { ...currency("crowns"), gradeDescriptions: { G: "text" } }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({
+        status: 400,
+        code: "invalid_grade_descriptions",
+      })
+    )
+  })
+
+  it("rejects a currencies entry with a non-empty config", () => {
+    const bad = { ...currency("crowns"), config: { rarity: "Common" } }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
   })
 
   it("rejects a duplicate (kind, stableId) with the row number", () => {

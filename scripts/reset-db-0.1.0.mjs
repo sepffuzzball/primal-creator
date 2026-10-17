@@ -41,8 +41,9 @@
  *      client backends (the app must be stopped first). Preflight NEVER mutates.
  *   6. ONLY after every check passes, spawns the local Prisma CLI
  *      `migrate reset --force --skip-seed` and then `db seed`.
- *   7. Verifies the result (11 tables, active house_rules, one baseline
- *      migration, >= 41 catalog entries, one seeded admin). Every error AFTER
+ *   7. Verifies the result (12 tables, active house_rules, the baseline plus its
+ *      additive currencies migration, >= 41 catalog entries, one seeded admin).
+ *      Every error AFTER
  *      the reset has started instructs the operator to keep the app offline and
  *      to restore the backup; nothing after that stage is ever labelled "setup".
  *
@@ -79,11 +80,19 @@ import { PrismaClient } from "@prisma/client"
 /** The single 0.1.0 from-scratch baseline migration. */
 export const BASELINE_MIGRATION_NAME = "20261016000000_initial_0_1_0"
 
-/** The 11 application tables the final schema creates (excluding _prisma_migrations). */
+/**
+ * The additive currencies migration layered on top of the 0.1.0 baseline. It is
+ * part of the normal `prisma migrate deploy` run, so any assertion on the
+ * applied-migration set (the reset verification included) must account for it.
+ */
+export const CURRENCIES_MIGRATION_NAME = "20261017000000_currencies"
+
+/** The 12 application tables the final schema creates (excluding _prisma_migrations). */
 export const APP_TABLES = [
   "assets",
   "catalog_definitions",
   "character_associations",
+  "character_currency_balances",
   "character_drafts",
   "character_inventory_items",
   "characters",
@@ -139,6 +148,11 @@ export const APP_INDEXES = {
     "character_associations_kind_idx",
     "character_associations_pkey",
   ],
+  character_currency_balances: [
+    "character_currency_balances_characterId_definitionId_key",
+    "character_currency_balances_characterId_idx",
+    "character_currency_balances_pkey",
+  ],
   catalog_definitions: [
     "catalog_definitions_kind_archived_idx",
     "catalog_definitions_kind_idx",
@@ -192,6 +206,12 @@ export const APP_CONSTRAINTS = {
     "character_associations_characterId_fkey",
     "character_associations_definitionId_fkey",
     "character_associations_pkey",
+  ],
+  character_currency_balances: [
+    "character_currency_balances_amount_check",
+    "character_currency_balances_characterId_fkey",
+    "character_currency_balances_definitionId_fkey",
+    "character_currency_balances_pkey",
   ],
   catalog_definitions: ["catalog_definitions_pkey"],
   house_rules: ["house_rules_pkey"],
@@ -1069,6 +1089,7 @@ export async function verifyReset(options) {
   const expectedTables = [...(options.expectedTables ?? APP_TABLES)].sort()
   const baseline = options.baseline ?? BASELINE_MIGRATION_NAME
   const minCatalog = options.minCatalog ?? 41
+  const expectedMigrations = [baseline, CURRENCIES_MIGRATION_NAME]
 
   const tableRows = await db.$queryRawUnsafe(
     `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`
@@ -1098,12 +1119,15 @@ export async function verifyReset(options) {
     `SELECT "migration_name" AS name, "finished_at" FROM "_prisma_migrations" ORDER BY "started_at"`
   )
   const applied = (migRows || []).filter((r) => r.finished_at != null)
-  if (applied.length !== 1 || applied[0].name !== baseline) {
+  const appliedNames = applied.map((r) => r.name)
+  if (JSON.stringify(appliedNames) !== JSON.stringify(expectedMigrations)) {
     return {
       ok: false,
-      reason: `expected exactly one applied baseline migration (${baseline}), found [${applied
-        .map((r) => r.name)
-        .join(", ")}]`,
+      reason: `expected the applied migrations [${expectedMigrations.join(
+        ", "
+      )}] (the baseline plus its additive currencies migration), found [${appliedNames.join(
+        ", "
+      )}]`,
     }
   }
 
@@ -1324,7 +1348,7 @@ export async function main(options = {}) {
     }
 
     log(
-      `0.1.0 reset complete: baseline ${BASELINE_MIGRATION_NAME} applied, 11 tables present, ` +
+      `0.1.0 reset complete: ${BASELINE_MIGRATION_NAME} and ${CURRENCIES_MIGRATION_NAME} applied, 12 tables present, ` +
         `house_rules active, >= 41 catalog entries, admin seeded. ` +
         `If you need to roll back, restore the backup: pg_restore --clean --if-exists --no-owner -d "<DATABASE_URL>" ${backupFile}`
     )

@@ -65,6 +65,9 @@ import {
   allGradeGrantedSkillStableIds,
   blessingTierAtLeast,
   characterStateSchema,
+  CURRENCY_AMOUNT_MAX,
+  currencyGradeDescriptionsForbidden,
+  currencyGradeForbidden,
   godGradeForbidden,
   gradeSchema,
   gradeSkillStableIdsFor,
@@ -96,6 +99,8 @@ import {
   IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
   IMPORT_SCHEMA_V7,
+  IMPORT_SCHEMA_V8,
+  MAX_IMPORT_CURRENCIES,
   MAX_IMPORT_INVENTORY,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
@@ -6358,6 +6363,255 @@ export async function adjustCharacterInventory(
     })
 }
 
+// ------------------------------------------------------------------ //
+// Character currency balances
+// ------------------------------------------------------------------ //
+
+/**
+ * A read-only view of a character's holdings of a `currencies` catalog entry.
+ * Ownership is per-definition house bookkeeping: only the integer `amount` and
+ * the linked definition's identity/metadata are exposed, and only for ACTIVE
+ * (unarchived) currency definitions. An active currency the character does not
+ * hold reads back with `amount: null` (an absent row means "no recorded
+ * balance"). A balance saved against an ARCHIVED currency definition is hidden
+ * from this view but retained, so reactivating the definition later reveals the
+ * kept amount.
+ */
+export interface CharacterCurrencyView {
+  /** The catalog `currencies` definition id (the row's own `id`, not its stableId). */
+  definitionId: string
+  stableId: string
+  name: string
+  description: string | null
+  /** The character's held balance, or null when no stored balance exists for this currency. */
+  amount: number | null
+}
+
+/**
+ * Read a character's currency balances (every active `currencies` catalog entry,
+ * joined with the character's stored balance) together with the current CAS
+ * version. A read path: no mutation, so an archived character's balances are
+ * still readable. Ownership is the same owner/admin guard used everywhere else
+ * (a non-owner is 403).
+ */
+export async function getCharacterCurrencies(
+  id: string,
+  user: SessionUser
+): Promise<{ currencies: CharacterCurrencyView[]; version: number }> {
+  const row = await prisma.character.findUnique({ where: { id } })
+  if (!row) throw notFound("character_not_found", "Character not found")
+  if (!user.isAdmin && row.ownerId !== user.id) {
+    throw forbidden("forbidden", "You do not own this character")
+  }
+  const [defs, balances] = await Promise.all([
+    prisma.catalogDefinition.findMany({
+      where: { kind: "currencies", archived: false },
+    }),
+    prisma.characterCurrencyBalance.findMany({
+      where: { characterId: id },
+      include: { definition: true },
+    }),
+  ])
+  // Only balances referencing a `currencies` definition contribute. Amounts are
+  // keyed by definition id so an archived currency's saved amount is simply not
+  // looked up (hidden), and a reactivated entry is revealed with its kept value.
+  const amountByDefinitionId = new Map<string, number>()
+  for (const balance of balances) {
+    if (balance.definition?.kind === "currencies") {
+      amountByDefinitionId.set(balance.definitionId, balance.amount)
+    }
+  }
+  const currencies = defs
+    .slice()
+    .sort(
+      (a, b) =>
+        a.name.localeCompare(b.name) || a.stableId.localeCompare(b.stableId)
+    )
+    .map((def) => ({
+      definitionId: def.id,
+      stableId: def.stableId,
+      name: def.name,
+      description: def.description ?? null,
+      amount: amountByDefinitionId.get(def.id) ?? null,
+    }))
+  return { currencies, version: row.version }
+}
+
+/**
+ * Set a character's balance for a single `currencies` catalog definition.
+ *
+ * This is the owner/admin manual bookkeeping path for durable currency holdings
+ * (no acquisition economy is invented here): the client states the exact held
+ * amount, and the service persists it as a `character_currency_balances` row.
+ * Unlike the engine's derived resources this value is NOT synthesized from a
+ * catalog config, and unlike inventory quantity it is never a consumable or
+ * equipment stock count - a balance is an end in itself. No progression event is
+ * emitted and no character state is mutated: currency holdings live outside
+ * `Character.state`.
+ *
+ * - `amount` must be a nonnegative whole number 0..2147483647 (the DB CHECK
+ *   upper bound, well below the safe-integer limit). A `0` balance is a legal
+ *   stored row (kept so the explicit character-currency association is
+ *   preserved); `null` removes the stored row (an absent row means "no recorded
+ *   balance").
+ * - Only an ACTIVE (unarchived) `currencies` definition is accepted: a missing
+ *   definition is a 404, and an archived or non-currency definition is rejected
+ *   (a balance saved against an archived currency is preserved for a later
+ *   reactivation but cannot be written while archived).
+ * - The write runs under SERIALIZABLE isolation, CASes the character version,
+ *   and maps a P2034 (cannot-serialize concurrent write) to a 409. A stale
+ *   version 409s and rolls back the balance change.
+ * - The version is bumped EXACTLY ONCE on an actual amount change. Setting the
+ *   already-stored amount (or setting null when no row exists) is an idempotent
+ *   no-op that never bumps the version, but a STALE no-op still 409s: a client
+ *   holding an outdated character version is rejected even when nothing would
+ *   change. A fresh no-op returns the unchanged current version and writes no
+ *   event and no row.
+ * - A NEW distinct balance row is limited to MAX_IMPORT_CURRENCIES per
+ *   character (matching the trusted-backup roundtrip cap, counting ARCHIVED
+ *   balances too), so an exported character always re-imports cleanly. Updating
+ *   or deleting an EXISTING row is always allowed at the cap; creating the
+ *   501st distinct row is a 409.
+ */
+export async function setCharacterCurrencyBalance(
+  id: string,
+  body: { definitionId: string; amount: number | null; version: number },
+  user: SessionUser
+): Promise<{ version: number }> {
+  return prisma
+    .$transaction(
+      async (tx) => {
+        const row = await assertOwner(tx, id, user)
+        if (row.archived) {
+          throw badRequest(
+            "character_archived",
+            "Archived character cannot update currency balances"
+          )
+        }
+        if (
+          body.amount != null &&
+          (!Number.isInteger(body.amount) ||
+            body.amount < 0 ||
+            body.amount > CURRENCY_AMOUNT_MAX)
+        ) {
+          throw badRequest(
+            "validation",
+            `Currency amount must be a whole number 0..${CURRENCY_AMOUNT_MAX}`
+          )
+        }
+        const definition = await tx.catalogDefinition.findUnique({
+          where: { id: body.definitionId },
+        })
+        if (!definition) {
+          throw notFound("catalog_not_found", "Catalog entry not found")
+        }
+        if (definition.kind !== "currencies") {
+          throw badRequest(
+            "wrong_kind",
+            `Catalog entry has wrong kind (expected "currencies")`
+          )
+        }
+        if (definition.archived) {
+          throw badRequest(
+            "catalog_archived",
+            "Catalog entry is archived and cannot be set as a currency balance"
+          )
+        }
+
+        const existing = await tx.characterCurrencyBalance.findUnique({
+          where: {
+            characterId_definitionId: {
+              characterId: id,
+              definitionId: definition.id,
+            },
+          },
+        })
+
+        let changed = false
+        if (body.amount == null) {
+          // `null` removes the stored row; with no row already present this is an
+          // idempotent no-op that never bumps the version.
+          if (existing) {
+            await tx.characterCurrencyBalance.deleteMany({
+              where: { characterId: id, definitionId: definition.id },
+            })
+            changed = true
+          }
+        } else if (existing) {
+          if (existing.amount !== body.amount) {
+            await tx.characterCurrencyBalance.updateMany({
+              where: { characterId: id, definitionId: definition.id },
+              data: { amount: body.amount },
+            })
+            changed = true
+          }
+        } else {
+          // Creating a distinct balance row. The trusted-backup export/import caps
+          // currency balances at MAX_IMPORT_CURRENCIES distinct definitions (see
+          // import-schema), so a manual set that would push the count past that cap
+          // is rejected with a 409 to keep an exported character self-roundtrippable.
+          // ARCHIVED balances count toward the cap (a hidden amount must survive a
+          // backup round-trip), so the check counts every stored row for the
+          // character, not just active ones.
+          const balanceCount = await tx.characterCurrencyBalance.count({
+            where: { characterId: id },
+          })
+          if (balanceCount >= MAX_IMPORT_CURRENCIES) {
+            throw conflict(
+              "currency_defs_cap_exceeded",
+              `Currency balances would exceed ${MAX_IMPORT_CURRENCIES} distinct definitions; the trusted-backup export cannot round-trip more`
+            )
+          }
+          await tx.characterCurrencyBalance.create({
+            data: {
+              characterId: id,
+              definitionId: definition.id,
+              amount: body.amount,
+            },
+          })
+          changed = true
+        }
+
+        if (!changed) {
+          // Nothing changed (idempotent no-op), but a STALE client version is still
+          // a conflict. Under SERIALIZABLE the row snapshot is authoritative; a
+          // concurrent version bump would surface as a P2034 and become a 409 above.
+          if (body.version !== row.version) {
+            throw conflict(
+              "version_conflict",
+              `Version mismatch: expected ${body.version}, got ${row.version}`
+            )
+          }
+          return { version: row.version }
+        }
+
+        // CAS: the character version must match the expected value. A mismatch
+        // returns 409 and rolls back the balance change.
+        const updatedMany = await tx.character.updateMany({
+          where: { id, version: body.version },
+          data: { version: { increment: 1 } },
+        })
+        if (updatedMany.count !== 1) {
+          throw conflict(
+            "version_conflict",
+            `Version mismatch: expected ${body.version}, got a newer version`
+          )
+        }
+        return { version: row.version + 1 }
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+    .catch((err) => {
+      if (isSerializationFailure(err)) {
+        throw conflict(
+          "catalog_serialization_conflict",
+          "Concurrent character currency write conflict; retry the change"
+        )
+      }
+      throw err
+    })
+}
+
 /** Decode the equipment slot from a catalog definition's parsed config (normalized). */
 function definitionSlot(def: {
   kind: string
@@ -7322,6 +7576,26 @@ export async function exportCharacter(
     },
     quantity: item.quantity,
   }))
+  // Export every saved currency balance as a STABLE identifier + the exact held
+  // amount (including a legal 0). The reference uses the catalog `stableId` (never
+  // the DB id) so a re-import on another server instance can resolve it against
+  // its own catalog, and an ARCHIVED currency definition's balance is still
+  // exported - a hidden amount must survive a backup round-trip. Only rows whose
+  // definition is actually a `currencies` entry contribute.
+  const currencyBalances = (
+    await prisma.characterCurrencyBalance.findMany({
+      where: { characterId: id },
+      include: { definition: true },
+    })
+  )
+    .filter((b) => b.definition?.kind === "currencies")
+    .map((b) => ({
+      definition: {
+        kind: "currencies",
+        stableId: b.definition.stableId,
+      },
+      amount: b.amount,
+    }))
   const identity = {
     name: row.name,
     description: row.description,
@@ -7378,7 +7652,7 @@ export async function exportCharacter(
     }
   })
   return {
-    schema: IMPORT_SCHEMA_V7,
+    schema: IMPORT_SCHEMA_V8,
     rulesetVersion: IMPORT_RULESET_VERSION,
     identity,
     character: await listItemFor(row, houseRules, true),
@@ -7390,6 +7664,7 @@ export async function exportCharacter(
     isTranscendent: isTranscendentFor(row),
     associations,
     inventory,
+    currencyBalances,
     events: events.map((e) => ({
       kind: e.kind,
       payload: e.payload,
@@ -7533,6 +7808,17 @@ type ResolvedInventoryItem = {
   quantity: number
 }
 
+/**
+ * A resolved (validated) currency balance: the referenced catalog definition is
+ * located by local `kind` + `stableId` (the definition may be archived - a hidden
+ * amount must survive an import) and the held amount is unaltered.
+ */
+type ResolvedCurrencyBalance = {
+  definitionId: string
+  definition: CatalogLookupRow
+  amount: number
+}
+
 type ResolveAssocOpts = {
   /** True for a v4 document; false for a legacy v3 doc (no inventory model). */
   enforceOwnership: boolean
@@ -7605,6 +7891,82 @@ async function resolveInventoryRefs(
       definitionId: def.id,
       definition: def,
       quantity: item.quantity,
+    })
+  }
+  return resolved
+}
+
+/**
+ * Resolve the v8 `currencyBalances` array against the local catalog. Every
+ * reference is matched by local `kind` + `stableId` to EXISTING `currencies`
+ * catalog definitions; an ARCHIVED currency definition is allowed (a hidden
+ * amount must survive an import). A missing definition, a wrong-kind reference
+ * (the stableId belongs to a non-`currencies` catalog entry), a duplicated
+ * definition reference, or an out-of-range amount is rejected before any DB
+ * write. The array is already bounded (<=500) and amount-validated by the
+ * document schema.
+ */
+async function resolveCurrencyBalances(
+  db: DbClient,
+  balances: Extract<
+    CharacterImportDocument,
+    { schema: typeof IMPORT_SCHEMA_V8 }
+  >["currencyBalances"]
+): Promise<ResolvedCurrencyBalance[]> {
+  const seen = new Set<string>()
+  const resolved: ResolvedCurrencyBalance[] = []
+  for (const entry of balances) {
+    // The only kind that can be a currency balance is `currencies`.
+    if (entry.definition.kind !== "currencies") {
+      throw badRequest(
+        "import_currency_wrong_kind",
+        `Imported balance "${entry.definition.stableId}" has definition kind "${entry.definition.kind}", expected "currencies"`
+      )
+    }
+    const def = await findCatalogByStableId(
+      db,
+      "currencies",
+      entry.definition.stableId
+    )
+    if (!def) {
+      // Distinguish a wrong-kind reference (the stableId exists under another
+      // catalog kind) from a genuinely missing currency, so the error is
+      // actionable rather than a blanket "not in the catalog".
+      const other = await db.catalogDefinition.findFirst({
+        where: { stableId: entry.definition.stableId },
+      })
+      if (other) {
+        throw badRequest(
+          "import_currency_wrong_kind",
+          `Imported balance "${entry.definition.stableId}" is catalog kind "${other.kind}", expected "currencies"`
+        )
+      }
+      throw badRequest(
+        "import_currency_missing",
+        `Imported balance references catalog currency "${entry.definition.stableId}" which is not in the catalog`
+      )
+    }
+    if (seen.has(def.stableId)) {
+      throw badRequest(
+        "import_duplicate_currency",
+        `Catalog "${def.name}" appears more than once in imported currency balances`
+      )
+    }
+    seen.add(def.stableId)
+    if (
+      !Number.isInteger(entry.amount) ||
+      entry.amount < 0 ||
+      entry.amount > CURRENCY_AMOUNT_MAX
+    ) {
+      throw badRequest(
+        "import_currency_invalid",
+        `Currency amount for "${def.name}" must be a whole number 0..${CURRENCY_AMOUNT_MAX}`
+      )
+    }
+    resolved.push({
+      definitionId: def.id,
+      definition: def,
+      amount: entry.amount,
     })
   }
   return resolved
@@ -8422,8 +8784,14 @@ export async function importCharacter(
   // pre-migration backup rather than silently dropping it. Migration 0019 (in
   // the archived 0001..0023 chain, now folded into the 0.1.0 baseline) is the
   // migration that retired the kind; the notice points at the backup taken
-  // before it.
-  if (input.schema !== IMPORT_SCHEMA_V7) {
+  // before it. A v7/v8 document shares the v7 blessing model, so it is never
+  // treated as legacy here.
+  const isLegacyBlessingSchema =
+    input.schema === IMPORT_SCHEMA_V3 ||
+    input.schema === IMPORT_SCHEMA_V4 ||
+    input.schema === IMPORT_SCHEMA_V5 ||
+    input.schema === IMPORT_SCHEMA_V6
+  if (isLegacyBlessingSchema) {
     const legacyBlessing = input.associations.find((a) => a.kind === "blessing")
     if (legacyBlessing) {
       throw badRequest(
@@ -8532,7 +8900,8 @@ export async function importCharacter(
         input.schema === IMPORT_SCHEMA_V4 ||
         input.schema === IMPORT_SCHEMA_V5 ||
         input.schema === IMPORT_SCHEMA_V6 ||
-        input.schema === IMPORT_SCHEMA_V7
+        input.schema === IMPORT_SCHEMA_V7 ||
+        input.schema === IMPORT_SCHEMA_V8
       let resolvedInventory: ResolvedInventoryItem[] = []
       let ownedStockByDefId = new Map<string, number>()
       if (hasInventory) {
@@ -8551,8 +8920,8 @@ export async function importCharacter(
           maxTranscendentSkills: houseRules.config.maxTranscendentSkills,
           raceGrade: state.race.grade,
           // Only a legacy v3/v4 document may recover a ring position from its own
-          // definition.config.slot snapshot; a v5/v6 document carries the position
-          // explicitly and never trusts the snapshot.
+          // definition.config.slot snapshot; a v5/v6/v7/v8 document carries the
+          // position explicitly and never trusts the snapshot.
           allowConfigSnapshotPosition:
             input.schema === IMPORT_SCHEMA_V3 ||
             input.schema === IMPORT_SCHEMA_V4,
@@ -8563,6 +8932,16 @@ export async function importCharacter(
         houseRules.config.maxTranscendentSkills
       )
       const resolvedOffers = await resolveSkillOfferRefs(tx, input.skillOffers)
+
+      // A legacy v3-v7 document has no `currencyBalances` field and produces no
+      // balances; only a v8 document carries them (validated before any DB write).
+      let resolvedBalances: ResolvedCurrencyBalance[] = []
+      if (input.schema === IMPORT_SCHEMA_V8) {
+        resolvedBalances = await resolveCurrencyBalances(
+          tx,
+          input.currencyBalances
+        )
+      }
 
       const serialized = serializeState(state)
       const created = await tx.character.create({
@@ -8618,7 +8997,7 @@ export async function importCharacter(
         })
       }
 
-      // Import owned stock. Only reached for a v4 document (v3 imports no stock, so
+      // Import owned stock. Reached for a v4-v8 document (v3 imports no stock, so
       // the array is empty). Archived catalog stock is imported inert.
       for (const item of resolvedInventory) {
         await tx.characterInventoryItem.create({
@@ -8626,6 +9005,20 @@ export async function importCharacter(
             characterId: created.id,
             definitionId: item.definitionId,
             quantity: item.quantity,
+          },
+        })
+      }
+
+      // Import currency balances transactionally with the character and its
+      // associations/inventory; any failure above already rolled the whole import
+      // back, so this writes only after every resolve has passed. An ARCHIVED
+      // currency definition's balance is imported inert (a hidden amount survives).
+      for (const balance of resolvedBalances) {
+        await tx.characterCurrencyBalance.create({
+          data: {
+            characterId: created.id,
+            definitionId: balance.definitionId,
+            amount: balance.amount,
           },
         })
       }
@@ -8682,10 +9075,12 @@ export async function importCharacter(
             professionStableId: prof?.stableId ?? null,
             rulesetVersion: IMPORT_RULESET_VERSION,
             // Record which backup schema produced this import and how many distinct
-            // stock definitions were restored, so the marker is an auditable record
-            // of the backup's origin (never verified source provenance itself).
+            // stock definitions and currency balances were restored, so the marker
+            // is an auditable record of the backup's origin (never verified source
+            // provenance itself).
             backupSchema: input.schema,
             inventoryCount: resolvedInventory.length,
+            currencyBalanceCount: resolvedBalances.length,
             sourceEvents: input.events.length,
           } as Prisma.InputJsonValue,
         },
@@ -9029,6 +9424,25 @@ export async function createCatalogItemInTransaction(
     throw badRequest(
       "invalid_grade",
       'Gods carry no catalog grade: a gods entry must store "grade" as null'
+    )
+  }
+  // A currencies entry likewise carries no catalog grade band (see
+  // `currencyGradeForbidden`): a currency is a named in-world tender, not a graded
+  // definition, so `grade` must be null/omitted. A non-null grade on a new
+  // currency is rejected before any write.
+  if (currencyGradeForbidden(kind, input.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'Currencies carry no catalog grade: a currencies entry must store "grade" as null'
+    )
+  }
+  // A currencies entry carries no grade ladder, so no grade-specific prose is
+  // legal: gradeDescriptions must be empty (`{}`) or omitted. A non-empty map on a
+  // new currency is rejected before any write.
+  if (currencyGradeDescriptionsForbidden(kind, input.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      'Currencies carry no grade ladder: "gradeDescriptions" must be empty or omitted'
     )
   }
   const config = parseConfigOr400(kind, input.config ?? {})
@@ -9800,6 +10214,24 @@ export async function updateCatalogItemInTransaction(
     throw badRequest(
       "invalid_grade",
       'A race/class/profession always carries a required catalog grade: "grade" cannot be cleared to null'
+    )
+  }
+  // A currencies entry carries no catalog grade band (see `currencyGradeForbidden`):
+  // a PATCH that tries to set a non-null grade on a currency is rejected before any
+  // write; `grade: null` (or omitting grade) is the only legal value.
+  if (currencyGradeForbidden(kind, patch.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'Currencies carry no catalog grade: a currencies entry must store "grade" as null'
+    )
+  }
+  // A currencies entry carries no grade ladder, so a PATCH that tries to set a
+  // non-empty gradeDescriptions map is rejected before any write; an omitted value
+  // preserves the stored (empty) map.
+  if (currencyGradeDescriptionsForbidden(kind, patch.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      'Currencies carry no grade ladder: "gradeDescriptions" must be empty or omitted'
     )
   }
   const existing = await tx.catalogDefinition.findUnique({ where: { id } })

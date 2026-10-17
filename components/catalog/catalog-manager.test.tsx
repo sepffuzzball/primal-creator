@@ -883,6 +883,142 @@ describe("structured catalog editors", () => {
     return mock
   }
 
+  it("creates and edits currencies with only name and description metadata", async () => {
+    const currency = {
+      ...item,
+      kind: "currencies",
+      id: "coin-1",
+      stableId: "silver-crown",
+      name: "Silver Crown",
+      description: "A coin",
+      sourceUrl: "https://wiki.example/original",
+      grade: null,
+      config: {},
+      gradeDescriptions: {},
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { item: currency }
+      if (init?.method === "PATCH") return { item: currency }
+      return { items: [currency] }
+    })
+    render(<CatalogManager kind="currencies" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New Currency" }))
+    expect(screen.queryByLabelText("Grade")).toBeNull()
+    expect(screen.queryByLabelText("Config (JSON)")).toBeNull()
+    expect(screen.queryByLabelText("Descriptions by grade")).toBeNull()
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Silver Crown" },
+    })
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "A coin" },
+    })
+    fireEvent.change(screen.getByLabelText("Source URL"), {
+      target: { value: "https://wiki.example/created" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const create = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "POST"
+    )
+    expect(JSON.parse((create?.[1] as RequestInit).body as string)).toEqual({
+      name: "Silver Crown",
+      description: "A coin",
+      sourceUrl: "https://wiki.example/created",
+      config: {},
+    })
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "Updated" },
+    })
+    fireEvent.change(screen.getByLabelText("Source URL"), {
+      target: { value: "https://wiki.example/changed" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const update = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    expect(JSON.parse((update?.[1] as RequestInit).body as string)).toEqual({
+      name: "Silver Crown",
+      description: "Updated",
+      sourceUrl: "https://wiki.example/changed",
+    })
+  })
+
+  it("keeps an unchanged currency source URL in the edit payload", async () => {
+    const currency = {
+      ...item,
+      kind: "currencies",
+      id: "coin-source",
+      stableId: "source-coin",
+      name: "Source Coin",
+      description: "A coin",
+      sourceUrl: "https://wiki.example/coin",
+      grade: null,
+      config: {},
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (_url: string, init?: RequestInit) =>
+      init?.method === "PATCH" ? { item: currency } : { items: [currency] }
+    )
+    render(<CatalogManager kind="currencies" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "Updated description" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const update = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    expect(JSON.parse((update?.[1] as RequestInit).body as string)).toEqual({
+      name: "Source Coin",
+      description: "Updated description",
+      sourceUrl: "https://wiki.example/coin",
+    })
+  })
+
+  it("shows archived currencies and restores them through the catalog PATCH", async () => {
+    const currency = {
+      ...item,
+      kind: "currencies",
+      id: "coin-archived",
+      stableId: "old-coin",
+      name: "Old Coin",
+      archived: true,
+      config: {},
+    }
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PATCH") return { item: currency }
+      return { items: url.includes("includeArchived") ? [currency] : [] }
+    })
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true)
+    )
+    render(<CatalogManager kind="currencies" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    expect(screen.getByText("Old Coin")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Unarchive" }))
+    await flush()
+    const restore = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    expect(JSON.parse((restore?.[1] as RequestInit).body as string)).toEqual({
+      archived: false,
+    })
+    vi.unstubAllGlobals()
+  })
+
   it.each(["titles", "bloodlines", "transcendent_skills"])(
     "sends grade null when clearing an optional grade on %s",
     async (kind) => {

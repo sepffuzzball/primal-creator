@@ -83,12 +83,20 @@ docker compose run --rm app pnpm db:seed
 
 - `db:migrate` = `prisma migrate deploy`. It applies `prisma/migrations`, which in
   release 0.1.0 is the single from-scratch baseline
-  (`20261016000000_initial_0_1_0`) - the old `0001..0023` chain was archived (see
-  section 1.4).
+  (`20261016000000_initial_0_1_0`) plus the additive currencies migration
+  (`20261017000000_currencies`) that follows it - the old `0001..0023` chain was
+  archived (see section 1.4).
 - `db:seed` = `prisma db seed`, which runs `node prisma/seed.ts` (Node 24 type
   stripping) against the same `DATABASE_URL`. It bootstraps the admin user and
   the verified/house catalog entries. It is idempotent (uses upsert/find) and
   does not create sample characters.
+- `prisma/migrations` carries the 0.1.0 from-scratch baseline plus the additive
+  `20261017000000_currencies` migration that follows it. That currencies
+  migration is **additive**: it only adds the `currencies` value to the
+  `CatalogKind` enum and creates the `character_currency_balances` table, and it
+  never drops or modifies a baseline object, so applying it is a normal
+  `prisma migrate deploy` step that needs **no** destructive reset. See
+  `docs/rules/currencies.md`.
 
 Run these **before** `docker compose up -d` if you want the first boot to be
 immediately usable, or after once; the app serves regardless because it never
@@ -147,14 +155,19 @@ be wiped and rebuilt. This is a one-time, explicit, opt-in, fail-closed
 operation. It is **never** run automatically, and the app never auto-resets on
 boot.
 
+The reset applies **both** the 0.1.0 baseline and its additive currencies
+migration (`20261017000000_currencies`) and verifies the combined result. It is
+**not** the routine path for a normal deployment: a fresh/empty database, or
+one already on the 0.1.0 baseline (hardened by `db:migrate`), never needs it.
+
 The historical `0001..0023` SQL is preserved (untouched) at
 `prisma/migrations-archive/pre-0.1.0`.
 
 > **Warning.** The reset drops ALL existing application data - users, admins,
 > characters, progression events, drafts, inventory, associations and every
-> catalog row - and rebuilds the 11 application tables, the active house-rules
-> row, the single baseline migration, the `>= 41` curated catalog entries and
-> the seeded admin from scratch. Portrait/upload binaries that live outside the
+> catalog row - and rebuilds the 12 application tables, the active house-rules
+> row, the baseline plus its additive currencies migration, the `>= 41` curated
+> catalog entries and the seeded admin from scratch. Portrait/upload binaries that live outside the
 > database (the `uploads` volume or `UPLOAD_DIR`) survive, but their database
 > references (the `assets` rows) are gone, so those files are orphaned.
 
@@ -221,7 +234,8 @@ docker compose pull app
 #    `DELETE <db> FOR 0.1.0`. The reset validates the backup, the target
 #    host/port/db, the admin credentials and a read-only preflight, then runs
 #    `prisma migrate reset --force --skip-seed` + `prisma db seed` and verifies
-#    the result (11 tables, active house_rules, one baseline migration, >= 41
+#    the result (12 tables, active house_rules, the baseline plus its additive
+#    currencies migration, >= 41
 #    catalog entries, one admin).
 docker compose run --rm -v "${PWD}:/backups:ro" app pnpm db:reset:0.1.0 -- \
   --target-host postgres:5432 \
@@ -485,7 +499,8 @@ docker run --rm \
    re-seed).
 3. Restore the uploads volume.
 4. Run `pnpm db:migrate` on a fresh/extracted database to apply the 0.1.0
-   baseline (`20261016000000_initial_0_1_0`). If the restored dump predates
+   baseline (`20261016000000_initial_0_1_0`) and its additive currencies
+   migration (`20261017000000_currencies`). If the restored dump predates
    0.1.0 (an old `0001..0023` database), the baseline refuses to run, so run
    the one-time reset in section 1.4 instead.
 5. Log in with the seed (or existing) admin.

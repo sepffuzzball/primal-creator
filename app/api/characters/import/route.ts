@@ -7,6 +7,8 @@ import {
   IMPORT_SCHEMA_V4,
   IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
+  IMPORT_SCHEMA_V7,
+  IMPORT_SCHEMA_V8,
 } from "@/lib/server/import-schema"
 import { importCharacter } from "@/lib/db/service"
 
@@ -90,11 +92,13 @@ export async function POST(req: Request) {
       IMPORT_SCHEMA_V4,
       IMPORT_SCHEMA_V5,
       IMPORT_SCHEMA_V6,
+      IMPORT_SCHEMA_V7,
+      IMPORT_SCHEMA_V8,
     ])
     if (!SUPPORTED_SCHEMAS.has(String(schemaValue))) {
       throw badRequest(
         "unsupported_schema",
-        `Unsupported schema "${String(schemaValue)}"; expected "${IMPORT_SCHEMA_V3}", "${IMPORT_SCHEMA_V4}", "${IMPORT_SCHEMA_V5}" or "${IMPORT_SCHEMA_V6}"`
+        `Unsupported schema "${String(schemaValue)}"; expected one of "${IMPORT_SCHEMA_V3}", "${IMPORT_SCHEMA_V4}", "${IMPORT_SCHEMA_V5}", "${IMPORT_SCHEMA_V6}", "${IMPORT_SCHEMA_V7}" or "${IMPORT_SCHEMA_V8}"`
       )
     }
 

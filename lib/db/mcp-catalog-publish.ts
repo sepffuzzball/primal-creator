@@ -52,6 +52,8 @@ import { badRequest, conflict } from "@/lib/server/errors"
 import {
   allGradeGrantedSkillStableIds,
   catalogKindSchema,
+  currencyGradeDescriptionsForbidden,
+  currencyGradeForbidden,
   gradeDescriptionsSchema,
   gradeSchema,
   skillClassStableIdOf,
@@ -421,6 +423,25 @@ function validateBatch(input: readonly unknown[]): ManagedCatalogEntry[] {
     }
     const entry = parsed.data
     assertEntryCaps(entry)
+    // A currencies entry carries no catalog grade band (see `currencyGradeForbidden`)
+    // and no grade ladder (see `currencyGradeDescriptionsForbidden`), so a
+    // non-null grade or a non-empty gradeDescriptions map is rejected up front,
+    // before any database write. The per-entity service create/update helpers
+    // enforce the same invariants; this is the shared pure pre-validation.
+    if (currencyGradeForbidden(entry.kind, entry.grade)) {
+      throw badRequest(
+        "invalid_grade",
+        'Currencies carry no catalog grade: a currencies entry must store "grade" as null'
+      )
+    }
+    if (
+      currencyGradeDescriptionsForbidden(entry.kind, entry.gradeDescriptions)
+    ) {
+      throw badRequest(
+        "invalid_grade_descriptions",
+        'Currencies carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+      )
+    }
     const key = keyOf(entry.kind, entry.stableId)
     if (seen.has(key)) {
       throw badRequest(

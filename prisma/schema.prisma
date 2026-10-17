@@ -36,6 +36,7 @@ enum CatalogKind {
   evolutions
   gods
   transcendent_skills
+  currencies
 }
 
 enum AssociationKind {
@@ -180,6 +181,7 @@ model Character {
   associations  CharacterAssociation[]
   inventory     CharacterInventoryItem[]
   skillOffers   SkillOffer[]
+  currencyBalances CharacterCurrencyBalance[]
 
   @@index([ownerId])
   @@index([archived])
@@ -241,6 +243,7 @@ model CatalogDefinition {
   inventoryItems      CharacterInventoryItem[] @relation("InventoryItemDefinition")
   skillOfferOptions   SkillOfferOption[] @relation("SkillOfferOptionDefinition")
   skillOfferSelections SkillOffer[] @relation("SkillOfferSelection")
+  currencyBalances    CharacterCurrencyBalance[] @relation("CurrencyBalanceDefinition")
 
   @@unique([kind, stableId])
   @@index([kind])
@@ -345,6 +348,46 @@ model CharacterInventoryItem {
   @@unique([characterId, definitionId])
   @@index([characterId])
   @@map("character_inventory_items")
+}
+
+// ------------------------------------------------------------------ //
+// Character currency balances (per-character durable holdings)
+// ------------------------------------------------------------------ //
+//
+// A per-character quantity of a catalog `currencies` definition (a named in-world
+// currency such as gold, silver, or a campaign-specific tender). This is durable
+// character-held value persisted OUTSIDE Character.state: unlike the engine's
+// transient/resource pool, it is not synthesized from a catalog config at read
+// time, and unlike inventory quantity it is never a consumable/equipment stock
+// count - a balance is an end in itself.
+//
+// - One row per (character, definition): a character may hold at most one balance
+//   of any given currency definition (`@@unique([characterId, definitionId])`).
+// - `amount` is a nonnegative integer bounded to the 32-bit signed INT range
+//   (0..2147483647) by the migration's CHECK constraint. Unlike inventory
+//   quantity, a balance of 0 IS stored (a zero balance row keeps the explicit
+//   character-currency association); the service layer will enforce the same bound
+//   once balance mutations exist. There are no add/remove balance methods yet -
+//   this stage only adds the persistence shape.
+// - Deleting a character cascades to its balances. A referenced catalog
+//   `currencies` definition is never deleted while a balance row points to it
+//   (RESTRICT), mirroring the association and inventory link behavior.
+
+model CharacterCurrencyBalance {
+  id           String   @id @default(uuid()) @db.Uuid
+  characterId  String
+  character    Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  definitionId String
+  definition   CatalogDefinition @relation("CurrencyBalanceDefinition", fields: [definitionId], references: [id], onDelete: Restrict)
+  // Nonnegative integer 0..2147483647 (enforced by the migration CHECK). A 0
+  // balance is a legal stored row.
+  amount       Int
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([characterId, definitionId])
+  @@index([characterId])
+  @@map("character_currency_balances")
 }
 
 // ------------------------------------------------------------------ //

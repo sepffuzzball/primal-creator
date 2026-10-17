@@ -45,6 +45,8 @@ import {
   allGradeGrantedSkillStableIds,
   catalogCreateSchema,
   catalogKindSchema,
+  currencyGradeDescriptionsForbidden,
+  currencyGradeForbidden,
   godGradeForbidden,
   hasInvalidSkillTrack,
   hasLegacyEquipmentRequirements,
@@ -208,6 +210,22 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     throw badRequest(
       "invalid_grade",
       `Manifest god entry "${entry.stableId}" carries a grade; gods have no catalog grade band`
+    )
+  }
+  // A currencies manifest entry likewise carries no catalog grade band (see
+  // `currencyGradeForbidden`): a non-null grade is rejected before any write.
+  if (currencyGradeForbidden(kind, entry.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      `Manifest currency entry "${entry.stableId}" carries a grade; currencies have no catalog grade band`
+    )
+  }
+  // A currencies entry carries no grade ladder, so no grade-specific prose is
+  // legal. A non-empty gradeDescriptions map is rejected before any write.
+  if (currencyGradeDescriptionsForbidden(kind, entry.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      `Manifest currency entry "${entry.stableId}" carries gradeDescriptions; currencies have no grade ladder`
     )
   }
   const parsed = catalogCreateSchema.safeParse({

@@ -61,6 +61,8 @@ import {
   allGradeGrantedSkillStableIds,
   catalogCreateSchema,
   catalogKindSchema,
+  currencyGradeDescriptionsForbidden,
+  currencyGradeForbidden,
   gradeDescriptionsSchema,
   gradeSchema,
   godGradeForbidden,
@@ -424,6 +426,28 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
       `Bulk row ${row}: a gods entry carries no catalog grade (got "${String(grade)}")`
     )
   }
+  // A currencies entry likewise carries no catalog grade band (see
+  // `currencyGradeForbidden`): a non-null grade is rejected before any write, so
+  // both preview and apply fail up front with no partial write.
+  if (currencyGradeForbidden(kind, grade)) {
+    throw badRequest(
+      "invalid_grade",
+      `Bulk row ${row}: a currencies entry carries no catalog grade (got "${String(grade)}")`
+    )
+  }
+  const gradeDescriptions = validateGradeDescriptions(
+    raw.gradeDescriptions,
+    row
+  )
+  // A currencies entry carries no grade ladder, so no grade-specific prose is
+  // legal. A non-empty gradeDescriptions map (already normalized to a Partial
+  // record) is rejected before any write.
+  if (currencyGradeDescriptionsForbidden(kind, gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      `Bulk row ${row}: a currencies entry carries gradeDescriptions; currencies have no grade ladder`
+    )
+  }
   const sourceUrl = optionalNullableString(raw.sourceUrl, row, "sourceUrl")
   if (sourceUrl != null && sourceUrl.length > MAX_SOURCE_URL) {
     throw badRequest(
@@ -482,7 +506,7 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     grade,
     sourceUrl: sourceUrl ?? null,
     config: parsedConfig,
-    gradeDescriptions: validateGradeDescriptions(raw.gradeDescriptions, row),
+    gradeDescriptions,
   }
 }
 

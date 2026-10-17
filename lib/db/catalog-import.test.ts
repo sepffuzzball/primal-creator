@@ -1327,6 +1327,95 @@ describe("catalog import (unit, mocked db)", () => {
     expect(god.grade).toBeNull()
   })
 
+  it("accepts a currencies manifest entry with no grade and persists a null column", async () => {
+    const good: WikiReviewedEntry[] = [
+      {
+        kind: "currencies",
+        stableId: "crowns",
+        name: "Crowns",
+        description: "A guild tender",
+        sourceUrl: "https://example.com/crowns",
+        config: {},
+      },
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    const currency = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "crowns"
+    )!
+    expect(currency.kind).toBe("currencies")
+    expect(currency.grade).toBeNull()
+    expect(currency.config).toEqual({})
+  })
+
+  it("rejects a currencies manifest entry that carries a non-null grade (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        kind: "currencies",
+        stableId: "graded-crowns",
+        name: "Graded Crowns",
+        description: "A currency that mistakenly carries a catalog grade",
+        grade: "S",
+        sourceUrl: "https://example.com/graded-crowns",
+        config: {},
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a currencies manifest entry that carries a non-empty gradeDescriptions (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        kind: "currencies",
+        stableId: "crowns",
+        name: "Crowns",
+        description: "A guild tender",
+        sourceUrl: "https://example.com/crowns",
+        config: {},
+        gradeDescriptions: { G: "text" },
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a currencies manifest entry with a non-empty config (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        kind: "currencies",
+        stableId: "crowns",
+        name: "Crowns",
+        description: "A guild tender",
+        sourceUrl: "https://example.com/crowns",
+        config: { rarity: "Common" },
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
   it("rejects a manifest skill that omits a track (preview and apply, no write)", async () => {
     // A NEW manifest skill must be typed so it can actually be offered; an
     // `effects`+`rarity`-only config (no track) is an incomplete modern config.

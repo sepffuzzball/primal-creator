@@ -1090,7 +1090,7 @@ export interface SkillOfferExport {
 }
 
 export interface ExportResponse {
-  /** "primal-character/7" - the current trusted-backup schema. */
+  /** "primal-character/8" - the current trusted-backup schema. */
   schema: string
   rulesetVersion: string
   identity: CharacterIdentityExport

@@ -41,6 +41,7 @@ import {
   ARCHIVE_REQUIRED_DATA_OBJECTS,
   ARCHIVE_REQUIRED_OBJECTS,
   BASELINE_MIGRATION_NAME,
+  CURRENCIES_MIGRATION_NAME,
   PGDMP_HEADER,
   archiveHeaderDbname,
   assertArchiveContainsObjects,
@@ -144,6 +145,7 @@ function mockDb(options: MockDbOptions = {}) {
     adminCount = 1,
     migrationRows = [
       { name: BASELINE_MIGRATION_NAME, finished_at: new Date() },
+      { name: CURRENCIES_MIGRATION_NAME, finished_at: new Date() },
     ],
     houseActive = true,
     foreignObjects = [],

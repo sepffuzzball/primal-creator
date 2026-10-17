@@ -43,12 +43,18 @@ const gate = await resolveDbIntegration()
 
 const BASELINE_MIGRATION_NAME = "20261016000000_initial_0_1_0"
 
-// The 11 application tables the final schema creates (everything except the
+// The additive currencies migration layered on top of the 0.1.0 baseline. It is
+// part of the normal `prisma migrate deploy` run, so any test that asserts the
+// applied-migration set or the full application table set must account for it.
+const CURRENCIES_MIGRATION_NAME = "20261017000000_currencies"
+
+// The 12 application tables the final schema creates (everything except the
 // Prisma tracking table `_prisma_migrations`).
 const APP_TABLES = [
   "assets",
   "catalog_definitions",
   "character_associations",
+  "character_currency_balances",
   "character_drafts",
   "character_inventory_items",
   "characters",
@@ -390,11 +396,15 @@ describe.skipIf(!gate.run)(
               "pg_stat_statements_reset",
             ])
 
-            // The single baseline migration is recorded as applied.
+            // The baseline and its additive currencies migration are recorded as
+            // applied.
             const migs = (await db.$queryRawUnsafe(
               `SELECT migration_name AS name, finished_at FROM public."_prisma_migrations" ORDER BY started_at`
             )) as Array<{ name: string; finished_at: Date | null }>
-            expect(migs.map((m) => m.name)).toEqual([BASELINE_MIGRATION_NAME])
+            expect(migs.map((m) => m.name)).toEqual([
+              BASELINE_MIGRATION_NAME,
+              CURRENCIES_MIGRATION_NAME,
+            ])
             expect(migs[0].finished_at).not.toBeNull()
           } finally {
             await db.$disconnect()
@@ -524,16 +534,19 @@ describe.skipIf(!gate.run)("prisma 0.1.0 initial baseline schema", () => {
     await prisma.$disconnect()
   })
 
-  it("records exactly one applied baseline migration and nothing else", async () => {
+  it("records exactly the applied migrations and nothing else", async () => {
     const rows = await prisma.$queryRaw<
       Array<{ migration_name: string; finished_at: Date | null }>
     >`SELECT "migration_name", "finished_at" FROM "_prisma_migrations" ORDER BY "started_at"`
 
-    expect(rows.map((r) => r.migration_name)).toEqual([BASELINE_MIGRATION_NAME])
+    expect(rows.map((r) => r.migration_name)).toEqual([
+      BASELINE_MIGRATION_NAME,
+      CURRENCIES_MIGRATION_NAME,
+    ])
     expect(rows[0].finished_at).not.toBeNull()
   })
 
-  it("creates exactly the 11 application tables", async () => {
+  it("creates exactly the 12 application tables", async () => {
     const rows = await prisma.$queryRaw<
       Array<{ table_name: string }>
     >`SELECT table_name FROM information_schema.tables

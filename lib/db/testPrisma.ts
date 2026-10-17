@@ -74,6 +74,17 @@ export interface TestInventoryRow {
   definition?: TestCatalogRow | null
 }
 
+export interface TestCurrencyBalanceRow {
+  id: string
+  characterId: string
+  definitionId: string
+  amount: number
+  createdAt: Date
+  updatedAt: Date
+  // Relation, only set on the object returned by findUnique/findMany/create.
+  definition?: TestCatalogRow | null
+}
+
 export interface TestSkillOfferOptionRow {
   id: string
   offerId: string
@@ -306,6 +317,33 @@ export interface TestPrismaInstance {
         orderBy?: unknown
       }) => Promise<TestEventRow[]>
     }
+    characterCurrencyBalance: {
+      findUnique: (args: {
+        where:
+          | { id: string }
+          | {
+              characterId_definitionId: {
+                characterId: string
+                definitionId: string
+              }
+            }
+      }) => Promise<TestCurrencyBalanceRow | null>
+      findMany: (args: {
+        where?: { characterId?: string }
+        include?: unknown
+      }) => Promise<TestCurrencyBalanceRow[]>
+      count: (args: { where?: { characterId?: string } }) => Promise<number>
+      create: (args: {
+        data: Record<string, unknown>
+      }) => Promise<TestCurrencyBalanceRow>
+      updateMany: (args: {
+        where: { characterId: string; definitionId: string }
+        data: Record<string, unknown>
+      }) => Promise<{ count: number }>
+      deleteMany: (args: {
+        where: { characterId: string; definitionId: string }
+      }) => Promise<{ count: number }>
+    }
     skillOffer: {
       create: (args: {
         data: Record<string, unknown>
@@ -366,6 +404,7 @@ export interface TestPrismaInstance {
     catalog: Map<string, TestCatalogRow>
     associations: TestAssociationRow[]
     inventory: TestInventoryRow[]
+    currencyBalances: TestCurrencyBalanceRow[]
     events: TestEventRow[]
     skillOffers: TestSkillOfferRow[]
     skillOfferOptions: TestSkillOfferOptionRow[]
@@ -403,6 +442,13 @@ export interface TestPrismaInstance {
         quantity: number
       }
     ): TestInventoryRow
+    addCurrencyBalance(
+      row: Partial<TestCurrencyBalanceRow> & {
+        characterId: string
+        definitionId: string
+        amount: number
+      }
+    ): TestCurrencyBalanceRow
     reset(): void
   }
 }
@@ -534,6 +580,33 @@ interface Transaction {
       where: { characterId: string; definitionId: string }
     }) => Promise<{ count: number }>
   }
+  characterCurrencyBalance: {
+    findUnique: (args: {
+      where:
+        | { id: string }
+        | {
+            characterId_definitionId: {
+              characterId: string
+              definitionId: string
+            }
+          }
+    }) => Promise<TestCurrencyBalanceRow | null>
+    findMany: (args: {
+      where?: { characterId?: string }
+      include?: unknown
+    }) => Promise<TestCurrencyBalanceRow[]>
+    count: (args: { where?: { characterId?: string } }) => Promise<number>
+    create: (args: {
+      data: Record<string, unknown>
+    }) => Promise<TestCurrencyBalanceRow>
+    updateMany: (args: {
+      where: { characterId: string; definitionId: string }
+      data: Record<string, unknown>
+    }) => Promise<{ count: number }>
+    deleteMany: (args: {
+      where: { characterId: string; definitionId: string }
+    }) => Promise<{ count: number }>
+  }
   progressionEvent: {
     create: (args: { data: Record<string, unknown> }) => Promise<TestEventRow>
     findMany: (args: {
@@ -620,6 +693,7 @@ export function createTestPrisma(): TestPrismaInstance {
   const catalog = new Map<string, TestCatalogRow>()
   const associations: TestAssociationRow[] = []
   const inventory: TestInventoryRow[] = []
+  const currencyBalances: TestCurrencyBalanceRow[] = []
   const events: TestEventRow[] = []
   const skillOffers: TestSkillOfferRow[] = []
   const skillOfferOptions: TestSkillOfferOptionRow[] = []
@@ -632,6 +706,7 @@ export function createTestPrisma(): TestPrismaInstance {
   let eventCounter = 0
   let associationCounter = 0
   let inventoryCounter = 0
+  let balanceCounter = 0
   let offerCounter = 0
   let optionCounter = 0
   let draftCounter = 0
@@ -1223,6 +1298,98 @@ export function createTestPrisma(): TestPrismaInstance {
         return { count: removed }
       },
     },
+    characterCurrencyBalance: {
+      findUnique: async ({ where }) => {
+        const key = where as {
+          id?: string
+          characterId_definitionId?: {
+            characterId: string
+            definitionId: string
+          }
+        }
+        if (key.id != null) {
+          const row = currencyBalances.find((b) => b.id === key.id)
+          if (!row) return null
+          return {
+            ...row,
+            definition: catalog.get(row.definitionId) ?? null,
+          }
+        }
+        const c = key.characterId_definitionId
+        if (c) {
+          const row = currencyBalances.find(
+            (b) =>
+              b.characterId === c.characterId &&
+              b.definitionId === c.definitionId
+          )
+          if (!row) return null
+          return {
+            ...row,
+            definition: catalog.get(row.definitionId) ?? null,
+          }
+        }
+        return null
+      },
+      findMany: async ({ where }) => {
+        let results = currencyBalances
+        if (where?.characterId != null)
+          results = results.filter((b) => b.characterId === where.characterId)
+        return results.map((b) => ({
+          ...b,
+          definition: catalog.get(b.definitionId) ?? null,
+        }))
+      },
+      count: async ({ where }) => {
+        if (where?.characterId != null)
+          return currencyBalances.filter(
+            (b) => b.characterId === where.characterId
+          ).length
+        return currencyBalances.length
+      },
+      create: async ({ data }) => {
+        const id = (data.id as string) ?? `bal-${++balanceCounter}`
+        const now = new Date()
+        const row: TestCurrencyBalanceRow = {
+          id,
+          characterId: data.characterId as string,
+          definitionId: data.definitionId as string,
+          amount: data.amount as number,
+          createdAt: now,
+          updatedAt: now,
+          definition: catalog.get(data.definitionId as string) ?? null,
+        }
+        currencyBalances.push(row)
+        return row
+      },
+      updateMany: async ({ where, data }) => {
+        let count = 0
+        for (const b of currencyBalances) {
+          if (
+            b.characterId === where.characterId &&
+            b.definitionId === where.definitionId
+          ) {
+            if (data.amount !== undefined) b.amount = data.amount as number
+            b.updatedAt = new Date()
+            count++
+          }
+        }
+        return { count }
+      },
+      deleteMany: async ({ where }) => {
+        let removed = 0
+        for (let i = currencyBalances.length - 1; i >= 0; i--) {
+          const b = currencyBalances[i]
+          if (
+            b.characterId === where.characterId &&
+            b.definitionId === where.definitionId
+          ) {
+            currencyBalances.splice(i, 1)
+            removed++
+          }
+        }
+        return { count: removed }
+      },
+    },
     progressionEvent: {
       create: async ({ data }) => {
         const id = (data.id as string) ?? `evt-${++eventCounter}`
@@ -1443,6 +1610,7 @@ export function createTestPrisma(): TestPrismaInstance {
   function snapshot() {
     const assocSnapshot = associations.map((a) => ({ ...a }))
     const inventorySnapshot = inventory.map((i) => ({ ...i }))
+    const balanceSnapshot = currencyBalances.map((b) => ({ ...b }))
     const eventSnapshot = [...events]
     const offerSnapshot = skillOffers.map((o) => ({ ...o }))
     const optionSnapshot = skillOfferOptions.map((o) => ({ ...o }))
@@ -1456,6 +1624,7 @@ export function createTestPrisma(): TestPrismaInstance {
     return {
       assocSnapshot,
       inventorySnapshot,
+      balanceSnapshot,
       eventSnapshot,
       offerSnapshot,
       optionSnapshot,
@@ -1470,6 +1639,7 @@ export function createTestPrisma(): TestPrismaInstance {
   function restore(snap: ReturnType<typeof snapshot>) {
     associations.splice(0, associations.length, ...snap.assocSnapshot)
     inventory.splice(0, inventory.length, ...snap.inventorySnapshot)
+    currencyBalances.splice(0, currencyBalances.length, ...snap.balanceSnapshot)
     events.splice(0, events.length, ...snap.eventSnapshot)
     skillOffers.splice(0, skillOffers.length, ...snap.offerSnapshot)
     skillOfferOptions.splice(
@@ -1618,6 +1788,7 @@ export function createTestPrisma(): TestPrismaInstance {
     characterDraft: tx.characterDraft,
     characterAssociation: tx.characterAssociation,
     characterInventoryItem: tx.characterInventoryItem,
+    characterCurrencyBalance: tx.characterCurrencyBalance,
     progressionEvent: tx.progressionEvent,
     skillOffer: tx.skillOffer,
     skillOfferOption: tx.skillOfferOption,
@@ -1631,6 +1802,7 @@ export function createTestPrisma(): TestPrismaInstance {
       catalog,
       associations,
       inventory,
+      currencyBalances,
       events,
       skillOffers,
       skillOfferOptions,
@@ -1769,11 +1941,27 @@ export function createTestPrisma(): TestPrismaInstance {
         inventory.push(full)
         return full
       },
+      addCurrencyBalance(row) {
+        const id = row.id ?? `bal-${++balanceCounter}`
+        const now = new Date()
+        const full: TestCurrencyBalanceRow = {
+          id,
+          characterId: row.characterId,
+          definitionId: row.definitionId,
+          amount: row.amount,
+          createdAt: row.createdAt ?? now,
+          updatedAt: row.updatedAt ?? now,
+          definition: catalog.get(row.definitionId) ?? null,
+        }
+        currencyBalances.push(full)
+        return full
+      },
       reset() {
         characters.clear()
         catalog.clear()
         associations.splice(0, associations.length)
         inventory.splice(0, inventory.length)
+        currencyBalances.splice(0, currencyBalances.length)
         events.splice(0, events.length)
         skillOffers.splice(0, skillOffers.length)
         skillOfferOptions.splice(0, skillOfferOptions.length)
@@ -1786,6 +1974,7 @@ export function createTestPrisma(): TestPrismaInstance {
         eventCounter = 0
         associationCounter = 0
         inventoryCounter = 0
+        balanceCounter = 0
         offerCounter = 0
         optionCounter = 0
         draftCounter = 0

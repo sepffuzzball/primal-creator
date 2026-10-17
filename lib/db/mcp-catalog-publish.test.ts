@@ -74,6 +74,16 @@ function godEntry(stableId: string, extra: Record<string, unknown> = {}) {
   }
 }
 
+function currencyEntry(stableId: string, extra: Record<string, unknown> = {}) {
+  return {
+    kind: "currencies" as const,
+    stableId,
+    name: `Currency ${stableId}`,
+    config: {},
+    ...extra,
+  }
+}
+
 function equipmentEntry(
   stableId: string,
   config: Record<string, unknown>,
@@ -758,6 +768,33 @@ describe("validation", () => {
     await expect(
       previewManagedCatalog([item("potion"), item("potion")])
     ).rejects.toMatchObject({ status: 400, code: "duplicate_managed_entry" })
+  })
+
+  it("accepts a currencies entry with an empty config and no grade", async () => {
+    const result = await previewManagedCatalog([currencyEntry("crowns")])
+    expect(result.changes[0].status).toBe("create")
+  })
+
+  it("rejects a currencies entry that carries a non-null grade", async () => {
+    await expect(
+      previewManagedCatalog([currencyEntry("crowns", { grade: "S" })])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+  })
+
+  it("rejects a currencies entry that carries a non-empty gradeDescriptions", async () => {
+    await expect(
+      previewManagedCatalog([
+        currencyEntry("crowns", { gradeDescriptions: { G: "text" } }),
+      ])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
+  })
+
+  it("rejects a currencies entry that carries a non-empty config", async () => {
+    await expect(
+      previewManagedCatalog([
+        currencyEntry("crowns", { config: { rarity: "Common" } }),
+      ])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
   })
 
   it("rejects an http sourceUrl and accepts https", async () => {

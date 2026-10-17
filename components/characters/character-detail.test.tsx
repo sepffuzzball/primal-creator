@@ -67,6 +67,177 @@ vi.mock("@/lib/api", () => {
   return { ApiError, jsonInit, apiFetch: vi.fn(), ATTRIBUTE_KEYS }
 })
 
+describe("character currencies", () => {
+  const currency = {
+    definitionId: "coin-id",
+    stableId: "gold_coin",
+    name: "Gold",
+    description: null,
+    amount: null,
+  }
+  async function openCurrencies() {
+    await renderDetail()
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]!
+    )
+    const panel = associationSheetContent("inventoryEquipment")
+    fireEvent.click(within(panel).getByRole("tab", { name: "Currencies" }))
+    await flush()
+    return panel
+  }
+
+  it("loads active balances with null blank and zero displayed", async () => {
+    setupMock()
+    currenciesForTest = [
+      currency,
+      { ...currency, definitionId: "zero", name: "Zero", amount: 0 },
+    ]
+    const panel = await openCurrencies()
+    expect(
+      within(panel)
+        .getByRole("textbox", { name: "Gold balance" })
+        .getAttribute("value")
+    ).toBe("")
+    expect(
+      within(panel)
+        .getByRole("textbox", { name: "Zero balance" })
+        .getAttribute("value")
+    ).toBe("0")
+  })
+
+  it.each([
+    ["12", 12],
+    ["0", 0],
+    ["", null],
+  ])("saves %s with version then refreshes", async (value, amount) => {
+    setupMock()
+    currenciesForTest = [currency]
+    const panel = await openCurrencies()
+    const input = within(panel).getByRole("textbox", { name: "Gold balance" })
+    fireEvent.change(input, { target: { value } })
+    expect(
+      within(panel)
+        .getByRole("button", { name: "Save" })
+        .hasAttribute("disabled")
+    ).toBe(false)
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }))
+    await flush()
+    expect(currencyPostsForTest).toEqual([
+      expect.objectContaining({ definitionId: "coin-id", amount, version: 3 }),
+    ])
+    expect(
+      (apiFetch as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([url, init]) =>
+          url.endsWith("/currencies") &&
+          (init as RequestInit | undefined)?.method !== "PATCH"
+      ).length
+    ).toBeGreaterThanOrEqual(2)
+  })
+
+  it.each(["-1", "1.5", "2147483648", "１２"])(
+    "rejects invalid balance %s",
+    async (value) => {
+      setupMock()
+      currenciesForTest = [currency]
+      const panel = await openCurrencies()
+      const input = within(panel).getByRole("textbox", { name: "Gold balance" })
+      fireEvent.change(input, { target: { value } })
+      expect(
+        within(panel)
+          .getByRole("button", { name: "Save" })
+          .hasAttribute("disabled")
+      ).toBe(true)
+      expect(currencyPostsForTest).toHaveLength(0)
+    }
+  )
+
+  it("disables edits for archived characters and shows an empty state", async () => {
+    setupMock({
+      character: { ...character, archived: true } as typeof character,
+    })
+    currenciesForTest = [currency]
+    const panel = await openCurrencies()
+    expect(
+      within(panel)
+        .getByRole("textbox", { name: "Gold balance" })
+        .hasAttribute("disabled")
+    ).toBe(true)
+    expect(within(panel).queryByRole("button", { name: "Save" })).toBeNull()
+    cleanup()
+    setupMock()
+    currenciesForTest = []
+    const emptyPanel = await openCurrencies()
+    expect(
+      within(emptyPanel).getByText("No active currencies in the catalog.")
+    ).toBeTruthy()
+  })
+
+  it("shows API errors and supports reload after a conflict", async () => {
+    setupMock()
+    currenciesForTest = [currency]
+    const panel = await openCurrencies()
+    currencyErrorForTest = new Error("Version conflict")
+    fireEvent.change(
+      within(panel).getByRole("textbox", { name: "Gold balance" }),
+      { target: { value: "42" } }
+    )
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }))
+    await flush()
+    expect(within(panel).getByText("Version conflict")).toBeTruthy()
+    currencyErrorForTest = null
+    currenciesForTest = [{ ...currency, amount: 7 }]
+    fireEvent.click(
+      within(panel).getByRole("button", { name: "Reload from server" })
+    )
+    await flush()
+    expect(
+      within(panel).getByRole("textbox", { name: "Gold balance" })
+    ).toHaveProperty("value", "7")
+  })
+
+  it("keeps another currency draft when saving one currency", async () => {
+    setupMock()
+    currenciesForTest = [
+      currency,
+      { ...currency, definitionId: "silver", name: "Silver", amount: 1 },
+    ]
+    const panel = await openCurrencies()
+    fireEvent.change(
+      within(panel).getByRole("textbox", { name: "Gold balance" }),
+      { target: { value: "12" } }
+    )
+    fireEvent.change(
+      within(panel).getByRole("textbox", { name: "Silver balance" }),
+      { target: { value: "99" } }
+    )
+    fireEvent.click(within(panel).getAllByRole("button", { name: "Save" })[0]!)
+    await flush()
+    expect(
+      within(panel).getByRole("textbox", { name: "Gold balance" })
+    ).toHaveProperty("value", "12")
+    expect(
+      within(panel).getByRole("textbox", { name: "Silver balance" })
+    ).toHaveProperty("value", "99")
+  })
+
+  it("refreshes the parent version after currency save", async () => {
+    setupMock()
+    currenciesForTest = [currency]
+    const panel = await openCurrencies()
+    fireEvent.change(
+      within(panel).getByRole("textbox", { name: "Gold balance" }),
+      { target: { value: "12" } }
+    )
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }))
+    await flush()
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Manage equipment" })[0]!
+    )
+    await flush()
+    expect(activeCharacter.version).toBe(4)
+  })
+})
+
 // --- Deferred promise helper ---------------------------------------------- //
 
 interface Deferred<T> {
@@ -505,6 +676,16 @@ let professionPosts: Array<Record<string, unknown>> = []
 let skillsCatalogForTest: import("@/lib/api").CatalogItem[] = []
 let upgradeErrorForTest: unknown = null
 let upgradePostsForTest: Array<Record<string, unknown>> = []
+let currenciesForTest: Array<{
+  definitionId: string
+  stableId: string
+  name: string
+  description: string | null
+  amount: number | null
+}> = []
+let currencyVersionForTest = 3
+let currencyPostsForTest: Array<Record<string, unknown>> = []
+let currencyErrorForTest: unknown = null
 
 /** Build a blessing/bloodline catalog item with documented defaults. */
 function catalogItem(
@@ -772,6 +953,10 @@ function setupMock(options?: {
   skillsCatalogForTest = options?.skills ?? []
   upgradeErrorForTest = options?.upgradeError ?? null
   upgradePostsForTest = []
+  currenciesForTest = []
+  currencyVersionForTest = activeCharacter.version
+  currencyPostsForTest = []
+  currencyErrorForTest = null
   associationsError = options?.associationsError ?? null
   blessingsCatalog = options?.blessings ?? []
   bloodlinesCatalog = options?.bloodlines ?? []
@@ -815,6 +1000,29 @@ function setupMock(options?: {
       patchPosts.push(body)
       activeCharacter = applyProfilePatch(activeCharacter, body)
       return { character: activeCharacter }
+    }
+    if (url === "/api/characters/chr-1/currencies" && method === "GET") {
+      if (currencyErrorForTest) throw currencyErrorForTest
+      return { currencies: currenciesForTest, version: currencyVersionForTest }
+    }
+    if (url === "/api/characters/chr-1/currencies" && method === "PATCH") {
+      if (currencyErrorForTest) throw currencyErrorForTest
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<
+        string,
+        unknown
+      >
+      currencyPostsForTest.push(body)
+      currencyVersionForTest += 1
+      activeCharacter = {
+        ...activeCharacter,
+        version: activeCharacter.version + 1,
+      }
+      currenciesForTest = currenciesForTest.map((item) =>
+        item.definitionId === body.definitionId
+          ? { ...item, amount: body.amount as number | null }
+          : item
+      )
+      return { version: currencyVersionForTest }
     }
     if (url === "/api/characters/chr-1/portrait") return { portrait: null }
     if (url === "/api/characters/chr-2/portrait") return { portrait: null }
@@ -1131,6 +1339,7 @@ describe("scheduled skill choice prompts", () => {
                 nameSnapshot: "Quick Shot",
                 archived: false,
                 classPriority: true,
+                grade: "A",
               },
             ],
           }),
@@ -1140,6 +1349,7 @@ describe("scheduled skill choice prompts", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("button", { name: "Choose skill" }))
     const sheet = associationSheetContent("titlesSkills")
+    expect(within(sheet).getByText("A")).toBeTruthy()
     expect(within(sheet).getByRole("tab", { name: "Skills" })).toBeTruthy()
     expect(within(sheet).getByText("Class match")).toBeTruthy()
     fireEvent.click(within(sheet).getByRole("button", { name: "Select" }))

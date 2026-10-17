@@ -14,6 +14,7 @@ import {
   CATALOG_ENTRY_PATH,
   CATALOG_PREVIEW_PATH,
   CATALOG_LIST_PATH,
+  CATALOG_KINDS,
   MAX_ENTRIES,
   MAX_STABLE_ID_LENGTH,
   CatalogApiError,
@@ -25,6 +26,7 @@ import {
   catalogList,
   catalogPublish,
   createClient,
+  isCatalogKind,
   createServer,
   parseJsonSafely,
   publishConflictMessage,
@@ -235,6 +237,26 @@ describe("catalogEntrySchema", () => {
     expect(
       catalogEntryListSchema.safeParse(many.slice(0, MAX_ENTRIES)).success
     ).toBe(true)
+  })
+})
+
+describe("currencies catalog kind", () => {
+  it("accepts a currencies entry in catalogEntrySchema", () => {
+    const parsed = catalogEntrySchema.safeParse(
+      validEntry({
+        kind: "currencies",
+        name: "Crowns",
+      } as Partial<CatalogEntry>)
+    )
+    expect(parsed.success).toBe(true)
+  })
+
+  it("isCatalogKind accepts currencies", () => {
+    expect(isCatalogKind("currencies")).toBe(true)
+  })
+
+  it("CATALOG_KINDS includes currencies", () => {
+    expect(CATALOG_KINDS).toContain("currencies")
   })
 })
 

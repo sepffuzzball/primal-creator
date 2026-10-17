@@ -21,6 +21,7 @@ import {
   exportCharacter,
   getCatalogItem,
   getCharacter,
+  getCharacterCurrencies,
   getCharacterInventory,
   getEvolutionOptions,
   importCharacter,
@@ -30,6 +31,7 @@ import {
   refreshPendingSkillOffers,
   resolveTrackDefinition,
   serializeState,
+  setCharacterCurrencyBalance,
   setCharacterProfession,
   skillCharacter,
   toListItem,
@@ -44,7 +46,9 @@ import {
   IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
   IMPORT_SCHEMA_V7,
+  IMPORT_SCHEMA_V8,
   IMPORT_RULESET_VERSION,
+  MAX_IMPORT_CURRENCIES,
   characterImportDocumentSchema,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
@@ -5768,7 +5772,7 @@ describe("exportCharacter (associations / live state)", () => {
       user
     )
     const portable = await exportCharacter("chr-1", user)
-    expect(portable.schema).toBe("primal-character/7")
+    expect(portable.schema).toBe(IMPORT_SCHEMA_V8)
     expect(portable.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(portable.identity).toMatchObject({
       name: "Test",
@@ -9025,7 +9029,7 @@ describe("importCharacter (trusted backup v3)", () => {
         "chr-r",
         user
       )) as CharacterImportDocument
-      expect(portable.schema).toBe("primal-character/7")
+      expect(portable.schema).toBe(IMPORT_SCHEMA_V8)
       const inv = (portable as { inventory: Array<{ quantity: number }> })
         .inventory
       expect(inv).toHaveLength(2)
@@ -9345,7 +9349,7 @@ describe("importCharacter (trusted backup v3)", () => {
       "chr-nr",
       user
     )) as CharacterImportDocument
-    expect(portable.schema).toBe("primal-character/7")
+    expect(portable.schema).toBe(IMPORT_SCHEMA_V8)
 
     // A real wire round-trip. JSON.stringify drops undefined values, which is what
     // used to delete equipmentPosition from a non-ring link and make the strict v5
@@ -13749,6 +13753,364 @@ describe("character inventory (owner-managed quantities)", () => {
     expect(res.character.state).toEqual(before.state)
     expect(res.character.inventory).toHaveLength(1)
     expect(res.character.inventory[0].quantity).toBe(1)
+  })
+})
+
+describe("character currency balances (owner-managed holdings)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedState(overrides: Record<string, unknown> = {}) {
+    const state = createInitialState("integrated", null, null)
+    return dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(state),
+      version: 0,
+      ...overrides,
+    })
+  }
+
+  function seedCurrency(
+    id: string,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ) {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "currencies",
+      stableId: id,
+      name: extra.name ?? `Currency ${id}`,
+      config: {},
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedBalance(definitionId: string, amount: number) {
+    return dbMock.store.addCurrencyBalance({
+      characterId: "chr-1",
+      definitionId,
+      amount,
+    })
+  }
+
+  const other = { id: "user-2", email: "x@y", isAdmin: false }
+
+  function patchBody(definitionId: string, amount: number | null, version = 0) {
+    return { definitionId, amount, version }
+  }
+
+  it("reads active currency balances with the current version, hiding archived definitions", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    seedCurrency("cur-silver", { name: "Silver" })
+    seedCurrency("cur-old", { name: "Old Tender", archived: true })
+    seedBalance("cur-gold", 500)
+    seedBalance("cur-old", 100)
+    const { currencies, version } = await getCharacterCurrencies("chr-1", user)
+    expect(version).toBe(0)
+    // Only active definitions appear, sorted by name then stableId. The archived
+    // "Old Tender" is hidden even though it carries a saved balance.
+    expect(currencies.map((c) => c.stableId)).toEqual([
+      "cur-gold",
+      "cur-silver",
+    ])
+    expect(currencies[0]).toMatchObject({
+      definitionId: "cur-gold",
+      stableId: "cur-gold",
+      name: "Gold",
+      amount: 500,
+    })
+    expect(currencies[1].amount).toBeNull()
+  })
+
+  it("rejects a non-owner read and lets an admin read any character", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    await expect(getCharacterCurrencies("chr-1", other)).rejects.toMatchObject({
+      status: 403,
+      code: "forbidden",
+    })
+    const admin = { ...user, isAdmin: true }
+    await expect(getCharacterCurrencies("chr-1", admin)).resolves.toMatchObject(
+      {
+        version: 0,
+      }
+    )
+  })
+
+  it("still reads balances on an archived character (read path)", async () => {
+    seedState({ archived: true })
+    seedCurrency("cur-gold", { name: "Gold" })
+    const { currencies, version } = await getCharacterCurrencies("chr-1", user)
+    expect(version).toBe(0)
+    expect(currencies).toHaveLength(1)
+    expect(currencies[0].amount).toBeNull()
+  })
+
+  it("hides a saved balance while its currency is archived, then reveals it on reactivation", async () => {
+    seedState()
+    seedCurrency("cur-old", { name: "Old Tender", archived: true })
+    seedBalance("cur-old", 120)
+    let { currencies } = await getCharacterCurrencies("chr-1", user)
+    expect(currencies).toHaveLength(0)
+    // Reactivate the catalog definition; the retained balance is revealed.
+    dbMock.store.catalog.get("cur-old")!.archived = false
+    ;({ currencies } = await getCharacterCurrencies("chr-1", user))
+    expect(currencies).toHaveLength(1)
+    expect(currencies[0]).toMatchObject({
+      stableId: "cur-old",
+      amount: 120,
+    })
+  })
+
+  it("lets an owner set a balance, bumping the version exactly once and writing no event", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    const res = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", 500),
+      user
+    )
+    expect(res.version).toBe(1)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    const balances = dbMock.store.currencyBalances
+    expect(balances).toHaveLength(1)
+    expect(balances[0]).toMatchObject({
+      definitionId: "cur-gold",
+      amount: 500,
+    })
+    // No progression event is emitted for a currency write.
+    expect(dbMock.store.events).toHaveLength(0)
+    // Character state is never mutated.
+    expect(dbMock.store.characters.get("chr-1")!.state).toEqual(
+      serializeState(createInitialState("integrated", null, null))
+    )
+  })
+
+  it("persists a zero balance, and a null amount removes the row", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    const zero = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", 0),
+      user
+    )
+    expect(zero.version).toBe(1)
+    expect(dbMock.store.currencyBalances).toHaveLength(1)
+    expect(dbMock.store.currencyBalances[0].amount).toBe(0)
+    const cleared = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", null, 1),
+      user
+    )
+    expect(cleared.version).toBe(2)
+    expect(dbMock.store.currencyBalances).toHaveLength(0)
+  })
+
+  it("setting null when no row exists is an idempotent no-op that never bumps", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    const res = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", null),
+      user
+    )
+    expect(res.version).toBe(0)
+    expect(dbMock.store.currencyBalances).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("setting the already-stored amount is idempotent and never bumps the version", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    await setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 500), user)
+    const res = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", 500, 1),
+      user
+    )
+    expect(res.version).toBe(1)
+    expect(dbMock.store.currencyBalances).toHaveLength(1)
+    expect(dbMock.store.currencyBalances[0].amount).toBe(500)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a stale version with 409 and writes nothing", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    await setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 500), user)
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 600, 0), user)
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.currencyBalances[0].amount).toBe(500)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a stale version for an unchanged amount (no-op) with 409 and writes nothing", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    await setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 500), user)
+    // A FRESH no-op (matching version) returns the unchanged version, no event,
+    // no write.
+    const fresh = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", 500, 1),
+      user
+    )
+    expect(fresh.version).toBe(1)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.currencyBalances).toHaveLength(1)
+    expect(dbMock.store.currencyBalances[0].amount).toBe(500)
+    expect(dbMock.store.events).toHaveLength(0)
+    // A STALE no-op (client still holds the old version 0) must 409 even though
+    // the amount is unchanged.
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 500, 0), user)
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(1)
+    expect(dbMock.store.currencyBalances).toHaveLength(1)
+    expect(dbMock.store.currencyBalances[0].amount).toBe(500)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a stale version for a null no-op (no row exists) with 409", async () => {
+    seedState({ version: 5 })
+    seedCurrency("cur-gold", { name: "Gold" })
+    // A FRESH null no-op (matching version) returns the unchanged version and
+    // writes no row.
+    const fresh = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", null, 5),
+      user
+    )
+    expect(fresh.version).toBe(5)
+    expect(dbMock.store.currencyBalances).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(0)
+    // A STALE null no-op (client holds version 0 while the current version is 5)
+    // must 409 even though no row exists.
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", null, 0), user)
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(5)
+    expect(dbMock.store.currencyBalances).toHaveLength(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects the MAX_IMPORT_CURRENCIES+1st distinct balance row (counting archived) with 409", async () => {
+    seedState()
+    // Seed exactly MAX_IMPORT_CURRENCIES distinct currencies, archiving every other
+    // one so the cap demonstrably counts ARCHIVED balances too.
+    for (let i = 0; i < MAX_IMPORT_CURRENCIES; i++) {
+      seedCurrency(`cur-${i}`, { archived: i % 2 === 0 })
+      seedBalance(`cur-${i}`, i)
+    }
+    expect(dbMock.store.currencyBalances).toHaveLength(MAX_IMPORT_CURRENCIES)
+    // A 501st distinct ACTIVE currency must be rejected before any write.
+    seedCurrency("cur-extra")
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-extra", 1, 0), user)
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "currency_defs_cap_exceeded",
+    })
+    expect(dbMock.store.currencyBalances).toHaveLength(MAX_IMPORT_CURRENCIES)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("allows updating and deleting existing rows at the cap, then accepts a new distinct row after a slot frees", async () => {
+    seedState()
+    for (let i = 0; i < MAX_IMPORT_CURRENCIES; i++) {
+      seedCurrency(`cur-${i}`)
+      seedBalance(`cur-${i}`, i)
+    }
+    // Update an existing row at the cap: allowed, still bumps the version exactly
+    // once (the per-row cap never restricts an update).
+    const upd = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-0", 123, 0),
+      user
+    )
+    expect(upd.version).toBe(1)
+    expect(
+      dbMock.store.currencyBalances.find((b) => b.definitionId === "cur-0")
+        ?.amount
+    ).toBe(123)
+    expect(dbMock.store.currencyBalances).toHaveLength(MAX_IMPORT_CURRENCIES)
+    // Delete an existing row at the cap: allowed, and a slot frees up.
+    const del = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-1", null, 1),
+      user
+    )
+    expect(del.version).toBe(2)
+    expect(dbMock.store.currencyBalances).toHaveLength(
+      MAX_IMPORT_CURRENCIES - 1
+    )
+    // A freed slot accepts a new distinct row.
+    seedCurrency("cur-extra")
+    const added = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-extra", 1, 2),
+      user
+    )
+    expect(added.version).toBe(3)
+    expect(dbMock.store.currencyBalances).toHaveLength(MAX_IMPORT_CURRENCIES)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a mutation on an archived character", async () => {
+    seedState({ archived: true })
+    seedCurrency("cur-gold", { name: "Gold" })
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 500), user)
+    ).rejects.toMatchObject({ status: 400, code: "character_archived" })
+  })
+
+  it("rejects an archived currency definition", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold", archived: true })
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 500), user)
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+  })
+
+  it("rejects a missing definition (404) and a non-currency definition (400)", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-missing", 500), user)
+    ).rejects.toMatchObject({ status: 404, code: "catalog_not_found" })
+    dbMock.store.addCatalog({
+      id: "gear-1",
+      kind: "equipment",
+      stableId: "gear-1",
+      name: "Headgear",
+      config: { slot: "head" },
+    })
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("gear-1", 500), user)
+    ).rejects.toMatchObject({ status: 400, code: "wrong_kind" })
+  })
+
+  it("lets an admin set any character's balance and rejects a non-owner", async () => {
+    seedState()
+    seedCurrency("cur-gold", { name: "Gold" })
+    const admin = { ...user, isAdmin: true }
+    const res = await setCharacterCurrencyBalance(
+      "chr-1",
+      patchBody("cur-gold", 100),
+      admin
+    )
+    expect(res.version).toBe(1)
+    expect(dbMock.store.currencyBalances).toHaveLength(1)
+    expect(dbMock.store.currencyBalances[0].amount).toBe(100)
+    await expect(
+      setCharacterCurrencyBalance("chr-1", patchBody("cur-gold", 0), other)
+    ).rejects.toMatchObject({ status: 403, code: "forbidden" })
   })
 })
 
@@ -20537,5 +20899,138 @@ describe("refresh pending scheduled skill offers", () => {
     expect(
       offer.options.find((o) => o.definitionId === "sk-archer")!.nameSnapshot
     ).toBe("Zulu Archer")
+  })
+})
+
+describe("catalog currencies create/update invariants", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("creates a currencies entry with a null grade and an empty config", async () => {
+    const item = await createCatalogItem("currencies", {
+      stableId: "crowns",
+      name: "Crowns",
+      grade: null,
+      config: {},
+    })
+    expect(item.kind).toBe("currencies")
+    expect(item.grade).toBeNull()
+    expect(item.config).toEqual({})
+  })
+
+  it("creates a currencies entry when grade is omitted and gradeDescriptions is empty", async () => {
+    const item = await createCatalogItem("currencies", {
+      stableId: "crowns",
+      name: "Crowns",
+      gradeDescriptions: {},
+    })
+    expect(item.grade).toBeNull()
+    expect(item.gradeDescriptions).toEqual({})
+    expect(item.config).toEqual({})
+  })
+
+  it("rejects a currencies entry with a non-null grade", async () => {
+    await expect(
+      createCatalogItem("currencies", {
+        stableId: "crowns",
+        name: "Crowns",
+        grade: "S",
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a currencies entry with a non-empty config", async () => {
+    await expect(
+      createCatalogItem("currencies", {
+        stableId: "crowns",
+        name: "Crowns",
+        config: { rarity: "Common" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a currencies entry with a non-empty gradeDescriptions", async () => {
+    await expect(
+      createCatalogItem("currencies", {
+        stableId: "crowns",
+        name: "Crowns",
+        gradeDescriptions: { G: "text" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("allows a currencies PATCH that clears the grade to null", async () => {
+    dbMock.store.addCatalog({
+      id: "cur-1",
+      kind: "currencies",
+      stableId: "crowns",
+      name: "Crowns",
+      config: {},
+    })
+    const item = await updateCatalogItem("currencies", "cur-1", {
+      grade: null,
+    })
+    expect(item.grade).toBeNull()
+    expect(item.config).toEqual({})
+  })
+
+  it("rejects a currencies PATCH that sets a non-null grade", async () => {
+    dbMock.store.addCatalog({
+      id: "cur-1",
+      kind: "currencies",
+      stableId: "crowns",
+      name: "Crowns",
+      config: {},
+    })
+    await expect(
+      updateCatalogItem("currencies", "cur-1", { grade: "A" })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    // The row is unchanged - the existing null grade is preserved.
+    expect(dbMock.store.catalog.get("cur-1")!.grade).toBeNull()
+  })
+
+  it("rejects a currencies PATCH with a non-empty config", async () => {
+    dbMock.store.addCatalog({
+      id: "cur-1",
+      kind: "currencies",
+      stableId: "crowns",
+      name: "Crowns",
+      config: {},
+    })
+    await expect(
+      updateCatalogItem("currencies", "cur-1", {
+        config: { grade: "S" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+  })
+
+  it("rejects a currencies PATCH with a non-empty gradeDescriptions", async () => {
+    dbMock.store.addCatalog({
+      id: "cur-1",
+      kind: "currencies",
+      stableId: "crowns",
+      name: "Crowns",
+      config: {},
+    })
+    await expect(
+      updateCatalogItem("currencies", "cur-1", {
+        gradeDescriptions: { F: "text" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
+  })
+
+  it("archive remains supported for a currencies entry", async () => {
+    const item = await createCatalogItem("currencies", {
+      stableId: "crowns",
+      name: "Crowns",
+    })
+    const archived = await updateCatalogItem("currencies", item.id, {
+      archived: true,
+    })
+    expect(archived.archived).toBe(true)
   })
 })

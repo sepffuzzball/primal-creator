@@ -373,6 +373,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     }
   }, [form.configText])
   const structuredKind = ["races", "classes", "professions"].includes(kind)
+  const isCurrency = kind === "currencies"
   const hasStructuredEditor =
     structuredKind || ["equipment", "skills"].includes(kind)
   const setConfigValue = React.useCallback((key: string, value: unknown) => {
@@ -1355,54 +1356,71 @@ export function CatalogManager({ kind }: { kind: string }) {
     setSubmitting(true)
     setFormError(null)
     try {
-      const body = {
-        name: form.name,
-        ...(form.description !== (editing?.description ?? "")
-          ? { description: form.description }
-          : {}),
-        ...(stableStringify(form.gradeDescriptions) !==
-        stableStringify(
-          (
-            editing as
-              | (CatalogItem & { gradeDescriptions?: Record<string, string> })
-              | null
-          )?.gradeDescriptions ?? {}
-        )
-          ? {
-              gradeDescriptions: Object.fromEntries(
-                Object.entries(form.gradeDescriptions)
-                  .map(([grade, text]) => [grade, text.trim()])
-                  .filter(([, text]) => text !== "")
-              ),
-            }
-          : {}),
-        ...(kind !== "gods" &&
-        form.grade.trim() &&
-        (kind !== "races" ||
-          !editing ||
-          form.grade !==
-            (isRecord(editing.config) &&
-            typeof editing.config.naturalGrade === "string"
-              ? editing.config.naturalGrade
-              : editing.grade))
-          ? { grade: form.grade }
-          : {}),
-        ...(OPTIONAL_GRADE_KINDS.includes(kind) &&
-        editing &&
-        form.grade !== (editing.grade ?? "")
-          ? { grade: form.grade || null }
-          : {}),
-        ...(form.sourceUrl.trim() ? { sourceUrl: form.sourceUrl } : {}),
-        // On an EDIT whose parsed config is semantically unchanged from the
-        // currently persisted one, omit `config` entirely so the PATCH does not
-        // re-validate / re-stamp the config server-side. Only send `config` when
-        // it actually changed (or on create). The comparison is a deep stable
-        // stringify, so key reordering alone is treated as unchanged.
-        ...(editing == null ||
-        stableStringify(config) !== stableStringify(editing.config ?? {})
-          ? { config }
-          : {}),
-      }
+      const body = isCurrency
+        ? {
+            name: form.name,
+            ...(form.description !== (editing?.description ?? "")
+              ? { description: form.description }
+              : {}),
+            ...(form.sourceUrl.trim() ? { sourceUrl: form.sourceUrl } : {}),
+            ...(!editing ? { config: {} } : {}),
+          }
+        : {
+            name: form.name,
+            ...(form.description !== (editing?.description ?? "")
+              ? { description: form.description }
+              : {}),
+            ...(!isCurrency &&
+            stableStringify(form.gradeDescriptions) !==
+              stableStringify(
+                (
+                  editing as
+                    | (CatalogItem & {
+                        gradeDescriptions?: Record<string, string>
+                      })
+                    | null
+                )?.gradeDescriptions ?? {}
+              )
+              ? {
+                  gradeDescriptions: Object.fromEntries(
+                    Object.entries(form.gradeDescriptions)
+                      .map(([grade, text]) => [grade, text.trim()])
+                      .filter(([, text]) => text !== "")
+                  ),
+                }
+              : {}),
+            ...(!isCurrency &&
+            kind !== "gods" &&
+            form.grade.trim() &&
+            (kind !== "races" ||
+              !editing ||
+              form.grade !==
+                (isRecord(editing.config) &&
+                typeof editing.config.naturalGrade === "string"
+                  ? editing.config.naturalGrade
+                  : editing.grade))
+              ? { grade: form.grade }
+              : {}),
+            ...(!isCurrency &&
+            OPTIONAL_GRADE_KINDS.includes(kind) &&
+            editing &&
+            form.grade !== (editing.grade ?? "")
+              ? { grade: form.grade || null }
+              : {}),
+            ...(!isCurrency && form.sourceUrl.trim()
+              ? { sourceUrl: form.sourceUrl }
+              : {}),
+            // On an EDIT whose parsed config is semantically unchanged from the
+            // currently persisted one, omit `config` entirely so the PATCH does not
+            // re-validate / re-stamp the config server-side. Only send `config` when
+            // it actually changed (or on create). The comparison is a deep stable
+            // stringify, so key reordering alone is treated as unchanged.
+            ...(!isCurrency &&
+            (editing == null ||
+              stableStringify(config) !== stableStringify(editing.config ?? {}))
+              ? { config }
+              : {}),
+          }
       if (editing) {
         await apiFetch<{ item: CatalogItem }>(
           `/api/catalog/${kind}/${editing.id}`,
@@ -1442,6 +1460,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     skillTrackTouched,
     classTie,
     classChoices,
+    isCurrency,
     commitBloodlineDraft,
   ])
 
@@ -1458,10 +1477,20 @@ export function CatalogManager({ kind }: { kind: string }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="font-heading text-lg font-medium capitalize">
-            {kind === "items" ? "Items" : kind}
+            {kind === "items"
+              ? "Items"
+              : kind === "currencies"
+                ? "Currencies"
+                : kind}
           </h1>
           <p className="text-xs text-muted-foreground">
-            Catalog entries for {kind === "items" ? "items" : kind}.
+            Catalog entries for{" "}
+            {kind === "items"
+              ? "items"
+              : kind === "currencies"
+                ? "currencies"
+                : kind}
+            .
           </p>
         </div>
         {isAdmin ? (
@@ -1476,7 +1505,11 @@ export function CatalogManager({ kind }: { kind: string }) {
             </label>
             <Button className="gap-1" onClick={openCreate}>
               <PlusIcon />
-              {kind === "items" ? "New Item" : "New entry"}
+              {kind === "items"
+                ? "New Item"
+                : kind === "currencies"
+                  ? "New Currency"
+                  : "New entry"}
             </Button>
             <Button variant="outline" onClick={openImport}>
               Import reviewed wiki entries
@@ -1546,7 +1579,7 @@ export function CatalogManager({ kind }: { kind: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
-                <TableHead>Grade</TableHead>
+                {isCurrency ? null : <TableHead>Grade</TableHead>}
                 <TableHead>Stable id</TableHead>
                 <TableHead>Source</TableHead>
                 {isAdmin ? (
@@ -1583,7 +1616,9 @@ export function CatalogManager({ kind }: { kind: string }) {
                             </span>
                           ) : null}
                         </TableCell>
-                        <TableCell>{item.grade ?? "-"}</TableCell>
+                        {isCurrency ? null : (
+                          <TableCell>{item.grade ?? "-"}</TableCell>
+                        )}
                         <TableCell className="font-mono text-[0.6875rem]">
                           {item.stableId}
                         </TableCell>
@@ -1797,6 +1832,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                 />
               </div>
               {kind === "items" ||
+              isCurrency ||
               !form.grade ||
               ![...GRADES].includes(form.grade as (typeof GRADES)[number]) ? (
                 <div className="flex flex-col gap-1.5">
@@ -1833,7 +1869,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                   </div>
                 </details>
               )}
-              {kind !== "items" &&
+              {!isCurrency &&
+                kind !== "items" &&
                 (!!form.grade ||
                 ["races", "classes", "professions", "skills"].includes(kind) ? (
                   <section
@@ -2377,7 +2414,9 @@ export function CatalogManager({ kind }: { kind: string }) {
                     </div>
                   ) : null}
                 </div>
-              ) : !["equipment", "skills", "gods"].includes(kind) ? (
+              ) : !["equipment", "skills", "gods", "currencies"].includes(
+                  kind
+                ) ? (
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="cat-grade">Grade</Label>
                   <Select
@@ -3873,7 +3912,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                     })()}
                   </section>
                 ) : null}
-                {true ? (
+                {!isCurrency ? (
                   <details className="rounded-md border p-3">
                     <summary className="cursor-pointer text-sm font-medium">
                       Advanced JSON

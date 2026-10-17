@@ -7,7 +7,10 @@ import {
   IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
   IMPORT_SCHEMA_V7,
+  IMPORT_SCHEMA_V8,
+  MAX_IMPORT_CURRENCIES,
 } from "@/lib/server/import-schema"
+import { CURRENCY_AMOUNT_MAX } from "@/lib/server/schemas"
 
 /**
  * Schema-layer tests for the trusted-backup skill-offer `canceledAt` timestamp.
@@ -648,4 +651,167 @@ describe("import document v7 skill-offer schedule provenance pair", () => {
       expect(parsed.success).toBe(true)
     }
   )
+})
+
+describe("import document v8 currency balances", () => {
+  function v8Doc(
+    overrides: {
+      associations?: unknown[]
+      inventory?: unknown[]
+      skillOffers?: unknown[]
+      currencyBalances?: unknown[]
+    } = {}
+  ): Record<string, unknown> {
+    return {
+      schema: IMPORT_SCHEMA_V8,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity,
+      state,
+      liveState: {},
+      status: {},
+      events: [],
+      associations: overrides.associations ?? [],
+      skillOffers: overrides.skillOffers ?? [],
+      inventory: overrides.inventory ?? [],
+      currencyBalances: overrides.currencyBalances ?? [],
+    }
+  }
+
+  it("accepts a v8 doc with an inventory entry, a god blessing and currency balances", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        associations: [
+          {
+            kind: "blessing",
+            definition: { kind: "gods", stableId: "the-malefic-viper" },
+            tier: "True",
+          },
+        ],
+        inventory: [
+          {
+            definition: { kind: "equipment", stableId: "gear-1" },
+            quantity: 1,
+          },
+        ],
+        currencyBalances: [
+          {
+            definition: { kind: "currencies", stableId: "crowns" },
+            amount: 100,
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(true)
+  })
+
+  it("accepts a zero balance", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        currencyBalances: [
+          { definition: { kind: "currencies", stableId: "crowns" }, amount: 0 },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(true)
+  })
+
+  it("rejects a v8 doc that omits currencyBalances (required)", () => {
+    const doc = v8Doc()
+    delete (doc as Record<string, unknown>).currencyBalances
+    expect(characterImportDocumentSchema.safeParse(doc).success).toBe(false)
+  })
+
+  it("rejects a duplicate currency definition stableId", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        currencyBalances: [
+          { definition: { kind: "currencies", stableId: "crowns" }, amount: 1 },
+          { definition: { kind: "currencies", stableId: "crowns" }, amount: 2 },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a currency balance whose definition kind is not 'currencies'", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        currencyBalances: [
+          { definition: { kind: "items", stableId: "crowns" }, amount: 1 },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it.each([
+    ["a negative amount", -1],
+    ["an amount above the max", CURRENCY_AMOUNT_MAX + 1],
+  ])("rejects %s", (_label, bad) => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        currencyBalances: [
+          {
+            definition: { kind: "currencies", stableId: "crowns" },
+            amount: bad,
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a non-integer amount", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        currencyBalances: [
+          {
+            definition: { kind: "currencies", stableId: "crowns" },
+            amount: 1.5,
+          },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects an empty currency stableId", () => {
+    const parsed = characterImportDocumentSchema.safeParse(
+      v8Doc({
+        currencyBalances: [
+          { definition: { kind: "currencies", stableId: "" }, amount: 1 },
+        ],
+      })
+    )
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a v8 doc with more than MAX_IMPORT_CURRENCIES entries", () => {
+    const many = Array.from({ length: MAX_IMPORT_CURRENCIES + 1 }, (_, i) => ({
+      definition: { kind: "currencies", stableId: `cur-${i}` },
+      amount: i,
+    }))
+    expect(
+      characterImportDocumentSchema.safeParse(v8Doc({ currencyBalances: many }))
+        .success
+    ).toBe(false)
+  })
+
+  it("still accepts a v7 doc that carries no currencyBalances", () => {
+    const parsed = characterImportDocumentSchema.safeParse({
+      schema: IMPORT_SCHEMA_V7,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity,
+      state,
+      liveState: {},
+      status: {},
+      events: [],
+      associations: [],
+      skillOffers: [],
+      inventory: [
+        { definition: { kind: "equipment", stableId: "gear-1" }, quantity: 1 },
+      ],
+    })
+    expect(parsed.success).toBe(true)
+  })
 })

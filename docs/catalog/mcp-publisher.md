@@ -172,8 +172,8 @@ without leaking the token.
   flag or a typo is rejected (strict), and a `sourceUrl` must be a valid HTTPS
   URL with a host when supplied. `kind` uses the canonical catalog kinds
   (`races`, `classes`, `professions`, `titles`, `equipment`, `skills`,
-  `bloodlines`, `items`, `gods`, `transcendent_skills`) - the legacy
-  `consumables` alias is not accepted here.
+  `bloodlines`, `items`, `gods`, `transcendent_skills`, `currencies`) - the
+  legacy `consumables` alias is not accepted here.
 
 ## Limits
 

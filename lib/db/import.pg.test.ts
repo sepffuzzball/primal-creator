@@ -1,10 +1,10 @@
 /**
  * Real-Postgres integration tests for trusted-backup character import.
  *
- * Exercises the full v7 export -> import round trip against a live database:
+ * Exercises the full v8 export -> import round trip against a live database:
  * creating a source character with a title, equipment, a granted skill, a
  * selected skill offer and a god (as a blessing + tier), exporting it as a
- * `primal-character/7` document, then importing that document into a NEW
+ * `primal-character/8` document, then importing that document into a NEW
  * character and asserting the import marker, the provenance events, and the
  * reapplied associations/offers. Also verifies that a missing catalog definition
  * and a semantically invalid state each reject with a 400 and leave NO character
@@ -26,6 +26,7 @@ import {
   exportCharacter,
   importCharacter,
   serializeState,
+  setCharacterCurrencyBalance,
   skillCharacter,
   updateCatalogItem,
 } from "@/lib/db/service"
@@ -36,6 +37,8 @@ import {
   IMPORT_SCHEMA_V5,
   IMPORT_SCHEMA_V6,
   IMPORT_SCHEMA_V7,
+  IMPORT_SCHEMA_V8,
+  MAX_IMPORT_CURRENCIES,
   type CharacterImportDocument,
 } from "@/lib/server/import-schema"
 import { resolveDbIntegration } from "@/lib/test/db-integration"
@@ -62,6 +65,8 @@ const CATALOG = {
   pgGod1: "catalog-pg-god-1",
   pgBloodline1: "catalog-pg-bloodline-1",
   pgTranscendent1: "catalog-pg-transcendent-1",
+  pgCurrency1: "catalog-pg-currency-1",
+  pgCurrency2: "catalog-pg-currency-2",
 } as const
 
 function attr(n: number) {
@@ -190,6 +195,28 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       "PG Transcendent One",
       { passiveEffects: [{ phase: "flat", amount: { strength: 3 } }] }
     )
+    // Currency catalog foundation for the v8 balance round trips. pgCurrency-1
+    // stays ACTIVE; pgCurrency-2 is ARCHIVED (using direct balance writes, since the
+    // owner-managed setter rejects an archived definition) so a hidden amount
+    // survives a backup round trip.
+    await seedCatalog(
+      CATALOG.pgCurrency1,
+      "currencies",
+      "pg-currency-1",
+      "PG Currency One",
+      {}
+    )
+    await seedCatalog(
+      CATALOG.pgCurrency2,
+      "currencies",
+      "pg-currency-2",
+      "PG Currency Two",
+      {}
+    )
+    await prisma.catalogDefinition.update({
+      where: { id: CATALOG.pgCurrency2 },
+      data: { archived: true },
+    })
   })
 
   afterAll(async () => {
@@ -324,7 +351,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const rawDoc = await exportCharacter(src.id, ownerUser)
     const doc = rawDoc as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/7")
+    expect(doc.schema).toBe(IMPORT_SCHEMA_V8)
     expect(doc.rulesetVersion).toBe(IMPORT_RULESET_VERSION)
     expect(doc.identity).toMatchObject({
       name: "Source Hero",
@@ -484,7 +511,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const raw = await exportCharacter(src.id, ownerUser)
     const doc = raw as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/7")
+    expect(doc.schema).toBe(IMPORT_SCHEMA_V8)
     const v4 = doc as unknown as {
       inventory: Array<{
         definition: { kind: string; stableId: string }
@@ -540,7 +567,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       where: { characterId: imported.id, kind: "import" },
     })
     const payload = importEvent!.payload as Record<string, unknown>
-    expect(payload.backupSchema).toBe("primal-character/7")
+    expect(payload.backupSchema).toBe(IMPORT_SCHEMA_V8)
     expect(payload.inventoryCount).toBe(2)
   })
 
@@ -1147,7 +1174,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       src.id,
       ownerUser
     )) as unknown as CharacterImportDocument
-    expect(doc.schema).toBe("primal-character/7")
+    expect(doc.schema).toBe(IMPORT_SCHEMA_V8)
     const ringAssocs = (
       doc.associations as Array<{
         kind: string
@@ -1465,7 +1492,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       imported.id,
       adminUser
     )) as unknown as CharacterImportDocument
-    expect(exported.schema).toBe(IMPORT_SCHEMA_V7)
+    expect(exported.schema).toBe(IMPORT_SCHEMA_V8)
     const eq = (
       exported.associations as Array<{
         kind: string
@@ -1705,7 +1732,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
       src.id,
       ownerUser
     )) as unknown as CharacterImportDocument
-    expect(doc.schema).toBe(IMPORT_SCHEMA_V7)
+    expect(doc.schema).toBe(IMPORT_SCHEMA_V8)
     expect(doc.skillOffers).toHaveLength(1)
     const exportedOffer = doc.skillOffers[0]
     expect(exportedOffer.generation).toBe(1)
@@ -1773,5 +1800,364 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     })
     expect(after).toBe(before)
     expect(await prisma.skillOffer.count()).toBe(offersBefore)
+  })
+
+  // ------------------------------------------------------------------ //
+  // v8 currency balances
+  // ------------------------------------------------------------------ //
+
+  function v8ImportDoc(
+    currencyBalances: unknown[],
+    extra: Record<string, unknown> = {}
+  ): CharacterImportDocument {
+    return {
+      schema: IMPORT_SCHEMA_V8,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "Imported V8",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+      currencyBalances,
+      ...extra,
+    } as CharacterImportDocument
+  }
+
+  async function expectImportRejects(
+    doc: CharacterImportDocument,
+    code: string,
+    ownerId: string
+  ): Promise<void> {
+    const before = await prisma.character.count({ where: { ownerId } })
+    const eventsBefore = await prisma.progressionEvent.count()
+    await expect(importCharacter(doc, adminUser)).rejects.toMatchObject({
+      status: 400,
+      code,
+    })
+    const after = await prisma.character.count({ where: { ownerId } })
+    expect(after).toBe(before)
+    expect(await prisma.progressionEvent.count()).toBe(eventsBefore)
+  }
+
+  it("round-trips a v8 backup that carries inventory, a god blessing, and currency balances", async () => {
+    const src = await createCharacter(
+      {
+        name: "V8 Wallet Hero",
+        description: "v8 currency round trip",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    // Owned stock + equipped (non-grandfathered) so the v8 inventory checks run,
+    // plus a god blessing so the v8 association model is exercised.
+    const inv = await adjustCharacterInventory(
+      src.id,
+      {
+        operation: "add",
+        definitionId: CATALOG.gear1,
+        quantity: 1,
+        version: 0,
+        sourceNote: "seed v8 stock",
+      },
+      ownerUser
+    )
+    const equip = await associateCharacter(
+      src.id,
+      {
+        kind: "equipment",
+        definitionId: CATALOG.gear1,
+        operation: "add",
+        version: inv.version,
+      },
+      ownerUser
+    )
+    const bless = await associateCharacter(
+      src.id,
+      {
+        kind: "blessing",
+        definitionId: CATALOG.pgGod1,
+        tier: "Minor",
+        operation: "add",
+        version: equip.character.version,
+      },
+      ownerUser
+    )
+    expect(bless.character.id).toBe(src.id)
+
+    // A held balance on the ACTIVE currency, and a ZERO balance against the
+    // ARCHIVED currency (created directly, since the owner-managed setter rejects
+    // an archived definition). A hidden amount must survive the backup round trip.
+    await prisma.characterCurrencyBalance.create({
+      data: {
+        characterId: src.id,
+        definitionId: CATALOG.pgCurrency1,
+        amount: 100,
+      },
+    })
+    await prisma.characterCurrencyBalance.create({
+      data: {
+        characterId: src.id,
+        definitionId: CATALOG.pgCurrency2,
+        amount: 0,
+      },
+    })
+
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    expect(doc.schema).toBe(IMPORT_SCHEMA_V8)
+    const balances = (
+      doc as {
+        currencyBalances: Array<{
+          definition: { kind: string; stableId: string }
+          amount: number
+        }>
+      }
+    ).currencyBalances
+    expect(balances).toHaveLength(2)
+    expect(balances).toContainEqual({
+      definition: { kind: "currencies", stableId: "pg-currency-1" },
+      amount: 100,
+    })
+    expect(balances).toContainEqual({
+      definition: { kind: "currencies", stableId: "pg-currency-2" },
+      amount: 0,
+    })
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+
+    expect(imported.associations).toHaveLength(2)
+    expect(imported.inventory).toHaveLength(1)
+    expect(imported.inventory[0].definitionId).toBe(CATALOG.gear1)
+
+    const rows = await prisma.characterCurrencyBalance.findMany({
+      where: { characterId: imported.id },
+    })
+    expect(rows).toHaveLength(2)
+    expect(
+      rows.find((r) => r.definitionId === CATALOG.pgCurrency1)?.amount
+    ).toBe(100)
+    expect(
+      rows.find((r) => r.definitionId === CATALOG.pgCurrency2)?.amount
+    ).toBe(0)
+
+    const importEvent = await prisma.progressionEvent.findFirst({
+      where: { characterId: imported.id, kind: "import" },
+    })
+    const payload = importEvent!.payload as Record<string, unknown>
+    expect(payload.backupSchema).toBe(IMPORT_SCHEMA_V8)
+    expect(payload.currencyBalanceCount).toBe(2)
+  })
+
+  it("caps NEW distinct balance rows at MAX_IMPORT_CURRENCIES and round-trips that exact count (archived included)", async () => {
+    // Seed exactly MAX_IMPORT_CURRENCIES distinct currencies, archiving every other
+    // one so the cap demonstrably counts ARCHIVED balances too (a hidden amount must
+    // survive a backup round-trip).
+    const currencyIds: string[] = []
+    for (let i = 0; i < MAX_IMPORT_CURRENCIES; i++) {
+      const id = `catalog-pg-cur-cap-${i}`
+      await seedCatalog(
+        id,
+        "currencies",
+        `pg-cur-cap-${i}`,
+        `Cap Currency ${i}`,
+        {}
+      )
+      currencyIds.push(id)
+      if (i % 2 === 0) {
+        await prisma.catalogDefinition.update({
+          where: { id },
+          data: { archived: true },
+        })
+      }
+    }
+
+    const src = await createCharacter(
+      {
+        name: "Cap Wallet",
+        description: "cap boundary round trip",
+        origin: "integrated",
+        raceId: CATALOG.human,
+        classId: CATALOG.archer,
+        professionId: CATALOG.alchemist,
+      },
+      ownerUser
+    )
+    createdCharacterIds.push(src.id)
+
+    for (let i = 0; i < MAX_IMPORT_CURRENCIES; i++) {
+      await prisma.characterCurrencyBalance.create({
+        data: {
+          characterId: src.id,
+          definitionId: currencyIds[i],
+          amount: i,
+        },
+      })
+    }
+
+    // Exporting a character at the cap yields exactly MAX_IMPORT_CURRENCIES
+    // balances, which is the v8 schema max, so a re-import always round-trips.
+    const doc = (await exportCharacter(
+      src.id,
+      ownerUser
+    )) as unknown as CharacterImportDocument
+    const balances = (doc as unknown as { currencyBalances: unknown[] })
+      .currencyBalances
+    expect(balances).toHaveLength(MAX_IMPORT_CURRENCIES)
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    const rows = await prisma.characterCurrencyBalance.findMany({
+      where: { characterId: imported.id },
+    })
+    expect(rows).toHaveLength(MAX_IMPORT_CURRENCIES)
+
+    // The imported character is at the cap: a 501st distinct ACTIVE currency must
+    // be rejected before any write.
+    await seedCatalog(
+      "catalog-pg-cur-cap-extra",
+      "currencies",
+      "pg-cur-cap-extra",
+      "Cap Currency Extra",
+      {}
+    )
+    await expect(
+      setCharacterCurrencyBalance(
+        imported.id,
+        { definitionId: "catalog-pg-cur-cap-extra", amount: 1, version: 0 },
+        adminUser
+      )
+    ).rejects.toMatchObject({ status: 409, code: "currency_defs_cap_exceeded" })
+
+    // Updates and deletes of EXISTING rows remain allowed at the cap.
+    const upd = await setCharacterCurrencyBalance(
+      imported.id,
+      { definitionId: currencyIds[1], amount: 9999, version: 0 },
+      adminUser
+    )
+    expect(upd.version).toBe(1)
+    const del = await setCharacterCurrencyBalance(
+      imported.id,
+      { definitionId: currencyIds[3], amount: null, version: 1 },
+      adminUser
+    )
+    expect(del.version).toBe(2)
+  })
+
+  it("imports a legacy v7 document and produces no currency balances", async () => {
+    const doc = {
+      schema: IMPORT_SCHEMA_V7,
+      rulesetVersion: IMPORT_RULESET_VERSION,
+      identity: {
+        name: "V7 No Balances",
+        description: null,
+        origin: "integrated",
+        race: { stableId: "human" },
+        class: { stableId: "archer" },
+        profession: null,
+      },
+      state: serializeState(createInitialState("integrated", null, null)),
+      liveState: {},
+      status: {},
+      associations: [],
+      inventory: [],
+      events: [],
+      skillOffers: [],
+    } as CharacterImportDocument
+
+    const imported = await importCharacter(doc, adminUser)
+    createdCharacterIds.push(imported.id)
+    const rows = await prisma.characterCurrencyBalance.findMany({
+      where: { characterId: imported.id },
+    })
+    expect(rows).toHaveLength(0)
+  })
+
+  it("rejects a v8 backup with a missing currency stableId (rollback)", async () => {
+    await expectImportRejects(
+      v8ImportDoc([
+        {
+          definition: { kind: "currencies", stableId: "ghost-currency" },
+          amount: 5,
+        },
+      ]),
+      "import_currency_missing",
+      adminUser.id
+    )
+  })
+
+  it("rejects a v8 backup with duplicate currency stableId references (rollback)", async () => {
+    await expectImportRejects(
+      v8ImportDoc([
+        {
+          definition: { kind: "currencies", stableId: "pg-currency-1" },
+          amount: 1,
+        },
+        {
+          definition: { kind: "currencies", stableId: "pg-currency-1" },
+          amount: 2,
+        },
+      ]),
+      "import_duplicate_currency",
+      adminUser.id
+    )
+  })
+
+  it("rejects a v8 backup that references a non-currency catalog entry as a currency (rollback)", async () => {
+    // gear-1 is an EQUIPMENT catalog entry; referencing it as a currency is a
+    // wrong-kind reference (the stableId exists, but under a different kind).
+    await expectImportRejects(
+      v8ImportDoc([
+        {
+          definition: { kind: "currencies", stableId: "gear-1" },
+          amount: 5,
+        },
+      ]),
+      "import_currency_wrong_kind",
+      adminUser.id
+    )
+  })
+
+  it("rejects a v8 backup whose currency definition kind is not 'currencies' (rollback)", async () => {
+    await expectImportRejects(
+      v8ImportDoc([
+        {
+          definition: { kind: "items", stableId: "pg-currency-1" },
+          amount: 5,
+        },
+      ]),
+      "import_currency_wrong_kind",
+      adminUser.id
+    )
+  })
+
+  it("rejects a v8 backup with an out-of-range currency amount (rollback)", async () => {
+    await expectImportRejects(
+      v8ImportDoc([
+        {
+          definition: { kind: "currencies", stableId: "pg-currency-1" },
+          amount: -1,
+        },
+      ]),
+      "import_currency_invalid",
+      adminUser.id
+    )
   })
 })

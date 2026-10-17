@@ -42,6 +42,7 @@ import { AllocationEditor } from "@/components/characters/allocation-editor"
 import { TrackEvolutionDialog } from "@/components/characters/track-evolution-dialog"
 import { Alert } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
+import { SemanticBadge } from "@/components/ui/semantic-badge"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -364,6 +365,208 @@ function humanizeStableId(value: string): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
+type CurrencyEntry = {
+  definitionId: string
+  stableId: string
+  name: string
+  description: string | null
+  amount: number | null
+}
+
+function CurrenciesPanel({
+  characterId,
+  version,
+  editable,
+  reloadCharacter,
+}: {
+  characterId: string
+  version: number
+  editable: boolean
+  reloadCharacter: () => Promise<void>
+}) {
+  const [currencies, setCurrencies] = React.useState<CurrencyEntry[]>([])
+  const currenciesRef = React.useRef<CurrencyEntry[]>([])
+  const [currencyVersion, setCurrencyVersion] = React.useState(version)
+  const [drafts, setDrafts] = React.useState<Record<string, string>>({})
+  const [loading, setLoading] = React.useState(false)
+  const [saving, setSaving] = React.useState<string | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+  const endpoint = `/api/characters/${characterId}/currencies`
+  const refresh = React.useCallback(
+    async (savedDefinitionId?: string, discardDrafts = false) => {
+      setLoading(true)
+      try {
+        const result = await apiFetch<{
+          currencies: CurrencyEntry[]
+          version: number
+        }>(endpoint)
+        const previousCurrencies = currenciesRef.current
+        currenciesRef.current = result.currencies
+        setCurrencies(result.currencies)
+        setCurrencyVersion(result.version)
+        setDrafts((current) =>
+          Object.fromEntries(
+            result.currencies.map((currency) => {
+              const id = currency.definitionId
+              const serverValue =
+                currency.amount == null ? "" : String(currency.amount)
+              const previous = previousCurrencies.find(
+                (entry) => entry.definitionId === id
+              )
+              const persistedValue =
+                previous?.amount == null ? "" : String(previous.amount)
+              return [
+                id,
+                !discardDrafts &&
+                id !== savedDefinitionId &&
+                previous &&
+                current[id] !== persistedValue
+                  ? current[id]
+                  : serverValue,
+              ]
+            })
+          )
+        )
+        setError(null)
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : "Failed to load currencies."
+        )
+      } finally {
+        setLoading(false)
+      }
+    },
+    [endpoint]
+  )
+  React.useEffect(() => {
+    let cancelled = false
+    void Promise.resolve().then(() => {
+      if (!cancelled) return refresh()
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [refresh])
+  const save = async (currency: CurrencyEntry) => {
+    const draft = drafts[currency.definitionId] ?? ""
+    if (
+      draft !== "" &&
+      (!/^[0-9]+$/.test(draft) ||
+        !Number.isSafeInteger(Number(draft)) ||
+        Number(draft) > 2147483647)
+    ) {
+      setError(
+        "Enter a whole number from 0 to 2147483647, or leave blank to clear."
+      )
+      return
+    }
+    setSaving(currency.definitionId)
+    setError(null)
+    try {
+      const result = await apiFetch<{ version: number }>(endpoint, {
+        ...jsonInit("PATCH", {
+          definitionId: currency.definitionId,
+          amount: draft === "" ? null : Number(draft),
+          version: currencyVersion,
+        }),
+      })
+      setCurrencyVersion(result.version)
+      await reloadCharacter()
+      await refresh(currency.definitionId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Currency update failed.")
+    } finally {
+      setSaving(null)
+    }
+  }
+  if (loading && currencies.length === 0)
+    return (
+      <p className="text-xs text-muted-foreground">Loading currencies...</p>
+    )
+  return (
+    <div className="flex flex-col gap-2">
+      {error ? (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-2 text-sm text-destructive"
+        >
+          <span>{error}</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refresh(undefined, true)}
+          >
+            Reload from server
+          </Button>
+        </div>
+      ) : null}
+      {currencies.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No active currencies in the catalog.
+        </p>
+      ) : (
+        currencies.map((currency) => {
+          const draft = drafts[currency.definitionId] ?? ""
+          const invalid =
+            draft !== "" &&
+            (!/^[0-9]+$/.test(draft) ||
+              !Number.isSafeInteger(Number(draft)) ||
+              Number(draft) > 2147483647)
+          return (
+            <div
+              key={currency.definitionId}
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-input/20 p-3"
+            >
+              <div className="min-w-0">
+                <p className="font-medium">{currency.name}</p>
+                {currency.description ? (
+                  <p className="text-xs text-muted-foreground">
+                    {currency.description}
+                  </p>
+                ) : null}
+                <p className="text-xs text-muted-foreground">
+                  {currency.stableId}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Label
+                  className="sr-only"
+                  htmlFor={`currency-${currency.definitionId}`}
+                >
+                  {currency.name} balance
+                </Label>
+                <Input
+                  id={`currency-${currency.definitionId}`}
+                  aria-label={`${currency.name} balance`}
+                  inputMode="numeric"
+                  value={draft}
+                  disabled={!editable}
+                  aria-invalid={invalid}
+                  onChange={(event) =>
+                    setDrafts((current) => ({
+                      ...current,
+                      [currency.definitionId]: event.target.value,
+                    }))
+                  }
+                />
+                {editable ? (
+                  <Button
+                    size="sm"
+                    disabled={invalid || saving !== null || loading}
+                    onClick={() => void save(currency)}
+                  >
+                    {saving === currency.definitionId ? "Saving..." : "Save"}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          )
+        })
+      )}
+    </div>
+  )
+}
+
 const ROMAN_NUMERALS = new Map<string, number>([
   ["I", 1],
   ["V", 5],
@@ -434,7 +637,7 @@ function SkillOfferOptionDetails({
     <div className="mt-1">
       <div className="flex flex-wrap gap-1">
         {option.rarity ? (
-          <Badge variant="outline">{option.rarity}</Badge>
+          <SemanticBadge kind="rarity" value={option.rarity} />
         ) : null}
         {option.skillType ? (
           <Badge variant="outline">
@@ -762,6 +965,7 @@ function AssociationSheet({
   focusedOfferId,
   onSelectSkill,
   onRetrySkills,
+  reloadCharacter,
   inventoryContent,
 }: {
   panel: "titlesSkills" | "powers" | "inventoryEquipment"
@@ -800,6 +1004,7 @@ function AssociationSheet({
   focusedOfferId: string | null
   onSelectSkill: (offerId: string, definitionId: string, name: string) => void
   onRetrySkills: () => void
+  reloadCharacter: () => Promise<void>
   inventoryContent?: React.ReactNode
 }) {
   const [blessingTier, setBlessingTier] = React.useState("Minor")
@@ -974,7 +1179,9 @@ function AssociationSheet({
           </div>
           {a.kind === "equipment" ? (
             <div className="flex flex-wrap items-center gap-1 text-[0.6875rem] text-muted-foreground">
-              {a.rarity ? <Badge variant="outline">{a.rarity}</Badge> : null}
+              {a.rarity ? (
+                <SemanticBadge kind="rarity" value={a.rarity} />
+              ) : null}
               {a.soulbound ? <Badge variant="outline">Soulbound</Badge> : null}
               {a.requirements?.minRaceLevel != null ? (
                 <Badge variant="outline">
@@ -1061,7 +1268,7 @@ function AssociationSheet({
           {association ? (
             <div className="flex flex-wrap items-center gap-1 text-[0.6875rem] text-muted-foreground">
               {association.rarity ? (
-                <Badge variant="outline">{association.rarity}</Badge>
+                <SemanticBadge kind="rarity" value={association.rarity} />
               ) : null}
               {association.soulbound ? (
                 <Badge variant="outline">Soulbound</Badge>
@@ -1535,6 +1742,7 @@ function AssociationSheet({
               <>
                 <TabsTrigger value="inventory">Inventory</TabsTrigger>
                 <TabsTrigger value="equipment">Equipment</TabsTrigger>
+                <TabsTrigger value="currencies">Currencies</TabsTrigger>
               </>
             ) : null}
             {panel === "powers" ? (
@@ -1733,9 +1941,10 @@ function AssociationSheet({
                                       <div className="flex flex-wrap items-center gap-1.5 font-medium">
                                         <span>{option.nameSnapshot}</span>
                                         {option.grade ? (
-                                          <Badge variant="outline">
-                                            {option.grade}
-                                          </Badge>
+                                          <SemanticBadge
+                                            kind="grade"
+                                            value={option.grade}
+                                          />
                                         ) : null}
                                         {option.classPriority ? (
                                           <Badge variant="outline">
@@ -1833,6 +2042,16 @@ function AssociationSheet({
             {panel === "inventoryEquipment" ? (
               <TabsContent value="inventory" className="pt-3">
                 {inventoryContent}
+              </TabsContent>
+            ) : null}
+            {panel === "inventoryEquipment" ? (
+              <TabsContent value="currencies" className="pt-3">
+                <CurrenciesPanel
+                  characterId={character.id}
+                  version={character.version}
+                  editable={!character.archived}
+                  reloadCharacter={reloadCharacter}
+                />
               </TabsContent>
             ) : null}
 
@@ -1935,9 +2154,10 @@ function AssociationSheet({
                                         : item.name}
                                     </span>
                                     {item.grade ? (
-                                      <Badge variant="outline">
-                                        {item.grade}
-                                      </Badge>
+                                      <SemanticBadge
+                                        kind="grade"
+                                        value={item.grade}
+                                      />
                                     ) : null}
                                     {item.archived ? (
                                       <Badge variant="outline">
@@ -2051,7 +2271,10 @@ function AssociationSheet({
                             <div className="flex flex-wrap items-center gap-1.5 font-medium">
                               {item.name}
                               {item.grade ? (
-                                <Badge variant="outline">{item.grade}</Badge>
+                                <SemanticBadge
+                                  kind="grade"
+                                  value={item.grade}
+                                />
                               ) : null}
                               {item.archived ? (
                                 <Badge variant="outline">Archived</Badge>
@@ -4670,7 +4893,7 @@ export function CharacterDetail({
                                   ? `${a.tier} Blessing of ${a.name}`
                                   : a.name}
                                 {a.grade ? (
-                                  <Badge variant="outline">{a.grade}</Badge>
+                                  <SemanticBadge kind="grade" value={a.grade} />
                                 ) : null}
                                 {a.definitionArchived ? (
                                   <Badge variant="outline">
@@ -5177,9 +5400,10 @@ export function CharacterDetail({
                                           {opt.nameSnapshot}
                                         </span>
                                         {opt.grade ? (
-                                          <Badge variant="outline">
-                                            {opt.grade}
-                                          </Badge>
+                                          <SemanticBadge
+                                            kind="grade"
+                                            value={opt.grade}
+                                          />
                                         ) : null}
                                         {opt.classPriority ? (
                                           <Badge variant="outline">
@@ -5283,10 +5507,10 @@ export function CharacterDetail({
                               <Badge variant="outline">Archived</Badge>
                             ) : null}
                             {a.grade ? (
-                              <Badge variant="outline">{a.grade}</Badge>
+                              <SemanticBadge kind="grade" value={a.grade} />
                             ) : null}
                             {a.rarity ? (
-                              <Badge variant="outline">{a.rarity}</Badge>
+                              <SemanticBadge kind="rarity" value={a.rarity} />
                             ) : null}
                           </div>
                           <p className="text-xs whitespace-pre-wrap text-muted-foreground">
@@ -5934,6 +6158,7 @@ export function CharacterDetail({
           setSelectConfirm({ offerId, definitionId, name })
         }
         onRetrySkills={() => void refreshSkills()}
+        reloadCharacter={reload}
       />
       <AssociationSheet
         panel="powers"
@@ -5974,6 +6199,7 @@ export function CharacterDetail({
           setSelectConfirm({ offerId, definitionId, name })
         }
         onRetrySkills={() => void refreshSkills()}
+        reloadCharacter={reload}
       />
       <AssociationSheet
         panel="inventoryEquipment"
@@ -6018,6 +6244,7 @@ export function CharacterDetail({
           setSelectConfirm({ offerId, definitionId, name })
         }
         onRetrySkills={() => void refreshSkills()}
+        reloadCharacter={reload}
       />
 
       <Dialog

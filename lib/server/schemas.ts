@@ -582,6 +582,35 @@ export const inventoryPostSchema = z.discriminatedUnion("operation", [
 ])
 
 /**
+ * The upper bound of a character currency balance amount. Mirrors the migration's
+ * CHECK constraint on `character_currency_balances.amount`: a nonnegative integer
+ * bounded to the 32-bit signed INT range (0..2147483647). This is well below the
+ * JS safe-integer limit, so an integer in [0, `CURRENCY_AMOUNT_MAX`] is always a
+ * safe integer.
+ */
+export const CURRENCY_AMOUNT_MAX = 2147483647
+
+/**
+ * A single character currency-balance write (PATCH /api/characters/[id]/currencies).
+ *
+ * `amount` is the character's durable holding of the named currency:
+ *   - a nonnegative whole number 0..2147483647 (the DB CHECK upper bound, well
+ *     below the safe-integer limit) is persisted as the balance;
+ *   - `0` is a legal stored balance (a zero-holding row is kept so the explicit
+ *     character-currency association is preserved);
+ *   - `null` removes the stored row (an absent row means "no recorded balance");
+ *     setting `null` when no row exists is an idempotent no-op.
+ * `definitionId` references an active (unarchived) `currencies` catalog entry; a
+ * missing, archived, or non-currency definition is rejected by the service layer.
+ * `version` is the CAS token: the write 409s on a stale value.
+ */
+export const currencyBalancePatchSchema = z.object({
+  definitionId: z.string().min(1),
+  amount: z.number().int().min(0).max(CURRENCY_AMOUNT_MAX).nullable(),
+  version: z.number().int().nonnegative(),
+})
+
+/**
  * A single evolution choice. Every track (race, class, profession) must be named
  * explicitly and must point at a DESTINATION catalog definition id - there is no
  * legacy grade-only path and no `evolutions` catalog kind anymore, so the client
@@ -704,6 +733,7 @@ export const catalogKindSchema = z.enum([
   "items",
   "gods",
   "transcendent_skills",
+  "currencies",
 ])
 
 /**
@@ -733,6 +763,48 @@ export function normalizeCatalogKind(kind: string): string {
  */
 export function godGradeForbidden(kind: string, grade: unknown): boolean {
   return kind === "gods" && grade != null
+}
+
+/**
+ * A `currencies` catalog entry, like a `gods` entry, carries no grade band: a
+ * currency is a named in-world tender with intrinsic holdings, not a graded
+ * combat/advancement definition, so the shared `catalog_definitions.grade` column
+ * is always null for it. Every write/import path must reject a non-null grade -
+ * only `null` (or an omitted grade, which reads back as null) is legal.
+ *
+ * Returns true when `kind` is `currencies` AND `grade` is a non-null value, which
+ * is exactly the case the service/import layer must reject with 400
+ * `invalid_grade`. Mirrors `godGradeForbidden` so every catalog write path shares
+ * the same invariant rather than inlining kind-specific logic.
+ */
+export function currencyGradeForbidden(kind: string, grade: unknown): boolean {
+  return kind === "currencies" && grade != null
+}
+
+/**
+ * A `currencies` catalog entry carries no grade-specific prose: unlike the graded
+ * kinds it has no grade ladder, so `gradeDescriptions` must be empty (`{}`) or
+ * omitted (`undefined`). A non-empty map on a currency write/import is rejected
+ * before any write.
+ *
+ * Returns true when `kind` is `currencies` AND `gradeDescriptions` is a non-empty
+ * object, which is exactly the case the service/import layer must reject with 400
+ * `invalid_grade_descriptions`. A null/omitted value (or an empty `{}` map) is
+ * legal.
+ */
+export function currencyGradeDescriptionsForbidden(
+  kind: string,
+  gradeDescriptions: unknown
+): boolean {
+  if (kind !== "currencies") return false
+  if (gradeDescriptions == null) return false
+  if (
+    typeof gradeDescriptions !== "object" ||
+    Array.isArray(gradeDescriptions)
+  ) {
+    return true
+  }
+  return Object.keys(gradeDescriptions).length > 0
 }
 
 /**
@@ -1624,6 +1696,17 @@ export const itemConfigSchema = z
   })
   .passthrough()
 
+/**
+ * Catalog config for a `currencies` entry (the currencies catalog kind).
+ *
+ * A currency entry is pure identity + narrative (name, description): it carries
+ * NO mechanical config and NO grade/rarity, so its `config` is STRICTLY the empty
+ * object `{}` - any key is rejected, and an omitted config reads back as `{}`. The
+ * durable per-character holdings of a currency are modeled by
+ * `CharacterCurrencyBalance`, not by anything in this config.
+ */
+export const currencyConfigSchema = z.object({}).strict()
+
 const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   races: raceConfigSchema,
   classes: trackConfigSchema,
@@ -1635,6 +1718,7 @@ const catalogConfigSchemaMap: Record<string, z.ZodTypeAny> = {
   items: itemConfigSchema,
   gods: godConfigSchema,
   transcendent_skills: transcendentSkillConfigSchema,
+  currencies: currencyConfigSchema,
 }
 
 /**

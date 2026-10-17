@@ -1,8 +1,8 @@
 /**
- * Zod schema for the trusted-backup character import document (v3 through v7).
+ * Zod schema for the trusted-backup character import document (v3 through v8).
  *
- * The v7 document is the output of `exportCharacter` (schema
- * `primal-character/7`) plus `skillOffers`. It is a *trusted backup*, NOT
+ * The v8 document is the output of `exportCharacter` (schema
+ * `primal-character/8`). It is a *trusted backup*, NOT
  * authoritative server-verified state: the `state` is validated against the
  * engine `characterStateSchema`, but `liveState` and `status` are advisory and
  * are recomputed server-side on import. Catalog references (identity race/class/
@@ -56,6 +56,18 @@
  * `legacyUnowned: true` (grandfathered - the link predates the inventory-ownership
  * model and stays equipped regardless of stock).
  *
+ * The v8 document adds durability for character-held currency balances. It is
+ * everything v7 carries (associations, inventory, skill offers, the god + tier
+ * blessing model, ring positions) PLUS a REQUIRED `currencyBalances` array: each
+ * entry is `{ definition: { kind: "currencies", stableId }, amount }`, where
+ * `amount` is a nonnegative whole number 0..2147483647 (`CURRENCY_AMOUNT_MAX`),
+ * and a `0` balance is a legal stored value. References are resolved by `kind` +
+ * `stableId` to EXISTING `currencies` catalog definitions; an archived currency
+ * definition is still a valid reference (a hidden amount must survive an import),
+ * while a missing / wrong-kind / duplicated stableId is rejected before any write.
+ * A legacy v3-v7 document has no `currencyBalances` field, so importing one
+ * produces no balances.
+ *
  * The document is strictly bounded so a huge / malformed payload is rejected
  * quickly (the request body itself is capped at 2 MiB before parsing, see the
  * import route).
@@ -65,6 +77,7 @@ import { z } from "zod"
 import {
   blessingTierSchema,
   characterStateSchema,
+  CURRENCY_AMOUNT_MAX,
   gradeSchema,
 } from "@/lib/server/schemas"
 
@@ -73,8 +86,9 @@ export const IMPORT_SCHEMA_V4 = "primal-character/4" as const
 export const IMPORT_SCHEMA_V5 = "primal-character/5" as const
 export const IMPORT_SCHEMA_V6 = "primal-character/6" as const
 export const IMPORT_SCHEMA_V7 = "primal-character/7" as const
+export const IMPORT_SCHEMA_V8 = "primal-character/8" as const
 /** The current trusted-backup schema (what `exportCharacter` emits). */
-export const IMPORT_SCHEMA = IMPORT_SCHEMA_V7
+export const IMPORT_SCHEMA = IMPORT_SCHEMA_V8
 
 export const IMPORT_RULESET_VERSION = "house-2026-10-12-v1" as const
 
@@ -84,6 +98,8 @@ export const MAX_IMPORT_SKILL_OFFERS = 1_000
 export const MAX_IMPORT_ASSOCIATIONS = 500
 /** Distinct stock definitions a backup may carry (self-roundtrip guarantee). */
 export const MAX_IMPORT_INVENTORY = 500
+/** Distinct currency balances a backup may carry (self-roundtrip guarantee). */
+export const MAX_IMPORT_CURRENCIES = 500
 
 const stableRefSchema = z.object({
   stableId: z.string().min(1).nullable(),
@@ -476,16 +492,16 @@ const inventoryRefSchemaV7 = z.object({
 })
 
 /**
- * The current v7 trusted-backup document. Everything v6 carries (the strict v6
+ * The v7 trusted-backup document. Everything v6 carries (the strict v6
  * skill-offer shape, inventory, ring positions) plus the god + tier blessing
  * model: a blessing association references a `gods` definition and carries a
  * REQUIRED `tier`. A v7 skill offer may additionally carry the schedule-credit
  * provenance (`earnedGrade` + `trackDefinitionStableId`, optional nullable and
  * validated together, plus the optional nullable `classStableIdAtEarn` earning-time
- * class snapshot that is nonempty-when-present). This is the ONLY schema
- * `exportCharacter` emits; legacy v3-v6 documents still parse and are accepted unless they carry a
- * blessing association (the service layer rejects those with a migration
- * notice).
+ * class snapshot that is nonempty-when-present). It is still ACCEPTED on import
+ * (and is the last version before `currencyBalances`); legacy v3-v6 documents
+ * still parse and are accepted unless they carry a blessing association (the
+ * service layer rejects those with a migration notice).
  */
 const v7DocumentSchema = z.object({
   schema: z.literal(IMPORT_SCHEMA_V7),
@@ -496,11 +512,61 @@ const v7DocumentSchema = z.object({
 })
 
 /**
- * The full trusted-backup document: the current v7 shape, or a legacy v6/v5/v4/v3
- * shape. `state` is the only authoritative field used to build the new character;
- * `liveState` / `status` are advisory and are validated loosely (they are ignored
- * on import, status is recomputed). The arrays are bounded so a pathological
- * backup is rejected before any DB write.
+ * A single exported/imported currency balance. `definition.kind` is always
+ * `"currencies"` (a balance is an end in itself and belongs to the `currencies`
+ * catalog kind only); `stableId` is the catalog stable identifier (never the DB
+ * id) so a backup round-trips across server instances. `amount` is a nonnegative
+ * whole number 0..2147483647 (`CURRENCY_AMOUNT_MAX`), and a `0` balance is a legal
+ * stored value (an absent entry means "no recorded balance").
+ */
+const currencyBalanceRefSchema = z.object({
+  definition: z.object({
+    kind: z.literal("currencies"),
+    stableId: z.string().min(1),
+  }),
+  amount: z.number().int().min(0).max(CURRENCY_AMOUNT_MAX),
+})
+
+/**
+ * The current v8 trusted-backup document. It is everything v7 carries (associations,
+ * inventory with the v7-only `equipment`/`items` kinds, the strict v7 skill-offer
+ * shape, the god + tier blessing model, ring positions) PLUS a REQUIRED
+ * `currencyBalances` array. A duplicate currency stableId is rejected at the schema
+ * boundary (no two balances may reference the same `currencies` definition), and
+ * the array is bounded like inventory. This is the ONLY schema `exportCharacter`
+ * emits.
+ */
+const v8DocumentSchema = z
+  .object({
+    schema: z.literal(IMPORT_SCHEMA_V8),
+    ...documentBase,
+    associations: z.array(v7AssociationSchema).max(MAX_IMPORT_ASSOCIATIONS),
+    inventory: z.array(inventoryRefSchemaV7).max(MAX_IMPORT_INVENTORY),
+    skillOffers: z.array(skillOfferSchemaV7).max(MAX_IMPORT_SKILL_OFFERS),
+    currencyBalances: z
+      .array(currencyBalanceRefSchema)
+      .max(MAX_IMPORT_CURRENCIES),
+  })
+  .superRefine((data, ctx) => {
+    const seen = new Set<string>()
+    for (const balance of data.currencyBalances) {
+      if (seen.has(balance.definition.stableId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Duplicate currency definition stableId "${balance.definition.stableId}"`,
+          path: ["currencyBalances"],
+        })
+      }
+      seen.add(balance.definition.stableId)
+    }
+  })
+
+/**
+ * The full trusted-backup document: the current v8 shape, a v7 shape, or a legacy
+ * v6/v5/v4/v3 shape. `state` is the only authoritative field used to build the new
+ * character; `liveState` / `status` are advisory and are validated loosely (they
+ * are ignored on import, status is recomputed). The arrays are bounded so a
+ * pathological backup is rejected before any DB write.
  */
 export const characterImportDocumentSchema = z.discriminatedUnion("schema", [
   v3DocumentSchema,
@@ -508,9 +574,10 @@ export const characterImportDocumentSchema = z.discriminatedUnion("schema", [
   v5DocumentSchema,
   v6DocumentSchema,
   v7DocumentSchema,
+  v8DocumentSchema,
 ])
 
-/** The validated import document type (v3, v4, v5, v6 or v7). */
+/** The validated import document type (v3, v4, v5, v6, v7 or v8). */
 export type CharacterImportDocument = z.infer<
   typeof characterImportDocumentSchema
 >

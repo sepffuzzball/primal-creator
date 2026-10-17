@@ -15,6 +15,7 @@ const KIND_LABELS: Record<string, string> = {
   skills: "Skills",
   bloodlines: "Bloodlines",
   items: "Items",
+  currencies: "Currencies",
   gods: "Gods",
   transcendent_skills: "Transcendent Skills",
 }
