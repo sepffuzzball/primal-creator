@@ -75,6 +75,7 @@ const ITEMS = [
   { name: "name", required: true },
   { name: "origin", required: true },
   { name: "race", required: true },
+  { name: "initialStats", required: false },
   { name: "class", required: true },
   { name: "profession", required: false },
   { name: "special", required: false },
@@ -111,6 +112,7 @@ interface Draft {
   description: string
   origin: string
   raceId: string
+  initialAttributes: Record<AttributeName, string>
   classId: string
   professionId: string
   special: string // 'yes' | 'none' (legacy only; the UI never sets 'yes')
@@ -129,6 +131,26 @@ interface Draft {
   }
 }
 
+const ATTRIBUTE_NAMES = [
+  "strength",
+  "agility",
+  "endurance",
+  "vitality",
+  "toughness",
+  "wisdom",
+  "intelligence",
+  "perception",
+  "willpower",
+] as const
+type AttributeName = (typeof ATTRIBUTE_NAMES)[number]
+const BASE_ATTRIBUTES = Object.fromEntries(
+  ATTRIBUTE_NAMES.map((name) => [name, "1"])
+) as Record<AttributeName, string>
+const ATTRIBUTE_BUDGET: Record<NonNullable<Draft["raceType"]>, number> = {
+  enlightened: 70,
+  monster: 210,
+}
+
 const EMPTY_DRAFT: Draft = {
   step: "raceType",
   raceType: undefined,
@@ -136,6 +158,7 @@ const EMPTY_DRAFT: Draft = {
   description: "",
   origin: "",
   raceId: "",
+  initialAttributes: { ...BASE_ATTRIBUTES },
   classId: "",
   professionId: "",
   special: "none",
@@ -193,6 +216,18 @@ function normalizeSpecialAbilities(raw: unknown): Draft["specialAbilities"] {
  */
 function normalizeDraft(partial: Partial<Draft>): Draft {
   const merged: Draft = { ...EMPTY_DRAFT, ...partial }
+  const rawAttributes = partial.initialAttributes
+  merged.initialAttributes = Object.fromEntries(
+    ATTRIBUTE_NAMES.map((name) => [
+      name,
+      rawAttributes &&
+      typeof rawAttributes === "object" &&
+      typeof rawAttributes[name] === "string" &&
+      rawAttributes[name].length <= 20
+        ? rawAttributes[name]
+        : BASE_ATTRIBUTES[name],
+    ])
+  ) as Record<AttributeName, string>
   if (merged.step === "equipment") merged.step = "review"
   if (!STEP_NAMES.includes(merged.step)) merged.step = "name"
   merged.specialAbilities = normalizeSpecialAbilities(merged.specialAbilities)
@@ -250,6 +285,8 @@ function stepIndexToName(index: number, raceType?: Draft["raceType"]): string {
   )
     return oldNames[index]
   const names = visibleStepNames(raceType)
+  // Drafts without an attribute vector are routed through the legacy branch map
+  // in fromServerData. A vector-bearing draft always uses the current step list.
   if (Number.isInteger(index) && index >= 0 && index < names.length)
     return names[index]
   if (Number.isInteger(index) && index >= names.length) return "review"
@@ -260,9 +297,13 @@ function stepIndexToName(index: number, raceType?: Draft["raceType"]): string {
 function toServerData(
   draft: Draft,
   inferredRaceType?: Draft["raceType"]
-): DraftData {
+): DraftData & { initialAttributes: Record<AttributeName, string> } {
   const raceType = draft.raceType ?? inferredRaceType
-  const data: DraftData = { step: stepNameToIndex(draft.step, raceType) }
+  const data: DraftData & { initialAttributes: Record<AttributeName, string> } =
+    {
+      step: stepNameToIndex(draft.step, raceType),
+      initialAttributes: { ...draft.initialAttributes },
+    }
   if (raceType) data.raceType = raceType
   if (draft.name) data.name = draft.name
   if (draft.description) data.description = draft.description
@@ -298,15 +339,42 @@ function toServerData(
 
 /** Map server draft data back onto the wizard's local representation. */
 function fromServerData(data: DraftData): Partial<Draft> {
+  const dataWithAttributes = data as DraftData & {
+    initialAttributes?: Record<AttributeName, string>
+  }
   const d: Partial<Draft> = {}
   if (data.raceType === "enlightened" || data.raceType === "monster")
     d.raceType = data.raceType
-  if (typeof data.step === "number")
-    d.step = stepIndexToName(data.step, d.raceType)
+  if (typeof data.step === "number") {
+    if (dataWithAttributes.initialAttributes == null && d.raceType) {
+      const legacyNames = [
+        "raceType",
+        "name",
+        "origin",
+        "race",
+        ...(d.raceType === "monster" ? [] : ["class", "profession"]),
+        "special",
+        "review",
+      ]
+      d.step = legacyNames[data.step] ?? "review"
+    } else {
+      d.step = stepIndexToName(data.step, d.raceType)
+    }
+  }
   if (typeof data.name === "string") d.name = data.name
   if (typeof data.description === "string") d.description = data.description
   if (typeof data.origin === "string") d.origin = data.origin
   if (typeof data.raceId === "string") d.raceId = data.raceId
+  if (
+    dataWithAttributes.initialAttributes &&
+    typeof dataWithAttributes.initialAttributes === "object"
+  )
+    d.initialAttributes = Object.fromEntries(
+      ATTRIBUTE_NAMES.map((name) => [
+        name,
+        dataWithAttributes.initialAttributes![name],
+      ])
+    ) as Record<AttributeName, string>
   if (typeof data.classId === "string") d.classId = data.classId
   if (typeof data.professionId === "string") d.professionId = data.professionId
   if (typeof data.special === "boolean")
@@ -400,6 +468,7 @@ function hasContent(draft: Draft): boolean {
     draft.description.length > 0 ||
     draft.origin.length > 0 ||
     draft.raceId.length > 0 ||
+    ATTRIBUTE_NAMES.some((name) => draft.initialAttributes[name] !== "1") ||
     draft.classId.length > 0 ||
     draft.professionId.length > 0 ||
     !!draft.specialAbilities.blessing ||
@@ -431,6 +500,8 @@ function draftsDiffer(a: Draft, b: Draft): boolean {
     a.description !== b.description ||
     a.origin !== b.origin ||
     a.raceId !== b.raceId ||
+    JSON.stringify(a.initialAttributes) !==
+      JSON.stringify(b.initialAttributes) ||
     a.classId !== b.classId ||
     a.professionId !== b.professionId ||
     a.specialAbilities.blessing?.godId !== b.specialAbilities.blessing?.godId ||
@@ -624,6 +695,7 @@ export function CreateCharacterForm() {
         ...current,
         raceType: value,
         ...(sameBranch ? {} : { raceId: "", classId: "", professionId: "" }),
+        ...(sameBranch ? {} : { initialAttributes: { ...BASE_ATTRIBUTES } }),
         step:
           current.step === "raceType" || !sameBranch ? "name" : current.step,
       }
@@ -1156,6 +1228,23 @@ export function CreateCharacterForm() {
         ? `This draft exceeds the transcendent maximum of ${maxTranscendentSkills}. Remove selections before continuing.`
         : null)
 
+  const attributeNumbers = ATTRIBUTE_NAMES.map(
+    (name) => draft.initialAttributes[name]
+  )
+  const initialTotal = attributeNumbers.reduce(
+    (sum, value) => sum + (Number(value) || 0),
+    0
+  )
+  const initialStatsError = !raceType
+    ? "Choose a character kind before assigning stats."
+    : attributeNumbers.some((value) => !/^[1-9]\d*$/.test(value))
+      ? "Each initial stat must be a whole number of at least 1."
+      : initialTotal > ATTRIBUTE_BUDGET[raceType]
+        ? "Initial stats exceed the available total. Remove points before continuing."
+        : initialTotal < ATTRIBUTE_BUDGET[raceType]
+          ? `Spend all points before continuing (${ATTRIBUTE_BUDGET[raceType] - initialTotal} remaining).`
+          : null
+
   // Stored ids that are no longer in the loaded ability catalog. They are still
   // rendered (checked) so the user can remove them, rather than being invisible
   // and unresolvable.
@@ -1196,7 +1285,7 @@ export function CreateCharacterForm() {
       // silently dropped. The error is surfaced inline on the special and review
       // steps. The submit button is disabled for the same reason; this guard is
       // defense in depth (e.g. a form submit via Enter).
-      if (specialError) return
+      if (specialError || initialStatsError) return
       setSubmitting(true)
       try {
         // Flush any pending autosave so the create uses the current draft
@@ -1209,6 +1298,7 @@ export function CreateCharacterForm() {
           description?: string
           origin: "integrated" | "born"
           raceId: string
+          initialAttributes: Record<AttributeName, number>
           classId: string | null
           professionId: string | null
           draftVersion?: number
@@ -1223,6 +1313,12 @@ export function CreateCharacterForm() {
           name: draft.name,
           origin: draft.origin as "integrated" | "born",
           raceId,
+          initialAttributes: Object.fromEntries(
+            ATTRIBUTE_NAMES.map((name) => [
+              name,
+              Number(draft.initialAttributes[name]),
+            ])
+          ) as Record<AttributeName, number>,
           classId: raceType === "monster" ? null : classId,
           professionId: raceType === "monster" ? null : professionId || null,
           specialAbilities: toServerData(draft).specialAbilities!,
@@ -1282,6 +1378,7 @@ export function CreateCharacterForm() {
       showRecoverLocal,
       ready,
       specialError,
+      initialStatsError,
     ]
   )
 
@@ -1420,7 +1517,16 @@ export function CreateCharacterForm() {
                   : draft.step) as (typeof ITEMS)[number]["name"])
               : (visibleStepNames[0] as (typeof ITEMS)[number]["name"])
           }
-          onItemChange={(name) => setField("step", name)}
+          onItemChange={(name) => {
+            if (
+              draftRef.current.step === "initialStats" &&
+              initialStatsError &&
+              visibleStepNames.indexOf(name) >
+                visibleStepNames.indexOf("initialStats")
+            )
+              return
+            setField("step", name)
+          }}
           onSubmit={onSubmit}
         >
           <QuestionnaireProgress />
@@ -1592,6 +1698,11 @@ export function CreateCharacterForm() {
                               raceId: race.id,
                               classId: "",
                               professionId: "",
+                              ...(d.raceId === race.id
+                                ? {}
+                                : {
+                                    initialAttributes: { ...BASE_ATTRIBUTES },
+                                  }),
                             }))
                           }
                         >
@@ -1611,6 +1722,54 @@ export function CreateCharacterForm() {
                       )
                     })}
                 </QuestionnaireChoices>
+              </QuestionnaireItem>
+
+              <QuestionnaireItem name="initialStats" required={false}>
+                <QuestionnaireTitle>Initial Stats</QuestionnaireTitle>
+                <QuestionnaireDescription>
+                  Every stat starts at 1. Distribute all{" "}
+                  {raceType === "monster" ? 201 : 61} bonus points before
+                  continuing.
+                </QuestionnaireDescription>
+                <p className="text-sm font-medium" aria-live="polite">
+                  Remaining points: {ATTRIBUTE_BUDGET[raceType] - initialTotal}
+                </p>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {ATTRIBUTE_NAMES.map((attribute) => (
+                    <label
+                      key={attribute}
+                      className="flex flex-col gap-1 text-sm capitalize"
+                    >
+                      {attribute}
+                      <QuestionnaireInput
+                        aria-label={attribute}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={20}
+                        value={draft.initialAttributes[attribute]}
+                        aria-invalid={
+                          !/^[1-9]\d*$/.test(draft.initialAttributes[attribute])
+                        }
+                        onChange={(event) => {
+                          const value = event.target.value
+                          // Keep the raw invalid/empty value for validation, but
+                          // never admit a value the draft schema cannot persist.
+                          if (value.length > 20) return
+                          setDraft((current) => ({
+                            ...current,
+                            initialAttributes: {
+                              ...current.initialAttributes,
+                              [attribute]: value,
+                            },
+                          }))
+                        }}
+                      />
+                    </label>
+                  ))}
+                </div>
+                {initialStatsError ? (
+                  <Alert variant="destructive">{initialStatsError}</Alert>
+                ) : null}
               </QuestionnaireItem>
 
               {raceType !== "monster" ? (
@@ -2138,9 +2297,8 @@ export function CreateCharacterForm() {
               <QuestionnaireItem name="review">
                 <QuestionnaireTitle>Review</QuestionnaireTitle>
                 <QuestionnaireDescription>
-                  Confirm your choices. Stats are calculated server-side; at
-                  level 0 your base attributes are all 0 with no awards granted
-                  yet.
+                  Confirm your choices. These starting attributes are your
+                  character&apos;s Initial stats.
                 </QuestionnaireDescription>
                 <div className="flex flex-col gap-1 rounded-lg border bg-input/20 p-3 text-xs/relaxed">
                   <div>
@@ -2196,6 +2354,14 @@ export function CreateCharacterForm() {
                     {raceName ?? (
                       <span className="text-muted-foreground">-</span>
                     )}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">
+                      Initial stats:{" "}
+                    </span>
+                    {ATTRIBUTE_NAMES.map(
+                      (name) => `${name} ${draft.initialAttributes[name]}`
+                    ).join(" - ")}
                   </div>
                   <div>
                     <span className="text-muted-foreground">
@@ -2280,14 +2446,23 @@ export function CreateCharacterForm() {
 
           <QuestionnaireActions>
             <QuestionnairePrevious>Back</QuestionnairePrevious>
-            <QuestionnaireNext>Next</QuestionnaireNext>
+            <QuestionnaireNext
+              disabled={draft.step === "initialStats" && !!initialStatsError}
+              onClick={(event) => {
+                if (draft.step === "initialStats" && initialStatsError)
+                  event.preventDefault()
+              }}
+            >
+              Next
+            </QuestionnaireNext>
             <QuestionnaireSubmit
               disabled={
                 submitting ||
                 showRecoverLocal ||
                 !ready ||
                 !raceType ||
-                !!specialError
+                !!specialError ||
+                !!initialStatsError
               }
             >
               {submitting ? "Creating..." : "Create character"}

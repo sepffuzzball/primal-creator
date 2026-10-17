@@ -83,6 +83,21 @@ function attr(n: number) {
   }
 }
 
+// Fully-allocated initial stat vector for the `initialAttributes` create field.
+// Every catalog race in this suite is derived (enlightened), so this sums to the
+// 70-point enlightened budget (9 base +61).
+const enlightenedInitialAttributes = {
+  strength: 1,
+  agility: 1,
+  endurance: 1,
+  vitality: 1,
+  toughness: 1,
+  wisdom: 1,
+  intelligence: 1,
+  perception: 1,
+  willpower: 62,
+}
+
 async function seedUser(id: string, email: string, isAdmin: boolean) {
   // Idempotent: a crashed prior run may have left the user behind.
   await prisma.user.upsert({
@@ -240,6 +255,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("round-trips a v3 backup with title, equipment, granted skill, selected skill offer, a god blessing and a bloodline", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Source Hero",
         description: "Original",
         origin: "integrated",
@@ -455,6 +471,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("round-trips a v4 backup with a consumable, an equipped item, and a grandfathered zero-stock link", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "V4 Hero",
         description: "v4 round trip",
         origin: "integrated",
@@ -574,6 +591,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("imports archived owned stock inertly", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Arch Stock",
         description: "archived stock",
         origin: "integrated",
@@ -810,6 +828,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
     // freely without blocking (the link stores the row `id`, not the stableId).
     const char = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Race God Referencer",
         description: "references the god",
         origin: "integrated",
@@ -876,6 +895,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("concurrent equip vs remove-last-unit holds the ownership invariant (single winner, 409 loser)", async () => {
     const char = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Race Equip",
         description: "Concurrent equip vs remove",
         origin: "integrated",
@@ -973,6 +993,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("rejects a second BLESSING link on one character via the partial unique index", async () => {
     const char = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Blessing Singleton",
         origin: "integrated",
         raceId: CATALOG.human,
@@ -1105,6 +1126,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("round-trips two distinct Ring 1 / Ring 2 links through v5 export/import preserving positions", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Ring Hero",
         description: "two rings",
         origin: "integrated",
@@ -1226,6 +1248,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("rejects a v5 backup carrying two rings in the same active position (import_link_collision)", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Ring Collide",
         description: "both at Ring 1",
         origin: "integrated",
@@ -1278,6 +1301,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("rejects a backup carrying a Ring link with no position (import_ring_position_required)", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Ring No Pos",
         description: "canonical Ring, no position",
         origin: "integrated",
@@ -1339,6 +1363,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("derives a ring position from a legacy Ring 1 catalog slot on a v3/v4 backup with no position in the doc", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Ring Legacy Slot",
         description: "legacy slot derives position",
         origin: "integrated",
@@ -1692,6 +1717,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("preserves a canceled offer's generation and canceledAt across a v6 backup round trip", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Undo Hero",
         description: "v6 canceled offer round trip",
         origin: "integrated",
@@ -1852,6 +1878,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
   it("round-trips a v8 backup that carries inventory, a god blessing, and currency balances", async () => {
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "V8 Wallet Hero",
         description: "v8 currency round trip",
         origin: "integrated",
@@ -1991,6 +2018,7 @@ describe.skipIf(!gate.run)("character import round trip (real PG)", () => {
 
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Cap Wallet",
         description: "cap boundary round trip",
         origin: "integrated",

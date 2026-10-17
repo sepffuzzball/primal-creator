@@ -71,6 +71,45 @@ export const partialVectorSchema = z.object({
 })
 
 /**
+ * The required initial-stat allocation a new character must submit on create.
+ *
+ * It is a FULL nine-key attribute vector: every canonical key must be present,
+ * each value a safe integer >= 1, and no other key is accepted (strict). The
+ * category-dependent TOTAL is NOT validated here - it depends on the resolved
+ * authoritative race type (an enlightened race has a budget of 70, a monster 210),
+ * which only the service layer can see from the race catalog config. Zod validates
+ * only the per-key shape; the service enforces the total AFTER resolving the
+ * authoritative race config inside the serializable create transaction.
+ */
+export const initialAttributesSchema = z
+  .object({
+    strength: z.number().int().min(1),
+    agility: z.number().int().min(1),
+    endurance: z.number().int().min(1),
+    vitality: z.number().int().min(1),
+    toughness: z.number().int().min(1),
+    wisdom: z.number().int().min(1),
+    intelligence: z.number().int().min(1),
+    perception: z.number().int().min(1),
+    willpower: z.number().int().min(1),
+  })
+  .strict()
+
+/**
+ * Total initial attribute points for an ENLIGHTENED (class/profession) race:
+ * nine base points (each attribute >= 1) plus 61 allocatable, for a 70-point
+ * budget. Enforced by the service layer, never by Zod.
+ */
+export const ENLIGHTENED_INITIAL_TOTAL = 70
+
+/**
+ * Total initial attribute points for a MONSTER (race-only) race: nine base
+ * points (each attribute >= 1) plus 201 allocatable, for a 210-point budget.
+ * Enforced by the service layer, never by Zod.
+ */
+export const MONSTER_INITIAL_TOTAL = 210
+
+/**
  * Sparse attribute patch whose values are nonnegative integers. Used for the
  * catalog-level bonuses that the engine consumes (title flat / percent basis
  * points, equipment bonus). These are bounded by the engine's caps, never
@@ -430,6 +469,12 @@ export const characterCreateSchema = z.object({
   // `professionId` is optional for an enlightened race and must be null for a
   // monster (see classId: enforcement lives in the service layer).
   professionId: z.string().min(1).nullable().optional(),
+  // REQUIRED fully-allocated initial stat vector. Every canonical attribute must
+  // be present as a safe integer >= 1, with no extra keys (the shape). The
+  // category-dependent TOTAL (70 for an enlightened race, 210 for a monster) is
+  // enforced by the service layer, which resolves the authoritative race config -
+  // Zod cannot see it, so only the per-key shape is validated here.
+  initialAttributes: initialAttributesSchema,
   // Explicit special-ability selections. When supplied, the corresponding
   // blessing/bloodline/transcendent-skill catalog definitions are resolved by
   // kind and linked as CharacterAssociations atomically with the create. When

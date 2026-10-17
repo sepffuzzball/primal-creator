@@ -57,6 +57,21 @@ import {
   transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
+// A valid fully-allocated initial stat vector for a derived (enlightened) race
+// create payload. Sums to 70 (9 base +61); the API schema only validates the
+// nine-key >=1 shape (not the total), so this is shape-valid regardless.
+const validInitialAttributes = {
+  strength: 1,
+  agility: 1,
+  endurance: 1,
+  vitality: 1,
+  toughness: 1,
+  wisdom: 1,
+  intelligence: 1,
+  perception: 1,
+  willpower: 62,
+}
+
 describe("evolveSchema (single evolution choice)", () => {
   it("parses a race choice with track: 'race'", () => {
     const parsed = evolveSchema.safeParse({
@@ -668,6 +683,7 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
         origin: "integrated",
         raceId: "race-1",
         classId: "cls-1",
+        initialAttributes: validInitialAttributes,
         specialAbilities: {},
       }).success
     ).toBe(true)
@@ -679,6 +695,7 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
       origin: "integrated",
       raceId: "race-1",
       classId: "cls-1",
+      initialAttributes: validInitialAttributes,
       specialAbilities: {
         blessing: { godId: "god-1", tier: "Major" },
         bloodlineIds: ["blood-1"],
@@ -733,12 +750,73 @@ describe("specialAbilitiesSchema / characterCreateSchema", () => {
   })
 })
 
+describe("initialAttributes at the API boundary (shape only)", () => {
+  const base = {
+    name: "Kael",
+    origin: "integrated" as const,
+    raceId: "race-1",
+    classId: "cls-1",
+  }
+
+  it("requires the initialAttributes field (a missing field is rejected before the service)", () => {
+    expect(characterCreateSchema.safeParse(base).success).toBe(false)
+  })
+
+  it("accepts a valid full nine-key vector with each integer >= 1", () => {
+    expect(
+      characterCreateSchema.safeParse({
+        ...base,
+        initialAttributes: validInitialAttributes,
+      }).success
+    ).toBe(true)
+  })
+
+  it("rejects a value below 1", () => {
+    expect(
+      characterCreateSchema.safeParse({
+        ...base,
+        initialAttributes: { ...validInitialAttributes, strength: 0 },
+      }).success
+    ).toBe(false)
+  })
+
+  it("rejects a non-integer value", () => {
+    expect(
+      characterCreateSchema.safeParse({
+        ...base,
+        initialAttributes: { ...validInitialAttributes, agility: 1.5 },
+      }).success
+    ).toBe(false)
+  })
+
+  it("rejects a missing attribute key", () => {
+    const partial = { ...validInitialAttributes } as Record<string, unknown>
+    delete (partial as Record<string, unknown>)["willpower"]
+    expect(
+      characterCreateSchema.safeParse({
+        ...base,
+        initialAttributes: partial,
+      }).success
+    ).toBe(false)
+  })
+
+  it("rejects an extra (unknown) key strictly", () => {
+    expect(
+      characterCreateSchema.safeParse({
+        ...base,
+        initialAttributes: { ...validInitialAttributes, luck: 1 },
+      }).success
+    ).toBe(false)
+  })
+})
+
 describe("character profile metadata schema bounds", () => {
   const base = {
     name: "Kael",
     origin: "integrated" as const,
     raceId: "race-1",
     classId: "cls-1",
+    initialAttributes: validInitialAttributes,
   }
 
   it("accepts all six metadata fields on create and preserves them", () => {
@@ -1016,6 +1094,7 @@ describe("race advancement (raceType / quarter / track)", () => {
       raceId: "race-1",
       classId: null,
       professionId: null,
+      initialAttributes: validInitialAttributes,
     })
     expect(parsed.success).toBe(true)
   })
@@ -1025,6 +1104,7 @@ describe("race advancement (raceType / quarter / track)", () => {
       name: "Kael",
       origin: "integrated",
       raceId: "race-1",
+      initialAttributes: validInitialAttributes,
     })
     expect(parsed.success).toBe(true)
   })

@@ -1,6 +1,6 @@
 {
   "name": "primal-creator",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "private": true,
   "scripts": {
@@ -19,6 +19,7 @@
     "db:migrate:dev": "prisma migrate dev",
     "db:generate": "prisma generate",
     "db:reset:0.1.0": "node scripts/reset-db-0.1.0.mjs",
+    "db:delete-character": "node scripts/delete-character.mjs",
     "prisma:validate": "prisma validate"
   },
   "prisma": {

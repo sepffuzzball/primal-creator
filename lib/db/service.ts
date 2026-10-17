@@ -68,6 +68,7 @@ import {
   CURRENCY_AMOUNT_MAX,
   currencyGradeDescriptionsForbidden,
   currencyGradeForbidden,
+  ENLIGHTENED_INITIAL_TOTAL,
   godGradeForbidden,
   gradeSchema,
   gradeSkillStableIdsFor,
@@ -81,6 +82,8 @@ import {
   isLegacyBloodlineConfig,
   isIncompleteEquipmentConfig,
   isLegacyTranscendentSkillConfig,
+  initialAttributesSchema,
+  MONSTER_INITIAL_TOTAL,
   normalizeCatalogKind,
   normalizeEquipmentSlot,
   parseCatalogConfig,
@@ -670,7 +673,12 @@ export function createInitialState(
   origin: "integrated" | "born",
   raceRow: CatalogRow | null,
   professionRow: CatalogRow | null,
-  classRow?: CatalogRow | null
+  classRow?: CatalogRow | null,
+  // Optional fully-allocated initial stat vector. The production `createCharacter`
+  // ALWAYS passes the validated vector from the required `initialAttributes` API
+  // field; legacy unit-fixture callers that omit it keep the historical zero-vector
+  // base (never fabricated stats, so their assertions are unchanged).
+  baseAttributes?: AttributeVector
 ): CharacterState {
   const tracks: CharacterState["tracks"] = {}
   const classLevel = 0
@@ -719,7 +727,7 @@ export function createInitialState(
   }
 
   return {
-    baseAttributes: zeroVector(),
+    baseAttributes: baseAttributes ?? zeroVector(),
     tracks,
     race:
       raceType === "monster"
@@ -746,6 +754,49 @@ export function createInitialState(
     currentResources: {},
     turn: 0,
   }
+}
+
+// ------------------------------------------------------------------ //
+// Initial-attribute validation
+// ------------------------------------------------------------------ //
+
+/**
+ * Validate a client-supplied initial stat vector AND its category-dependent total,
+ * returning the verified engine AttributeVector.
+ *
+ * The shape (full nine-key, each a safe integer >= 1, no extra keys) is enforced
+ * by `initialAttributesSchema` (the same strict shape the API boundary uses). The
+ * TOTAL is category-dependent and only known once the authoritative race type is
+ * resolved, so it is enforced here, inside the transaction, AFTER the race config
+ * is read - never at the API boundary, where Zod cannot see the race config.
+ *
+ * Budgets: 70 for an enlightened (class/profession) race, 210 for a monster
+ * (race-only) race. A missing / shape-invalid / wrong-total vector rejects with
+ * 400 `invalid_initial_attributes` BEFORE any character write or draft consume.
+ */
+function validateInitialAttributes(
+  value: unknown,
+  raceType: RaceType
+): AttributeVector {
+  const parsed = initialAttributesSchema.safeParse(value)
+  if (!parsed.success) {
+    throw badRequest(
+      "invalid_initial_attributes",
+      "initialAttributes must be a full nine-key attribute vector (strength, agility, endurance, vitality, toughness, wisdom, intelligence, perception, willpower), each a safe integer >= 1, with no extra keys"
+    )
+  }
+  const vector = parsed.data
+  const budget =
+    raceType === "monster" ? MONSTER_INITIAL_TOTAL : ENLIGHTENED_INITIAL_TOTAL
+  let total = 0
+  for (const attr of ATTRIBUTES) total += vector[attr]
+  if (total !== budget) {
+    throw badRequest(
+      "invalid_initial_attributes",
+      `initialAttributes sum ${total} does not match the ${raceType} race budget of ${budget}`
+    )
+  }
+  return vector
 }
 
 // ------------------------------------------------------------------ //
@@ -2354,6 +2405,13 @@ export async function createCharacter(
     classId?: string | null
     // Optional for an enlightened race, must be null for a monster.
     professionId?: string | null
+    // REQUIRED fully-allocated initial stat vector. The API boundary (Zod) has
+    // already enforced the full nine-key shape with each integer >= 1; the
+    // service re-validates the shape defensively and then enforces the
+    // category-dependent TOTAL (70 for an enlightened race, 210 for a monster)
+    // after resolving the authoritative race config, so an absent / wrong
+    // allocation 400s before any character write or draft consume.
+    initialAttributes: AttributeVector
     // Explicit special-ability selections. When supplied, the referenced
     // blessing (a god + tier), bloodline or transcendent-skill catalog
     // definitions are resolved by kind, validated (unarchived, no collision) and
@@ -2512,7 +2570,21 @@ export async function createCharacter(
         )
       }
 
-      const state = createInitialState(input.origin, race, profession, cls)
+      // Validate the required initial-stat allocation against the authoritative
+      // race type NOW (after the race config is resolved and all per-grade checks
+      // above have passed) so an absent / wrong allocation 400s BEFORE the
+      // character row or any draft consume is written/removed.
+      const initialAttributes = validateInitialAttributes(
+        input.initialAttributes,
+        raceType
+      )
+      const state = createInitialState(
+        input.origin,
+        race,
+        profession,
+        cls,
+        initialAttributes
+      )
       const serialized = serializeState(state)
 
       // Resolve the explicit special-ability selections INSIDE the transaction so a

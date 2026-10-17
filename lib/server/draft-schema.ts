@@ -4,7 +4,8 @@
  * A draft is a resumable character-creation snapshot that is persisted per
  * authenticated user but is NEVER authoritative final character state. The only
  * fields the server accepts and stores are the ones whitelisted below; anything
- * else (stat vectors, awards, effects, uploaded binaries) is rejected or dropped.
+ * else (awards, effects, uploaded binaries) is rejected or dropped. Initial
+ * attributes are explicitly whitelisted as resumable creation choices.
  *
  * The payload is bounded: each string field has a per-field cap and the whole
  * `data` object is capped at 256 KiB, so a draft never grows unbounded and no
@@ -16,6 +17,25 @@ import { specialAbilitiesSchema } from "@/lib/server/schemas"
 
 /** Hard cap on the serialized `data` payload (256 KiB). */
 export const DRAFT_DATA_MAX_BYTES = 256 * 1024
+
+const attributeNames = [
+  "strength",
+  "agility",
+  "endurance",
+  "vitality",
+  "toughness",
+  "wisdom",
+  "intelligence",
+  "perception",
+  "willpower",
+] as const
+const initialAttributesSchema = z
+  .object(
+    Object.fromEntries(
+      attributeNames.map((name) => [name, z.string().max(20)])
+    ) as Record<(typeof attributeNames)[number], z.ZodString>
+  )
+  .strict()
 
 /**
  * Hard cap on the entire PUT request body. The `data` payload may be up to
@@ -60,6 +80,7 @@ export const draftDataSchema = z
     origin: z.enum(["integrated", "born"]).optional(),
     raceType: z.enum(["enlightened", "monster"]).optional(),
     raceId: z.string().max(128).optional(),
+    initialAttributes: initialAttributesSchema.optional(),
     classId: z.string().max(128).optional(),
     professionId: z.string().max(128).nullable().optional(),
     special: z.boolean().optional(),

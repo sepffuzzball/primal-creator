@@ -34,6 +34,17 @@ const DATA: DraftData = {
   description: "A resolute hunter.",
   origin: "born" as const,
   raceId: "race-1",
+  initialAttributes: {
+    strength: "62",
+    agility: "1",
+    endurance: "1",
+    vitality: "1",
+    toughness: "1",
+    wisdom: "1",
+    intelligence: "1",
+    perception: "1",
+    willpower: "1",
+  },
   classId: "class-1",
   professionId: "prof-1",
   special: true,
@@ -117,6 +128,36 @@ describe("draft data schema (whitelist / bounds)", () => {
   it("accepts a partial draft (resumable at any step)", () => {
     const parsed = draftDataSchema.safeParse({ step: 1, name: "Kael" })
     expect(parsed.success).toBe(true)
+  })
+
+  it("accepts complete starting attributes without imposing a branch total", () => {
+    const attrs = {
+      strength: "",
+      agility: "invalid",
+      endurance: "1",
+      vitality: "1",
+      toughness: "1",
+      wisdom: "1",
+      intelligence: "1",
+      perception: "1",
+      willpower: "1000",
+    }
+    expect(
+      draftDataSchema.safeParse({ initialAttributes: attrs }).success
+    ).toBe(true)
+    expect(
+      draftDataSchema.safeParse({ initialAttributes: { strength: "x" } })
+        .success
+    ).toBe(false)
+    expect(
+      draftDataSchema.safeParse({ initialAttributes: { ...attrs, extra: 1 } })
+        .success
+    ).toBe(false)
+    expect(
+      draftDataSchema.safeParse({
+        initialAttributes: { ...attrs, willpower: "x".repeat(21) },
+      }).success
+    ).toBe(false)
   })
 
   it("accepts a draft that records an enlightened raceType branch", () => {
@@ -290,6 +331,15 @@ describe("draft service (persistence + CAS)", () => {
     expect(dbMock.store.drafts.size).toBe(1)
     const stored = [...dbMock.store.drafts.values()][0]
     expect(stored.userId).toBe(user.id)
+  })
+
+  it("persists and restores the full initial attribute vector", async () => {
+    const saved = await saveDraft(user, { data: DATA })
+    const restored = await getDraft(user)
+    expect(restored?.data).toEqual(saved.data)
+    expect((restored?.data as DraftData).initialAttributes).toEqual(
+      DATA.initialAttributes
+    )
   })
 
   it("saveDraft CAS-updates at the exact supplied version", async () => {

@@ -100,6 +100,32 @@ function allEqual(n: number): AttributeVector {
   return out
 }
 
+// Fully-allocated initial stat vectors for the `initialAttributes` create field.
+// The enlightened vector sums to 70 (9 base +61); the monster vector sums to 210
+// (9 base +201), matching each race's category-dependent create budget.
+const enlightenedInitialAttributes: AttributeVector = {
+  strength: 1,
+  agility: 1,
+  endurance: 1,
+  vitality: 1,
+  toughness: 1,
+  wisdom: 1,
+  intelligence: 1,
+  perception: 1,
+  willpower: 62,
+}
+const monsterInitialAttributes: AttributeVector = {
+  strength: 1,
+  agility: 1,
+  endurance: 1,
+  vitality: 1,
+  toughness: 1,
+  wisdom: 1,
+  intelligence: 1,
+  perception: 1,
+  willpower: 202,
+}
+
 const humanRace = {
   kind: "races",
   stableId: "human",
@@ -449,7 +475,13 @@ describe("optimistic concurrency (CAS)", () => {
     })
     seedClassCatalog()
     const detail = await createCharacter(
-      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      {
+        initialAttributes: enlightenedInitialAttributes,
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+      },
       user
     )
     expect(detail.id).toBeTruthy()
@@ -493,6 +525,7 @@ describe("optimistic concurrency (CAS)", () => {
       await expect(
         createCharacter(
           {
+            initialAttributes: enlightenedInitialAttributes,
             name: "Kael",
             origin: "integrated",
             raceId: "race-1",
@@ -554,6 +587,7 @@ describe("optimistic concurrency (CAS)", () => {
       await expect(
         createCharacter(
           {
+            initialAttributes: enlightenedInitialAttributes,
             name: "Kael",
             origin: "integrated",
             raceId: "race-1",
@@ -576,6 +610,7 @@ describe("optimistic concurrency (CAS)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "N",
           origin: "integrated",
           raceId: "missing",
@@ -609,6 +644,7 @@ describe("optimistic concurrency (CAS)", () => {
     })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -647,6 +683,7 @@ describe("optimistic concurrency (CAS)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -686,6 +723,7 @@ describe("optimistic concurrency (CAS)", () => {
     })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -997,6 +1035,7 @@ describe("race adoption (monster vs enlightened)", () => {
     seedMonsterRace()
     const detail = await createCharacter(
       {
+        initialAttributes: monsterInitialAttributes,
         name: "Wyrm",
         origin: "born",
         raceId: "race-m",
@@ -1021,6 +1060,7 @@ describe("race adoption (monster vs enlightened)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: monsterInitialAttributes,
           name: "Wyrm",
           origin: "born",
           raceId: "race-m",
@@ -1032,6 +1072,7 @@ describe("race adoption (monster vs enlightened)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: monsterInitialAttributes,
           name: "Wyrm",
           origin: "born",
           raceId: "race-m",
@@ -1049,6 +1090,7 @@ describe("race adoption (monster vs enlightened)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Human",
           origin: "integrated",
           raceId: "race-e",
@@ -1065,6 +1107,7 @@ describe("race adoption (monster vs enlightened)", () => {
     // A class at the natural grade (F) with an F config is accepted.
     const ok = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Archer",
         origin: "born",
         raceId: "race-e",
@@ -1079,6 +1122,7 @@ describe("race adoption (monster vs enlightened)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Mage",
           origin: "born",
           raceId: "race-e",
@@ -1109,6 +1153,7 @@ describe("race adoption (monster vs enlightened)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Human",
           origin: "integrated",
           raceId: "race-no-g",
@@ -1136,6 +1181,7 @@ describe("race adoption (monster vs enlightened)", () => {
     })
     const created = await createCharacter(
       {
+        initialAttributes: monsterInitialAttributes,
         name: "Wyrm",
         origin: "integrated",
         raceId: "race-m-g",
@@ -1184,7 +1230,13 @@ describe("race adoption (monster vs enlightened)", () => {
       },
     })
     const created = await createCharacter(
-      { name: "Wyrm", origin: "born", raceId: "race-m-b", classId: null },
+      {
+        initialAttributes: monsterInitialAttributes,
+        name: "Wyrm",
+        origin: "born",
+        raceId: "race-m-b",
+        classId: null,
+      },
       user
     )
     const state = created.state as CharacterState
@@ -1209,6 +1261,7 @@ describe("race adoption (monster vs enlightened)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: monsterInitialAttributes,
           name: "Wyrm",
           origin: "integrated",
           raceId: "race-m-no-g",
@@ -1223,6 +1276,7 @@ describe("race adoption (monster vs enlightened)", () => {
     seedMonsterRace()
     const created = await createCharacter(
       {
+        initialAttributes: monsterInitialAttributes,
         name: "Wyrm",
         origin: "born",
         raceId: "race-m",
@@ -1262,7 +1316,13 @@ describe("race adoption (monster vs enlightened)", () => {
   it("rejects a class/profession advance on a monster and a race advance on an enlightened race", async () => {
     seedMonsterRace()
     const created = await createCharacter(
-      { name: "Wyrm", origin: "born", raceId: "race-m", classId: null },
+      {
+        initialAttributes: monsterInitialAttributes,
+        name: "Wyrm",
+        origin: "born",
+        raceId: "race-m",
+        classId: null,
+      },
       user
     )
     await expect(
@@ -1273,6 +1333,7 @@ describe("race adoption (monster vs enlightened)", () => {
     seedClassF()
     const human = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Human",
         origin: "integrated",
         raceId: "race-e",
@@ -1431,7 +1492,13 @@ describe("race adoption (monster vs enlightened)", () => {
   it("exports a monster with a null class/profession identity and no tracks", async () => {
     seedMonsterRace()
     const created = await createCharacter(
-      { name: "Wyrm", origin: "born", raceId: "race-m", classId: null },
+      {
+        initialAttributes: monsterInitialAttributes,
+        name: "Wyrm",
+        origin: "born",
+        raceId: "race-m",
+        classId: null,
+      },
       user
     )
     const exported = (await exportCharacter(created.id, user)) as Record<
@@ -1497,6 +1564,177 @@ describe("race adoption (monster vs enlightened)", () => {
     const importedState = imported.state as CharacterState
     expect(importedState.race.grade).toBe("B")
     expect(importedState.race.level).toBe(0)
+  })
+})
+
+describe("createCharacter initial attribute allocation", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedEnlightenedRace() {
+    dbMock.store.addCatalog({
+      id: "race-e",
+      kind: "races",
+      stableId: "human",
+      name: "Human",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          G: { id: "human:G", perLevel: { strength: 1 }, freePerLevel: 1 },
+          F: { id: "human:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedMonsterRace() {
+    dbMock.store.addCatalog({
+      id: "race-m",
+      kind: "races",
+      stableId: "wyrm",
+      name: "Wyrm",
+      config: {
+        raceType: "monster",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "wyrm:F", perLevel: { strength: 2 }, freePerLevel: 1 },
+        },
+      },
+    })
+  }
+
+  function seedClassF() {
+    dbMock.store.addCatalog({
+      id: "cls-f",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      grade: "F",
+      config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
+    })
+  }
+
+  it("persists the supplied enlightened vector verbatim and leaves no free points", async () => {
+    seedEnlightenedRace()
+    seedClassF()
+    const detail = await createCharacter(
+      {
+        initialAttributes: { ...enlightenedInitialAttributes },
+        name: "Human",
+        origin: "integrated",
+        raceId: "race-e",
+        classId: "cls-f",
+      },
+      user
+    )
+    const state = detail.state as CharacterState
+    expect(state.baseAttributes).toEqual(enlightenedInitialAttributes)
+    expect(state.historicalLevelAwards).toEqual([])
+    expect(state.allocations).toEqual([])
+    expect(detail.status?.availablePoints).toBe(0)
+    expect(detail.status?.totalFreePoints).toBe(0)
+  })
+
+  it("persists the supplied monster vector verbatim and leaves no free points", async () => {
+    seedMonsterRace()
+    const detail = await createCharacter(
+      {
+        initialAttributes: { ...monsterInitialAttributes },
+        name: "Wyrm",
+        origin: "born",
+        raceId: "race-m",
+        classId: null,
+        professionId: null,
+      },
+      user
+    )
+    const state = detail.state as CharacterState
+    expect(state.baseAttributes).toEqual(monsterInitialAttributes)
+    expect(state.historicalLevelAwards).toEqual([])
+    expect(state.allocations).toEqual([])
+    expect(detail.status?.availablePoints).toBe(0)
+    expect(detail.status?.totalFreePoints).toBe(0)
+  })
+
+  it("rejects an enlightened allocation with the wrong total before writing", async () => {
+    seedEnlightenedRace()
+    seedClassF()
+    await expect(
+      createCharacter(
+        {
+          initialAttributes: { ...enlightenedInitialAttributes, willpower: 63 },
+          name: "Human",
+          origin: "integrated",
+          raceId: "race-e",
+          classId: "cls-f",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_initial_attributes" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a monster allocation with the wrong total before writing", async () => {
+    seedMonsterRace()
+    await expect(
+      createCharacter(
+        {
+          initialAttributes: { ...monsterInitialAttributes, willpower: 203 },
+          name: "Wyrm",
+          origin: "born",
+          raceId: "race-m",
+          classId: null,
+          professionId: null,
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_initial_attributes" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects a missing initialAttributes before writing", async () => {
+    seedEnlightenedRace()
+    seedClassF()
+    await expect(
+      createCharacter(
+        {
+          initialAttributes: undefined as unknown as AttributeVector,
+          name: "Human",
+          origin: "integrated",
+          raceId: "race-e",
+          classId: "cls-f",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_initial_attributes" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects an allocation with an extra key before writing", async () => {
+    seedEnlightenedRace()
+    seedClassF()
+    await expect(
+      createCharacter(
+        {
+          initialAttributes: {
+            ...enlightenedInitialAttributes,
+            luck: 1,
+          } as unknown as AttributeVector,
+          name: "Human",
+          origin: "integrated",
+          raceId: "race-e",
+          classId: "cls-f",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "invalid_initial_attributes" })
+    expect(dbMock.store.characters.size).toBe(0)
+    expect(dbMock.store.events).toHaveLength(0)
   })
 })
 
@@ -1613,6 +1851,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -1669,6 +1908,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1692,6 +1932,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1714,6 +1955,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1736,6 +1978,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1757,6 +2000,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1779,6 +2023,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1806,6 +2051,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     await expect(
       createCharacter(
         {
+          initialAttributes: enlightenedInitialAttributes,
           name: "Kael",
           origin: "integrated",
           raceId: "race-1",
@@ -1829,6 +2075,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     seedCreateBase()
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -1855,6 +2102,7 @@ describe("createCharacter special abilities (atomic selection)", () => {
     })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -1955,6 +2203,7 @@ describe("character profile metadata (create/read/edit/clear)", () => {
     seedRaceClass()
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -1992,7 +2241,13 @@ describe("character profile metadata (create/read/edit/clear)", () => {
   it("creates a character with omitted metadata as null", async () => {
     seedRaceClass()
     const detail = await createCharacter(
-      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      {
+        initialAttributes: enlightenedInitialAttributes,
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+      },
       user
     )
     expect(detail.nickname).toBeNull()
@@ -2007,6 +2262,7 @@ describe("character profile metadata (create/read/edit/clear)", () => {
     seedRaceClass()
     const created = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "N",
         origin: "integrated",
         raceId: "race-1",
@@ -2023,7 +2279,13 @@ describe("character profile metadata (create/read/edit/clear)", () => {
   it("edits and clears profile metadata through updateCharacter", async () => {
     seedRaceClass()
     const created = await createCharacter(
-      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      {
+        initialAttributes: enlightenedInitialAttributes,
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+      },
       user
     )
     const updated = await updateCharacter(
@@ -2051,7 +2313,13 @@ describe("character profile metadata (create/read/edit/clear)", () => {
   it("records the update journal as changed field names + actor, never the prose", async () => {
     seedRaceClass()
     const created = await createCharacter(
-      { name: "N", origin: "integrated", raceId: "race-1", classId: "cls-1" },
+      {
+        initialAttributes: enlightenedInitialAttributes,
+        name: "N",
+        origin: "integrated",
+        raceId: "race-1",
+        classId: "cls-1",
+      },
       user
     )
     await updateCharacter(
@@ -2075,6 +2343,7 @@ describe("character profile metadata (create/read/edit/clear)", () => {
     seedRaceClass()
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-1",
@@ -2139,6 +2408,7 @@ describe("character profile metadata (create/read/edit/clear)", () => {
     const notes = "  \nleading space line\n\tindented\t\n"
     const created = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "N",
         origin: "integrated",
         raceId: "race-1",
@@ -2173,6 +2443,7 @@ describe("character profile metadata (create/read/edit/clear)", () => {
     seedRaceClass()
     const created = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "N",
         origin: "integrated",
         raceId: "race-1",
@@ -7717,6 +7988,7 @@ describe("importCharacter (trusted backup v3)", () => {
     )
     const created = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "N",
         origin: "integrated",
         raceId: "human",
@@ -8040,6 +8312,7 @@ describe("importCharacter (trusted backup v3)", () => {
 
     const src = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Upgrader",
         origin: "integrated",
         raceId: "human",
@@ -17897,6 +18170,7 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
     seedClassCatalog()
     const created = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-e",
@@ -18261,6 +18535,7 @@ describe("experienceCharacter (authoritative EXP percent)", () => {
     seedClassCatalog()
     const created = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-e",
@@ -19257,6 +19532,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedProfGrant("prof-gg", "F", { F: ["prof-skill"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19297,6 +19573,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedProfGrant("prof-gg", "F", { F: ["prof-skill"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Bael",
         origin: "born",
         raceId: "race-gg",
@@ -19323,6 +19600,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedClassGrant("cls-gg", "F", { F: ["shared"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19356,6 +19634,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedClassGrant("cls-gg", "F", { F: ["sk-a"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19408,6 +19687,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedProfGrant("prof-gg", "F", { F: ["sk-a"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19447,6 +19727,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedClassGrant("cls-gg", "F", { F: ["shared"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19486,6 +19767,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedProfGrant("prof-gg", "F", { F: ["sk-c"] })
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19675,6 +19957,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
     seedClassGrant("cls-gg", "F")
     const detail = await createCharacter(
       {
+        initialAttributes: enlightenedInitialAttributes,
         name: "Kael",
         origin: "integrated",
         raceId: "race-gg",
@@ -19706,6 +19989,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
       await expect(
         createCharacter(
           {
+            initialAttributes: enlightenedInitialAttributes,
             name: "Kael",
             origin: "integrated",
             raceId: "race-gg",

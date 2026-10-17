@@ -112,8 +112,13 @@ vi.mock("@/components/ui/questionnaire", () => {
       <input data-slot="questionnaire-input" {...props} />
     ),
     QuestionnaireItem: div,
-    QuestionnaireNext: ({ children }: React.ComponentProps<"button">) => (
-      <button type="button">{children ?? "Next"}</button>
+    QuestionnaireNext: ({
+      children,
+      ...props
+    }: React.ComponentProps<"button">) => (
+      <button type="button" {...props}>
+        {children ?? "Next"}
+      </button>
     ),
     QuestionnairePrevious: ({ children }: React.ComponentProps<"button">) => (
       <button type="button">{children ?? "Previous"}</button>
@@ -161,6 +166,8 @@ type ServerDraft = {
 
 /** Build a draft data payload the way the wizard's server contract expects. */
 function serverData(partial: Record<string, unknown>) {
+  const raceType = partial.raceType ?? "enlightened"
+  const monster = raceType === "monster"
   return {
     step: 1,
     raceType: "enlightened",
@@ -168,6 +175,17 @@ function serverData(partial: Record<string, unknown>) {
     description: null,
     origin: "integrated",
     raceId: "",
+    initialAttributes: {
+      strength: String(monster ? 202 : 62),
+      agility: "1",
+      endurance: "1",
+      vitality: "1",
+      toughness: "1",
+      wisdom: "1",
+      intelligence: "1",
+      perception: "1",
+      willpower: "1",
+    },
     classId: "",
     professionId: null,
     special: false,
@@ -183,6 +201,17 @@ const EMPTY = {
   description: "",
   origin: "",
   raceId: "",
+  initialAttributes: {
+    strength: "1",
+    agility: "1",
+    endurance: "1",
+    vitality: "1",
+    toughness: "1",
+    wisdom: "1",
+    intelligence: "1",
+    perception: "1",
+    willpower: "1",
+  },
   classId: "",
   professionId: "",
   special: "none",
@@ -196,7 +225,19 @@ const EMPTY = {
 }
 
 function localDraft(partial: Record<string, unknown>) {
-  return { ...EMPTY, ...partial }
+  const monster = partial.raceType === "monster"
+  return {
+    ...EMPTY,
+    ...partial,
+    initialAttributes:
+      partial.initialAttributes ??
+      (Object.keys(partial).some((key) => key !== "step")
+        ? {
+            ...EMPTY.initialAttributes,
+            strength: monster ? "202" : "62",
+          }
+        : EMPTY.initialAttributes),
+  }
 }
 
 type Options = {
@@ -379,6 +420,7 @@ function putCalls(): string[] {
 /** Parsed POST /api/characters request bodies, in call order. */
 function createPostBodies(): Array<{
   name: string
+  initialAttributes?: Record<string, number>
   specialAbilities?: {
     blessing?: { godId: string; tier: string } | null
     bloodlineIds?: string[]
@@ -405,6 +447,7 @@ function lastDraftPutBody(): Array<{
     step?: number
     classId?: string
     professionId?: string | null
+    initialAttributes?: Record<string, string>
     special?: boolean
     specialAbilities?: unknown
   }
@@ -944,6 +987,227 @@ describe("CreateCharacterForm local recovery", () => {
 })
 
 describe("CreateCharacterForm special abilities", () => {
+  it.each([
+    ["enlightened", 0, "raceType"],
+    ["enlightened", 1, "name"],
+    ["enlightened", 2, "origin"],
+    ["enlightened", 3, "race"],
+    ["enlightened", 4, "initialStats"],
+    ["enlightened", 5, "class"],
+    ["enlightened", 6, "profession"],
+    ["enlightened", 7, "special"],
+    ["enlightened", 8, "review"],
+    ["monster", 0, "raceType"],
+    ["monster", 1, "name"],
+    ["monster", 2, "origin"],
+    ["monster", 3, "race"],
+    ["monster", 4, "initialStats"],
+    ["monster", 5, "special"],
+    ["monster", 6, "review"],
+  ] as const)(
+    "restores current %s draft index %i as %s",
+    async (raceType, step, expected) => {
+      setupMock({
+        serverDraft: { data: serverData({ raceType, step }), version: 1 },
+      })
+      await renderForm()
+      expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
+        expected
+      )
+    }
+  )
+
+  it.each([
+    ["enlightened", 0, "raceType"],
+    ["enlightened", 1, "name"],
+    ["enlightened", 4, "class"],
+    ["enlightened", 5, "profession"],
+    ["enlightened", 6, "special"],
+    ["enlightened", 7, "review"],
+    ["monster", 0, "raceType"],
+    ["monster", 1, "name"],
+    ["monster", 4, "special"],
+    ["monster", 5, "review"],
+  ] as const)(
+    "restores legacy %s draft step %i as %s",
+    async (raceType, step, expected) => {
+      const data = serverData({ raceType, step })
+      delete (data as Record<string, unknown>).initialAttributes
+      setupMock({ serverDraft: { data, version: 1 } })
+      await renderForm()
+      expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
+        expected
+      )
+    }
+  )
+
+  it("persists empty and invalid stats on reload and recovery, with saved status", async () => {
+    const attrs = { ...EMPTY.initialAttributes, strength: "", agility: "oops" }
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        ...EMPTY,
+        step: "initialStats",
+        initialAttributes: attrs,
+      })
+    )
+    setupMock({ serverDraft: null })
+    await renderForm()
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    })
+    expect(lastDraftPutBody()[0].data?.initialAttributes).toEqual(attrs)
+    expect(screen.getByText(/Saved/)).toBeTruthy()
+    cleanup()
+    await renderForm()
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      ""
+    )
+    expect((screen.getByLabelText("agility") as HTMLInputElement).value).toBe(
+      "oops"
+    )
+  })
+
+  it("rejects stat input longer than 20 characters without clipping and preserves allowed raw values", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ ...EMPTY, step: "initialStats" })
+    )
+    setupMock({ serverDraft: null })
+    await renderForm()
+    const strength = screen.getByLabelText("strength") as HTMLInputElement
+    expect(strength.maxLength).toBe(20)
+
+    fireEvent.change(strength, { target: { value: "123456789012345678901" } })
+    expect(strength.value).toBe("1")
+
+    fireEvent.change(strength, { target: { value: "12345678901234567890" } })
+    fireEvent.change(screen.getByLabelText("agility"), {
+      target: { value: "" },
+    })
+    fireEvent.change(screen.getByLabelText("endurance"), {
+      target: { value: "not-a-number" },
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    })
+
+    const attrs = lastDraftPutBody().at(-1)?.data?.initialAttributes
+    expect(attrs).toMatchObject({
+      strength: "12345678901234567890",
+      agility: "",
+      endurance: "not-a-number",
+    })
+    cleanup()
+    await renderForm()
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      "12345678901234567890"
+    )
+    expect((screen.getByLabelText("agility") as HTMLInputElement).value).toBe(
+      ""
+    )
+    expect((screen.getByLabelText("endurance") as HTMLInputElement).value).toBe(
+      "not-a-number"
+    )
+  })
+
+  it("keeps invalid raw stats through the device-draft recovery choice", async () => {
+    const attrs = { ...EMPTY.initialAttributes, strength: "", agility: "bad" }
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        ...EMPTY,
+        step: "initialStats",
+        initialAttributes: attrs,
+      })
+    )
+    setupMock({
+      serverDraft: { data: serverData({}), version: 4 },
+      putResult: { data: serverData({}), version: 5 },
+    })
+    await renderForm()
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    fireEvent.click(screen.getByText(/Use device draft/))
+    await flush()
+    expect(lastDraftPutBody().at(-1)?.data?.initialAttributes).toEqual(attrs)
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      ""
+    )
+    expect((screen.getByLabelText("agility") as HTMLInputElement).value).toBe(
+      "bad"
+    )
+  })
+  it.each([
+    ["enlightened", 70, 61],
+    ["monster", 210, 201],
+  ] as const)(
+    "requires the full %s stat budget and posts all initial stats",
+    async (raceType, total, bonus) => {
+      const startingStats = Object.fromEntries(
+        [
+          "strength",
+          "agility",
+          "endurance",
+          "vitality",
+          "toughness",
+          "wisdom",
+          "intelligence",
+          "perception",
+          "willpower",
+        ].map((name) => [name, "1"])
+      )
+      window.localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          ...EMPTY,
+          raceType,
+          step: "initialStats",
+          initialAttributes: startingStats,
+        })
+      )
+      setupMock({ serverDraft: null })
+      await renderForm()
+
+      expect(screen.getByText(`Remaining points: ${total - 9}`)).toBeTruthy()
+      expect(
+        (screen.getByText("Next").closest("button") as HTMLButtonElement)
+          .disabled
+      ).toBe(true)
+      expect(
+        (
+          screen
+            .getByText("Create character")
+            .closest("button") as HTMLButtonElement
+        ).disabled
+      ).toBe(true)
+      fireEvent.submit(screen.getByTestId("questionnaire"))
+      await flush()
+      expect(createCalls).toBe(0)
+
+      fireEvent.change(screen.getByLabelText("strength"), {
+        target: { value: String(bonus + 1) },
+      })
+      expect(screen.getByText("Remaining points: 0")).toBeTruthy()
+      expect(
+        (screen.getByText("Next").closest("button") as HTMLButtonElement)
+          .disabled
+      ).toBe(false)
+      fireEvent.submit(screen.getByTestId("questionnaire"))
+      await flush()
+      expect(createPostBodies()[0].initialAttributes).toEqual({
+        strength: bonus + 1,
+        agility: 1,
+        endurance: 1,
+        vitality: 1,
+        toughness: 1,
+        wisdom: 1,
+        intelligence: 1,
+        perception: 1,
+        willpower: 1,
+      })
+    }
+  )
+
   it("mounts only registry items and avoids missing-item console warnings", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
     const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {})
@@ -958,7 +1222,7 @@ describe("CreateCharacterForm special abilities", () => {
       await flush()
       fireEvent.click(screen.getByLabelText("Monster"))
       expect(questionnaire.dataset.itemNames).toBe(
-        "raceType,name,origin,race,special,review"
+        "raceType,name,origin,race,initialStats,special,review"
       )
       expect(
         questionnaire.querySelectorAll("[name=class], [name=profession]")
@@ -970,6 +1234,100 @@ describe("CreateCharacterForm special abilities", () => {
       consoleError.mockRestore()
       consoleWarn.mockRestore()
     }
+  })
+
+  it("resets stats when the selected branch changes and blocks invalid entries", async () => {
+    const values = { ...EMPTY.initialAttributes, strength: "62" }
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        ...EMPTY,
+        step: "initialStats",
+        initialAttributes: values,
+      })
+    )
+    setupMock({ serverDraft: null })
+    await renderForm()
+    fireEvent.change(screen.getByLabelText("agility"), {
+      target: { value: "-2" },
+    })
+    expect(
+      (screen.getByText("Next").closest("button") as HTMLButtonElement).disabled
+    ).toBe(true)
+    fireEvent.click(screen.getByLabelText("Monster"))
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      "1"
+    )
+    expect(screen.getByText("Remaining points: 201")).toBeTruthy()
+  })
+
+  it("offers recovery when only initial stats differ", async () => {
+    const local = { ...EMPTY.initialAttributes, strength: "61", agility: "2" }
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ ...EMPTY, initialAttributes: local })
+    )
+    setupMock({
+      serverDraft: {
+        data: serverData({
+          initialAttributes: {
+            strength: 62,
+            agility: 1,
+            endurance: 1,
+            vitality: 1,
+            toughness: 1,
+            wisdom: 1,
+            intelligence: 1,
+            perception: 1,
+            willpower: 1,
+          },
+        }),
+        version: 2,
+      },
+    })
+    await renderForm()
+    expect(screen.getByText(/Use device draft/)).toBeTruthy()
+    expect(
+      JSON.parse(window.localStorage.getItem(RECOVERY_KEY) as string)
+        .initialAttributes
+    ).toEqual(local)
+  })
+
+  it("resets initial attributes when choosing a different race but not on restore", async () => {
+    const attributes = { ...EMPTY.initialAttributes, strength: "62" }
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        ...EMPTY,
+        step: "race",
+        raceId: "race-a",
+        origin: "born",
+        initialAttributes: attributes,
+      })
+    )
+    setupMock({
+      serverDraft: null,
+      catalog: {
+        races: ["race-a", "race-b"].map((id) =>
+          makeItem(id, {
+            name: id,
+            config: {
+              raceType: "enlightened",
+              naturalGrade: "F",
+              raceDefinitions: { F: {} },
+            },
+          })
+        ),
+      },
+    })
+    await renderForm()
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      "62"
+    )
+    fireEvent.click(screen.getByText("race-b").closest("label")!)
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      "1"
+    )
   })
 
   it("requires an explicit branch choice and persists its canonical step", async () => {
@@ -1001,7 +1359,7 @@ describe("CreateCharacterForm special abilities", () => {
 
     expect(
       screen.getByTestId("questionnaire").getAttribute("data-item-count")
-    ).toBe("6")
+    ).toBe("7")
     expect(screen.queryByRole("heading", { name: "Class" })).toBeNull()
     expect(screen.queryByRole("heading", { name: "Profession" })).toBeNull()
   })
@@ -1248,7 +1606,7 @@ describe("CreateCharacterForm special abilities", () => {
     )
     expect(
       screen.getByTestId("questionnaire").getAttribute("data-item-count")
-    ).toBe("6")
+    ).toBe("7")
   })
 
   it("preserves legacy server race and class selections when reaffirming Enlightened", async () => {
@@ -1293,7 +1651,7 @@ describe("CreateCharacterForm special abilities", () => {
       raceType: "enlightened",
       raceId: "human",
       classId: "archer",
-      step: 4,
+      step: 5,
     })
     fireEvent.submit(screen.getByTestId("questionnaire"))
     await flush()
@@ -1340,7 +1698,7 @@ describe("CreateCharacterForm special abilities", () => {
       raceType: "enlightened",
       raceId: "human",
       classId: "archer",
-      step: 4,
+      step: 5,
     })
     fireEvent.submit(screen.getByTestId("questionnaire"))
     await flush()
@@ -1874,6 +2232,10 @@ describe("CreateCharacterForm special abilities", () => {
   })
 
   it("allows a no-selection create when creation rules are unavailable", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Valid", origin: "born" }))
+    )
     setupMock({ serverDraft: null, rulesError: new Error("rules offline") })
     await renderForm()
     expect(screen.getByText("Create character").closest("button")).toBeTruthy()
@@ -1906,10 +2268,10 @@ describe("CreateCharacterForm special abilities", () => {
         url === "/api/drafts" && (init as RequestInit)?.method === "PUT"
     )
     expect(JSON.parse((put![1] as RequestInit).body as string).data.step).toBe(
-      7
+      8
     )
     cleanup()
-    setupMock({ serverDraft: { data: serverData({ step: 7 }), version: 2 } })
+    setupMock({ serverDraft: { data: serverData({ step: 8 }), version: 2 } })
     await renderForm()
     expect(screen.getByTestId("questionnaire").getAttribute("item")).toBe(
       "review"
@@ -2446,6 +2808,10 @@ describe("CreateCharacterForm profile metadata", () => {
   })
 
   it("includes the exact metadata values and the draft version in the create POST", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Kael", origin: "born" }))
+    )
     setupMock({
       serverDraft: null,
       putResult: { data: serverData({ name: "Kael" }), version: 4 },
@@ -2541,6 +2907,10 @@ describe("CreateCharacterForm profile metadata", () => {
   })
 
   it("clearing previously-set metadata fields posts null in the create POST", async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(localDraft({ name: "Kael", origin: "born" }))
+    )
     setupMock({
       serverDraft: null,
       putResult: { data: serverData({ name: "Kael" }), version: 5 },

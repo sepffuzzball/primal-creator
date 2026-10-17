@@ -263,6 +263,65 @@ database before this reset - the baseline guard aborts it. For a **fresh,
 empty** database there is nothing to wipe: use the normal `db:migrate` then
 `db:seed` in section 1.3, no reset.
 
+### 1.5 Delete a single character (to recreate it)
+
+There are times you do not want to wipe the whole database - a character has
+been created with bad data, or a re-roll is needed - and you only want to
+recreate that one character. The `db:delete-character` command is an explicit,
+per-character **hard delete**: it deletes exactly one `characters` row and,
+through the schema's `ON DELETE CASCADE` foreign keys, everything that belongs
+exclusively to that character (its `assets` metadata rows, progression events,
+character associations, inventory items, currency balances, skill offers and the
+options belonging to those offers).
+
+It is **never** run automatically, does **not** touch any other character, does
+**not** run migrations, and does **not** reset the database. The deletion is
+prefixed by the separator `--` so pnpm passes the flags through, and
+`DATABASE_URL` is read from the inherited env (it is never printed; credentials
+and the URL are never logged).
+
+First, preview what would be deleted (read-only; nothing is deleted):
+
+```bash
+docker compose run --rm app pnpm db:delete-character -- \
+  --id <character-id>
+```
+
+The preview prints the target character's id, name, `ownerId`, `archived` flag
+and the counts of every dependent kind (assets, progression events,
+associations, inventory items, currency balances, skill offers and offer
+options).
+
+Then, to actually delete, pass `--execute` and repeat the **exact** character id
+as `--confirm`. `--confirm` is the operator's fail-safe: it must equal the id
+being deleted, so an accidental `--confirm` for a different id is refused
+before anything is deleted. No backup is required - the character is simply
+gone and can be recreated by running the create flow again.
+
+```bash
+docker compose run --rm app pnpm db:delete-character -- \
+  --id <character-id> --execute --confirm <character-id>
+```
+
+Safety and behaviour:
+
+- Only the single `characters` row is deleted (`WHERE id = <id>`); its
+  dependents cascade. No broad `DELETE`, no `deleteMany`, no whole-DB reset.
+- `--id` is always required. A missing `--id`, a duplicate flag, an unknown
+  flag, a stray positional argument, a missing `DATABASE_URL`, an invalid
+  `DATABASE_URL`, a `--execute` without `--confirm`, or a `--confirm` that does
+  not equal `--id` are all refused before any database connection or mutation.
+- An id that does not exist reports "not found" and deletes nothing (exit code
+  is nonzero); a successful deletion reports the deleted id and exits 0.
+
+> **Portrait / upload caveat.** Deleting a character cascades and removes its
+> `assets` **metadata** rows (including the `character-avatar` portrait row).
+> The underlying image **bytes** on disk (the uploads volume / `UPLOAD_DIR`) are
+> **not** touched, so those files become orphaned. The utility warns about this
+> on every deletion. If you want to reclaim the space, remove the orphaned files
+> from the uploads directory yourself; nothing in the app or this command does
+> it for you.
+
 ## 2. Health checks
 
 - The **app** image has a container `HEALTHCHECK` (and a Compose override) that

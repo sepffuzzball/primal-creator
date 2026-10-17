@@ -105,6 +105,47 @@ enlightened backup must carry the class track (and a profession track iff it dec
 a profession). See `docs/rules/leveling.md` for the four-quarter race advance and
 `docs/rules/evolution.md` for race evolution.
 
+## Initial attributes at creation
+
+On character creation the client MUST supply a fully-allocated initial stat
+vector (`initialAttributes`). It is a strict full nine-key vector - every canonical
+attribute (strength, agility, endurance, vitality, toughness, wisdom,
+intelligence, perception, willpower) must be present as a safe integer `>= 1`,
+with no extra keys.
+
+- Each of the nine attributes starts at **1**.
+- The remaining points are allocatable but MUST **all** be spent before creation:
+  the vector must sum **exactly** to the category-dependent budget. The total is
+  enforced by the service layer after it resolves the authoritative race type
+  (Zod validates only the per-key shape; it cannot see the race config, so the
+  wrong total is rejected inside the create transaction, never at the API
+  boundary). An under- or over-spend is rejected `400 invalid_initial_attributes`
+  BEFORE any character row is written or any draft is consumed:
+  - **enlightened** (class/profession) race budget: **70** total = nine base
+    points (each `>= 1`) + **61** allocatable.
+  - **monster** (race-only) race budget: **210** total = nine base points (each
+    `>= 1`) + **201** allocatable.
+- The entire selected vector is stored as the engine state's
+  **`baseAttributes`** (`CharacterState.baseAttributes`). It is NOT a `free`
+  award and NOT an allocation: `historicalLevelAwards` and `allocations` both
+  start empty at create, and the creation vector is never recorded in either
+  ledger. It is the fixed starting base that later level-up awards and free-point
+  allocations are added on top of.
+- This split does **not** change later level-up points. The per-level `fixed` /
+  `free` awards snapshotted from the catalog race/class/profession definitions,
+  and the free-point `allocations` ledger, are unchanged and continue to be
+  earned and spent exactly as before.
+- Existing characters created before this policy are **not backfilled**: a
+  character created earlier keeps the legacy all-zero `baseAttributes` and is
+  never rewritten by a create-time migration. To apply the new initial stats to
+  such a character, delete it and re-run the create flow. Recreate through the
+  explicit guarded per-character deletion script (`pnpm db:delete-character`,
+  see `docs/deployment.md` section 1.5): preview it first (read-only), then
+  delete by repeating the EXACT character id as `--confirm`. The script is never
+  run automatically, deletes only the single `characters` row (no whole-DB
+  reset), and requires no backup - the character is simply gone and can be
+  recreated.
+
 ## Seeded Human race (`db:seed`)
 
 `pnpm db:seed` seeds the Human race table (`races/human`) from

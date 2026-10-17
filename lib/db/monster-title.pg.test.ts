@@ -92,6 +92,21 @@ describe.skipIf(!gate.run)(
       return out
     }
 
+    // Fully-allocated initial stat vector for the `initialAttributes` create field.
+    // This suite creates race-only MONSTER characters, so it sums to the 210-point
+    // monster budget (9 base +201).
+    const monsterInitialAttributes = {
+      strength: 1,
+      agility: 1,
+      endurance: 1,
+      vitality: 1,
+      toughness: 1,
+      wisdom: 1,
+      intelligence: 1,
+      perception: 1,
+      willpower: 202,
+    }
+
     /** The "flat" phase delta for an attribute from a status trace. */
     function flatDelta(status: unknown, attribute: string): number | undefined {
       const phases = (
@@ -258,6 +273,7 @@ describe.skipIf(!gate.run)(
     it("creates a born monster race-only character, advances to race level 1 via four CAS advances, then claims Dungeon Pioneer ranks 1 and 2", async () => {
       const created = await createCharacter(
         {
+          initialAttributes: monsterInitialAttributes,
           name: "Born Crawler",
           origin: "born",
           raceId,
@@ -394,6 +410,7 @@ describe.skipIf(!gate.run)(
     it("creates an integrated monster at race grade G on the independent race-only track", async () => {
       const created = await createCharacter(
         {
+          initialAttributes: monsterInitialAttributes,
           name: "Integrated Crawler",
           origin: "integrated",
           raceId,
@@ -415,6 +432,7 @@ describe.skipIf(!gate.run)(
     it("counts an archived prior rank link for rank progression (rank 2 allowed after rank 1 is archived)", async () => {
       const created = await createCharacter(
         {
+          initialAttributes: monsterInitialAttributes,
           name: "Archived Prior Crawler",
           origin: "born",
           raceId,
