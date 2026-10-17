@@ -192,10 +192,21 @@ docker compose exec -T postgres \
 
 # 4. Pull / build the new 0.1.0 image (the one carrying the baseline migration
 #    and the reset script). The image is referenced by ${DOCKER_TAG:-latest}.
-#    `.github/workflows/docker.yml` publishes only `main`, `latest` and the
-#    short SHA on main pushes - there is NO `0.1.0` tag unless you also push a
-#    `v0.1.0` tag - so use `main` after GitHub Actions has published it, or
-#    build locally. Do not assume a `0.1.0` tag exists.
+#    `.github/workflows/docker.yml` publishes `main`, `latest` and the short SHA
+#    on main pushes, plus a bare tag mirroring the root `package.json` semver
+#    (e.g. `0.1.2`) - so a bare semver tag exists for the current release in
+#    addition to `v*` git tags, whose behaviour is unchanged. The workflow still
+#    publishes that bare package semver and it is NOT version-gated: it is
+#    re-pushed on every `main` push, so if `package.json`'s version is not bumped
+#    before a later push, that push overwrites the same bare semver tag at the
+#    same package version - the bare semver label is MUTABLE. For an immutable
+#    reference to a specific build, use the short SHA tag
+#    (`ghcr.io/sepffuzzball/primal-creator:<sha>`) or the image digest
+#    (`ghcr.io/sepffuzzball/primal-creator@sha256:...`), which never change for a
+#    given build. To target this release after GitHub Actions has published it,
+#    `main` is usable (it too is a moving ref) or build locally. A bare `0.1.0`
+#    tag only exists if `package.json` held `0.1.0` when that release was pushed;
+#    do not assume it.
 #      Option A - pull a published tag (once the docker.yml publish job on
 #      `main` has succeeded; if the image is not available yet, wait for CI):
 export DOCKER_TAG=main
@@ -260,8 +271,16 @@ The `docker.yml` workflow pushes to `ghcr.io/sepffuzzball/primal-creator`:
   cache scope is the GitHub repo).
 - **Token**: the default `GITHUB_TOKEN`, scoped to the repository, with
   `permissions: packages: write`. No long-lived secret is required.
-- **Tags**: `type=ref,event=branch` (e.g. `main`), `type=ref,event=tag`, and
-  `type=sha,format=short`.
+- **Tags**: `type=ref,event=branch` (e.g. `main`), `type=ref,event=tag` (the `v*`
+  tags, unchanged), `type=sha,format=short` (short SHA), and - on pushes to `main`
+  only - `latest` plus a bare tag mirroring the root `package.json` semver (e.g.
+  `0.1.2`), so a release can be pulled exactly without a git `v*` tag. The
+  workflow still publishes that bare package semver on every `main` push and it is
+  NOT version-gated, so it is MUTABLE: a later `main` push at the same package
+  version overwrites the bare semver tag. For an immutable reference to a specific
+  build, use the short SHA tag or the image digest (`@sha256:...`), which never
+  change for that build - the bare semver, the `main` branch ref and `latest` are
+  all moving labels.
 
 To consume the image directly:
 
@@ -270,8 +289,14 @@ docker pull ghcr.io/sepffuzzball/primal-creator:main
 ```
 
 Note: the image is a published target only if the workflow has actually pushed
-it. The `compose.yaml` references `${DOCKER_TAG:-latest}`; the build step in the
-workflow supplies `latest`/`main`/tag refs, not necessarily literal `latest`.
+it. The `compose.yaml` references `${DOCKER_TAG:-latest}`. Left unset, it resolves
+to `latest`, which the workflow publishes only on pushes to `main`; the bare
+package semver tag (e.g. `0.1.2`) is likewise published only on `main` pushes,
+and the branch, short SHA and `v*` tag refs are published per the existing
+workflow. Because `latest`, `main` and the bare package semver are all moving
+labels that a later push can overwrite, pin an immutable deployment to the short
+SHA tag or the image digest instead:
+`docker pull ghcr.io/sepffuzzball/primal-creator@sha256:...`.
 
 ## 4. Runtime concerns
 

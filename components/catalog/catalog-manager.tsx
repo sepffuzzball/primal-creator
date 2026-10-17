@@ -252,6 +252,118 @@ export function CatalogManager({ kind }: { kind: string }) {
     React.useState<(typeof GRADES)[number]>("G")
   const [blessingTier, setBlessingTier] =
     React.useState<BlessingTier>("Baptism")
+  const [bloodlineScope, setBloodlineScope] = React.useState<string>("base")
+  const [bloodlineDrafts, setBloodlineDrafts] = React.useState<
+    Record<string, string>
+  >({})
+  const [bloodlineErrors, setBloodlineErrors] = React.useState<
+    Record<string, string>
+  >({})
+  const bloodlineDraftsRef = React.useRef(bloodlineDrafts)
+  const bloodlineDraftKey = (scope: string, phase: string, attribute: string) =>
+    `${scope}|${phase}|${attribute}`
+  const parseBloodlineValue = (
+    phase: "flat" | "percent",
+    raw: string
+  ): number | null => {
+    if (phase === "flat") {
+      if (!/^-?\d+$/.test(raw)) return null
+      const value = Number(raw)
+      return Number.isSafeInteger(value) ? value : null
+    }
+    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(raw)
+    if (!match) return null
+    const cents = (match[2] ?? "").padEnd(2, "0")
+    const bps = Number(match[1]) * 100 + Number(cents || "0")
+    return Number.isSafeInteger(bps) ? bps : null
+  }
+  const commitBloodlineDraft = React.useCallback(
+    (
+      scope: string,
+      phase: "flat" | "percent",
+      attribute: string,
+      raw: string
+    ) => {
+      const key = bloodlineDraftKey(scope, phase, attribute)
+      if (raw !== "" && parseBloodlineValue(phase, raw) === null) {
+        const message =
+          phase === "flat"
+            ? "Enter a signed whole number within the safe integer range."
+            : "Enter a nonnegative percentage with at most 2 decimal places."
+        setBloodlineErrors((current) => ({ ...current, [key]: message }))
+        return false
+      }
+      setBloodlineErrors((current) => {
+        const next = { ...current }
+        delete next[key]
+        return next
+      })
+      setBloodlineDrafts((current) => {
+        const next = { ...current }
+        delete next[key]
+        bloodlineDraftsRef.current = next
+        return next
+      })
+      setForm((current) => {
+        try {
+          const config = JSON.parse(current.configText || "{}") as Record<
+            string,
+            unknown
+          >
+          if (!isRecord(config)) return current
+          const gradeEffects = isRecord(config.gradeEffects)
+            ? { ...config.gradeEffects }
+            : {}
+          const source = scope === "base" ? config.effects : gradeEffects[scope]
+          const list: unknown[] = Array.isArray(source) ? [...source] : []
+          const eligible = (entry: unknown) =>
+            isRecord(entry) &&
+            entry.phase === phase &&
+            (entry.stacking === undefined || entry.stacking === "stack") &&
+            Object.keys(entry).every((k) =>
+              ["phase", "amount", "basisPoints", "stacking"].includes(k)
+            )
+          const matches = list
+            .map((entry, index) => (eligible(entry) ? index : -1))
+            .filter((index) => index >= 0)
+          if (matches.length > 1) return current
+          if (raw === "" && matches.length === 0) return current
+          const index = matches[0]
+          const effect =
+            index === undefined
+              ? ({ phase, stacking: "stack" } as Record<string, unknown>)
+              : { ...(list[index] as Record<string, unknown>) }
+          const vectorKey = phase === "flat" ? "amount" : "basisPoints"
+          const vector = isRecord(effect[vectorKey])
+            ? { ...(effect[vectorKey] as Record<string, unknown>) }
+            : {}
+          if (raw === "") delete vector[attribute]
+          else
+            vector[attribute] =
+              phase === "flat"
+                ? parseBloodlineValue(phase, raw)
+                : parseBloodlineValue(phase, raw)
+          if (Object.keys(vector).length === 0) {
+            if (index !== undefined) list.splice(index, 1)
+          } else {
+            effect[vectorKey] = vector
+            if (index === undefined) list.push(effect)
+            else list[index] = effect
+          }
+          if (scope === "base") config.effects = list
+          else {
+            gradeEffects[scope] = list
+            config.gradeEffects = gradeEffects
+          }
+          return { ...current, configText: JSON.stringify(config, null, 2) }
+        } catch {
+          return current
+        }
+      })
+      return true
+    },
+    []
+  )
   const structuredConfig = React.useMemo(() => {
     try {
       const parsed: unknown = JSON.parse(form.configText || "{}")
@@ -320,6 +432,7 @@ export function CatalogManager({ kind }: { kind: string }) {
   )
   const [submitting, setSubmitting] = React.useState(false)
   const [formError, setFormError] = React.useState<string | null>(null)
+  const saveRef = React.useRef<() => Promise<void>>(async () => {})
   const [showArchived, setShowArchived] = React.useState(false)
   const [expandedSeries, setExpandedSeries] = React.useState<
     Record<string, boolean>
@@ -751,6 +864,9 @@ export function CatalogManager({ kind }: { kind: string }) {
   )
 
   const openCreate = React.useCallback(() => {
+    bloodlineDraftsRef.current = {}
+    setBloodlineDrafts({})
+    setBloodlineErrors({})
     setEditing(null)
     setForm(EMPTY_FORM)
     setDescriptionGrade("G")
@@ -763,6 +879,9 @@ export function CatalogManager({ kind }: { kind: string }) {
   }, [])
 
   const openEdit = React.useCallback((item: CatalogItem) => {
+    bloodlineDraftsRef.current = {}
+    setBloodlineDrafts({})
+    setBloodlineErrors({})
     setEditing(item)
     setForm(toForm(item))
     setDescriptionGrade("G")
@@ -783,6 +902,33 @@ export function CatalogManager({ kind }: { kind: string }) {
   }, [])
 
   const save = React.useCallback(async () => {
+    if (
+      kind === "bloodlines" &&
+      Object.keys(bloodlineDraftsRef.current).length
+    ) {
+      let valid = true
+      for (const [key, raw] of Object.entries(bloodlineDraftsRef.current)) {
+        const [scope, phase, attribute] = key.split("|")
+        if (
+          !commitBloodlineDraft(
+            scope,
+            phase as "flat" | "percent",
+            attribute,
+            raw
+          )
+        )
+          valid = false
+      }
+      if (!valid) {
+        setFormError("Fix the highlighted bloodline values before saving.")
+        return
+      }
+      // Defer until React has applied the validated config edits, then save with
+      // the latest form snapshot instead of submitting stale config.
+      setFormError(null)
+      window.setTimeout(() => void saveRef.current(), 0)
+      return
+    }
     let config: Record<string, unknown>
     try {
       const parsed = JSON.parse(form.configText || "{}")
@@ -1204,6 +1350,8 @@ export function CatalogManager({ kind }: { kind: string }) {
         delete config.classStableId
       }
     }
+    if (kind === "bloodlines" && !editing && config.effects === undefined)
+      config.effects = []
     setSubmitting(true)
     setFormError(null)
     try {
@@ -1294,7 +1442,12 @@ export function CatalogManager({ kind }: { kind: string }) {
     skillTrackTouched,
     classTie,
     classChoices,
+    commitBloodlineDraft,
   ])
+
+  React.useEffect(() => {
+    saveRef.current = save
+  }, [save])
 
   const openSource = React.useCallback((url: string | null) => {
     if (url) window.open(url, "_blank", "noopener")
@@ -3422,6 +3575,300 @@ export function CatalogManager({ kind }: { kind: string }) {
                             )
                           })}
                         </div>
+                      )
+                    })()}
+                  </section>
+                ) : null}
+                {kind === "bloodlines" ? (
+                  <section
+                    className="flex flex-col gap-3 rounded-md border p-3"
+                    aria-label="Bloodline stat bonuses"
+                  >
+                    <h3 className="text-sm font-medium">Visual stat bonuses</h3>
+                    <p className="text-xs text-muted-foreground">
+                      A grade override replaces all base effects, including with
+                      an empty list. Grades without an override fall back to
+                      base.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        variant={
+                          bloodlineScope === "base" ? "default" : "outline"
+                        }
+                        onClick={() => setBloodlineScope("base")}
+                      >
+                        Base
+                      </Button>
+                      {GRADES.map((grade) => (
+                        <Button
+                          key={grade}
+                          type="button"
+                          variant={
+                            bloodlineScope === grade ? "default" : "outline"
+                          }
+                          onClick={() => setBloodlineScope(grade)}
+                        >
+                          {grade}
+                        </Button>
+                      ))}
+                    </div>
+                    {(() => {
+                      const config = structuredConfig ?? {}
+                      const overrides = isRecord(config.gradeEffects)
+                        ? config.gradeEffects
+                        : {}
+                      const isOverride =
+                        bloodlineScope !== "base" &&
+                        Object.hasOwn(overrides, bloodlineScope)
+                      const effects =
+                        bloodlineScope === "base"
+                          ? config.effects
+                          : overrides[bloodlineScope]
+                      const list = Array.isArray(effects) ? effects : []
+                      const simple = (entry: unknown, phase: string) =>
+                        isRecord(entry) &&
+                        entry.phase === phase &&
+                        (entry.stacking === undefined ||
+                          entry.stacking === "stack") &&
+                        Object.keys(entry).every((key) =>
+                          [
+                            "phase",
+                            "amount",
+                            "basisPoints",
+                            "stacking",
+                          ].includes(key)
+                        )
+                      return (
+                        <>
+                          <p className="text-xs text-muted-foreground">
+                            {bloodlineScope === "base"
+                              ? "Editing base effects."
+                              : isOverride
+                                ? `Editing ${bloodlineScope}-grade replacement override.`
+                                : `No ${bloodlineScope}-grade override; currently falling back to base.`}
+                          </p>
+                          {bloodlineScope !== "base" ? (
+                            <div className="flex gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                disabled={structuredConfig === null}
+                                onClick={() => {
+                                  if (!isOverride) {
+                                    const next = {
+                                      ...overrides,
+                                      [bloodlineScope]: [],
+                                    }
+                                    setForm((f) => {
+                                      const c = JSON.parse(
+                                        f.configText || "{}"
+                                      ) as Record<string, unknown>
+                                      c.gradeEffects = next
+                                      return {
+                                        ...f,
+                                        configText: JSON.stringify(c, null, 2),
+                                      }
+                                    })
+                                  }
+                                }}
+                              >
+                                Create empty override
+                              </Button>
+                              {isOverride ? (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  disabled={structuredConfig === null}
+                                  onClick={() => {
+                                    const scope = bloodlineScope
+                                    const drafts = {
+                                      ...bloodlineDraftsRef.current,
+                                    }
+                                    for (const key of Object.keys(drafts)) {
+                                      if (key.startsWith(`${scope}|`))
+                                        delete drafts[key]
+                                    }
+                                    bloodlineDraftsRef.current = drafts
+                                    setBloodlineDrafts(drafts)
+                                    setBloodlineErrors((current) =>
+                                      Object.fromEntries(
+                                        Object.entries(current).filter(
+                                          ([key]) =>
+                                            !key.startsWith(`${scope}|`)
+                                        )
+                                      )
+                                    )
+                                    const next = { ...overrides }
+                                    delete next[bloodlineScope]
+                                    setForm((f) => {
+                                      const c = JSON.parse(
+                                        f.configText || "{}"
+                                      ) as Record<string, unknown>
+                                      c.gradeEffects = next
+                                      return {
+                                        ...f,
+                                        configText: JSON.stringify(c, null, 2),
+                                      }
+                                    })
+                                  }}
+                                >
+                                  Clear override
+                                </Button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          {(["flat", "percent"] as const).map((phase) => {
+                            const matches = list.filter((entry) =>
+                              simple(entry, phase)
+                            )
+                            if (matches.length > 1)
+                              return (
+                                <p
+                                  key={phase}
+                                  role="status"
+                                  className="text-xs text-amber-700"
+                                >
+                                  Multiple simple {phase} effects exist. Use
+                                  Advanced JSON to resolve ambiguity; controls
+                                  disabled.
+                                </p>
+                              )
+                            const vectorKey =
+                              phase === "flat" ? "amount" : "basisPoints"
+                            const vector =
+                              matches[0] &&
+                              isRecord(matches[0]) &&
+                              isRecord(matches[0][vectorKey])
+                                ? (matches[0][vectorKey] as Record<
+                                    string,
+                                    unknown
+                                  >)
+                                : {}
+                            return (
+                              <fieldset
+                                key={phase}
+                                disabled={
+                                  (bloodlineScope !== "base" && !isOverride) ||
+                                  matches.length > 1
+                                }
+                                className="flex flex-col gap-2"
+                              >
+                                <legend className="text-sm font-medium">
+                                  {phase === "flat"
+                                    ? "Flat integer bonus"
+                                    : "Percentage bonus"}
+                                </legend>
+                                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                                  {ATTRIBUTE_KEYS.map((attribute) => (
+                                    <label
+                                      key={attribute}
+                                      className="flex flex-col gap-1 text-xs"
+                                    >
+                                      {attribute}
+                                      <Input
+                                        aria-label={`${bloodlineScope} ${phase} ${attribute}`}
+                                        type="text"
+                                        inputMode="decimal"
+                                        value={
+                                          bloodlineDrafts[
+                                            bloodlineDraftKey(
+                                              bloodlineScope,
+                                              phase,
+                                              attribute
+                                            )
+                                          ] ??
+                                          (typeof vector[attribute] === "number"
+                                            ? phase === "flat"
+                                              ? String(vector[attribute])
+                                              : String(
+                                                  (vector[
+                                                    attribute
+                                                  ] as number) / 100
+                                                )
+                                            : "")
+                                        }
+                                        aria-invalid={Boolean(
+                                          bloodlineErrors[
+                                            bloodlineDraftKey(
+                                              bloodlineScope,
+                                              phase,
+                                              attribute
+                                            )
+                                          ]
+                                        )}
+                                        aria-describedby={
+                                          bloodlineErrors[
+                                            bloodlineDraftKey(
+                                              bloodlineScope,
+                                              phase,
+                                              attribute
+                                            )
+                                          ]
+                                            ? `${bloodlineDraftKey(bloodlineScope, phase, attribute)}-error`
+                                            : undefined
+                                        }
+                                        onChange={(event) => {
+                                          const key = bloodlineDraftKey(
+                                            bloodlineScope,
+                                            phase,
+                                            attribute
+                                          )
+                                          const next = {
+                                            ...bloodlineDraftsRef.current,
+                                            [key]: event.target.value,
+                                          }
+                                          bloodlineDraftsRef.current = next
+                                          setBloodlineDrafts(next)
+                                          setBloodlineErrors((current) => {
+                                            const copy = { ...current }
+                                            delete copy[key]
+                                            return copy
+                                          })
+                                        }}
+                                        onBlur={(event) =>
+                                          commitBloodlineDraft(
+                                            bloodlineScope,
+                                            phase,
+                                            attribute,
+                                            event.target.value
+                                          )
+                                        }
+                                      />
+                                      {bloodlineErrors[
+                                        bloodlineDraftKey(
+                                          bloodlineScope,
+                                          phase,
+                                          attribute
+                                        )
+                                      ] ? (
+                                        <span
+                                          id={`${bloodlineDraftKey(bloodlineScope, phase, attribute)}-error`}
+                                          className="text-destructive"
+                                        >
+                                          {
+                                            bloodlineErrors[
+                                              bloodlineDraftKey(
+                                                bloodlineScope,
+                                                phase,
+                                                attribute
+                                              )
+                                            ]
+                                          }
+                                        </span>
+                                      ) : null}
+                                    </label>
+                                  ))}
+                                </div>
+                                <p className="text-xs text-muted-foreground">
+                                  {phase === "flat"
+                                    ? "Whole numbers only; no rounding."
+                                    : "Nonnegative percent, up to 2 decimals; saved as integer basis points."}
+                                </p>
+                              </fieldset>
+                            )
+                          })}
+                        </>
                       )
                     })()}
                   </section>

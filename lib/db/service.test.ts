@@ -4098,7 +4098,7 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     expect(flat.delta).toBe(15)
   })
 
-  it("scales a bloodline by the EXACT race grade and never falls back to another grade", async () => {
+  it("scales a bloodline by the EXACT race grade, REPLACING the base effects and never falling back", async () => {
     seedCharacter({ strength: 100 }, "G")
     seedBloodline("blood-scale", {
       effects: [{ phase: "flat", amount: { strength: 1 } }],
@@ -4121,13 +4121,15 @@ describe("associateCharacter (blessings / bloodlines)", () => {
       (t) => t.attribute === "strength"
     )!
     let flat = trace.phases.find((p) => p.phase === "flat")!
-    expect(flat.delta).toBe(1)
+    // Grade G exactly matches gradeEffects.G: the base flat +1 is REPLACED, so
+    // only the grade-G percent contribution applies (flat delta 0 - no addition).
+    expect(flat.delta).toBe(0)
     const gPercent = trace.phases.find((p) => p.phase === "percent")!
     expect(gPercent).toBeDefined()
     expect(gPercent.delta).toBe(5) // +5% on the base/derived 100
-    // Grade E has no gradeEffects entry: the bloodline contributes NO percent
-    // bonus (no fallback to F or G), so only the base flat applies. The percent
-    // phase is always present in the trace but its delta must be 0.
+    // Grade E has no gradeEffects entry: the bloodline falls back to the base
+    // flat effects (+1) and contributes NO percent bonus (no fallback to F or G).
+    // The percent phase is always present in the trace but its delta must be 0.
     const stored = dbMock.store.characters.get("chr-1")!
     const storedState = deserializeState(stored.state)
     storedState.race.grade = "E" as Grade
@@ -4138,6 +4140,199 @@ describe("associateCharacter (blessings / bloodlines)", () => {
     expect(flat.delta).toBe(1)
     const ePercent = trace.phases.find((p) => p.phase === "percent")!
     expect(ePercent.delta).toBe(0)
+  })
+
+  it("applies a bloodline's base effects when it declares no gradeEffects", async () => {
+    seedCharacter({ strength: 100 }, "G")
+    seedBloodline("blood-base", {
+      effects: [{ phase: "flat", amount: { strength: 2 } }],
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "bloodline",
+        definitionId: "blood-base",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    // No gradeEffects at all: the base effects are the only applicable set.
+    expect(flatDelta(res.character.status, "strength")).toBe(2)
+  })
+
+  it("replaces the base effects with the exact grade effects when the grade matches", async () => {
+    seedCharacter({ strength: 100 }, "G")
+    seedBloodline("blood-override", {
+      effects: [{ phase: "flat", amount: { strength: 2 } }],
+      gradeEffects: {
+        G: [{ phase: "flat", amount: { strength: 9 } }],
+      },
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "bloodline",
+        definitionId: "blood-override",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    // Only the grade-G replacement applies; the base +2 is dropped entirely.
+    expect(flatDelta(res.character.status, "strength")).toBe(9)
+  })
+
+  it("falls back to the base effects when the character's grade has no gradeEffects entry", async () => {
+    seedCharacter({ strength: 100 }, "G")
+    seedBloodline("blood-fallback", {
+      effects: [{ phase: "flat", amount: { strength: 3 } }],
+      gradeEffects: {
+        F: [{ phase: "flat", amount: { strength: 9 } }],
+      },
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "bloodline",
+        definitionId: "blood-fallback",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    // Grade G has no gradeEffects entry: the base +3 is used; the grade-F effect
+    // is ignored (never a fallback to another grade, never an addition).
+    expect(flatDelta(res.character.status, "strength")).toBe(3)
+  })
+
+  it("suppresses all bloodline effects when the exact grade's effect list is empty", async () => {
+    seedCharacter({ strength: 100 }, "G")
+    seedBloodline("blood-empty", {
+      effects: [{ phase: "flat", amount: { strength: 4 } }],
+      gradeEffects: {
+        G: [],
+      },
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "bloodline",
+        definitionId: "blood-empty",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    const trace = res.character.status!.traces.find(
+      (t) => t.attribute === "strength"
+    )!
+    const flat = trace.phases.find((p) => p.phase === "flat")!
+    // The empty G override is authoritative: it suppresses the base +4 entirely.
+    expect(flat.delta).toBe(0)
+  })
+
+  it("preserves condition/group/stacking on grade-replacement effects (base dropped, conditions honored)", async () => {
+    seedCharacter({ strength: 100 }, "G")
+    seedBloodline("blood-cond", {
+      effects: [{ phase: "flat", amount: { strength: 2 } }],
+      gradeEffects: {
+        G: [
+          {
+            phase: "flat",
+            amount: { strength: 7 },
+            condition: { kind: "gradeAtLeast", grade: "D" },
+            group: "hunter",
+            stacking: "replace",
+          },
+        ],
+        E: [
+          {
+            phase: "flat",
+            amount: { strength: 7 },
+            condition: { kind: "gradeAtLeast", grade: "E" },
+            group: "hunter",
+            stacking: "replace",
+          },
+        ],
+      },
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "bloodline",
+        definitionId: "blood-cond",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    let trace = res.character.status!.traces.find(
+      (t) => t.attribute === "strength"
+    )!
+    let flat = trace.phases.find((p) => p.phase === "flat")!
+    // The grade-replacement effect survives WITH its condition: at grade G the
+    // gradeAtLeast D condition is unmet, so it contributes 0 and the base +2 is
+    // still gone (replacement set only, no addition).
+    expect(flat.delta).toBe(0)
+    // Elevate to grade E, which matches gradeEffects.E and satisfies its own
+    // gradeAtLeast E condition; the replacement effect applies, still no base.
+    const stored = dbMock.store.characters.get("chr-1")!
+    const storedState = deserializeState(stored.state)
+    storedState.race.grade = "E" as Grade
+    stored.state = serializeState(storedState)
+    const detail = await getCharacter("chr-1", user)
+    trace = detail.status!.traces.find((t) => t.attribute === "strength")!
+    flat = trace.phases.find((p) => p.phase === "flat")!
+    expect(flat.delta).toBe(7)
+  })
+
+  it("recomputes a bloodline's live grade effects on a catalog edit and stays inert when archived", async () => {
+    seedCharacter({ strength: 100 }, "G")
+    seedBloodline("blood-live", {
+      effects: [{ phase: "flat", amount: { strength: 2 } }],
+      gradeEffects: {
+        G: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+    })
+    const res = await associateCharacter(
+      "chr-1",
+      {
+        kind: "bloodline",
+        definitionId: "blood-live",
+        operation: "add",
+        version: 0,
+      },
+      user
+    )
+    expect(flatDelta(res.character.status, "strength")).toBe(5)
+    const beforeVersion = res.character.version
+    const beforeState = res.character.state
+    // Edit the grade-G replacement magnitude in the catalog (replacement set).
+    await updateCatalogItem("bloodlines", "blood-live", {
+      config: {
+        effects: [{ phase: "flat", amount: { strength: 2 } }],
+        gradeEffects: {
+          G: [{ phase: "flat", amount: { strength: 10 } }],
+        },
+      },
+    })
+    const after = await getCharacter("chr-1", user)
+    expect(flatDelta(after.status, "strength")).toBe(10)
+    // No character mutation: version and stored state are untouched; no event.
+    expect(after.version).toBe(beforeVersion)
+    expect(after.state).toEqual(beforeState)
+    expect(
+      (after.state as { activeEffects: unknown[] }).activeEffects
+    ).toHaveLength(0)
+    // Archiving the linked bloodline makes it inert (no synthesized flat).
+    await updateCatalogItem("bloodlines", "blood-live", { archived: true })
+    const inert = await getCharacter("chr-1", user)
+    const inertTrace = inert.status!.traces.find(
+      (t) => t.attribute === "strength"
+    )!
+    const inertFlat = inertTrace.phases.find((p) => p.phase === "flat")!
+    expect(inertFlat.delta).toBe(0)
   })
 
   it("a catalog blessing live edit changes status but never rewrites stored state or awards", async () => {

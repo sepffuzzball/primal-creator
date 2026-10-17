@@ -829,8 +829,10 @@ type DeclarativeEffect = {
  * on the catalog entry is never used here (it is only an add/select replacement
  * group), so a single entry's flat AND percent effects both apply. `idBase` is
  * the prefix used to give every effect a unique id - for a skill/blessing it is
- * the definition id, and for a bloodline's grade-scaled effects it is
- * `def.id:grade-<grade>` so a base effect and a grade effect never share an id.
+ * the definition id, and for a bloodline's grade-replacement effects it is
+ * `def.id:grade-<grade>` so a grade-replacement effect never shares an id with a
+ * base effect (a bloodline applies EXACTLY ONE set per character - either the
+ * base effects or the matching grade's, never both).
  * `source` comes from the catalog row; the synthesized effect's `provenance` is
  * the generic internal `"catalog"` string (the catalog provenance taxonomy no
  * longer exists).
@@ -1332,29 +1334,39 @@ async function liveState(
       const chosen = tier ? (effects[tier] ?? []) : []
       appendDeclarativeEffects(activeEffects, def, chosen, def.id)
     } else if (def.kind === "bloodlines") {
-      // Bloodlines apply their declared `effects` live AND, EXACTLY when the
-      // character's current race grade matches a key in `gradeEffects`, apply that
-      // grade's effects on top (no fallback to another grade - a mismatched grade
-      // contributes nothing rather than inferring a bonus). The grade effects use
-      // a distinct id prefix so a base effect and a grade-scaled effect never
-      // share an id. Legacy `{ grade, vector }` config contributes nothing.
-      appendDeclarativeEffects(
-        activeEffects,
-        def,
-        (config.effects ?? []) as DeclarativeEffect[],
-        def.id
-      )
+      // A bloodline's declared effects are grade-specific REPLACEMENT, never
+      // additive: when the character's current race grade has an OWN entry in
+      // `gradeEffects`, EXACTLY that grade's effects replace the base `effects`
+      // (an explicit empty list for the current grade suppresses the base
+      // effects entirely, so no effects apply). A missing exact grade falls back
+      // to the base `effects`. There is never a fallback to another grade and
+      // never a base+grade addition. Legacy `{ grade, vector }` config
+      // contributes nothing. The grade-replacement effects use a distinct id
+      // prefix so a grade-replacement effect never collides with a base-effect id.
       const gradeEffects = (config.gradeEffects ?? {}) as Record<
         string,
         DeclarativeEffect[]
       >
-      const gradeEff = gradeEffects[state.race.grade]
-      if (gradeEff && gradeEff.length > 0) {
+      const gradeKey = state.race.grade
+      // "property exists" is OWN-property presence, so an explicit empty grade
+      // list (`[]`) is still an authoritative override that suppresses base.
+      const hasGradeOverride = Object.prototype.hasOwnProperty.call(
+        gradeEffects,
+        gradeKey
+      )
+      if (hasGradeOverride) {
         appendDeclarativeEffects(
           activeEffects,
           def,
-          gradeEff,
-          `${def.id}:grade-${state.race.grade}`
+          (gradeEffects[gradeKey] ?? []) as DeclarativeEffect[],
+          `${def.id}:grade-${gradeKey}`
+        )
+      } else {
+        appendDeclarativeEffects(
+          activeEffects,
+          def,
+          (config.effects ?? []) as DeclarativeEffect[],
+          def.id
         )
       }
     } else if (def.kind === "transcendent_skills") {

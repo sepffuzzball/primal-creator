@@ -42,6 +42,15 @@ per-grade Perception bonus:
 This is the clearest verified per-grade gradient and is a good template for how a
 bloodline might scale by grade.
 
+The Bloodline of the Primal Hunter is NOT part of the curated seed catalog
+(`prisma/seed.ts` -> `prisma/catalog/jake-seed.ts`, the 41 curated entries). Its
+entry lives in the admin opt-in reviewed wiki manifest
+`prisma/catalog/wiki-reviewed.ts`, applied only when an admin calls
+`POST /api/admin/catalog-import`. That entry is deliberately
+`{ effects: [], gradeEffects: {} }` - the wiki's per-grade gradient is
+illustrative, not yet curated, so no numeric bonus and no per-grade override is
+invented; its stats are left unknown (see `docs/catalog/wiki-reviewed.md`).
+
 ## Wiki-uncertain
 
 - The **numeric effect** of most bloodlines (this table is Jake-specific; other
@@ -69,8 +78,11 @@ config-changing update:
   // Every vector value must be a finite integer (never a float, NaN or Infinity).
   effects: SkillEffect[],
   // Optional: per-grade effect lists, so a bloodline like the Primal Hunter's can
-  // scale its Perception bonus by grade (G +5%, F +10%, ...). Grade-specific
-  // effects overlay the flat `effects` for matching grades.
+  // scale its Perception bonus by grade (G +5%, F +10%, ...). When a key for the
+  // character's current race grade exists, that grade's effects REPLACE all base
+  // `effects` (including conditional/grouped base effects) for that character; an
+  // explicit [] for the current grade suppresses base. When no key matches, the
+  // flat `effects` apply. There is NO fallback to another grade's effects.
   gradeEffects?: Partial<Record<Grade, SkillEffect[]>>,
   // Optional: forwarded as-is.
   upgradeGroup?: string,
@@ -80,20 +92,39 @@ config-changing update:
 `SkillEffect` is the shared flat/percent discriminated union used by skills,
 blessings and bloodlines: `{ phase: "flat", amount }` or
 `{ phase: "percent", basisPoints }`, each optionally carrying `condition`,
-`stacking`, and `group`. The server validates that every effect vector is a
-finite integer so the stored config is a plain JSON-safe data object.
+`stacking`, and `group`. A `flat` `amount` is a partial vector of finite integers
+(whole numbers only, never a float); a `percent` `basisPoints` is a partial vector
+of nonnegative integer basis points, where **100 basis points = 1%** (so a +5%
+bonus is stored as `500`, not `5`). The server validates that every vector value
+is a finite integer, so the stored config is a plain JSON-safe data object.
+
+Advanced JSON stays available for any effect the simple flat/percent controls
+cannot express unambiguously - effects carrying `condition`, `group`, or
+`stacking`, or multiple simple effects for the same phase - and is never discarded
+by the visual editor.
 
 Legacy entries carrying the old `{ grade, vector }` shape remain readable and
-metadata-only-PATCHable; a create or config-changing update is rejected unless
+metadata-only-PATCHable but are **inert**: they contribute no synthesized effect
+(no invented numeric bonus). A create or config-changing update is rejected unless
 `effects` is present.
 
 ## Character associations (wired)
 
 Bloodlines can be attached to a character as an association. The server
-synthesizes the declared `effects` (and, exactly when the character's current
-race grade matches a key in `gradeEffects` and nothing otherwise, that grade's
-effects) into the character's live `status` without rewriting the stored state,
-so catalog edits recalculate live effects and never mutate historical awards.
+synthesizes effects into the character's live `status` without rewriting the
+stored state, so catalog edits recalculate live effects and never mutate
+historical awards. The resolution is exactly:
+
+- If the character's current race grade has **no** entry in `gradeEffects`, the
+  base `effects` apply as declared.
+- If the current race grade **does** have an entry, that grade's effects
+  **replace** the base `effects` entirely - including any conditional or grouped
+  base effects. An explicit `[]` for that grade suppresses base, so the bloodline
+  contributes no effect at that grade.
+- There is **no grade fallback**: a missing grade key means base applies; a
+  present key (even an empty one) replaces base and never falls back to another
+  grade's effects.
+
 Archived bloodlines are inert: a linked but archived definition contributes no
 effect.
 
@@ -107,3 +138,25 @@ never holds two bloodlines. Selecting two bloodlines at create is a
 `bloodline_singleton_conflict`. A remove detaches only the named link. The
 `upgradeGroup` remains part of the catalog config but is no longer an
 add/select replacement criterion - the singleton is.
+
+## Visual editor (catalog manager)
+
+The bloodline editor in the catalog manager exposes a **Base** scope plus one
+scope per grade. Editing **Base** edits the flat `effects`; editing a **grade**
+scope edits `gradeEffects[grade]`.
+
+- A grade without an existing override falls back to Base, and its controls are
+  disabled until an override exists; a **Create empty override** button sets
+  `gradeEffects[grade] = []`, which explicitly suppresses Base for that grade.
+- A grade with an existing override shows a **Clear override** button that
+  removes the grade key and restores the fallback to Base.
+- Flat bonuses are whole integers (no rounding); percent bonuses are entered as
+  nonnegative percentages up to 2 decimals and saved as integer basis points
+  (100 = 1%).
+- Advanced JSON is retained for effects the simple controls cannot represent
+  unambiguously (conditions, groups, stacking, or multiple simple effects for one
+  phase); the editor does not discard JSON it cannot edit.
+
+There is no grade fallback in the editor either: a grade with no override uses
+Base, while a grade with an override (even an empty one) never falls back to Base
+or to another grade.

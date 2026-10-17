@@ -170,6 +170,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Publish a Docker tag equal to the root package.json semver on every push
+      # to main (alongside the existing branch/sha/latest tags). Built via Node
+      # so the value is never hardcoded; the release process only bumps
+      # package.json, and this image tag follows automatically.
+      - name: Read package version
+        id: version
+        run: |
+          node <<'EOF' >> "$GITHUB_OUTPUT"
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+          const v = pkg.version;
+          // Semver-like MAJOR.MINOR.PATCH with optional -prerelease and +build
+          // metadata (build metadata is not valid in a Docker tag, so drop it).
+          const m = v.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/);
+          if (!m) {
+            console.error(`Invalid semver-like version "${v}" in package.json`);
+            process.exit(1);
+          }
+          const build = m[5] ? `+${m[5]}` : '';
+          const clean = v.replace(build, '');
+          // Docker tags: [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}.
+          if (!/^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$/.test(clean)) {
+            console.error(`Version "${v}" is not a safe Docker tag after cleaning (got "${clean}")`);
+            process.exit(1);
+          }
+          console.log(`version=${clean}`);
+          EOF
+
       - name: Set up QEMU (for arm64 emulation on amd64 runners)
         uses: docker/setup-qemu-action@v3
 
@@ -195,6 +223,9 @@ jobs:
             # Compose defaults to `latest`; publish it on main so `docker compose
             # up` resolves to the latest main build without an explicit tag.
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Mirror the root package.json semver as an image tag on pushes to
+            # main only, so `docker pull` can target a version exactly.
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError, apiFetch } from "@/lib/api"
 import { CatalogManager } from "@/components/catalog/catalog-manager"
+import { bloodlineConfigSchema } from "@/lib/server/schemas"
 
 // --- Module mocks --------------------------------------------------------- //
 
@@ -1653,6 +1654,217 @@ describe("skill type and class priority", () => {
         ([, init]) => (init as RequestInit)?.method === "POST"
       )
     ).toBe(true)
+  })
+})
+
+describe("bloodline visual editor", () => {
+  afterEach(() => cleanup())
+  const bloodline = (config: Record<string, unknown>) => ({
+    ...item,
+    id: "bloodline-1",
+    kind: "bloodlines",
+    stableId: "bloodline-one",
+    name: "Bloodline One",
+    grade: "G",
+    config,
+  })
+  function configure(
+    mock: ReturnType<typeof vi.fn>,
+    fixture = bloodline({ effects: [], note: "retain" })
+  ) {
+    mock.mockReset()
+    mock.mockImplementation(async (_url: string, init?: RequestInit) =>
+      init?.method === "PATCH" ? { item: fixture } : { items: [fixture] }
+    )
+  }
+  function configFrom(mock: ReturnType<typeof vi.fn>) {
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    return JSON.parse((call?.[1] as RequestInit).body as string)
+      .config as Record<string, unknown>
+  }
+  it("converts exact decimal percentages into basis points and preserves unknown config", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    configure(
+      mock,
+      bloodline({
+        effects: [{ phase: "flat", amount: { strength: 4 } }],
+        custom: { retained: true },
+      })
+    )
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.change(screen.getByLabelText("base percent agility"), {
+      target: { value: "5.25" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(configFrom(mock).effects).toEqual([
+      { phase: "flat", amount: { strength: 4 } },
+      { phase: "percent", stacking: "stack", basisPoints: { agility: 525 } },
+    ])
+    expect(configFrom(mock).custom).toEqual({ retained: true })
+  })
+  it("supports replacement overrides, empty suppression, and clearing back to base", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const fixture = bloodline({
+      effects: [{ phase: "flat", amount: { strength: 2 } }],
+    })
+    configure(mock, fixture)
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.click(screen.getByRole("button", { name: "F" }))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Create empty override" })
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(configFrom(mock).gradeEffects).toEqual({ F: [] })
+    cleanup()
+    configure(
+      mock,
+      bloodline({
+        ...fixture.config,
+        gradeEffects: { F: [{ phase: "flat", amount: { agility: 3 } }] },
+      })
+    )
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.click(screen.getByRole("button", { name: "F" }))
+    fireEvent.click(screen.getByRole("button", { name: "Clear override" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(configFrom(mock)).not.toHaveProperty("gradeEffects.F")
+  })
+  it("drops invalid pending values when clearing a grade override", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    configure(
+      mock,
+      bloodline({
+        effects: [],
+        gradeEffects: { F: [{ phase: "flat", amount: { agility: 3 } }] },
+      })
+    )
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.click(screen.getByRole("button", { name: "F" }))
+    const field = screen.getByLabelText("F flat agility")
+    fireEvent.change(field, { target: { value: "1.5" } })
+    fireEvent.blur(field)
+    fireEvent.click(screen.getByRole("button", { name: "Clear override" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const config = configFrom(mock)
+    expect(config.gradeEffects).not.toHaveProperty("F")
+    expect(bloodlineConfigSchema.safeParse(config).success).toBe(true)
+  })
+  it("does not crash on invalid advanced JSON and keeps save blocked", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    configure(mock, bloodline({ effects: [], gradeEffects: { F: [] } }))
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+      target: { value: "{" },
+    })
+    expect(() =>
+      fireEvent.click(screen.getByRole("button", { name: "F" }))
+    ).not.toThrow()
+    expect(() =>
+      fireEvent.click(
+        screen.getByRole("button", { name: "Create empty override" })
+      )
+    ).not.toThrow()
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Create empty override",
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+      )
+    ).toBe(false)
+  })
+  it.each([
+    ["flat", "strength", "1.5", /whole number/],
+    ["percent", "agility", "-1", /nonnegative/],
+    ["percent", "agility", "1.234", /2 decimal/],
+  ])("blocks invalid %s value %s", async (phase, attribute, value, error) => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    configure(mock)
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    const field = screen.getByLabelText(`base ${phase} ${attribute}`)
+    fireEvent.change(field, { target: { value } })
+    fireEvent.blur(field)
+    expect(screen.getAllByText(error as RegExp).length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(
+      mock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+      )
+    ).toBe(false)
+  })
+  it("preserves advanced array entries and refuses ambiguous simple effects", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    const effects = [
+      {
+        phase: "flat",
+        amount: { strength: 1 },
+        condition: { kind: "gradeAtLeast", grade: "D" },
+        group: "moon",
+        stacking: "replace",
+      },
+      { phase: "flat", amount: { agility: 2 } },
+      { phase: "flat", amount: { wisdom: 3 } },
+    ]
+    expect(bloodlineConfigSchema.safeParse({ effects }).success).toBe(true)
+    configure(mock, bloodline({ effects, note: "before" }))
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    expect(screen.getByText(/Multiple simple flat effects exist/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+      target: { value: JSON.stringify({ effects, note: "after" }) },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    expect(configFrom(mock).effects).toEqual(effects)
+  })
+  it("creates narrative-only bloodlines with an empty effects list", async () => {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (_url: string, init?: RequestInit) =>
+      init?.method === "POST"
+        ? { item: bloodline({ effects: [] }) }
+        : { items: [] }
+    )
+    render(<CatalogManager kind="bloodlines" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Narrative" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+    )
+    expect(
+      JSON.parse((call?.[1] as RequestInit).body as string).config.effects
+    ).toEqual([])
   })
 })
 

@@ -145,6 +145,19 @@ describe("bloodline / god catalog config", () => {
     }
   })
 
+  it("accepts an explicit empty grade-replacement list (suppresses base effects)", () => {
+    const parsed = bloodlineConfigSchema.safeParse({
+      effects: [{ phase: "flat", amount: { strength: 1 } }],
+      gradeEffects: {
+        G: [],
+      },
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.gradeEffects?.G).toEqual([])
+    }
+  })
+
   it("reads a legacy bloodline config (grade/vector) without effects", () => {
     const parsed = bloodlineConfigSchema.safeParse({
       grade: "F",

@@ -1480,8 +1480,11 @@ export const titleConfigSchema = z
  *     for a narrative-only bloodline that grants no numeric effect.
  *   - `gradeEffects` (optional) is a partial map of grade -> effect list, so a
  *     bloodline like the Primal Hunter's can scale its Perception bonus per
- *     grade (see docs/rules/bloodlines.md). Grade-specific effects overlay the
- *     flat `effects` for matching grades.
+ *     grade (see docs/rules/bloodlines.md). Grade-specific effects REPLACE the
+ *     flat `effects` for the character's exact current race grade; a missing
+ *     grade falls back to the base `effects`, and an explicit empty list for the
+ *     character's grade suppresses the base effects entirely (never a base+grade
+ *     addition).
  *   - `upgradeGroup` (optional) is forwarded as-is.
  *
  * The schema reads permissively (passthrough) so a LEGACY `{grade, vector}`
