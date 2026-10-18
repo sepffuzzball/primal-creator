@@ -574,6 +574,8 @@ const character = {
   raceName: "Human",
   className: "Archer",
   professionName: null,
+  classDescription: null,
+  professionDescription: null,
   state: {
     baseAttributes: {
       strength: 0,
@@ -5233,12 +5235,14 @@ describe("CharacterDetail progression tabs and grade descriptions", () => {
     ).toBeNull()
   })
 
-  it("renders configured race/class/profession grade descriptions on their tabs", async () => {
+  it("renders race grade prose and general class/profession descriptions", async () => {
     setupMock({
       character: {
         ...character,
         raceGradeDescription: "A towering human lineage.",
+        classDescription: "A general description of archery.",
         classGradeDescription: "Precise archer training.",
+        professionDescription: "A general profession description.",
         professionGradeDescription: "Masterful profession lore.",
       },
     })
@@ -5248,20 +5252,26 @@ describe("CharacterDetail progression tabs and grade descriptions", () => {
     expect(screen.getByText("A towering human lineage.")).toBeTruthy()
     fireEvent.click(screen.getByRole("tab", { name: "Class" }))
     await flush()
-    expect(screen.getByText("Precise archer training.")).toBeTruthy()
+    expect(screen.getByText("A general description of archery.")).toBeTruthy()
+    expect(screen.queryByText("Precise archer training.")).toBeNull()
     fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
     await flush()
-    expect(screen.getByText("Masterful profession lore.")).toBeTruthy()
+    expect(screen.getByText("A general profession description.")).toBeTruthy()
+    expect(screen.queryByText("Masterful profession lore.")).toBeNull()
   })
 
-  it("shows the grade description fallback when no description is configured", async () => {
+  it("shows general-description fallbacks for class and profession", async () => {
     setupMock()
     await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Class" }))
+    await flush()
+    expect(screen.getByText("No class description")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Profession" }))
+    await flush()
+    expect(screen.getByText("No profession description")).toBeTruthy()
     fireEvent.click(screen.getByRole("tab", { name: "Race" }))
     await flush()
-    expect(
-      screen.getAllByText("No description for this grade").length
-    ).toBeGreaterThan(0)
+    expect(screen.getByText("No description for this grade")).toBeTruthy()
   })
 })
 

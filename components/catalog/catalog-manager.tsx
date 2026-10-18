@@ -257,6 +257,7 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [classTieFilter, setClassTieFilter] = React.useState("")
   const [skillGrantGrade, setSkillGrantGrade] =
     React.useState<(typeof GRADES)[number]>("G")
+  const singleGradeKind = kind === "classes" || kind === "professions"
   const [skillToGrant, setSkillToGrant] = React.useState("")
   const [skillGrantFilter, setSkillGrantFilter] = React.useState("")
   const [titleSkillFilter, setTitleSkillFilter] = React.useState("")
@@ -1419,24 +1420,69 @@ export function CatalogManager({ kind }: { kind: string }) {
         }
       }
       const configuredGrades = isRecord(config.grades) ? config.grades : {}
+      const originalGrade = editing?.grade ?? ""
+      const multiGradeLegacy =
+        singleGradeKind &&
+        editing &&
+        Object.keys(
+          isRecord(editing.config) && isRecord(editing.config.grades)
+            ? editing.config.grades
+            : {}
+        ).filter((key) =>
+          isRecord(
+            (editing.config as Record<string, unknown>).grades &&
+              (
+                (editing.config as Record<string, unknown>).grades as Record<
+                  string,
+                  unknown
+                >
+              )[key]
+          )
+        ).length > 1
       if (
-        ["classes", "professions"].includes(kind) &&
-        !editing &&
-        !isRecord(configuredGrades[form.grade])
+        multiGradeLegacy &&
+        stableStringify(config) !== stableStringify(editing?.config ?? {}) &&
+        !(
+          Object.keys(configuredGrades).filter((key) =>
+            isRecord(configuredGrades[key])
+          ).length === 1 &&
+          isRecord(configuredGrades[form.grade]) &&
+          (!isRecord(config.gradeGrantedSkillStableIds) ||
+            Object.keys(config.gradeGrantedSkillStableIds).every(
+              (grade) => grade === form.grade
+            ))
+        )
       ) {
         setFormError(
-          "Add a row for the initial grade before creating this entry."
+          "This legacy entry has multiple gains rows. Resolve them before saving progression changes."
         )
         return
       }
       if (
-        ["classes", "professions"].includes(kind) &&
+        singleGradeKind &&
+        (!editing ||
+          stableStringify(config) !== stableStringify(editing.config ?? {}))
+      ) {
+        const rows = isRecord(configuredGrades)
+          ? Object.entries(configuredGrades).filter(
+              ([key, value]) => key === form.grade && isRecord(value)
+            )
+          : []
+        if (!form.grade || rows.length !== 1) {
+          setFormError(
+            "Add a gains row for the selected grade before saving progression changes."
+          )
+          return
+        }
+      }
+      if (
+        singleGradeKind &&
         editing &&
-        form.grade !== editing.grade &&
-        !isRecord(configuredGrades[form.grade])
+        form.grade !== originalGrade &&
+        stableStringify(config) === stableStringify(editing.config ?? {})
       ) {
         setFormError(
-          "The selected initial grade has no matching gains row. Add it or restore the previous grade."
+          "Grade changes require a matching gains row. Edit the per-level gains to move the progression."
         )
         return
       }
@@ -1610,6 +1656,7 @@ export function CatalogManager({ kind }: { kind: string }) {
               : {}),
             ...(kind !== "skills" &&
             !isCurrency &&
+            !singleGradeKind &&
             stableStringify(form.gradeDescriptions) !==
               stableStringify(
                 (
@@ -1703,6 +1750,7 @@ export function CatalogManager({ kind }: { kind: string }) {
     classChoices,
     isCurrency,
     commitBloodlineDraft,
+    singleGradeKind,
   ])
 
   React.useEffect(() => {
@@ -2444,7 +2492,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                   }
                 />
               </div>
-              {kind === "items" ||
+              {singleGradeKind ||
+              kind === "items" ||
               kind === "skills" ||
               isCurrency ||
               !form.grade ||
@@ -2483,7 +2532,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                   </div>
                 </details>
               )}
-              {!isCurrency &&
+              {!singleGradeKind &&
+                !isCurrency &&
                 kind !== "skills" &&
                 kind !== "items" &&
                 (!!form.grade ||
@@ -2548,20 +2598,88 @@ export function CatalogManager({ kind }: { kind: string }) {
               {structuredKind ? (
                 <div className="flex flex-col gap-2">
                   <Label htmlFor="cat-grade">
-                    {kind === "races" ? "Natural grade" : "Initial grade"}
+                    {kind === "races" ? "Natural grade" : "Grade"}
                   </Label>
                   <Select
                     value={form.grade}
-                    onValueChange={(grade) =>
-                      setForm((f) => ({ ...f, grade: String(grade ?? "") }))
-                    }
+                    onValueChange={(grade) => {
+                      const nextGrade = String(grade ?? "")
+                      if (singleGradeKind && form.grade !== nextGrade) {
+                        setForm((current) => {
+                          try {
+                            const config = JSON.parse(
+                              current.configText || "{}"
+                            ) as Record<string, unknown>
+                            const rows = isRecord(config.grades)
+                              ? { ...config.grades }
+                              : {}
+                            const keys = Object.keys(rows).filter((key) =>
+                              isRecord(rows[key])
+                            )
+                            const oldGrade = current.grade
+                            if (keys.length === 1 && keys[0] === oldGrade) {
+                              const row = rows[oldGrade]
+                              delete rows[oldGrade]
+                              rows[nextGrade] = row
+                              config.grades = rows
+                            }
+                            if (
+                              keys.length === 0 ||
+                              (keys.length === 1 && keys[0] === oldGrade)
+                            ) {
+                              if (isRecord(config.gradeGrantedSkillStableIds)) {
+                                const grants = {
+                                  ...config.gradeGrantedSkillStableIds,
+                                }
+                                if (Object.hasOwn(grants, oldGrade)) {
+                                  const destination = Array.isArray(
+                                    grants[nextGrade]
+                                  )
+                                    ? grants[nextGrade]
+                                    : []
+                                  const source = Array.isArray(grants[oldGrade])
+                                    ? grants[oldGrade]
+                                    : []
+                                  grants[nextGrade] = [
+                                    ...new Set([...destination, ...source]),
+                                  ]
+                                  delete grants[oldGrade]
+                                }
+                                config.gradeGrantedSkillStableIds = grants
+                              }
+                            }
+                            return {
+                              ...current,
+                              grade: nextGrade,
+                              configText: JSON.stringify(config, null, 2),
+                            }
+                          } catch {
+                            return { ...current, grade: nextGrade }
+                          }
+                        })
+                      } else
+                        setForm((current) => ({ ...current, grade: nextGrade }))
+                    }}
                   >
                     <SelectTrigger
                       id="cat-grade"
-                      aria-label={
-                        kind === "races" ? "Natural grade" : "Initial grade"
+                      aria-label={kind === "races" ? "Natural grade" : "Grade"}
+                      disabled={
+                        !structuredConfig ||
+                        (singleGradeKind &&
+                          editing != null &&
+                          isRecord(structuredConfig.grades) &&
+                          Object.keys(structuredConfig.grades).filter((key) =>
+                            isRecord(
+                              (
+                                structuredConfig.grades as Record<
+                                  string,
+                                  unknown
+                                >
+                              )[key]
+                            )
+                          ).length > 1)
                       }
-                      disabled={!structuredConfig}
                     >
                       <SelectValue placeholder="Choose a grade" />
                     </SelectTrigger>
@@ -2600,259 +2718,376 @@ export function CatalogManager({ kind }: { kind: string }) {
                     kind
                   ) ? (
                     <div className="flex flex-col gap-2">
-                      <p className="text-xs text-muted-foreground">
-                        Per-level gains by grade. Blank rows are left unchanged;
-                        enter 0 explicitly to save zero. Integrated characters
-                        require a G-grade race row.
-                      </p>
-                      <div className="overflow-x-auto rounded-md border">
-                        <Table>
-                          <TableHeader>
-                            <TableRow>
-                              <TableHead>Grade</TableHead>
-                              {ATTRIBUTE_KEYS.map((key) => (
-                                <TableHead key={key}>{key}</TableHead>
-                              ))}
-                              <TableHead>Free points</TableHead>
-                              <TableHead>Actions</TableHead>
-                            </TableRow>
-                          </TableHeader>
-                          <TableBody>
-                            {GRADES.filter((grade) => {
-                              const natural =
-                                form.grade &&
-                                GRADES.indexOf(grade) >=
-                                  GRADES.indexOf(
-                                    form.grade as (typeof GRADES)[number]
-                                  )
-                              const configured =
-                                kind === "races"
-                                  ? isRecord(
-                                      structuredConfig?.raceDefinitions
-                                    ) &&
-                                    Object.hasOwn(
-                                      structuredConfig.raceDefinitions,
-                                      grade
+                      {singleGradeKind
+                        ? (() => {
+                            const grades = isRecord(structuredConfig?.grades)
+                              ? structuredConfig.grades
+                              : {}
+                            const rowGrades = Object.keys(grades).filter(
+                              (grade) => isRecord(grades[grade])
+                            )
+                            const conflicted = rowGrades.length > 1
+                            const row: Record<string, unknown> = isRecord(
+                              grades[form.grade]
+                            )
+                              ? (grades[form.grade] as Record<string, unknown>)
+                              : {}
+                            const fixed: Record<string, unknown> = isRecord(
+                              row.fixed
+                            )
+                              ? row.fixed
+                              : {}
+                            const update = (field: string, value: unknown) => {
+                              const nextRow: Record<string, unknown> = {
+                                ...row,
+                                fixed: { ...fixed },
+                                free: row.free ?? 0,
+                              }
+                              if (field === "fixed") nextRow.fixed = value
+                              else nextRow[field] = value
+                              setConfigValue("grades", {
+                                ...grades,
+                                [form.grade]: nextRow,
+                              })
+                            }
+                            return (
+                              <>
+                                {conflicted ? (
+                                  <Alert variant="destructive">
+                                    This legacy entry has multiple gains rows (
+                                    {rowGrades.join(", ")}). Resolve the extra
+                                    rows before changing grade or editing
+                                    progression.
+                                  </Alert>
+                                ) : null}
+                                <h3 className="text-sm font-medium">
+                                  Per-level gains
+                                </h3>
+                                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                                  {ATTRIBUTE_KEYS.map((key) => (
+                                    <div
+                                      key={key}
+                                      className="flex flex-col gap-1.5"
+                                    >
+                                      <Label htmlFor={`gain-${key}`}>
+                                        {key}
+                                      </Label>
+                                      <Input
+                                        id={`gain-${key}`}
+                                        aria-label={key}
+                                        type="number"
+                                        min="0"
+                                        step="1"
+                                        value={
+                                          fixed[key] == null
+                                            ? ""
+                                            : String(fixed[key])
+                                        }
+                                        disabled={
+                                          !structuredConfig || conflicted
+                                        }
+                                        onChange={(e) =>
+                                          update("fixed", {
+                                            ...fixed,
+                                            [key]:
+                                              e.target.value === ""
+                                                ? undefined
+                                                : Number(e.target.value),
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                  ))}
+                                  <div className="flex flex-col gap-1.5">
+                                    <Label htmlFor="gain-free">
+                                      Free points
+                                    </Label>
+                                    <Input
+                                      id="gain-free"
+                                      aria-label="Free points"
+                                      type="number"
+                                      min="0"
+                                      step="1"
+                                      value={
+                                        row.free == null ? "" : String(row.free)
+                                      }
+                                      disabled={!structuredConfig || conflicted}
+                                      onChange={(e) =>
+                                        update(
+                                          "free",
+                                          e.target.value === ""
+                                            ? undefined
+                                            : Number(e.target.value)
+                                        )
+                                      }
+                                    />
+                                  </div>
+                                </div>
+                              </>
+                            )
+                          })()
+                        : null}
+                      {!singleGradeKind ? (
+                        <p className="text-xs text-muted-foreground">
+                          Per-level gains by grade. Blank rows are left
+                          unchanged; enter 0 explicitly to save zero. Integrated
+                          characters require a G-grade race row.
+                        </p>
+                      ) : null}
+                      {singleGradeKind ? null : (
+                        <div className="overflow-x-auto rounded-md border">
+                          <Table>
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead>Grade</TableHead>
+                                {ATTRIBUTE_KEYS.map((key) => (
+                                  <TableHead key={key}>{key}</TableHead>
+                                ))}
+                                <TableHead>Free points</TableHead>
+                                <TableHead>Actions</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {GRADES.filter((grade) => {
+                                const natural =
+                                  form.grade &&
+                                  GRADES.indexOf(grade) >=
+                                    GRADES.indexOf(
+                                      form.grade as (typeof GRADES)[number]
                                     )
-                                  : isRecord(structuredConfig?.grades) &&
-                                    Object.hasOwn(
-                                      structuredConfig.grades,
-                                      grade
-                                    )
-                              return natural || configured || grade === "G"
-                            }).map((grade) => {
-                              const track =
-                                kind === "races"
-                                  ? isRecord(
-                                      structuredConfig?.raceDefinitions
-                                    ) &&
-                                    isRecord(
-                                      structuredConfig.raceDefinitions[grade]
-                                    )
-                                    ? (structuredConfig.raceDefinitions[
-                                        grade
-                                      ] as Record<string, unknown>)
-                                    : {}
-                                  : isRecord(structuredConfig?.grades) &&
-                                      isRecord(structuredConfig.grades[grade])
-                                    ? (structuredConfig.grades[grade] as Record<
-                                        string,
-                                        unknown
-                                      >)
-                                    : {}
-                              const vectorKey =
-                                kind === "races" ? "perLevel" : "fixed"
-                              const vector = isRecord(track[vectorKey])
-                                ? (track[vectorKey] as Record<string, unknown>)
-                                : {}
-                              const updateTrack = (
-                                field: string,
-                                value: unknown
-                              ) => {
-                                const outerKey =
+                                const configured =
                                   kind === "races"
-                                    ? "raceDefinitions"
-                                    : "grades"
-                                const outer = isRecord(
-                                  structuredConfig?.[outerKey]
-                                )
-                                  ? (structuredConfig[outerKey] as Record<
+                                    ? isRecord(
+                                        structuredConfig?.raceDefinitions
+                                      ) &&
+                                      Object.hasOwn(
+                                        structuredConfig.raceDefinitions,
+                                        grade
+                                      )
+                                    : isRecord(structuredConfig?.grades) &&
+                                      Object.hasOwn(
+                                        structuredConfig.grades,
+                                        grade
+                                      )
+                                return natural || configured || grade === "G"
+                              }).map((grade) => {
+                                const track =
+                                  kind === "races"
+                                    ? isRecord(
+                                        structuredConfig?.raceDefinitions
+                                      ) &&
+                                      isRecord(
+                                        structuredConfig.raceDefinitions[grade]
+                                      )
+                                      ? (structuredConfig.raceDefinitions[
+                                          grade
+                                        ] as Record<string, unknown>)
+                                      : {}
+                                    : isRecord(structuredConfig?.grades) &&
+                                        isRecord(structuredConfig.grades[grade])
+                                      ? (structuredConfig.grades[
+                                          grade
+                                        ] as Record<string, unknown>)
+                                      : {}
+                                const vectorKey =
+                                  kind === "races" ? "perLevel" : "fixed"
+                                const vector = isRecord(track[vectorKey])
+                                  ? (track[vectorKey] as Record<
                                       string,
                                       unknown
                                     >)
                                   : {}
-                                const old = isRecord(outer[grade])
-                                  ? (outer[grade] as Record<string, unknown>)
-                                  : {}
-                                const slug =
-                                  form.name
-                                    .trim()
-                                    .toLowerCase()
-                                    .replace(/[^a-z0-9]+/g, "-")
-                                    .replace(/^-|-$/g, "") ||
-                                  editing?.stableId ||
-                                  "entry"
-                                const updated = {
-                                  ...old,
-                                  ...(kind === "races"
-                                    ? {
-                                        id:
-                                          old.id ??
-                                          `${slug}-${grade.toLowerCase()}`,
-                                        freePerLevel: old.freePerLevel ?? 0,
-                                        perLevel: old.perLevel ?? {},
-                                      }
-                                    : {
-                                        free: old.free ?? 0,
-                                        fixed: old.fixed ?? {},
-                                      }),
-                                  [field]: value,
+                                const updateTrack = (
+                                  field: string,
+                                  value: unknown
+                                ) => {
+                                  const outerKey =
+                                    kind === "races"
+                                      ? "raceDefinitions"
+                                      : "grades"
+                                  const outer = isRecord(
+                                    structuredConfig?.[outerKey]
+                                  )
+                                    ? (structuredConfig[outerKey] as Record<
+                                        string,
+                                        unknown
+                                      >)
+                                    : {}
+                                  const old = isRecord(outer[grade])
+                                    ? (outer[grade] as Record<string, unknown>)
+                                    : {}
+                                  const slug =
+                                    form.name
+                                      .trim()
+                                      .toLowerCase()
+                                      .replace(/[^a-z0-9]+/g, "-")
+                                      .replace(/^-|-$/g, "") ||
+                                    editing?.stableId ||
+                                    "entry"
+                                  const updated = {
+                                    ...old,
+                                    ...(kind === "races"
+                                      ? {
+                                          id:
+                                            old.id ??
+                                            `${slug}-${grade.toLowerCase()}`,
+                                          freePerLevel: old.freePerLevel ?? 0,
+                                          perLevel: old.perLevel ?? {},
+                                        }
+                                      : {
+                                          free: old.free ?? 0,
+                                          fixed: old.fixed ?? {},
+                                        }),
+                                    [field]: value,
+                                  }
+                                  setConfigValue(outerKey, {
+                                    ...outer,
+                                    [grade]: updated,
+                                  })
                                 }
-                                setConfigValue(outerKey, {
-                                  ...outer,
-                                  [grade]: updated,
-                                })
-                              }
-                              return (
-                                <TableRow key={grade}>
-                                  <TableHead scope="row">{grade}</TableHead>
-                                  {ATTRIBUTE_KEYS.map((key) => (
-                                    <TableCell key={key}>
+                                return (
+                                  <TableRow key={grade}>
+                                    <TableHead scope="row">{grade}</TableHead>
+                                    {ATTRIBUTE_KEYS.map((key) => (
+                                      <TableCell key={key}>
+                                        <Input
+                                          aria-label={`${grade} ${key}`}
+                                          type="number"
+                                          min="0"
+                                          step="1"
+                                          disabled={!structuredConfig}
+                                          inputMode="numeric"
+                                          className="w-16"
+                                          value={
+                                            vector[key] == null
+                                              ? ""
+                                              : String(vector[key])
+                                          }
+                                          onChange={(e) =>
+                                            updateTrack(vectorKey, {
+                                              ...vector,
+                                              [key]:
+                                                e.target.value === ""
+                                                  ? undefined
+                                                  : Number.isFinite(
+                                                        Number(e.target.value)
+                                                      )
+                                                    ? Number(e.target.value)
+                                                    : vector[key],
+                                            })
+                                          }
+                                        />
+                                      </TableCell>
+                                    ))}
+                                    <TableCell>
                                       <Input
-                                        aria-label={`${grade} ${key}`}
+                                        aria-label={`${grade} Free points`}
                                         type="number"
                                         min="0"
                                         step="1"
                                         disabled={!structuredConfig}
                                         inputMode="numeric"
-                                        className="w-16"
+                                        className="w-20"
                                         value={
-                                          vector[key] == null
+                                          track[
+                                            kind === "races"
+                                              ? "freePerLevel"
+                                              : "free"
+                                          ] == null
                                             ? ""
-                                            : String(vector[key])
-                                        }
-                                        onChange={(e) =>
-                                          updateTrack(vectorKey, {
-                                            ...vector,
-                                            [key]:
-                                              e.target.value === ""
-                                                ? undefined
-                                                : Number.isFinite(
-                                                      Number(e.target.value)
-                                                    )
-                                                  ? Number(e.target.value)
-                                                  : vector[key],
-                                          })
-                                        }
-                                      />
-                                    </TableCell>
-                                  ))}
-                                  <TableCell>
-                                    <Input
-                                      aria-label={`${grade} Free points`}
-                                      type="number"
-                                      min="0"
-                                      step="1"
-                                      disabled={!structuredConfig}
-                                      inputMode="numeric"
-                                      className="w-20"
-                                      value={
-                                        track[
-                                          kind === "races"
-                                            ? "freePerLevel"
-                                            : "free"
-                                        ] == null
-                                          ? ""
-                                          : String(
-                                              track[
-                                                kind === "races"
-                                                  ? "freePerLevel"
-                                                  : "free"
-                                              ]
-                                            )
-                                      }
-                                      onChange={(e) =>
-                                        updateTrack(
-                                          kind === "races"
-                                            ? "freePerLevel"
-                                            : "free",
-                                          e.target.value === ""
-                                            ? undefined
-                                            : Number.isFinite(
-                                                  Number(e.target.value)
-                                                )
-                                              ? Number(e.target.value)
-                                              : track[
+                                            : String(
+                                                track[
                                                   kind === "races"
                                                     ? "freePerLevel"
                                                     : "free"
                                                 ]
-                                        )
-                                      }
-                                    />
-                                  </TableCell>
-                                  <TableCell>
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      variant="outline"
-                                      disabled={
-                                        !Object.hasOwn(
-                                          isRecord(
-                                            structuredConfig?.[
-                                              kind === "races"
-                                                ? "raceDefinitions"
-                                                : "grades"
-                                            ]
+                                              )
+                                        }
+                                        onChange={(e) =>
+                                          updateTrack(
+                                            kind === "races"
+                                              ? "freePerLevel"
+                                              : "free",
+                                            e.target.value === ""
+                                              ? undefined
+                                              : Number.isFinite(
+                                                    Number(e.target.value)
+                                                  )
+                                                ? Number(e.target.value)
+                                                : track[
+                                                    kind === "races"
+                                                      ? "freePerLevel"
+                                                      : "free"
+                                                  ]
                                           )
-                                            ? (structuredConfig[
+                                        }
+                                      />
+                                    </TableCell>
+                                    <TableCell>
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={
+                                          !Object.hasOwn(
+                                            isRecord(
+                                              structuredConfig?.[
                                                 kind === "races"
                                                   ? "raceDefinitions"
                                                   : "grades"
-                                              ] as object)
-                                            : {},
-                                          grade
-                                        )
-                                      }
-                                      onClick={() => {
-                                        if (
-                                          !window.confirm(
-                                            `Remove the ${grade}-grade gains row?`
+                                              ]
+                                            )
+                                              ? (structuredConfig[
+                                                  kind === "races"
+                                                    ? "raceDefinitions"
+                                                    : "grades"
+                                                ] as object)
+                                              : {},
+                                            grade
                                           )
-                                        )
-                                          return
-                                        const key =
-                                          kind === "races"
-                                            ? "raceDefinitions"
-                                            : "grades"
-                                        const rows = isRecord(
-                                          structuredConfig?.[key]
-                                        )
-                                          ? (structuredConfig[key] as Record<
-                                              string,
-                                              unknown
-                                            >)
-                                          : {}
-                                        const next = { ...rows }
-                                        delete next[grade]
-                                        setConfigValue(key, next)
-                                      }}
-                                    >
-                                      Remove
-                                    </Button>
-                                  </TableCell>
-                                </TableRow>
-                              )
-                            })}
-                          </TableBody>
-                        </Table>
-                      </div>
+                                        }
+                                        onClick={() => {
+                                          if (
+                                            !window.confirm(
+                                              `Remove the ${grade}-grade gains row?`
+                                            )
+                                          )
+                                            return
+                                          const key =
+                                            kind === "races"
+                                              ? "raceDefinitions"
+                                              : "grades"
+                                          const rows = isRecord(
+                                            structuredConfig?.[key]
+                                          )
+                                            ? (structuredConfig[key] as Record<
+                                                string,
+                                                unknown
+                                              >)
+                                            : {}
+                                          const next = { ...rows }
+                                          delete next[grade]
+                                          setConfigValue(key, next)
+                                        }}
+                                      >
+                                        Remove
+                                      </Button>
+                                    </TableCell>
+                                  </TableRow>
+                                )
+                              })}
+                            </TableBody>
+                          </Table>
+                        </div>
+                      )}
                       <section
                         aria-label="Grade skill grants"
                         className="flex flex-col gap-2 rounded-md border p-3"
                       >
                         <h3 className="text-sm font-medium">
-                          Skills granted at each grade
+                          {singleGradeKind
+                            ? "Skills granted"
+                            : "Skills granted at each grade"}
                         </h3>
                         <p className="text-xs text-muted-foreground">
                           These are automatic grants for characters acquiring
@@ -2860,38 +3095,49 @@ export function CatalogManager({ kind }: { kind: string }) {
                           reach the grade). Catalog edits do not retroactively
                           grant skills to existing characters.
                         </p>
-                        <Label htmlFor="skill-grant-grade">Grant grade</Label>
-                        <div
-                          aria-label="Grant grade"
-                          className="flex flex-wrap gap-1"
-                        >
-                          {GRADES.map((grade) => (
-                            <Button
-                              key={grade}
-                              type="button"
-                              size="sm"
-                              variant={
-                                skillGrantGrade === grade
-                                  ? "secondary"
-                                  : "outline"
-                              }
-                              aria-pressed={skillGrantGrade === grade}
-                              onClick={() => setSkillGrantGrade(grade)}
+                        {singleGradeKind ? null : (
+                          <>
+                            <Label htmlFor="skill-grant-grade">
+                              Grant grade
+                            </Label>
+                            <div
+                              aria-label="Grant grade"
+                              className="flex flex-wrap gap-1"
                             >
-                              {grade}
-                            </Button>
-                          ))}
-                        </div>
+                              {GRADES.map((grade) => (
+                                <Button
+                                  key={grade}
+                                  type="button"
+                                  size="sm"
+                                  variant={
+                                    skillGrantGrade === grade
+                                      ? "secondary"
+                                      : "outline"
+                                  }
+                                  aria-pressed={skillGrantGrade === grade}
+                                  onClick={() => setSkillGrantGrade(grade)}
+                                >
+                                  {grade}
+                                </Button>
+                              ))}
+                            </div>
+                          </>
+                        )}
                         {(() => {
-                          const configured = isRecord(
+                          const currentGrantGrade = singleGradeKind
+                            ? form.grade
+                            : skillGrantGrade
+                          const configured: Record<string, unknown> = isRecord(
                             structuredConfig?.gradeGrantedSkillStableIds
                           )
-                            ? structuredConfig.gradeGrantedSkillStableIds
+                            ? (structuredConfig.gradeGrantedSkillStableIds as Record<
+                                string,
+                                unknown
+                              >)
                             : {}
-                          const existing = Array.isArray(
-                            configured[skillGrantGrade]
-                          )
-                            ? configured[skillGrantGrade].filter(
+                          const rawExisting = configured[currentGrantGrade]
+                          const existing: string[] = Array.isArray(rawExisting)
+                            ? rawExisting.filter(
                                 (value): value is string =>
                                   typeof value === "string"
                               )
@@ -2905,7 +3151,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                               return
                             setConfigValue("gradeGrantedSkillStableIds", {
                               ...configured,
-                              [skillGrantGrade]: [
+                              [currentGrantGrade]: [
                                 ...uniqueExisting,
                                 skillToGrant,
                               ],
@@ -2918,8 +3164,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                             )
                             const next = { ...configured }
                             if (remaining.length)
-                              next[skillGrantGrade] = remaining
-                            else delete next[skillGrantGrade]
+                              next[currentGrantGrade] = remaining
+                            else delete next[currentGrantGrade]
                             setConfigValue("gradeGrantedSkillStableIds", next)
                           }
                           const selectable = skills.filter(

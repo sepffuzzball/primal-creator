@@ -57,6 +57,45 @@ so the catalog must define a `<grade>`-grade per-level config
 otherwise. Profession evolution is then a catalog-driven per-track path choice
 with **no** grade-only legacy fallback (see `docs/rules/evolution.md`).
 
+## Catalog definition (single-grade)
+
+A `professions` catalog entry is a SINGLE-grade definition, exactly like a class:
+its `grade` column is the one grade it belongs to, and its `config.grades` map
+must authorize exactly that one grade - the key matching `grade` - with a valid
+per-level row (a missing, extra, or mismatched grade row is rejected with 400
+`invalid_config` on creation or a config/grade-changing edit). The optional
+auto-grant map, when present, may only declare that same grade key
+(`gradeGrantedSkillStableIds[<grade>]`). Races remain multi-grade: a `races`
+entry authorizes many `raceDefinitions` (one per grade) and a separate
+`gradeGrantedSkillStableIds` map keyed across all grades.
+
+The admin editor renders a profession as a single row at one grade. Changing the
+grade in the editor moves the existing `grades[<oldGrade>]` gains row (and any
+`gradeGrantedSkillStableIds[<oldGrade>]` grants) onto the new grade key, so the
+per-level progression and the auto-grants travel with the grade change. The grade
+selector is disabled on a legacy multi-row entry, and a config-changing edit on
+such an entry is refused until the rows are resolved to a single grade.
+
+A profession carries no authored grade-specific prose: `gradeDescriptions`, when
+sent on a new or config/grade-changing write, must be empty (`{}`) or omitted; a
+non-empty map is rejected with 400 `invalid_grade_descriptions`. The legacy
+`description` string is the prose for the profession's one grade, and it is what
+the character detail **profession** tab shows (via `professionDescription`). A
+legacy profession row that still stores an authored `gradeDescriptions` map keeps
+returning it on the API (as `professionGradeDescription`), but the UI does not
+display it - it shows the general `description` instead. Legacy authored grade
+prose is never migrated or cleared; it is simply no longer shown by the UI nor
+newly authored.
+
+A **grade-only PATCH** - changing `grade` without supplying `config` in the same
+PATCH - is rejected with 400 `invalid_config`, because otherwise the single-grade
+`grades` map would be silently rekeyed to the wrong grade. A metadata-only PATCH
+(no `grade`, no `config`) leaves a legacy empty or multi-row profession alone. A
+legacy profession row that is empty or multi-grade stays readable and
+metadata-only PATCHable but cannot be newly created that way, and a
+config-changing PATCH must first normalize it to a single grade row. No database
+migration clears or rewrites these rows today.
+
 ## Setting a profession after creation (set-once)
 
 A character created without a profession (or that must be assigned later by an

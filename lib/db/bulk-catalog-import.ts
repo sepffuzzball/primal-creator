@@ -68,9 +68,11 @@ import {
   godGradeForbidden,
   normalizeCatalogKind,
   parseCatalogConfig,
+  singleGradeTrackIssue,
   skillClassStableIdOf,
   skillGradeDescriptionsForbidden,
   skillGradeForbidden,
+  trackGradeDescriptionsForbidden,
 } from "@/lib/server/schemas"
 import { assertModernConfig, type CatalogKind } from "@/lib/db/catalog-import"
 import {
@@ -522,6 +524,25 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     const message =
       err instanceof Error ? err.message : "Invalid catalog config"
     throw badRequest("invalid_config", `Bulk row ${row}: ${message}`)
+  }
+  // A classes/professions row is a SINGLE-grade definition: its catalog `grade`
+  // column is the one grade it belongs to, and its `config.grades` map must
+  // authorize EXACTLY that one grade. Zero-grade, multi-grade, and mismatched
+  // definitions (and grade grants outside the selected grade) are rejected before
+  // any write, mirroring the service-layer create path. No-op for races / other
+  // kinds (the helper returns null for non-track kinds).
+  const trackIssue = singleGradeTrackIssue(kind, grade, parsedConfig)
+  if (trackIssue) {
+    throw badRequest("invalid_config", `Bulk row ${row}: ${trackIssue}`)
+  }
+  // A classes/professions row carries no authored grade-specific prose (the legacy
+  // `description` is the prose for that one grade), so a non-empty gradeDescriptions
+  // map is rejected before any write.
+  if (trackGradeDescriptionsForbidden(kind, gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      `Bulk row ${row}: classes and professions carry no grade ladder; "gradeDescriptions" must be empty or omitted`
+    )
   }
 
   return {

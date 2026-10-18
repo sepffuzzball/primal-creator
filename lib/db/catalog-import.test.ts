@@ -104,6 +104,8 @@ function classEntry(
     name,
     description: `Description for ${name}`,
     sourceUrl: `https://example.com/${stableId}`,
+    // A class/profession is a single-grade definition and always carries a grade.
+    grade: "F",
     config,
   }
 }
@@ -119,6 +121,8 @@ function professionEntry(
     name,
     description: `Description for ${name}`,
     sourceUrl: `https://example.com/${stableId}`,
+    // A class/profession is a single-grade definition and always carries a grade.
+    grade: "F",
     config,
   }
 }
@@ -1657,5 +1661,164 @@ describe("catalog import (unit, mocked db)", () => {
       code: "invalid_grade_descriptions",
     })
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  // ------------------------------------------------------------------ //
+  // Class / profession single-grade validation
+  // ------------------------------------------------------------------ //
+
+  it("rejects a classes manifest entry with a zero-grade grades map (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      { ...classEntry("zero-cls", { grades: {} }), grade: "F" },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a professions manifest entry with a multiple-grade grades map (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        ...professionEntry("multi-prof", {
+          grades: {
+            F: { fixed: { wisdom: 1 }, free: 0 },
+            G: { fixed: { wisdom: 2 }, free: 0 },
+          },
+        }),
+        grade: "F",
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a classes manifest entry whose grades map does not match its catalog grade (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        ...classEntry("mismatch-cls", {
+          grades: { G: { fixed: { agility: 1 }, free: 0 } },
+        }),
+        grade: "F",
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a classes manifest entry that grants grade skills outside its selected grade (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        ...classEntry("grant-out-cls", {
+          grades: { F: { fixed: { agility: 1 }, free: 0 } },
+          gradeGrantedSkillStableIds: { G: [] },
+        }),
+        grade: "F",
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_config",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a classes manifest entry that carries authored gradeDescriptions (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      {
+        ...classEntry("prose-cls", canonicalTrackConfig()),
+        grade: "F",
+        gradeDescriptions: { G: "A G-grade blurb" },
+      },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("accepts a valid single-grade classes manifest entry and persists it", async () => {
+    const good: WikiReviewedEntry[] = [
+      { ...classEntry("valid-cls", canonicalTrackConfig()), grade: "F" },
+    ]
+    const preview = await previewWikiReviewedImport(good)
+    expect(preview.createCount).toBe(1)
+    expect(preview.skipCount).toBe(0)
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "valid-cls"
+    )!
+    expect(row.kind).toBe("classes")
+    expect(row.grade).toBe("F")
+    expect(row.config).toMatchObject({
+      grades: { F: { fixed: { agility: 1 }, free: 0 } },
+    })
+  })
+
+  it("accepts a classes manifest entry that grants grade skills only for its selected grade", async () => {
+    const good: WikiReviewedEntry[] = [
+      {
+        ...classEntry("grant-in-cls", {
+          grades: { F: { fixed: { agility: 1 }, free: 0 } },
+          gradeGrantedSkillStableIds: { F: [] },
+        }),
+        grade: "F",
+      },
+    ]
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+  })
+
+  it("accepts a race manifest entry with multiple grade definitions (races are not single-grade)", async () => {
+    const good: WikiReviewedEntry[] = [
+      raceEntry("multi-race", {
+        raceType: "enlightened",
+        naturalGrade: "F",
+        raceDefinitions: {
+          F: { id: "r:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+          G: { id: "r:G", perLevel: { strength: 2 }, freePerLevel: 2 },
+        },
+      }),
+    ]
+    const preview = await previewWikiReviewedImport(good)
+    expect(preview.createCount).toBe(1)
+    expect(preview.skipCount).toBe(0)
+    const result = await applyWikiReviewedImport(good)
+    expect(result.createCount).toBe(1)
+    const race = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "multi-race"
+    )!
+    expect(race.kind).toBe("races")
   })
 })

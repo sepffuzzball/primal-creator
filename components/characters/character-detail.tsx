@@ -5191,8 +5191,7 @@ export function CharacterDetail({
               </CardContent>
             </Card>
             <p className="mt-3 text-sm whitespace-pre-wrap text-muted-foreground">
-              {character.classGradeDescription ??
-                "No description for this grade"}
+              {character.classDescription ?? "No class description"}
             </p>
             <section
               className="mt-3 flex flex-col gap-2"
@@ -5327,8 +5326,7 @@ export function CharacterDetail({
               </CardContent>
             </Card>
             <p className="mt-3 text-sm whitespace-pre-wrap text-muted-foreground">
-              {character.professionGradeDescription ??
-                "No description for this grade"}
+              {character.professionDescription ?? "No profession description"}
             </p>
             <section
               className="mt-3 flex flex-col gap-2"

@@ -597,19 +597,16 @@ describe("grade skill grants", () => {
             },
           ],
         }
+      if (init?.method === "POST") return { item: record }
       if (init?.method === "PATCH") return { item: record }
       throw new Error(`unexpected url ${url}`)
     })
     return mock
   }
 
-  function chooseGrantGrade(grade: string) {
-    const controls = screen.getByLabelText("Grant grade")
-    const button = [...controls.querySelectorAll("button")].find(
-      (entry) => entry.textContent === grade
-    )
-    if (!button) throw new Error(`missing grade button ${grade}`)
-    fireEvent.click(button)
+  function chooseEntryGrade(grade: string) {
+    fireEvent.click(screen.getByRole("combobox", { name: "Grade" }))
+    fireEvent.click(screen.getByRole("option", { name: grade }))
   }
 
   function addGrant(stableId: string) {
@@ -703,26 +700,27 @@ describe("grade skill grants", () => {
     expect(body.config.raceDefinitions).toEqual(race.config.raceDefinitions)
   })
 
-  it("keeps independent class skill grants across grade switches and persists stable IDs", async () => {
+  it("moves the sole class gains row and grants when grade changes", async () => {
     const gains = {
       G: { fixed: { strength: 1 }, free: 2 },
-      F: { fixed: { agility: 3 }, free: 4 },
     }
-    const mock = setupStructuredEdit("classes", { grades: gains })
+    const mock = setupStructuredEdit("classes", {
+      grades: gains,
+      gradeGrantedSkillStableIds: { G: ["skill-one"] },
+      extra: "retain",
+    })
     render(<CatalogManager kind="classes" />)
     await flush()
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
-    chooseGrantGrade("F")
-    addGrant("skill-one")
+    chooseEntryGrade("F")
+    expect((screen.getByLabelText("strength") as HTMLInputElement).value).toBe(
+      "1"
+    )
     addGrant("skill-two")
     expect((screen.getByText("Add skill") as HTMLButtonElement).disabled).toBe(
       true
     )
-    chooseGrantGrade("G")
-    addGrant("skill-two")
-    chooseGrantGrade("F")
-    expect(screen.getByText("Skill One")).toBeTruthy()
     expect(screen.getByText("Skill Two")).toBeTruthy()
     fireEvent.click(screen.getByText("Save"))
     await flush()
@@ -732,18 +730,40 @@ describe("grade skill grants", () => {
     const config = savedConfig(mock)
     expect(config.gradeGrantedSkillStableIds).toEqual({
       F: ["skill-one", "skill-two"],
-      G: ["skill-two"],
     })
     expect(JSON.stringify(config.gradeGrantedSkillStableIds)).not.toContain(
       "db-skill"
     )
-    expect(config.grades).toEqual(gains)
+    expect(config.grades).toEqual({ F: gains.G })
+    expect(config.extra).toBe("retain")
   })
 
-  it("removes and adds profession grants while preserving grade gains", async () => {
+  it("merges existing destination grants with source grants on grade change", async () => {
+    const gains = { G: { fixed: { strength: 1 }, free: 2 } }
+    const mock = setupStructuredEdit("classes", {
+      grades: gains,
+      gradeGrantedSkillStableIds: {
+        G: ["shared-skill", "source-only"],
+        F: ["destination-only", "shared-skill"],
+      },
+    })
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    chooseEntryGrade("F")
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const config = savedConfig(mock)
+    expect(config.gradeGrantedSkillStableIds).toEqual({
+      F: ["destination-only", "shared-skill", "source-only"],
+    })
+    expect(config.grades).toEqual({ F: gains.G })
+  })
+
+  it("moves profession grants and preserves gains when grade changes", async () => {
     const gains = {
       G: { fixed: { wisdom: 2 }, free: 1 },
-      F: { fixed: { vitality: 3 }, free: 2 },
     }
     const mock = setupStructuredEdit("professions", {
       grades: gains,
@@ -754,6 +774,7 @@ describe("grade skill grants", () => {
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
     expect(screen.getByText("Skill One")).toBeTruthy()
+    chooseEntryGrade("F")
     fireEvent.click(screen.getByRole("button", { name: "Remove Skill One" }))
     addGrant("skill-two")
     fireEvent.click(screen.getByText("Save"))
@@ -773,12 +794,74 @@ describe("grade skill grants", () => {
       "PATCH",
     ])
     const config = savedConfig(mock)
-    expect(config.gradeGrantedSkillStableIds).toEqual({ G: ["skill-two"] })
+    expect(config.gradeGrantedSkillStableIds).toEqual({ F: ["skill-two"] })
     expect(JSON.stringify(config.gradeGrantedSkillStableIds)).not.toContain(
       "db-skill"
     )
-    expect(config.grades).toEqual(gains)
+    expect(config.grades).toEqual({ F: gains.G })
   })
+
+  it.each(["classes", "professions"] as const)(
+    "moves grants authored before gains when a new %s changes grade",
+    async (kind) => {
+      const mock = setupStructuredEdit(kind, { grades: {} })
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+      await flush()
+      fireEvent.change(screen.getByLabelText(/Name/), {
+        target: { value: "Fresh" },
+      })
+      chooseEntryGrade("G")
+      addGrant("skill-one")
+      chooseEntryGrade("F")
+      fireEvent.change(screen.getByLabelText("strength"), {
+        target: { value: "2" },
+      })
+      fireEvent.click(screen.getByText("Save"))
+      await flush()
+      const call = mock.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+      )
+      const body = JSON.parse((call?.[1] as RequestInit).body as string)
+      expect(body.config.gradeGrantedSkillStableIds).toEqual({
+        F: ["skill-one"],
+      })
+      expect(body.config.grades).toEqual({
+        F: { fixed: { strength: 2 }, free: 0 },
+      })
+    }
+  )
+
+  it.each(["classes", "professions"] as const)(
+    "moves authored new %s gains and grants when grade changes",
+    async (kind) => {
+      const mock = setupStructuredEdit(kind, { grades: {} })
+      // Start from the create flow; the catalog response is only used to load the list.
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+      await flush()
+      fireEvent.change(screen.getByLabelText(/Name/), {
+        target: { value: "Fresh" },
+      })
+      chooseEntryGrade("G")
+      fireEvent.change(screen.getByLabelText("strength"), {
+        target: { value: "2" },
+      })
+      chooseEntryGrade("F")
+      fireEvent.click(screen.getByText("Save"))
+      await flush()
+      const call = mock.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.method === "POST"
+      )
+      expect(call).toBeTruthy()
+      const body = JSON.parse((call?.[1] as RequestInit).body as string)
+      expect(body.grade).toBe("F")
+      expect(Object.keys(body.config.grades)).toEqual(["F"])
+      expect(body.config.gradeGrantedSkillStableIds ?? {}).toEqual({})
+    }
+  )
 
   it("filters a large grant list by name and stable ID, clears filters, and saves hidden grants intact", async () => {
     const existingIds = ["hidden-skill"]
@@ -873,6 +956,125 @@ describe("grade skill grants", () => {
       F: ["other-grade-grant"],
     })
   })
+
+  it.each(["classes", "professions"] as const)(
+    "allows metadata-only edit for a zero-row %s without fabricating progression",
+    async (kind) => {
+      const mock = setupStructuredEdit(kind, { grades: {}, untouched: true })
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Edit"))
+      await flush()
+      expect(
+        (screen.getByLabelText("Free points") as HTMLInputElement).value
+      ).toBe("")
+      fireEvent.change(screen.getByLabelText(/Name/), {
+        target: { value: `Renamed ${kind}` },
+      })
+      fireEvent.click(screen.getByText("Save"))
+      await flush()
+      const call = mock.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+      )
+      expect(call).toBeTruthy()
+      expect(
+        JSON.parse((call?.[1] as RequestInit).body as string)
+      ).not.toHaveProperty("config")
+    }
+  )
+
+  it.each(["classes", "professions"] as const)(
+    "warns and blocks progression edits for legacy multi-grade %s",
+    async (kind) => {
+      const config = {
+        grades: {
+          G: { fixed: { strength: 1 }, free: 0 },
+          F: { fixed: { agility: 2 }, free: 1 },
+        },
+        gradeGrantedSkillStableIds: { G: ["skill-one"] },
+      }
+      const mock = setupStructuredEdit(kind, config)
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Edit"))
+      await flush()
+      expect(
+        [...screen.getAllByRole("alert")].some((alert) =>
+          alert.textContent?.includes("multiple gains rows")
+        )
+      ).toBe(true)
+      expect(
+        (screen.getByRole("combobox", { name: "Grade" }) as HTMLButtonElement)
+          .disabled
+      ).toBe(true)
+      fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+        target: { value: JSON.stringify({ ...config, note: "edit" }) },
+      })
+      fireEvent.click(screen.getByText("Save"))
+      await flush()
+      expect(
+        [...screen.getAllByRole("alert")].some((alert) =>
+          alert.textContent?.includes("multiple gains rows")
+        )
+      ).toBe(true)
+      expect(
+        mock.mock.calls.some(
+          ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+        )
+      ).toBe(false)
+    }
+  )
+
+  it("allows explicit Advanced JSON normalization of legacy multi-grade config", async () => {
+    const original = {
+      grades: {
+        G: { fixed: { strength: 1 }, free: 0 },
+        F: { fixed: { agility: 2 }, free: 1 },
+      },
+      gradeGrantedSkillStableIds: { G: ["skill-one"], F: ["skill-two"] },
+    }
+    const mock = setupStructuredEdit("classes", original)
+    render(<CatalogManager kind="classes" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Edit"))
+    await flush()
+    fireEvent.change(screen.getByLabelText("Config (JSON)"), {
+      target: {
+        value: JSON.stringify({
+          ...original,
+          grades: { G: original.grades.G },
+          gradeGrantedSkillStableIds: { G: ["skill-one"] },
+        }),
+      },
+    })
+    fireEvent.click(screen.getByText("Save"))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH"
+    )
+    expect(call).toBeTruthy()
+    const body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body.config.grades).toEqual({ G: original.grades.G })
+    expect(body.config.gradeGrantedSkillStableIds).toEqual({ G: ["skill-one"] })
+  })
+
+  it.each(["classes", "professions"] as const)(
+    "shows unavailable legacy skill grant IDs for %s",
+    async (kind) => {
+      setupStructuredEdit(kind, {
+        grades: { G: { fixed: {}, free: 0 } },
+        gradeGrantedSkillStableIds: { G: ["retired-skill"] },
+      })
+      render(<CatalogManager kind={kind} />)
+      await flush()
+      fireEvent.click(screen.getByLabelText("Edit"))
+      await flush()
+      expect(
+        screen.getByText("retired-skill (archived or unavailable)")
+      ).toBeTruthy()
+      expect(screen.queryByLabelText("Grant grade")).toBeNull()
+    }
+  )
 })
 
 describe("structured catalog editors", () => {
@@ -1455,11 +1657,11 @@ describe("structured catalog editors", () => {
       "perception",
       "willpower",
     ]) {
-      fireEvent.change(screen.getByLabelText(`F ${key}`), {
+      fireEvent.change(screen.getByLabelText(key), {
         target: { value: "0" },
       })
     }
-    fireEvent.change(screen.getByLabelText("F Free points"), {
+    fireEvent.change(screen.getByLabelText("Free points"), {
       target: { value: "0" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
@@ -1833,6 +2035,7 @@ describe("bloodline visual editor", () => {
         custom: { retained: true },
       })
     )
+
     render(<CatalogManager kind="bloodlines" />)
     await flush()
     fireEvent.click(screen.getByLabelText("Edit"))
@@ -2143,7 +2346,7 @@ describe("structured catalog editor legacy and sparse rows", () => {
     expect((body.config as Record<string, unknown>).raceType).toBe("monster")
   })
 
-  it("edits a graded row's legacy description without using it as a grade fallback", async () => {
+  it("uses the general description and hides grade prose controls for classes", async () => {
     const graded = {
       ...item,
       kind: "classes",
@@ -2161,16 +2364,9 @@ describe("structured catalog editor legacy and sparse rows", () => {
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
 
-    expect(screen.queryByLabelText("Description")).toBeNull()
-    fireEvent.click(
-      screen.getByText(
-        "Legacy general description (not displayed in grade tabs)"
-      )
-    )
-    const legacyField = screen.getByLabelText("Legacy general description")
+    const legacyField = screen.getByLabelText("Description")
     expect((legacyField as HTMLTextAreaElement).value).toBe("Legacy overview")
-    const gradeField = screen.getByLabelText("G-grade description")
-    expect((gradeField as HTMLTextAreaElement).value).toBe("")
+    expect(screen.queryByLabelText("Descriptions by grade")).toBeNull()
     fireEvent.change(legacyField, { target: { value: "Updated legacy text" } })
     fireEvent.click(screen.getByText("Save"))
     await flush()
@@ -2196,9 +2392,9 @@ describe("structured catalog editor legacy and sparse rows", () => {
     await flush()
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
-    fireEvent.click(screen.getByRole("tab", { name: "F" }))
-    fireEvent.change(screen.getByLabelText("F-grade description"), {
-      target: { value: "Updated grade text" },
+    expect(screen.queryByRole("tab", { name: "F" })).toBeNull()
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "Legacy class renamed" },
     })
     fireEvent.click(screen.getByText("Save"))
     await flush()
@@ -2208,7 +2404,8 @@ describe("structured catalog editor legacy and sparse rows", () => {
       (calls[0][1] as RequestInit).body as string
     ) as Record<string, unknown>
     expect(body).not.toHaveProperty("config")
-    expect(body.gradeDescriptions).toEqual({ F: "Updated grade text" })
+    expect(body.name).toBe("Legacy class renamed")
+    expect(body).not.toHaveProperty("gradeDescriptions")
   })
 
   it("creates a race entering only free points, serializing a sparse perLevel vector", async () => {
@@ -2249,7 +2446,10 @@ describe("structured catalog editor legacy and sparse rows", () => {
       target: { value: "Vanguard" },
     })
     fireEvent.click(screen.getByRole("option", { name: "F" }))
-    fireEvent.change(screen.getByLabelText("F Free points"), {
+    expect(
+      (screen.getByLabelText("Free points") as HTMLInputElement).value
+    ).toBe("")
+    fireEvent.change(screen.getByLabelText("Free points"), {
       target: { value: "2" },
     })
     fireEvent.click(screen.getByText("Save"))

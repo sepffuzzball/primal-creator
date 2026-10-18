@@ -915,6 +915,32 @@ export function skillGradeDescriptionsForbidden(
 }
 
 /**
+ * A `classes` / `professions` catalog entry is a SINGLE-grade definition: the
+ * entry's `grade` column is the one grade it belongs to, and its `config.grades`
+ * map authorizes exactly that one grade. Like a skill, it carries no authored
+ * grade-specific prose - the legacy `description` is the prose for that one grade
+ * - so `gradeDescriptions` must be empty (`{}`) or omitted (`undefined`). A
+ * non-empty map on a write/import is rejected with 400
+ * `invalid_grade_descriptions`, before any write; an empty `{}` (a legal clear) is
+ * fine. A null/omitted value is legal. Returns true when `kind` is `classes` or
+ * `professions` AND `gradeDescriptions` is a non-empty object.
+ */
+export function trackGradeDescriptionsForbidden(
+  kind: string,
+  gradeDescriptions: unknown
+): boolean {
+  if (kind !== "classes" && kind !== "professions") return false
+  if (gradeDescriptions == null) return false
+  if (
+    typeof gradeDescriptions !== "object" ||
+    Array.isArray(gradeDescriptions)
+  ) {
+    return true
+  }
+  return Object.keys(gradeDescriptions).length > 0
+}
+
+/**
  * The advancement-track kinds that always carry a required catalog grade. A
  * race/class/profession is graded by definition - its `grade` is how the engine
  * pins a track to a per-grade definition (see `resolveTrackDefinition`) and is
@@ -1162,6 +1188,74 @@ export const trackConfigSchema = z
     gradeGrantedSkillStableIds: gradeGrantedSkillStableIdsSchema.optional(),
   })
   .passthrough()
+
+/**
+ * Diagnose a `classes`/`professions` catalog config that is not a valid single-grade
+ * track definition for a NEW or CONFIG/GRADE-changing write.
+ *
+ * A class/profession is a SINGLE-grade definition: its catalog `grade` column is the
+ * one grade it belongs to, and its `config.grades` map must authorize EXACTLY that
+ * one grade (the one matching `grade`) with a valid row. `gradeGrantedSkillStableIds`
+ * may be absent/empty or may declare ONLY the selected grade key. Legacy rows that
+ * predate this invariant (zero-grade, multi-grade, or a grade-less entry) stay
+ * readable and are freely metadata-only-PATCHable; this helper is never invoked for a
+ * metadata-only edit. Non-track kinds return null (no issue).
+ *
+ * Returns a concise, actionable issue string, or null when the config is valid.
+ */
+export function singleGradeTrackIssue(
+  kind: string,
+  grade: unknown,
+  config: Record<string, unknown>
+): string | null {
+  if (kind !== "classes" && kind !== "professions") return null
+
+  // A class/profession must carry a valid G..S catalog grade; never null.
+  if (
+    typeof grade !== "string" ||
+    !gradeSchema.options.includes(grade as (typeof gradeSchema.options)[number])
+  ) {
+    const shown = grade == null ? "null" : JSON.stringify(grade)
+    return `A ${kind} entry must carry a valid catalog grade (G,F,E,D,C,B,A,S); got ${shown}`
+  }
+
+  // config.grades must be a grade-keyed object with exactly one key.
+  const grades = config.grades
+  if (grades == null || typeof grades !== "object" || Array.isArray(grades)) {
+    return `A ${kind} entry must define a single-grade "grades" map`
+  }
+  const keys = Object.keys(grades as Record<string, unknown>)
+  if (keys.length === 0) {
+    return `A ${kind} entry's "grades" must define exactly its one grade "${grade}" (found none)`
+  }
+  if (keys.length > 1) {
+    return `A ${kind} entry's "grades" must define exactly its one grade "${grade}" (found ${keys.length}: ${keys.join(", ")})`
+  }
+  const declaredKey = keys[0]
+  if (declaredKey !== grade) {
+    return `A ${kind} entry's "grades" must define its own grade "${grade}" (found "${declaredKey}")`
+  }
+  const row = (grades as Record<string, unknown>)[declaredKey]
+  if (row == null || typeof row !== "object" || Array.isArray(row)) {
+    return `The "${grade}" grade row in "grades" must be an object with "fixed" and "free"`
+  }
+
+  // gradeGrantedSkillStableIds, when present, may only declare the selected grade.
+  const grants = config.gradeGrantedSkillStableIds
+  if (grants != null) {
+    if (typeof grants !== "object" || Array.isArray(grants)) {
+      return `"gradeGrantedSkillStableIds" must be a grade-keyed map`
+    }
+    const extra = Object.keys(grants as Record<string, unknown>).filter(
+      (g) => g !== grade
+    )
+    if (extra.length > 0) {
+      return `A ${kind} entry's "gradeGrantedSkillStableIds" may only declare its own grade "${grade}" (found ${extra.join(", ")})`
+    }
+  }
+
+  return null
+}
 
 // ------------------------------------------------------------------ //
 // Equipment metadata (slot / rarity / soulbound / eligibility)

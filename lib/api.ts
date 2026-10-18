@@ -678,6 +678,22 @@ export interface CharacterDetail {
    * legacy `description`.
    */
   professionGradeDescription: string | null
+  /**
+   * General catalog prose for the character's linked class definition, read from
+   * the live definition (`character.class.description`). Never falls back to the
+   * authored grade-specific `classGradeDescription`. `null` when the class
+   * definition is missing or carries no prose. Exposed even for an archived
+   * definition.
+   */
+  classDescription: string | null
+  /**
+   * General catalog prose for the character's linked profession definition, read
+   * from the live definition (`character.profession.description`). Never falls
+   * back to the authored grade-specific `professionGradeDescription`. `null` when
+   * the profession definition is missing or carries no prose. Exposed even for an
+   * archived definition.
+   */
+  professionDescription: string | null
   state: CharacterState
   version: number
   archived: boolean

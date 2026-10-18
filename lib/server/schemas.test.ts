@@ -47,6 +47,7 @@ import {
   rarityOrderIndex,
   raritySchema,
   requiredGradeNullForbidden,
+  singleGradeTrackIssue,
   skillClassStableIdOf,
   skillConfigSchema,
   skillGradeDescriptionsForbidden,
@@ -57,6 +58,7 @@ import {
   titleConfigSchema,
   titleImprovementSchema,
   trackConfigSchema,
+  trackGradeDescriptionsForbidden,
   transcendentSkillConfigSchema,
 } from "@/lib/server/schemas"
 
@@ -2720,5 +2722,112 @@ describe("associationSchema (blessing tier requirement)", () => {
       version: 0,
     })
     expect(parsed.success).toBe(true)
+  })
+})
+
+describe("singleGradeTrackIssue (class/profession single-grade validation)", () => {
+  function singleGradeConfig(grade: string): Record<string, unknown> {
+    return {
+      grades: { [grade]: { fixed: { agility: 2 }, free: 1 } },
+    }
+  }
+
+  it("returns null for a valid single-grade class config", () => {
+    expect(
+      singleGradeTrackIssue("classes", "F", singleGradeConfig("F"))
+    ).toBeNull()
+  })
+
+  it("returns null for a valid single-grade profession config", () => {
+    expect(
+      singleGradeTrackIssue("professions", "G", singleGradeConfig("G"))
+    ).toBeNull()
+  })
+
+  it("returns null for any non-track kind (race multi-grade is unaffected)", () => {
+    expect(
+      singleGradeTrackIssue("races", "F", { raceDefinitions: {} })
+    ).toBeNull()
+    expect(singleGradeTrackIssue("skills", null, {})).toBeNull()
+  })
+
+  it("rejects a zero-grade grades map", () => {
+    expect(singleGradeTrackIssue("classes", "F", { grades: {} })).toContain(
+      "exactly its one grade"
+    )
+  })
+
+  it("rejects a multiple-grade grades map", () => {
+    expect(
+      singleGradeTrackIssue("classes", "F", {
+        grades: {
+          F: { fixed: { agility: 2 }, free: 1 },
+          E: { fixed: { agility: 3 }, free: 1 },
+        },
+      })
+    ).toContain("exactly its one grade")
+  })
+
+  it("rejects a grades map whose single key does not match the catalog grade", () => {
+    expect(
+      singleGradeTrackIssue("classes", "F", singleGradeConfig("E"))
+    ).toContain("found")
+  })
+
+  it("rejects grade-granted skills declaring another grade", () => {
+    const config = {
+      grades: { F: { fixed: { agility: 2 }, free: 1 } },
+      gradeGrantedSkillStableIds: { E: ["sk-1"] },
+    }
+    expect(singleGradeTrackIssue("classes", "F", config)).toContain(
+      "gradeGrantedSkillStableIds"
+    )
+  })
+
+  it("accepts grade-granted skills declaring only the selected grade", () => {
+    const config = {
+      grades: { F: { fixed: { agility: 2 }, free: 1 } },
+      gradeGrantedSkillStableIds: { F: ["sk-1"] },
+    }
+    expect(singleGradeTrackIssue("classes", "F", config)).toBeNull()
+  })
+
+  it("rejects a null (or missing) grade", () => {
+    expect(
+      singleGradeTrackIssue("classes", null, singleGradeConfig("F"))
+    ).toContain("valid catalog grade")
+    expect(
+      singleGradeTrackIssue("classes", undefined, singleGradeConfig("F"))
+    ).toContain("valid catalog grade")
+  })
+
+  it("rejects a grades config that is not an object", () => {
+    expect(singleGradeTrackIssue("classes", "F", {})).toContain(
+      'single-grade "grades" map'
+    )
+    expect(singleGradeTrackIssue("classes", "F", { grades: [] })).toContain(
+      'single-grade "grades" map'
+    )
+  })
+})
+
+describe("trackGradeDescriptionsForbidden (class/profession prose ban)", () => {
+  it("returns false for a non-track kind and for empty/omitted maps", () => {
+    expect(trackGradeDescriptionsForbidden("races", { F: "x" })).toBe(false)
+    expect(trackGradeDescriptionsForbidden("classes", undefined)).toBe(false)
+    expect(trackGradeDescriptionsForbidden("classes", null)).toBe(false)
+    expect(trackGradeDescriptionsForbidden("classes", {})).toBe(false)
+  })
+
+  it("returns true for a non-empty class/profession gradeDescriptions map", () => {
+    expect(trackGradeDescriptionsForbidden("classes", { F: "x" })).toBe(true)
+    expect(trackGradeDescriptionsForbidden("professions", { F: "x" })).toBe(
+      true
+    )
+  })
+
+  it("returns true for a malformed gradeDescriptions value", () => {
+    expect(trackGradeDescriptionsForbidden("classes", [])).toBe(true)
+    expect(trackGradeDescriptionsForbidden("classes", "x")).toBe(true)
   })
 })

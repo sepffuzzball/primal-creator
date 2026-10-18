@@ -65,6 +65,50 @@ evolution is then a catalog-driven per-track path choice with **no** grade-only
 legacy fallback (see `docs/rules/evolution.md`). A monster race is race-only and
 carries no class at all (see `docs/rules/races.md`).
 
+## Catalog definition (single-grade)
+
+A `classes` catalog entry is a SINGLE-grade definition: its `grade` column is the
+one grade it belongs to, and its `config.grades` map must authorize exactly that
+one grade - the key matching `grade` - with a valid per-level row (a missing,
+extra, or mismatched grade row is rejected with 400 `invalid_config` on creation
+or a config/grade-changing edit). The optional auto-grant map, when present, may
+only declare that same grade key (`gradeGrantedSkillStableIds[<grade>]`); a key
+for any other grade is rejected. Races are the opposite and remain multi-grade: a
+`races` entry authorizes many `raceDefinitions` (one per grade) and a separate
+`gradeGrantedSkillStableIds` map keyed across all grades.
+
+The admin editor renders a class as a single row at one grade. Changing the grade
+in the editor moves the existing `grades[<oldGrade>]` gains row (and any
+`gradeGrantedSkillStableIds[<oldGrade>]` grants) onto the new grade key, so the
+per-level progression and the auto-grants travel with the grade change. The grade
+selector is disabled on a legacy multi-row entry, and a config-changing edit on
+such an entry is refused until the rows are resolved to a single grade.
+
+A class carries no authored grade-specific prose: `gradeDescriptions`, when sent
+on a new or config/grade-changing write, must be empty (`{}`) or omitted; a
+non-empty map is rejected with 400 `invalid_grade_descriptions`. The legacy
+`description` string is the prose for the class's one grade, and it is what the
+character detail **class** tab shows (via `classDescription`). A legacy class row
+that still stores an authored `gradeDescriptions` map keeps returning it on the
+API (as `classGradeDescription`), but the UI does not display it - it shows the
+general `description` instead. Legacy authored grade prose is never migrated or
+cleared; it is simply no longer shown by the UI nor newly authored.
+
+A **grade-only PATCH** - changing `grade` without supplying `config` in the same
+PATCH - is rejected with 400 `invalid_config`, because otherwise the single-grade
+`grades` map would be silently rekeyed to the wrong grade. A metadata-only PATCH
+(no `grade`, no `config`) leaves a legacy empty or multi-row class alone.
+
+A legacy class row that is **empty** (no `grades` entry for any grade) or
+**multi-grade** (more than one `grades` row) stays readable and metadata-only
+PATCHable (name, description, sourceUrl, archived). It cannot be newly created
+that way, and a config-changing PATCH must first normalize it to a single grade
+row - the editor refuses a config change on such an entry until the rows are
+resolved. No database migration clears or rewrites these rows today; the deployed
+catalog still contains 18 legacy zero-row classes, which remain visible and
+metadata-editable but must be normalized before their progression config can
+change.
+
 ## Seeded class definitions (`db:seed`)
 
 `pnpm db:seed` seeds the curated Jake Thayne class progression
@@ -73,13 +117,13 @@ carries no class at all (see `docs/rules/races.md`).
 (secondary fan-wiki source) carries exactly one `grades.<grade>` entry for its own
 grade:
 
-| Grade | Name | stableId |
-| ----- | ---- | -------- |
-| F | Archer | `archer` |
-| E | Ambitious Hunter | `ambitious-hunter` |
-| D | Avaricious Arcane Hunter | `avaricious-arcane-hunter` |
-| C | Arcane Hunter of Horizon's Edge | `arcane-hunter-of-horizons-edge` |
-| B | Arcane Hunter of the Boundless Horizon | `arcane-hunter-of-the-boundless-horizon` |
+| Grade | Name                                   | stableId                                 |
+| ----- | -------------------------------------- | ---------------------------------------- |
+| F     | Archer                                 | `archer`                                 |
+| E     | Ambitious Hunter                       | `ambitious-hunter`                       |
+| D     | Avaricious Arcane Hunter               | `avaricious-arcane-hunter`               |
+| C     | Arcane Hunter of Horizon's Edge        | `arcane-hunter-of-horizons-edge`         |
+| B     | Arcane Hunter of the Boundless Horizon | `arcane-hunter-of-the-boundless-horizon` |
 
 The legacy `classes/archer` row (a house placeholder granting only agility +
 perception) is updated to the sourced F-grade Archer values only when it still

@@ -89,12 +89,14 @@ import {
   parseCatalogConfig,
   rarityOrderIndex,
   requiredGradeNullForbidden,
+  singleGradeTrackIssue,
   skillClassStableIdOf,
   SKILL_UPGRADE_TARGET_LIMIT,
   skillUpgradeCloneSchema,
   skillGradeDescriptionsForbidden,
   skillGradeForbidden,
   titleImprovementSchema,
+  trackGradeDescriptionsForbidden,
   legacyRingPositionForConfig,
   type BlessingTier,
   type TitleImprovement,
@@ -402,6 +404,22 @@ export interface CharacterDetail {
    * legacy `description`.
    */
   professionGradeDescription: string | null
+  /**
+   * General catalog prose for the character's linked class definition, read from
+   * the live definition (`character.class.description`). Never falls back to the
+   * authored grade-specific `classGradeDescription`. `null` when the class
+   * definition is missing or carries no prose. Exposed even for an archived
+   * definition.
+   */
+  classDescription: string | null
+  /**
+   * General catalog prose for the character's linked profession definition, read
+   * from the live definition (`character.profession.description`). Never falls
+   * back to the authored grade-specific `professionGradeDescription`. `null` when
+   * the profession definition is missing or carries no prose. Exposed even for an
+   * archived definition.
+   */
+  professionDescription: string | null
   state: unknown
   version: number
   archived: boolean
@@ -2052,6 +2070,8 @@ async function toDetail(
     raceGradeDescription,
     classGradeDescription,
     professionGradeDescription,
+    classDescription: character.class?.description ?? null,
+    professionDescription: character.profession?.description ?? null,
     state: character.state,
     version: character.version,
     archived: character.archived,
@@ -9755,7 +9775,23 @@ export async function createCatalogItemInTransaction(
       'Skills carry no grade ladder: "gradeDescriptions" must be empty or omitted'
     )
   }
+  // A new class/profession is a SINGLE-grade definition: it carries no authored
+  // grade-specific prose (the legacy `description` is the prose for that one grade),
+  // so gradeDescriptions must be empty (`{}`) or omitted. A non-empty map is
+  // rejected before any write.
+  if (trackGradeDescriptionsForbidden(kind, input.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      'Classes and professions carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+    )
+  }
   const config = parseConfigOr400(kind, input.config ?? {})
+  // A new class/profession is a single-grade definition: its catalog `grade` must be
+  // a valid G..S grade and its `grades` map must authorize exactly that one grade.
+  if (kind === "classes" || kind === "professions") {
+    const issue = singleGradeTrackIssue(kind, input.grade, config)
+    if (issue) throw badRequest("invalid_config", issue)
+  }
   if (kind === "skills" && isIncompleteSkillConfig(config)) {
     throw badRequest(
       "invalid_config",
@@ -10745,9 +10781,42 @@ export async function updateCatalogItemInTransaction(
   if (!existing || existing.kind !== kind) {
     throw notFound("catalog_not_found", "Catalog entry not found")
   }
+  const isTrackKind = kind === "classes" || kind === "professions"
+  if (isTrackKind) {
+    // A class/profession is a SINGLE-grade definition, so it carries no authored
+    // grade-specific prose: a PATCH that explicitly sends a non-empty
+    // gradeDescriptions map is rejected, while `{}` (a legal clear) and an
+    // omitted value are fine. This runs even on a metadata-only PATCH.
+    if (trackGradeDescriptionsForbidden(kind, patch.gradeDescriptions)) {
+      throw badRequest(
+        "invalid_grade_descriptions",
+        'Classes and professions carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+      )
+    }
+    const gradeChanged =
+      patch.grade !== undefined && patch.grade !== existing.grade
+    // Changing a class/profession's catalog grade must be accompanied by the
+    // matching parsed config in the SAME PATCH - otherwise the single-grade
+    // `grades` map would be silently rekeyed to the wrong grade. A metadata-only
+    // PATCH (no grade, no config) leaves legacy zero-row/multi-row entries alone.
+    if (gradeChanged && patch.config == null) {
+      throw badRequest(
+        "invalid_config",
+        `Changing a ${kind} grade requires providing the ${kind} "config" in the same PATCH`
+      )
+    }
+  }
   let config: Record<string, unknown> | undefined
   if (patch.config != null) {
     config = parseConfigOr400(kind, patch.config)
+    // A config-changing class/profession PATCH is a single-grade write: the final
+    // grade (`patch.grade ?? existing.grade`) must match the parsed config's
+    // single-grade `grades` map.
+    if (isTrackKind) {
+      const finalGrade = patch.grade ?? existing.grade
+      const issue = singleGradeTrackIssue(kind, finalGrade, config)
+      if (issue) throw badRequest("invalid_config", issue)
+    }
     if (kind === "skills" && isIncompleteSkillConfig(config)) {
       throw badRequest(
         "invalid_config",

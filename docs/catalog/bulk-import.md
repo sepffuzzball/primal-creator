@@ -201,6 +201,18 @@ row being left without the field). It is optional and independent: it never
 populates or is populated from `description`, and never revalidates a legacy
 config. Old rows simply read back an empty `{}`.
 
+For `classes` and `professions`, `gradeDescriptions` is further restricted: each
+is a SINGLE-grade definition whose legacy `description` IS the prose for that one
+grade, so a non-empty `gradeDescriptions` map is rejected with 400
+`invalid_grade_descriptions` (an empty `{}` or an omitted value is legal). The
+entry must also be a valid single-grade definition: `grade` must be a valid G..S
+value and the `config.grades` map must authorize EXACTLY that one grade with a
+valid per-level row (a missing, extra, or mismatched row is 400
+`invalid_config`), and `gradeGrantedSkillStableIds`, when present, may only
+declare that same grade key. See
+[docs/rules/classes.md](../rules/classes.md) and
+[docs/rules/professions.md](../rules/professions.md).
+
 ## CSV format
 
 CSV must be RFC 4180, UTF-8 (a BOM is tolerated and stripped), with CRLF (or LF)
@@ -230,6 +242,13 @@ titles,legendary-prodigy,"Legendary Prodigy","{""flat"":{""strength"":10},""perc
 A new or config-changing `skill`/`equipment` config requires a `rarity`; an
 `equipment` config must also declare a canonical `slot` (see
 [docs/rules/equipment.md](../rules/equipment.md) for the slot name list).
+
+A `classes` / `professions` row is likewise a single-grade definition: the
+`grade` cell must be a valid G..S grade and the `config.grades` object must
+authorize exactly that one grade; a non-empty `gradeDescriptions` cell is
+rejected (400 `invalid_grade_descriptions`) because these kinds carry no authored
+grade prose. See [docs/rules/classes.md](../rules/classes.md) and
+[docs/rules/professions.md](../rules/professions.md).
 
 ## What is safe about it
 

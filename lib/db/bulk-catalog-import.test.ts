@@ -113,6 +113,8 @@ function classRow(stableId: string, extra: Record<string, unknown> = {}) {
     description: `Class of ${stableId}`,
     provenance: "house",
     sourceUrl: "https://example.com/class/" + stableId,
+    // A class/profession is a single-grade definition and always carries a grade.
+    grade: "F",
     config: { grades: { F: { fixed: { agility: 1 }, free: 0 } }, ...extra },
   }
 }
@@ -125,6 +127,8 @@ function professionRow(stableId: string, extra: Record<string, unknown> = {}) {
     description: `Profession of ${stableId}`,
     provenance: "house",
     sourceUrl: "https://example.com/profession/" + stableId,
+    // A class/profession is a single-grade definition and always carries a grade.
+    grade: "F",
     config: { grades: { F: { fixed: { wisdom: 1 }, free: 0 } }, ...extra },
   }
 }
@@ -1788,5 +1792,153 @@ describe("bulk skill grade ban and upgrade graph", () => {
     // The final-graph check runs before ANY write, so the valid first skill was
     // never persisted.
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+})
+
+// ------------------------------------------------------------------ //
+// Class / profession single-grade validation
+// ------------------------------------------------------------------ //
+
+describe("bulk class/profession single-grade validation", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("rejects a classes row with a zero-grade grades map (parse-time, no write)", () => {
+    const bad = { ...classRow("zero-cls", { grades: {} }), grade: "F" }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*grades/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a professions row with a multiple-grade grades map (parse-time, no write)", () => {
+    const bad = {
+      ...professionRow("multi-prof", {
+        grades: {
+          F: { fixed: { wisdom: 1 }, free: 0 },
+          G: { fixed: { wisdom: 2 }, free: 0 },
+        },
+      }),
+      grade: "F",
+    }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*exactly its one grade/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a classes row whose grades map does not match its catalog grade (parse-time, no write)", () => {
+    const bad = {
+      ...classRow("mismatch-cls", {
+        grades: { G: { fixed: { agility: 1 }, free: 0 } },
+      }),
+      grade: "F",
+    }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*grades/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a classes row that grants grade skills outside its selected grade (parse-time, no write)", () => {
+    const bad = {
+      ...classRow("grant-out-cls", {
+        gradeGrantedSkillStableIds: { G: [] },
+      }),
+      grade: "F",
+    }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_config" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*gradeGrantedSkillStableIds/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a classes row that carries authored gradeDescriptions (parse-time, no write)", () => {
+    const bad = {
+      ...classRow("prose-cls"),
+      grade: "F",
+      gradeDescriptions: { G: "A G-grade blurb" },
+    }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({
+        status: 400,
+        code: "invalid_grade_descriptions",
+      })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: .*no grade ladder/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("accepts a valid single-grade classes row and applies it", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([{ ...classRow("valid-cls"), grade: "F" }])
+    )
+    expect(entries).toHaveLength(1)
+    expect(entries[0].grade).toBe("F")
+    const result = await applyBulkImport(entries, "digest")
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "valid-cls"
+    )!
+    expect(row.kind).toBe("classes")
+    expect(row.grade).toBe("F")
+    expect(row.config).toMatchObject({
+      grades: { F: { fixed: { agility: 1 }, free: 0 } },
+    })
+  })
+
+  it("accepts a classes row that grants grade skills only for its selected grade", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        {
+          ...classRow("grant-in-cls", {
+            gradeGrantedSkillStableIds: { F: [] },
+          }),
+          grade: "F",
+        },
+      ])
+    )
+    const result = await applyBulkImport(entries, "digest")
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+  })
+
+  it("accepts a race row with multiple grade definitions (races are not single-grade)", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        race("multi-race", {
+          raceDefinitions: {
+            F: { id: "r:F", perLevel: { strength: 1 }, freePerLevel: 1 },
+            G: { id: "r:G", perLevel: { strength: 2 }, freePerLevel: 2 },
+          },
+        }),
+      ])
+    )
+    const result = await applyBulkImport(entries, "digest")
+    expect(result.createCount).toBe(1)
+    expect(result.skipCount).toBe(0)
+    const row = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "multi-race"
+    )!
+    expect(row.kind).toBe("races")
   })
 })

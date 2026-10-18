@@ -18334,6 +18334,300 @@ describe("catalog grade-specific descriptions (create/update/clear/preserve)", (
   })
 })
 
+describe("class/profession single-grade track validation (create/update)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  const kinds = ["classes", "professions"] as const
+
+  function singleGradeConfig(grade: string): Record<string, unknown> {
+    return {
+      grades: { [grade]: { fixed: { agility: 2 }, free: 1 } },
+    }
+  }
+
+  function seedSkill(stableId: string): void {
+    dbMock.store.addCatalog({
+      id: `skill-${stableId}`,
+      kind: "skills",
+      stableId,
+      name: `Skill ${stableId}`,
+      config: { track: "class", rarity: "Common" },
+    })
+  }
+
+  function seedTrack(
+    id: string,
+    kind: (typeof kinds)[number],
+    grade: string | null,
+    config: Record<string, unknown>
+  ): void {
+    dbMock.store.addCatalog({
+      id,
+      kind,
+      stableId: id,
+      name: `${kind} ${id}`,
+      grade,
+      config,
+    })
+  }
+
+  // ------------------------------------------------------------------ //
+  // Create
+  // ------------------------------------------------------------------ //
+
+  it("creates a valid single-grade class matching its catalog grade", async () => {
+    const item = await createCatalogItem("classes", {
+      name: "Archer",
+      stableId: "archer",
+      grade: "F",
+      config: singleGradeConfig("F"),
+    })
+    expect(item.grade).toBe("F")
+    expect(item.config).toMatchObject({
+      grades: { F: { fixed: { agility: 2 }, free: 1 } },
+    })
+  })
+
+  it("creates a valid single-grade profession matching its catalog grade", async () => {
+    const item = await createCatalogItem("professions", {
+      name: "Alchemist",
+      stableId: "alchemist",
+      grade: "G",
+      config: singleGradeConfig("G"),
+    })
+    expect(item.grade).toBe("G")
+    expect(item.config).toMatchObject({
+      grades: { G: { fixed: { agility: 2 }, free: 1 } },
+    })
+  })
+
+  it("rejects a track entry with zero grade rows for both kinds", async () => {
+    for (const kind of kinds) {
+      await expect(
+        createCatalogItem(kind, {
+          name: `Empty ${kind}`,
+          stableId: `empty-${kind}`,
+          grade: "F",
+          config: { grades: {} },
+        })
+      ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    }
+  })
+
+  it("rejects a track entry with multiple grade rows for both kinds", async () => {
+    for (const kind of kinds) {
+      await expect(
+        createCatalogItem(kind, {
+          name: `Multi ${kind}`,
+          stableId: `multi-${kind}`,
+          grade: "F",
+          config: {
+            grades: {
+              F: { fixed: { agility: 2 }, free: 1 },
+              E: { fixed: { agility: 3 }, free: 1 },
+            },
+          },
+        })
+      ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    }
+  })
+
+  it("rejects a track entry whose grades map declares a different grade for both kinds", async () => {
+    for (const kind of kinds) {
+      await expect(
+        createCatalogItem(kind, {
+          name: `Mismatch ${kind}`,
+          stableId: `mismatch-${kind}`,
+          grade: "F",
+          config: singleGradeConfig("E"),
+        })
+      ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    }
+  })
+
+  it("rejects a track entry whose grade-granted skills declare another grade for both kinds", async () => {
+    for (const kind of kinds) {
+      await expect(
+        createCatalogItem(kind, {
+          name: `GrantsOther ${kind}`,
+          stableId: `grants-other-${kind}`,
+          grade: "F",
+          config: {
+            grades: { F: { fixed: { agility: 2 }, free: 1 } },
+            gradeGrantedSkillStableIds: { E: ["sk-1"] },
+          },
+        })
+      ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    }
+  })
+
+  it("rejects a track entry with a null grade for both kinds", async () => {
+    for (const kind of kinds) {
+      await expect(
+        createCatalogItem(kind, {
+          name: `NoGrade ${kind}`,
+          stableId: `no-grade-${kind}`,
+          grade: null,
+          config: singleGradeConfig("F"),
+        })
+      ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    }
+  })
+
+  it("rejects a new track entry with non-empty gradeDescriptions for both kinds", async () => {
+    for (const kind of kinds) {
+      await expect(
+        createCatalogItem(kind, {
+          name: `Prose ${kind}`,
+          stableId: `prose-${kind}`,
+          grade: "F",
+          config: singleGradeConfig("F"),
+          gradeDescriptions: { F: "a grade blurb" },
+        })
+      ).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_grade_descriptions",
+      })
+    }
+  })
+
+  it("accepts an empty gradeDescriptions {} on a new class (a legal clear)", async () => {
+    const item = await createCatalogItem("classes", {
+      name: "Empty Prose",
+      stableId: "empty-prose",
+      grade: "F",
+      config: singleGradeConfig("F"),
+      gradeDescriptions: {},
+    })
+    expect(item.gradeDescriptions).toEqual({})
+  })
+
+  // ------------------------------------------------------------------ //
+  // Update
+  // ------------------------------------------------------------------ //
+
+  it("rejects a grade-only change without the same-PATCH config (no silent rekey)", async () => {
+    seedTrack("cls-up", "classes", "F", singleGradeConfig("F"))
+    await expect(
+      updateCatalogItem("classes", "cls-up", { grade: "E" })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+  })
+
+  it("rejects a config-changing update whose single grade does not match the final grade", async () => {
+    seedTrack("cls-mis", "classes", "F", singleGradeConfig("F"))
+    await expect(
+      updateCatalogItem("classes", "cls-mis", {
+        config: singleGradeConfig("E"),
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+  })
+
+  it("accepts a grade+config move (including grants) and rekeys the config", async () => {
+    seedSkill("sk-1")
+    seedTrack("cls-move", "classes", "F", singleGradeConfig("F"))
+    const updated = await updateCatalogItem("classes", "cls-move", {
+      grade: "E",
+      config: {
+        grades: { E: { fixed: { agility: 3 }, free: 0 } },
+        gradeGrantedSkillStableIds: { E: ["sk-1"] },
+      },
+    })
+    expect(updated.grade).toBe("E")
+    expect(updated.config).toMatchObject({
+      grades: { E: { fixed: { agility: 3 }, free: 0 } },
+      gradeGrantedSkillStableIds: { E: ["sk-1"] },
+    })
+    const row = dbMock.store.catalog.get("cls-move")!
+    expect((row as { grade: string }).grade).toBe("E")
+  })
+
+  it("preserves a metadata-only edit of a legacy zero-grade class", async () => {
+    seedTrack("cls-zero", "classes", "F", {})
+    const updated = await updateCatalogItem("classes", "cls-zero", {
+      name: "Renamed Zero",
+    })
+    expect(updated.name).toBe("Renamed Zero")
+    const row = dbMock.store.catalog.get("cls-zero")!
+    expect((row.config as Record<string, unknown>).grades).toBeUndefined()
+  })
+
+  it("preserves a metadata-only edit of a legacy multi-grade class", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-multi",
+      kind: "classes",
+      stableId: "cls-multi",
+      name: "Multi Grade",
+      config: {
+        grades: {
+          F: { fixed: { agility: 2 }, free: 1 },
+          E: { fixed: { agility: 3 }, free: 1 },
+        },
+      },
+    })
+    const updated = await updateCatalogItem("classes", "cls-multi", {
+      name: "Renamed Multi",
+    })
+    expect(updated.name).toBe("Renamed Multi")
+    const row = dbMock.store.catalog.get("cls-multi")!
+    expect((row.config as Record<string, unknown>).grades).toMatchObject({
+      F: { fixed: { agility: 2 }, free: 1 },
+      E: { fixed: { agility: 3 }, free: 1 },
+    })
+  })
+
+  it("rejects non-empty gradeDescriptions even on a metadata-only patch", async () => {
+    seedTrack("cls-prose", "classes", "F", singleGradeConfig("F"))
+    await expect(
+      updateCatalogItem("classes", "cls-prose", {
+        gradeDescriptions: { F: "a blurb" },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
+    })
+  })
+
+  it("accepts an empty gradeDescriptions {} clear on update", async () => {
+    dbMock.store.addCatalog({
+      id: "cls-clear",
+      kind: "classes",
+      stableId: "cls-clear",
+      name: "Clear",
+      grade: "F",
+      config: singleGradeConfig("F"),
+      gradeDescriptions: { F: "stale prose" },
+    })
+    const updated = await updateCatalogItem("classes", "cls-clear", {
+      gradeDescriptions: {},
+    })
+    expect(updated.gradeDescriptions).toEqual({})
+  })
+
+  it("leaves a race multi-grade definition unaffected (race is not a track kind)", async () => {
+    // singleGradeTrackIssue returns null for a race (non-track kind), so a
+    // multi-grade race config stays creatable and readable unchanged.
+    const item = await createCatalogItem("races", {
+      name: "Race",
+      stableId: "race-x",
+      grade: "B",
+      config: {
+        raceType: "enlightened",
+        naturalGrade: "B",
+        raceDefinitions: {
+          B: { id: "r:B", perLevel: { strength: 1 }, freePerLevel: 1 },
+        },
+      },
+    })
+    expect(item.config).toMatchObject({
+      raceDefinitions: {
+        B: { id: "r:B", perLevel: { strength: 1 }, freePerLevel: 1 },
+      },
+    })
+  })
+})
+
 describe("character detail grade-description exposure (owner-authorized detail)", () => {
   beforeEach(() => {
     dbMock.store.reset()
@@ -18585,6 +18879,96 @@ describe("character detail grade-description exposure (owner-authorized detail)"
     expect(detail.raceGradeDescription).toBeNull()
     expect(detail.classGradeDescription).toBeNull()
     expect(detail.professionGradeDescription).toBeNull()
+  })
+
+  it("exposes general class/profession descriptions independently of the grade-specific prose", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      description: "Human general description",
+    })
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      description: "Archer general description",
+      gradeDescriptions: { F: "Archer-grade-F prose" },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      description: "Alchemist general description",
+      gradeDescriptions: { E: "Alchemist-grade-E prose" },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    // The general catalog description is read from `description`, never the
+    // grade-specific prose, and the grade prose is still resolved independently.
+    expect(detail.classDescription).toBe("Archer general description")
+    expect(detail.professionDescription).toBe("Alchemist general description")
+    expect(detail.classGradeDescription).toBe("Archer-grade-F prose")
+    expect(detail.professionGradeDescription).toBe("Alchemist-grade-E prose")
+  })
+
+  it("returns null class/profession descriptions when the definition carries no general prose", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {})
+    // Class/profession definitions author ONLY grade-specific prose, never the
+    // general `description`; the general description must remain null and must not
+    // fall back to the grade prose.
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      gradeDescriptions: { F: "Archer F prose" },
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      gradeDescriptions: { E: "Alchemist E prose" },
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.classDescription).toBeNull()
+    expect(detail.professionDescription).toBeNull()
+    // The grade-specific prose is still resolved; it is not repurposed into the
+    // general description.
+    expect(detail.classGradeDescription).toBe("Archer F prose")
+    expect(detail.professionGradeDescription).toBe("Alchemist E prose")
+  })
+
+  it("exposes general class/profession descriptions even for archived definitions", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {})
+    seedDefinition("cls-a", "classes", "archer", "Archer", {
+      description: "Archived Archer description",
+      archived: true,
+    })
+    seedDefinition("prof-b", "professions", "alchemist", "Alchemist", {
+      description: "Archived Alchemist description",
+      archived: true,
+    })
+    seedCharacterWith({
+      raceId: "race-h",
+      classId: "cls-a",
+      professionId: "prof-b",
+      raceGrade: "G",
+      classGrade: "F",
+      professionGrade: "E",
+    })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.classDescription).toBe("Archived Archer description")
+    expect(detail.professionDescription).toBe("Archived Alchemist description")
+  })
+
+  it("returns null class/profession descriptions when no class/profession is linked", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {})
+    seedCharacterWith({ raceId: "race-h", raceGrade: "G" })
+    const detail = await getCharacter("chr-1", user)
+    expect(detail.className).toBeNull()
+    expect(detail.professionName).toBeNull()
+    expect(detail.classDescription).toBeNull()
+    expect(detail.professionDescription).toBeNull()
   })
 
   it("surfaces gradeDescription on a graded linked association at the definition's own grade", async () => {
@@ -22099,13 +22483,13 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
       definitionId: "sk-d1",
       kind: "SKILL",
     })
-    // Upgrade the destination row to grant sk-d2 at E.
+    // Upgrade the destination row to grant sk-d2 at E. The destination is a
+    // single-grade class definition (grade E), so the config-changing PATCH must
+    // carry that grade and authorize exactly its one grade.
     await updateCatalogItem("classes", "cls-ev", {
+      grade: "E",
       config: {
-        grades: {
-          F: { fixed: { agility: 2 }, free: 0 },
-          E: { fixed: { agility: 3 }, free: 0 },
-        },
+        grades: { E: { fixed: { agility: 3 }, free: 0 } },
         gradeGrantedSkillStableIds: { E: ["sk-d2"] },
       },
     })
@@ -22252,6 +22636,7 @@ describe("grade-granted skills (per-grade automatic skill grants)", () => {
       kind: "classes",
       stableId: "archer",
       name: "Archer",
+      grade: "F",
       config: { grades: { F: { fixed: { agility: 2 }, free: 1 } } },
     })
     await expect(

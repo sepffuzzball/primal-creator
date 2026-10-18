@@ -64,9 +64,28 @@ The field is accepted wherever a catalog item can be created or edited:
 - Bulk import (`docs/catalog/bulk-import.md`) - optional `gradeDescriptions` JSON
   key and optional `gradeDescriptions` CSV header (a JSON object string).
 
-It applies to **every graded catalog kind** (bloodlines, classes, consumables,
-equipment, professions, races, skills, titles, transcendents, and so on), and is
-ignored/stored as `{}` for a kind that has no grade (the map simply ends up empty).
+It is authored by the graded kinds that carry a grade ladder: bloodlines,
+equipment, races, titles, transcendents, and the like. `races` in
+particular is - and remains - a multi-grade kind: a race authorizes many
+`raceDefinitions` and a `gradeGrantedSkillStableIds` map keyed across all grades,
+and it is the one graded kind whose character-detail **race** tab displays the
+authored grade prose (`raceGradeDescription`).
+
+`classes` and `professions` are the exception. Each is a SINGLE-grade definition
+whose legacy `description` string IS the prose for that one grade, so neither
+authors new grade-specific prose: a non-empty `gradeDescriptions` on a new or
+config/grade-changing class/profession write is rejected with 400
+`invalid_grade_descriptions`, while an empty `{}` (a legal clear) or an omitted
+value is fine. Their `grade` column is never null on a fresh definition. The
+character-detail **class** and **profession** tabs display the general
+`description` (`classDescription` / `professionDescription`), never a grade map.
+The single-grade catalog definition invariant is covered in
+[docs/rules/classes.md](classes.md) and [docs/rules/professions.md](professions.md).
+
+A kind that has no grade ladder at all (currencies, skills, gods) is
+ignored/stored as `{}` - the map simply ends up empty - and a non-empty map there
+is likewise rejected with `invalid_grade_descriptions`.
+
 It has no effect on, and is unrelated to, UI, equipment-slot, percent-based, or
 ring mechanics.
 
@@ -95,6 +114,14 @@ Rules for these three fields:
   entry for that grade all read back `null`.
 - They **never fall back to the legacy `description`** string. The general
   `description` field is preserved unchanged and is completely independent.
+- **Backward-compatible readbacks.** On a NEW class/profession, neither
+  `classGradeDescription` nor `professionGradeDescription` is ever authored (no
+  `gradeDescriptions` map), so both read back `null`. The two fields exist on the
+  `CharacterDetail` API only so a legacy class/profession row that still stores an
+  authored `gradeDescriptions` map keeps exposing it. The character-detail UI does
+  not use them: the **class** and **profession** tabs render the general
+  `description` (`character.classDescription` / `character.professionDescription`).
+  Only the **race** tab displays grade prose (`character.raceGradeDescription`).
 
 Linked **associations** (skills, equipment, titles, blessings, bloodlines,
 transcendents) expose `CharacterAssociationView.gradeDescription?: string` when

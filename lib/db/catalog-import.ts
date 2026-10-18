@@ -58,9 +58,11 @@ import {
   isLegacyTranscendentSkillConfig,
   normalizeCatalogKind,
   parseCatalogConfig,
+  singleGradeTrackIssue,
   skillClassStableIdOf,
   skillGradeDescriptionsForbidden,
   skillGradeForbidden,
+  trackGradeDescriptionsForbidden,
 } from "@/lib/server/schemas"
 import type { Grade } from "@/lib/rules"
 import {
@@ -281,6 +283,25 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     )
   }
   assertModernConfig(kind, config)
+  // A classes/professions entry is a SINGLE-grade definition: its catalog `grade`
+  // column is the one grade it belongs to, and its `config.grades` map must
+  // authorize EXACTLY that one grade. Zero-grade, multi-grade, and mismatched
+  // definitions (and grade grants outside the selected grade) are rejected before
+  // any write, mirroring the service-layer create path. No-op for races / other
+  // kinds (the helper returns null for non-track kinds).
+  const trackIssue = singleGradeTrackIssue(kind, entry.grade, config)
+  if (trackIssue) {
+    throw badRequest("invalid_config", trackIssue)
+  }
+  // A classes/professions entry carries no authored grade-specific prose (the
+  // legacy `description` is the prose for that one grade), so a non-empty
+  // gradeDescriptions map is rejected before any write.
+  if (trackGradeDescriptionsForbidden(kind, entry.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      'Classes and professions carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+    )
+  }
   return {
     kind,
     stableId: entry.stableId,
