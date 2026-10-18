@@ -1215,6 +1215,27 @@ export function rarityOrderIndex(value: unknown): number | undefined {
   return index >= 0 ? index : undefined
 }
 
+/**
+ * Admin clone-a-skill-variant payload sent to
+ * `POST /api/catalog/skills/[id]/upgrades`.
+ *
+ * The admin clones an ACTIVE source `skills` entry into a full mechanical copy at
+ * the requested `rarity` and links it as a DIRECT successor of the source. Every
+ * field is validated at the boundary:
+ *   - `rarity` is REQUIRED and must be one of the shared rarity vocabulary
+ *     (Inferior..Divine plus the incomparable `Unique`, see `raritySchema`), the
+ *     same vocabulary the source's own `config.rarity` uses.
+ *   - `name` is OPTIONAL. When supplied it overrides the clone's display name
+ *     (defaulting to the source name); it must be a nonempty string trimmed to at
+ *     most 200 characters. The clone's stableId is derived from the final name
+ *     plus the rarity (`newName + '-' + rarity.toLowerCase()`), so a name override
+ *     changes the slug and therefore the resulting stableId.
+ */
+export const skillUpgradeCloneSchema = z.object({
+  rarity: raritySchema,
+  name: z.string().trim().min(1).max(200).optional(),
+})
+
 /** The canonical equipment slots. */
 export const EQUIPMENT_SLOTS = [
   "Head",
@@ -1490,6 +1511,19 @@ export const catalogEffectSchema = z.discriminatedUnion("phase", [
 export type SkillEffect = z.infer<typeof catalogEffectSchema>
 
 /**
+ * The maximum number of DIRECT outgoing successor skill stableIds a single skill
+ * config may declare in `upgradeToStableIds`.
+ *
+ * The bound is deliberately far above any realistic authored branch list, but it
+ * must also accommodate the LEGACY `upgradeGroup` + `rarity` fallback, which a
+ * skill-source clone materializes by enumerating every strictly-higher same-group
+ * active skill and appending the freshly cloned child. The current deployed catalog
+ * carries 332 skill entries, so 500 is a generous upper bound on a single group;
+ * a group that would exceed it is rejected early (see `createSkillUpgradeVariant`).
+ */
+export const SKILL_UPGRADE_TARGET_LIMIT = 500
+
+/**
  * Catalog config for a `skills` entry.
  *
  * `track` is read permissively so a legacy entry carrying an arbitrary string
@@ -1517,9 +1551,10 @@ export type SkillEffect = z.infer<typeof catalogEffectSchema>
  * `rarity` fallback resolves the successor at runtime; an explicit `[]` means the
  * skill is terminal (no fallback); a nonempty list declares explicit targets (a
  * skill may branch to several). Only the local shape is validated here (each id
- * nonempty, internally unique, capped at 50); reference and cycle validation is
- * performed later by `validateSkillUpgradeGraph`.
+ * nonempty, internally unique, capped at `SKILL_UPGRADE_TARGET_LIMIT`); reference
+ * and cycle validation is performed later by `validateSkillUpgradeGraph`.
  */
+
 export const skillConfigSchema = z
   .object({
     track: z.string().optional(),
@@ -1533,10 +1568,13 @@ export const skillConfigSchema = z
     // Optional DIRECT outgoing successor skill stableIds. ABSENT means the legacy
     // `upgradeGroup` + `rarity` fallback applies; an explicit `[]` means the skill
     // is explicitly terminal (no fallback). Each id must be a nonempty string and
-    // internally unique; the list is capped at 50. A self-link and a missing /
-    // duplicate target are GRAPH errors (validated by `validateSkillUpgradeGraph`),
-    // not shape errors, and are never rejected here.
-    upgradeToStableIds: z.array(z.string().min(1)).max(50).optional(),
+    // internally unique; the list is capped at `SKILL_UPGRADE_TARGET_LIMIT`. A
+    // self-link and a missing / duplicate target are GRAPH errors (validated by
+    // `validateSkillUpgradeGraph`), not shape errors, and are never rejected here.
+    upgradeToStableIds: z
+      .array(z.string().min(1))
+      .max(SKILL_UPGRADE_TARGET_LIMIT)
+      .optional(),
   })
   .passthrough()
   .superRefine((config, ctx) => {

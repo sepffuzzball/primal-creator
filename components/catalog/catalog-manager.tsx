@@ -49,10 +49,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { ATTRIBUTE_KEYS } from "@/lib/api"
-import {
-  skillUpgradeComponents,
-  skillUpgradeTargets,
-} from "@/lib/skills/upgrade-graph"
+import { skillUpgradeTargets } from "@/lib/skills/upgrade-graph"
 import {
   EQUIPMENT_RARITIES,
   EQUIPMENT_SLOTS,
@@ -231,6 +228,14 @@ export function CatalogManager({ kind }: { kind: string }) {
   const [error, setError] = React.useState<string | null>(null)
   const [query, setQuery] = React.useState("")
   const [dialogOpen, setDialogOpen] = React.useState(false)
+  const [upgradeOpen, setUpgradeOpen] = React.useState(false)
+  const [upgradeSource, setUpgradeSource] = React.useState<CatalogItem | null>(
+    null
+  )
+  const [upgradeName, setUpgradeName] = React.useState("")
+  const [upgradeRarity, setUpgradeRarity] = React.useState("")
+  const [upgradeError, setUpgradeError] = React.useState<string | null>(null)
+  const [upgradeSubmitting, setUpgradeSubmitting] = React.useState(false)
   const [editing, setEditing] = React.useState<CatalogItem | null>(null)
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM)
   const [gods, setGods] = React.useState<
@@ -839,8 +844,52 @@ export function CatalogManager({ kind }: { kind: string }) {
       archived: item.archived,
       config: item.config,
     }))
-    // Explicit edges are grouped by the shared graph helper. Legacy groups are
-    // then joined into the same weak components without changing edge direction.
+    const byStableId = new Map(source.map((item) => [item.stableId, item]))
+    const effectiveEdges = new Map<string, string[]>()
+    for (const item of source) {
+      const config = isRecord(item.config) ? item.config : {}
+      const explicit = skillUpgradeTargets(config)
+      if (explicit !== undefined) {
+        effectiveEdges.set(
+          item.stableId,
+          explicit.filter((id) => byStableId.has(id))
+        )
+        continue
+      }
+      const rarity =
+        typeof config.rarity === "string"
+          ? EQUIPMENT_RARITIES.indexOf(
+              config.rarity as (typeof EQUIPMENT_RARITIES)[number]
+            )
+          : -1
+      const groupName =
+        typeof config.upgradeGroup === "string" ? config.upgradeGroup : ""
+      const targets = source
+        .filter((candidate) => {
+          const candidateConfig = isRecord(candidate.config)
+            ? candidate.config
+            : {}
+          const candidateGroup =
+            typeof candidateConfig.upgradeGroup === "string"
+              ? candidateConfig.upgradeGroup
+              : ""
+          const candidateRarity =
+            typeof candidateConfig.rarity === "string"
+              ? EQUIPMENT_RARITIES.indexOf(
+                  candidateConfig.rarity as (typeof EQUIPMENT_RARITIES)[number]
+                )
+              : -1
+          return (
+            groupName.trim().length > 0 &&
+            !candidate.archived &&
+            candidateGroup === groupName &&
+            rarity >= 0 &&
+            candidateRarity > rarity
+          )
+        })
+        .map((candidate) => candidate.stableId)
+      effectiveEdges.set(item.stableId, targets)
+    }
     const parent = new Map<string, string>(
       nodes.map((node) => [node.stableId, node.stableId])
     )
@@ -856,47 +905,8 @@ export function CatalogManager({ kind }: { kind: string }) {
       const rb = root(b)
       if (ra !== rb) parent.set(rb, ra)
     }
-    for (const component of skillUpgradeComponents(nodes))
-      for (const id of component.slice(1)) join(component[0], id)
-    const legacyGroups = new Map<string, string[]>()
-    for (const node of nodes) {
-      const config = isRecord(node.config) ? node.config : {}
-      if (typeof config.upgradeGroup !== "string") continue
-      legacyGroups.set(config.upgradeGroup, [
-        ...(legacyGroups.get(config.upgradeGroup) ?? []),
-        node.stableId,
-      ])
-    }
-    for (const ids of legacyGroups.values()) {
-      for (const sourceId of ids) {
-        const sourceNode = nodes.find((node) => node.stableId === sourceId)!
-        const sourceConfig = isRecord(sourceNode.config)
-          ? sourceNode.config
-          : {}
-        if (skillUpgradeTargets(sourceConfig) !== undefined) continue
-        const sourceRarity =
-          typeof sourceConfig.rarity === "string"
-            ? EQUIPMENT_RARITIES.indexOf(
-                sourceConfig.rarity as (typeof EQUIPMENT_RARITIES)[number]
-              )
-            : -1
-        if (sourceRarity < 0) continue
-        for (const targetId of ids) {
-          if (targetId === sourceId) continue
-          const targetNode = nodes.find((node) => node.stableId === targetId)!
-          const targetConfig = isRecord(targetNode.config)
-            ? targetNode.config
-            : {}
-          const targetRarity =
-            typeof targetConfig.rarity === "string"
-              ? EQUIPMENT_RARITIES.indexOf(
-                  targetConfig.rarity as (typeof EQUIPMENT_RARITIES)[number]
-                )
-              : -1
-          if (targetRarity > sourceRarity) join(sourceId, targetId)
-        }
-      }
-    }
+    for (const [from, targets] of effectiveEdges)
+      for (const target of targets) join(from, target)
     const grouped = new Map<string, CatalogItem[]>()
     for (const node of nodes) {
       const key = root(node.stableId)
@@ -918,7 +928,48 @@ export function CatalogManager({ kind }: { kind: string }) {
         const entries = (matches ? group : []).sort((a, b) =>
           a.name.localeCompare(b.name)
         )
-        return { group, entries, isLegacyOnly }
+        const rarityRank = (item: CatalogItem) => {
+          const rarity = isRecord(item.config) ? item.config.rarity : undefined
+          return typeof rarity === "string"
+            ? EQUIPMENT_RARITIES.indexOf(
+                rarity as (typeof EQUIPMENT_RARITIES)[number]
+              )
+            : -1
+        }
+        const groupIds = new Set(group.map((item) => item.stableId))
+        const parents = new Map<string, string[]>()
+        const children = new Map<string, string[]>()
+        for (const item of group)
+          for (const target of effectiveEdges.get(item.stableId) ?? [])
+            if (groupIds.has(target)) {
+              parents.set(target, [
+                ...(parents.get(target) ?? []),
+                item.stableId,
+              ])
+              children.set(item.stableId, [
+                ...(children.get(item.stableId) ?? []),
+                target,
+              ])
+            }
+        const roots = group
+          .filter((item) => !parents.get(item.stableId)?.length)
+          .sort(
+            (a, b) =>
+              rarityRank(a) - rarityRank(b) ||
+              a.name.localeCompare(b.name) ||
+              a.stableId.localeCompare(b.stableId)
+          )
+        const root = roots[0] ?? group[0]
+        return {
+          group,
+          entries,
+          isLegacyOnly,
+          root,
+          otherRoots: roots.length - 1,
+          effectiveEdges,
+          parents,
+          children,
+        }
       })
       .filter(({ entries }) => entries.length > 0)
   }, [items, kind, isAdmin, showArchived, query])
@@ -992,6 +1043,63 @@ export function CatalogManager({ kind }: { kind: string }) {
       }
     },
     [isAdmin, kind, load]
+  )
+
+  const openUpgrade = React.useCallback(
+    (source: CatalogItem) => {
+      if (!isAdmin || source.archived) return
+      const rarity = isRecord(source.config) ? source.config.rarity : undefined
+      const index =
+        typeof rarity === "string"
+          ? EQUIPMENT_RARITIES.indexOf(
+              rarity as (typeof EQUIPMENT_RARITIES)[number]
+            )
+          : -1
+      setUpgradeSource(source)
+      setUpgradeName(source.name)
+      setUpgradeRarity(index >= 0 ? (EQUIPMENT_RARITIES[index + 1] ?? "") : "")
+      setUpgradeError(null)
+      setUpgradeOpen(true)
+    },
+    [isAdmin]
+  )
+
+  const createUpgrade = React.useCallback(
+    async (keepOpen: boolean) => {
+      if (!upgradeSource || !upgradeRarity || !isAdmin) return
+      setUpgradeSubmitting(true)
+      setUpgradeError(null)
+      try {
+        const result = await apiFetch<{
+          source: CatalogItem
+          item: CatalogItem
+        }>(`/api/catalog/skills/${upgradeSource.id}/upgrades`, {
+          ...jsonInit("POST", {
+            rarity: upgradeRarity,
+            ...(upgradeName.trim() !== upgradeSource.name
+              ? { name: upgradeName.trim() }
+              : {}),
+          }),
+        })
+        toast.success(`Created "${result.item.name}" as an upgrade.`)
+        await load()
+        if (keepOpen) {
+          setUpgradeSource(result.item)
+          setUpgradeName(result.item.name)
+          const index = EQUIPMENT_RARITIES.indexOf(
+            upgradeRarity as (typeof EQUIPMENT_RARITIES)[number]
+          )
+          setUpgradeRarity(EQUIPMENT_RARITIES[index + 1] ?? "")
+        } else setUpgradeOpen(false)
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Could not create upgrade."
+        setUpgradeError(message)
+      } finally {
+        setUpgradeSubmitting(false)
+      }
+    },
+    [upgradeSource, upgradeRarity, upgradeName, isAdmin, load]
   )
 
   const openCreate = React.useCallback(() => {
@@ -1744,7 +1852,15 @@ export function CatalogManager({ kind }: { kind: string }) {
                 <>
                   {kind === "skills"
                     ? visibleSkillGroups.map(
-                        ({ group, entries, isLegacyOnly }) => {
+                        ({
+                          group,
+                          entries,
+                          isLegacyOnly,
+                          root,
+                          otherRoots,
+                          parents,
+                          children,
+                        }) => {
                           const groupKey = group
                             .map((entry) => entry.stableId)
                             .sort()
@@ -1755,28 +1871,11 @@ export function CatalogManager({ kind }: { kind: string }) {
                           const byId = new Map(
                             group.map((entry) => [entry.stableId, entry])
                           )
-                          const parents = new Map<string, string[]>()
-                          const children = new Map<string, string[]>()
-                          for (const entry of group) {
-                            const config = isRecord(entry.config)
-                              ? entry.config
-                              : {}
-                            for (const target of skillUpgradeTargets(config) ??
-                              []) {
-                              if (!byId.has(target)) continue
-                              parents.set(target, [
-                                ...(parents.get(target) ?? []),
-                                entry.stableId,
-                              ])
-                              children.set(entry.stableId, [
-                                ...(children.get(entry.stableId) ?? []),
-                                target,
-                              ])
-                            }
-                          }
                           const depth = new Map<string, number>(
                             group
-                              .filter((entry) => !parents.has(entry.stableId))
+                              .filter(
+                                (entry) => !parents.get(entry.stableId)?.length
+                              )
                               .map((entry) => [entry.stableId, 0])
                           )
                           for (let pass = 0; pass < group.length; pass++) {
@@ -1852,6 +1951,15 @@ export function CatalogManager({ kind }: { kind: string }) {
                                     >
                                       <PencilIcon />
                                     </Button>
+                                    {!single.archived ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => openUpgrade(single)}
+                                      >
+                                        Create upgrade
+                                      </Button>
+                                    ) : null}
                                     {single.archived ? (
                                       <Button
                                         variant="outline"
@@ -1871,7 +1979,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                           return (
                             <React.Fragment key={`skill-group-${groupKey}`}>
                               <TableRow>
-                                <TableCell colSpan={isAdmin ? 4 : 3}>
+                                <TableCell>
                                   <button
                                     type="button"
                                     aria-expanded={expanded}
@@ -1885,14 +1993,35 @@ export function CatalogManager({ kind }: { kind: string }) {
                                     }
                                   >
                                     {expanded ? "▾" : "▸"}{" "}
-                                    {isLegacyOnly
-                                      ? "Skill group"
-                                      : "Skill tree"}
+                                    {`${root.name} ${isLegacyOnly ? "Skill Group" : "Skill Tree"}`}
                                   </button>
-                                  <span className="ml-2 text-xs text-muted-foreground">
-                                    {group.length} skills
-                                  </span>
+                                  <Badge variant="secondary" className="ml-2">
+                                    {isRecord(root.config) &&
+                                    typeof root.config.rarity === "string"
+                                      ? root.config.rarity
+                                      : "Unspecified rarity"}
+                                  </Badge>
+                                  {otherRoots > 0 ? (
+                                    <span className="ml-2 text-xs text-muted-foreground">
+                                      + {otherRoots} other starting skills
+                                    </span>
+                                  ) : null}
                                 </TableCell>
+                                <TableCell>{group.length} skills</TableCell>
+                                <TableCell>-</TableCell>
+                                {isAdmin ? (
+                                  <TableCell className="text-right">
+                                    {!root.archived ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => openUpgrade(root)}
+                                      >
+                                        Create upgrade
+                                      </Button>
+                                    ) : null}
+                                  </TableCell>
+                                ) : null}
                               </TableRow>
                               {expanded
                                 ? nodesInGroup.map(
@@ -1904,12 +2033,22 @@ export function CatalogManager({ kind }: { kind: string }) {
                                         typeof config.rarity === "string"
                                           ? config.rarity
                                           : "Unspecified rarity"
+                                      const relatedLabel = (id: string) => {
+                                        const related = byId.get(id)
+                                        if (!related) return id
+                                        const relatedConfig = isRecord(
+                                          related.config
+                                        )
+                                          ? related.config
+                                          : {}
+                                        return `${related.name || related.stableId} (${typeof relatedConfig.rarity === "string" ? relatedConfig.rarity : "Unspecified rarity"})`
+                                      }
                                       const incoming = (
                                         parents.get(entry.stableId) ?? []
-                                      ).map((id) => byId.get(id)?.name ?? id)
+                                      ).map(relatedLabel)
                                       const outgoing = (
                                         children.get(entry.stableId) ?? []
-                                      ).map((id) => byId.get(id)?.name ?? id)
+                                      ).map(relatedLabel)
                                       return (
                                         <TableRow key={entry.id}>
                                           <TableCell
@@ -1971,6 +2110,17 @@ export function CatalogManager({ kind }: { kind: string }) {
                                               >
                                                 <PencilIcon />
                                               </Button>
+                                              {!entry.archived ? (
+                                                <Button
+                                                  variant="outline"
+                                                  size="sm"
+                                                  onClick={() =>
+                                                    openUpgrade(entry)
+                                                  }
+                                                >
+                                                  Create upgrade
+                                                </Button>
+                                              ) : null}
                                               {entry.archived ? (
                                                 <Button
                                                   variant="outline"
@@ -2197,6 +2347,69 @@ export function CatalogManager({ kind }: { kind: string }) {
           </Table>
         </div>
       )}
+
+      <Dialog open={upgradeOpen} onOpenChange={setUpgradeOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Create skill upgrade</DialogTitle>
+            <DialogDescription>
+              Clone {upgradeSource?.name} (
+              {isRecord(upgradeSource?.config)
+                ? String(upgradeSource.config.rarity ?? "unspecified rarity")
+                : "unspecified rarity"}
+              ). Full config and effects are copied.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="upgrade-name">Name (optional)</Label>
+              <Input
+                id="upgrade-name"
+                value={upgradeName}
+                onChange={(event) => setUpgradeName(event.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label>Rarity</Label>
+              <Select
+                value={upgradeRarity || null}
+                onValueChange={(value) => setUpgradeRarity(value ?? "")}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose rarity" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {RARITIES.map((rarity) => (
+                      <SelectItem key={rarity} value={rarity}>
+                        {rarity}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+            {upgradeError ? (
+              <Alert variant="destructive">{upgradeError}</Alert>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={upgradeSubmitting || !upgradeRarity}
+              onClick={() => void createUpgrade(false)}
+            >
+              Create upgrade
+            </Button>
+            <Button
+              variant="outline"
+              disabled={upgradeSubmitting || !upgradeRarity}
+              onClick={() => void createUpgrade(true)}
+            >
+              Create &amp; next
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent

@@ -3205,9 +3205,13 @@ describe("skill upgrade trees", () => {
       screen.getAllByRole("button", { name: /^Expand skill tree/ })[0]
     )
     expect(
-      screen.getByText("Upgrades to: Left branch, Right branch")
+      screen.getByText(
+        "Upgrades to: Left branch (Common), Right branch (Common)"
+      )
     ).toBeTruthy()
-    expect(screen.getByText("From: Left branch, Right branch")).toBeTruthy()
+    expect(
+      screen.getByText("From: Left branch (Common), Right branch (Common)")
+    ).toBeTruthy()
     expect(screen.getAllByText("Shared apex")).toHaveLength(1)
     expect(screen.getAllByText("Common").length).toBeGreaterThan(0)
     expect(
@@ -3242,6 +3246,294 @@ describe("skill upgrade trees", () => {
     expect(
       screen.queryByRole("button", { name: /Expand skill tree/ })
     ).toBeNull()
+  })
+
+  it("matches legacy upgrade groups by exact string while allowing padded exact groups", async () => {
+    seed([
+      skill("padded-root", "Padded Root", {
+        upgradeGroup: " fire ",
+        rarity: "Inferior",
+      }),
+      skill("plain-child", "Plain Child", {
+        upgradeGroup: "fire",
+        rarity: "Common",
+      }),
+      skill("padded-child", "Padded Child", {
+        upgradeGroup: " fire ",
+        rarity: "Common",
+      }),
+    ])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    const groupButton = screen.getByRole("button", {
+      name: /^Expand skill group/,
+    })
+    fireEvent.click(groupButton)
+    expect(screen.getByText("Upgrades to: Padded Child (Common)")).toBeTruthy()
+    expect(screen.queryByText("Upgrades to: Plain Child (Common)")).toBeNull()
+  })
+
+  it("uses the directed starting skill for explicit and legacy upgrade headings", async () => {
+    const root = skill("alchemical", "Alchemical Flame", {
+      rarity: "Common",
+      upgradeToStableIds: ["alchemical-plus"],
+    })
+    const child = skill("alchemical-plus", "Alchemical Flame Plus", {
+      rarity: "Uncommon",
+      upgradeToStableIds: [],
+    })
+    const legacy = skill("legacy-basic", "Basic Stealth", {
+      rarity: "Common",
+      upgradeGroup: "stealth",
+    })
+    const legacyNext = skill("legacy-rare", "Stealth Mastery", {
+      rarity: "Rare",
+      upgradeGroup: "stealth",
+    })
+    const branch = skill("branch", "Second Start", {
+      rarity: "Common",
+      upgradeToStableIds: ["alchemical-plus"],
+    })
+    seed([child, branch, legacyNext, legacy, root])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    expect(
+      screen.getByRole("row", { name: /Alchemical Flame Skill Tree/ })
+    ).toBeTruthy()
+    expect(screen.getByText("+ 1 other starting skills")).toBeTruthy()
+    expect(
+      screen.getByRole("row", { name: /Basic Stealth Skill Group/ })
+    ).toBeTruthy()
+    expect(screen.getAllByText("Common")).toHaveLength(2)
+    fireEvent.change(screen.getByLabelText("Search"), {
+      target: { value: "Alchemical Flame Plus" },
+    })
+    expect(
+      screen.getByRole("row", { name: /Alchemical Flame Skill Tree/ })
+    ).toBeTruthy()
+  })
+
+  it("offers a collapsed root upgrade only to admins and never for archived roots", async () => {
+    const root = skill("legacy-root", "Legacy Root", {
+      rarity: "Inferior",
+      upgradeGroup: "legacy",
+    })
+    const child = skill("legacy-child", "Legacy Child", {
+      rarity: "Common",
+      upgradeGroup: "legacy",
+    })
+    const archivedRoot = skill(
+      "archived-root",
+      "Archived Root",
+      {
+        rarity: "Inferior",
+        upgradeGroup: "archived-chain",
+      },
+      true
+    )
+    const archivedChild = skill("archived-child", "Archived Child", {
+      rarity: "Common",
+      upgradeGroup: "archived-chain",
+    })
+    seed([root, child, archivedRoot, archivedChild])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    expect(
+      screen.getAllByRole("button", { name: "Create upgrade" })
+    ).toHaveLength(2)
+    expect(screen.queryByText("Legacy Child")).toBeNull()
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Create upgrade" })[0]
+    )
+    expect(screen.getByText(/Legacy Root \(Inferior\)/)).toBeTruthy()
+    cleanup()
+
+    mockIsAdmin = false
+    seed([root, child])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    expect(screen.queryByRole("button", { name: "Create upgrade" })).toBeNull()
+    mockIsAdmin = true
+  })
+
+  it("does not infer legacy edges from blank groups or archived targets shown in admin view", async () => {
+    const source = skill("empty-source", "Blank Source", {
+      upgradeGroup: "  ",
+      rarity: "Inferior",
+    })
+    const target = skill("empty-target", "Blank Target", {
+      upgradeGroup: "",
+      rarity: "Common",
+    })
+    const grouped = skill("grouped", "Grouped Source", {
+      upgradeGroup: " shared ",
+      rarity: "Inferior",
+    })
+    const archived = skill(
+      "archived-target",
+      "Archived Target",
+      { upgradeGroup: "shared", rarity: "Common" },
+      true
+    )
+    seed([source, target, grouped, archived])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    expect(
+      screen.queryByRole("button", { name: /Expand skill group/ })
+    ).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /Expand skill tree/ })
+    ).toBeNull()
+    expect(screen.getByText("Archived Target")).toBeTruthy()
+    expect(screen.queryByText(/Upgrades to:/)).toBeNull()
+  })
+
+  it("includes rarity in parent and child labels for same-name variants", async () => {
+    seed([
+      skill("parent", "Basic Stealth", {
+        rarity: "Inferior",
+        upgradeToStableIds: ["child"],
+      }),
+      skill("child", "Basic Stealth", {
+        rarity: "Common",
+        upgradeToStableIds: [],
+      }),
+    ])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: /Expand skill tree/ }))
+    expect(screen.getByText("Upgrades to: Basic Stealth (Common)")).toBeTruthy()
+    expect(screen.getByText("From: Basic Stealth (Inferior)")).toBeTruthy()
+  })
+
+  it("creates successive cloned upgrades through the atomic endpoint and refreshes", async () => {
+    const source = skill("basic-stealth", "Basic Stealth", {
+      rarity: "Inferior",
+      effects: [{ phase: "flat", amount: { agility: 2 } }],
+      custom: { copied: true },
+    })
+    const common = skill("basic-stealth-common", "Basic Stealth", {
+      rarity: "Common",
+      upgradeToStableIds: [],
+      effects: source.config.effects,
+      custom: source.config.custom,
+    })
+    const uncommon = skill("basic-stealth-uncommon", "Basic Stealth", {
+      rarity: "Uncommon",
+    })
+    let catalog: CatalogItem[] = [source]
+    const mock = seed(catalog)
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: catalog }
+      if (url === "/api/catalog/skills?includeArchived=1")
+        return { items: catalog }
+      if (url === "/api/catalog/classes") return { items: [] }
+      if (url.endsWith("/upgrades")) {
+        const body = JSON.parse(String(init?.body))
+        const parent = catalog.find(
+          (entry) => entry.id === url.split("/").at(-2)
+        )!
+        const created = body.rarity === "Common" ? common : uncommon
+        catalog = catalog
+          .map((entry) =>
+            entry.id === parent.id
+              ? {
+                  ...entry,
+                  config: {
+                    ...entry.config,
+                    upgradeToStableIds: [created.stableId],
+                  },
+                }
+              : entry
+          )
+          .concat(created)
+        return {
+          source: parent,
+          item: created,
+        }
+      }
+      throw new Error(`unexpected ${url}`)
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Create upgrade" }).at(-1)!
+    )
+    expect(screen.getByText(/Basic Stealth \(Inferior\)/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("option", { name: "Common" }))
+    fireEvent.click(screen.getByRole("button", { name: "Create & next" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Create & next" }))
+    await flush()
+    const calls = mock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/upgrades")
+    )
+    expect(calls).toHaveLength(2)
+    expect(calls.map(([url]) => url)).toEqual([
+      "/api/catalog/skills/basic-stealth/upgrades",
+      "/api/catalog/skills/basic-stealth-common/upgrades",
+    ])
+    expect(JSON.parse(String((calls[0][1] as RequestInit).body))).toEqual({
+      rarity: "Common",
+    })
+    expect(JSON.parse(String((calls[1][1] as RequestInit).body))).toEqual({
+      rarity: "Uncommon",
+    })
+    fireEvent.click(screen.getByRole("button", { name: /Expand skill tree/ }))
+    expect(screen.getByText("Upgrades to: Basic Stealth (Common)")).toBeTruthy()
+    expect(screen.getByText("From: Basic Stealth (Common)")).toBeTruthy()
+    expect(
+      screen.getByText("Upgrades to: Basic Stealth (Uncommon)")
+    ).toBeTruthy()
+    expect(screen.getByText("From: Basic Stealth (Common)")).toBeTruthy()
+    expect(
+      mock.mock.calls.filter(([url]) => url === "/api/catalog/skills").length
+    ).toBeGreaterThan(2)
+  })
+
+  it("offers upgrades only for active skills and preserves Divine selection on a conflict", async () => {
+    const divine = skill("divine", "Divine Technique", { rarity: "Divine" })
+    const archived = skill(
+      "archived",
+      "Archived Technique",
+      { rarity: "Common" },
+      true
+    )
+    const mock = seed([divine, archived])
+    mock.mockImplementation(async (url: string) => {
+      if (
+        url === "/api/catalog/skills" ||
+        url === "/api/catalog/skills?includeArchived=1"
+      )
+        return { items: [divine, archived] }
+      if (url === "/api/catalog/classes") return { items: [] }
+      if (url.endsWith("/upgrades"))
+        throw new ApiError(409, "CONFLICT", "Upgrade already exists.")
+      return { item: divine }
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    expect(
+      screen.getAllByRole("button", { name: "Create upgrade" })
+    ).toHaveLength(1)
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Create upgrade" }).at(-1)!
+    )
+    expect(
+      (screen.getByRole("combobox") as HTMLButtonElement).textContent
+    ).toBe("")
+    fireEvent.click(screen.getByRole("option", { name: "Unique" }))
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Create upgrade" }).at(-1)!
+    )
+    await flush()
+    expect(screen.getByText("Upgrade already exists.")).toBeTruthy()
+    expect(screen.getByLabelText("Name (optional)")).toBeTruthy()
+    expect(
+      mock.mock.calls.some(([url]) => String(url).endsWith("/upgrades"))
+    ).toBe(true)
   })
 
   it("uses archived skill references for inbound paths and existing targets only", async () => {

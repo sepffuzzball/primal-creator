@@ -90,6 +90,8 @@ import {
   rarityOrderIndex,
   requiredGradeNullForbidden,
   skillClassStableIdOf,
+  SKILL_UPGRADE_TARGET_LIMIT,
+  skillUpgradeCloneSchema,
   skillGradeDescriptionsForbidden,
   skillGradeForbidden,
   titleImprovementSchema,
@@ -9646,9 +9648,21 @@ export async function getMcpCatalogEntry(
  * the skill classStableId ref, link-collision, race-type-in-use, and equipment
  * position checks. Omitted (or false) keeps the current per-item validation and
  * is what public CRUD relies on.
+ *
+ * `preserveRawSkillConfig` may ONLY be set true by the skill-variant clone
+ * (`createSkillUpgradeVariant`). Every other caller leaves it unset. Because the
+ * create/update helpers parse the config via Zod and persist the NORMALIZED
+ * parsed shape, a config that carries unknown NESTED fields inside
+ * `effects` / `condition` (which Zod strips even though the top-level schema is
+ * `.passthrough()`) would lose that metadata on clone. When true AND the kind is
+ * `skills`, the helper still fully validates the parsed config and runs every
+ * guard, but persists the supplied RAW JSON config in place of the parsed
+ * normalized config, so no unknown nested key is dropped. This option therefore
+ * preserves the source's and clone's full raw metadata payload byte-for-byte.
  */
 export type CatalogItemWriteOptions = {
   skillGraphValidatedInBatch?: true
+  preserveRawSkillConfig?: true
 }
 
 export type CreateCatalogItemInput = {
@@ -9832,6 +9846,14 @@ export async function createCatalogItemInTransaction(
       })
     }
   }
+  // The clone path (`preserveRawSkillConfig`) keeps the supplied RAW JSON config
+  // so unknown nested fields inside `effects` / `condition` survive verbatim; every
+  // OTHER caller persists the parsed normalized config. Both paths have been fully
+  // validated above - this only changes what is WRITTEN, never what is checked.
+  const persistedConfig =
+    kind === "skills" && options?.preserveRawSkillConfig === true
+      ? (input.config ?? {})
+      : config
   const row = await tx.catalogDefinition.create({
     data: {
       kind: kind as never,
@@ -9841,7 +9863,7 @@ export async function createCatalogItemInTransaction(
       grade: input.grade ?? null,
       sourceUrl: input.sourceUrl ?? null,
       archived: input.archived ?? false,
-      config: config as Prisma.InputJsonValue,
+      config: persistedConfig as Prisma.InputJsonValue,
       ...(input.gradeDescriptions != null
         ? {
             gradeDescriptions: input.gradeDescriptions as Prisma.InputJsonValue,
@@ -10950,6 +10972,16 @@ export async function updateCatalogItemInTransaction(
       })
     }
   }
+  // The clone path (`preserveRawSkillConfig`) keeps the supplied RAW JSON config
+  // so unknown nested fields inside `effects` / `condition` survive verbatim; every
+  // OTHER caller persists the parsed normalized config. Both paths have been fully
+  // validated above - this only changes what is WRITTEN, never what is checked.
+  const persistedConfig =
+    kind === "skills" &&
+    options?.preserveRawSkillConfig === true &&
+    patch.config != null
+      ? patch.config
+      : config
   const row = await tx.catalogDefinition.update({
     where: { id },
     data: {
@@ -10961,7 +10993,9 @@ export async function updateCatalogItemInTransaction(
       ...(patch.grade !== undefined ? { grade: patch.grade } : {}),
       ...(patch.sourceUrl !== undefined ? { sourceUrl: patch.sourceUrl } : {}),
       ...(patch.archived != null ? { archived: patch.archived } : {}),
-      ...(config != null ? { config: config as Prisma.InputJsonValue } : {}),
+      ...(persistedConfig != null
+        ? { config: persistedConfig as Prisma.InputJsonValue }
+        : {}),
       ...(patch.gradeDescriptions !== undefined
         ? {
             gradeDescriptions: patch.gradeDescriptions as Prisma.InputJsonValue,
@@ -11012,6 +11046,262 @@ export async function updateCatalogItem(
       throw conflict(
         "catalog_stable_id_conflict",
         `Catalog entry with stableId "${patch.stableId}" already exists`
+      )
+    }
+    if (isSerializationFailure(err)) {
+      throw conflict(
+        "catalog_serialization_conflict",
+        "Concurrent catalog write conflict; retry the change"
+      )
+    }
+    throw err
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Skill variant cloning (admin upgrade-branch creation)
+// ------------------------------------------------------------------ //
+
+/** The validated clone-a-variant payload from `skillUpgradeCloneSchema`. */
+export type SkillUpgradeCloneInput = z.infer<typeof skillUpgradeCloneSchema>
+
+/**
+ * Clone an ACTIVE `skills` catalog entry into a full mechanical copy at the
+ * requested `rarity`, and link it as a DIRECT successor of the source, all inside
+ * ONE SERIALIZABLE transaction.
+ *
+ * The clone is an exact copy of the source's identity (name/description/sourceUrl)
+ * and a DEEP copy of its full RAW persisted catalog `config` (effects, conditions,
+ * `track`, `classStableId`, `upgradeGroup` and every unknown passthrough key -
+ * INCLUDING unknown nested metadata inside an `effect` or an `effect.condition`,
+ * which Zod strips even though the top-level schema is `.passthrough()`). The
+ * write payloads are built from a deep clone of the RAW `source.config`, never from
+ * the Zod-parsed shape, and are persisted verbatim via
+ * `preserveRawSkillConfig: true`; the parsed shape is consulted ONLY for the
+ * known-field validation/rank/group/edge extraction. It differs only in:
+ *   - `config.rarity` is set to the requested `input.rarity`;
+ *   - `config.upgradeToStableIds` is set to `[]`, so the clone is explicitly
+ *     terminal and never copies the source's outgoing edges.
+ * The clone carries no catalog grade (`grade: null`) and no grade-specific prose
+ * (`gradeDescriptions: {}`), matching the skills invariant (a skill has no grade
+ * band).
+ *
+ * The source is then atomically linked as the clone's direct predecessor: its
+ * `config.upgradeToStableIds` is rewritten to include the new clone stableId.
+ *   - If the source ALREADY declares its own explicit `upgradeToStableIds` list
+ *     (including `[]`), the new stableId is APPENDED at the end, preserving the
+ *     declared order. A multi-branching skill therefore gains the new branch
+ *     without disturbing its existing outgoing edges.
+ *   - If the source is LEGACY (no own `upgradeToStableIds` field), the legacy
+ *     `upgradeGroup` + `rarity` fallback successor set is preserved verbatim from
+ *     the old runtime ONLY when the source declares BOTH a nonempty `upgradeGroup`
+ *     AND a comparable ordered rarity: every currently ACTIVE skill in the same
+ *     `upgradeGroup` whose rarity is STRICTLY higher than the source's ordered
+ *     rarity (regardless of gap; the incomparable `Unique` and missing/unrecognized
+ *     rarities never count) is sorted by rarity order then stableId, deduplicated,
+ *     and the clone stableId is APPENDED last. A legacy source with NO group (its
+ *     null group would otherwise match every unrelated ungrouped skill) or with an
+ *     incomparable/missing rarity has no higher candidates - its only successor is
+ *     the freshly cloned child (`[newChildStableId]`).
+ *
+ * Preconditions, all enforced inside the same transaction (so a failure leaves no
+ * orphan clone and no half-linked source):
+ *   - the source must exist, be a `skills` entry (404 otherwise), and be ACTIVE
+ *     (400 `skill_archived` when archived);
+ *   - the derived stableId (`deriveCatalogStableId(name + '-' + rarity)`) must be
+ *     free (409 `catalog_stable_id_conflict` when a skill already owns the slug);
+ *   - the cloned `classStableId` must resolve to an existing class: an archived
+ *     class tie is rejected with 400 before/during the create (never silently
+ *     dropped), rolling the whole transaction back;
+ *   - the full skill upgrade graph must stay valid (targets exist, no self-link,
+ *     no cycle) - validated via the shared helpers by the create and the source
+ *     update, so a broken pre-existing graph aborts with 400 and rolls back;
+ *   - the computed source successor set must fit within
+ *     `SKILL_UPGRADE_TARGET_LIMIT`: when a legacy group (or an explicit edge list)
+ *     would resolve to MORE than the limit, the clone fails EARLY with 409
+ *     `skill_upgrade_group_too_large` (with guidance to restructure the group),
+ *     before any row is written.
+ *
+ * The source's own `rarity` and `upgradeGroup` are never changed by the link, so
+ * the linked-skill immutability guards remain satisfied. Character progression
+ * events, status and character rows are never touched - only catalog rows.
+ *
+ * A concurrent unique (P2002) or serialization (P2034) conflict is surfaced as a
+ * retryable 409, never a raw 500.
+ */
+export async function createSkillUpgradeVariant(
+  sourceId: string,
+  input: SkillUpgradeCloneInput
+): Promise<{ source: CatalogItem; item: CatalogItem }> {
+  const serializable = {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+  // Captured across the transaction boundary so a P2002 from the concurrent
+  // create window can still report the real slug the clone was creating.
+  let resolvedName = input.name ?? ""
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // Find the source by id: a wrong-kind / missing row is 404, an archived
+      // skill is 400 (only an ACTIVE skill may be cloned).
+      const source = await tx.catalogDefinition.findUnique({
+        where: { id: sourceId },
+      })
+      if (!source || source.kind !== "skills") {
+        throw notFound("catalog_not_found", "Skill source not found")
+      }
+      if (source.archived) {
+        throw badRequest(
+          "skill_archived",
+          "Source skill is archived; clone an active skill"
+        )
+      }
+
+      const sourceConfig = parseConfigOr400("skills", source.config ?? {})
+      const name = input.name ?? source.name
+      resolvedName = name
+      const rarity = input.rarity
+      const stableId = deriveCatalogStableId(`${name}-${rarity.toLowerCase()}`)
+
+      // Duplicate variant guard: the derived slug (name + rarity) is globally
+      // unique, so a same-name / same-rarity variant anywhere in the tree - or any
+      // other skill already owning the slug - is a 409, never silently suffixed.
+      const existing = await tx.catalogDefinition.findUnique({
+        where: { kind_stableId: { kind: "skills", stableId } },
+      })
+      if (existing) {
+        throw conflict(
+          "catalog_stable_id_conflict",
+          `A skill variant with stableId "${stableId}" already exists`
+        )
+      }
+
+      // Compute the source's new outgoing targets BEFORE creating the clone so the
+      // legacy fallback set is read against the pre-clone catalog (the clone itself
+      // is appended last and never sorted into the legacy list).
+      const sourceTargets = skillUpgradeTargets(sourceConfig)
+      let outgoingTargets: string[]
+      if (sourceTargets !== undefined) {
+        // Declared explicit list (including `[]`): append the clone, preserving the
+        // declared order. The clone is new, so it is never already present, but a
+        // defensive dedup is cheap and harmless.
+        outgoingTargets = Array.from(new Set([...sourceTargets, stableId]))
+      } else {
+        // Legacy source. Enumerate the legacy `upgradeGroup` + `rarity` fallback
+        // successor set ONLY when the source declares BOTH a nonempty group AND a
+        // comparable ordered rarity. A source with NO group must never gather every
+        // unrelated ungrouped skill in the catalog (its null group would match
+        // every null-group skill), and a source with an incomparable/missing rarity
+        // has nothing strictly higher - in both cases the only successor is the
+        // freshly cloned child.
+        const group = upgradeGroupForConfig(sourceConfig)
+        const sourceRarityIndex = rarityOrderIndex(sourceConfig.rarity)
+        if (group != null && sourceRarityIndex != null) {
+          const activeRows = await tx.catalogDefinition.findMany({
+            where: { kind: "skills", archived: false },
+          })
+          const higher: Array<{ stableId: string; rarityIndex: number }> = []
+          for (const row of activeRows) {
+            if (row.stableId === stableId) continue
+            const cfg = parseCatalogConfig("skills", row.config ?? {})
+            if (upgradeGroupForConfig(cfg) !== group) continue
+            const index = rarityOrderIndex(cfg.rarity)
+            if (index == null) continue
+            if (index <= sourceRarityIndex) continue
+            higher.push({ stableId: row.stableId, rarityIndex: index })
+          }
+          higher.sort((a, b) => {
+            if (a.rarityIndex !== b.rarityIndex)
+              return a.rarityIndex - b.rarityIndex
+            return a.stableId < b.stableId
+              ? -1
+              : a.stableId > b.stableId
+                ? 1
+                : 0
+          })
+          const seen = new Set<string>()
+          const targets: string[] = []
+          for (const h of higher) {
+            if (seen.has(h.stableId)) continue
+            seen.add(h.stableId)
+            targets.push(h.stableId)
+          }
+          targets.push(stableId)
+          outgoingTargets = targets
+        } else {
+          outgoingTargets = [stableId]
+        }
+      }
+
+      // A legacy source group with a huge strictly-higher set would write a source
+      // `upgradeToStableIds` beyond `SKILL_UPGRADE_TARGET_LIMIT`, which the update
+      // guard would reject AFTER the clone row was already inserted. Fail EARLY,
+      // before any write, with an actionable 409 so the admin knows to restructure
+      // the group rather than seeing a cryptic 400.
+      if (outgoingTargets.length > SKILL_UPGRADE_TARGET_LIMIT) {
+        throw conflict(
+          "skill_upgrade_group_too_large",
+          `Skill "${source.stableId}" would resolve to ${outgoingTargets.length} successor skills, exceeding the maximum of ${SKILL_UPGRADE_TARGET_LIMIT}. Restructure this upgrade group (e.g. split it into smaller groups) before cloning`
+        )
+      }
+
+      // Deep copy the source's RAW persisted `config` so effects/conditions/track/
+      // classStableId/upgradeGroup and every unknown nested passthrough key (even
+      // inside an `effect.condition`) are cloned verbatim. `sourceConfig` (the
+      // Zod-validated shape) is used ONLY above for the known-field extraction
+      // (rarity/rank/group/edges) - never as the write payload, because Zod strips
+      // unknown nested fields inside `effects` / `condition`. The clone never
+      // copies the source's outgoing edges (terminal `[]`) and carries the requested
+      // rarity.
+      const childConfig = JSON.parse(
+        JSON.stringify(source.config ?? {})
+      ) as Record<string, unknown>
+      childConfig.rarity = rarity
+      childConfig.upgradeToStableIds = []
+
+      const item = await createCatalogItemInTransaction(
+        tx,
+        "skills",
+        {
+          stableId,
+          name,
+          description: source.description,
+          sourceUrl: source.sourceUrl,
+          grade: null,
+          config: childConfig,
+          gradeDescriptions: {},
+        },
+        { preserveRawSkillConfig: true }
+      )
+
+      // Link the source as the clone's direct predecessor. Rarity/upgradeGroup are
+      // untouched, so the linked-skill immutability guards still pass; the global
+      // skill upgrade graph is revalidated against the same transaction snapshot
+      // (which now includes the clone). The source write payload is likewise a deep
+      // clone of the RAW persisted config (not `sourceConfig`) so the source's own
+      // unknown nested metadata survives the link exactly.
+      const sourceWriteConfig = JSON.parse(
+        JSON.stringify(source.config ?? {})
+      ) as Record<string, unknown>
+      sourceWriteConfig.upgradeToStableIds = outgoingTargets
+      const updatedSource = await updateCatalogItemInTransaction(
+        tx,
+        "skills",
+        sourceId,
+        {
+          config: sourceWriteConfig,
+        },
+        { preserveRawSkillConfig: true }
+      )
+
+      return { source: updatedSource, item }
+    }, serializable)
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw conflict(
+        "catalog_stable_id_conflict",
+        `A skill variant with stableId "${deriveCatalogStableId(
+          `${resolvedName}-${input.rarity.toLowerCase()}`
+        )}" already exists`
       )
     }
     if (isSerializationFailure(err)) {

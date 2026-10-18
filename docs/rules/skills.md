@@ -123,7 +123,7 @@ for offers):
   // several. An edge is authoritative: the runtime ignores rarity, track and
   // upgrade group when following a declared edge, so a same-rarity, lower-rarity,
   // `Unique`, cross-group or cross-track target is allowed. Each id must be a
-  // nonempty string and internally unique; the list is capped at 50. A self-link,
+  // nonempty string and internally unique; the list is capped at 500. A self-link,
   // a missing/wrong-kind target, a duplicate stableId or a cycle through the
   // explicit-edge graph is a GRAPH error (validated by `validateSkillUpgradeGraph`),
   // not a config-shape error.

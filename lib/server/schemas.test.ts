@@ -51,6 +51,7 @@ import {
   skillConfigSchema,
   skillGradeDescriptionsForbidden,
   skillGradeForbidden,
+  skillUpgradeCloneSchema,
   skillUpgradeSchema,
   specialAbilitiesSchema,
   titleConfigSchema,
@@ -1925,6 +1926,70 @@ describe("skill rarity (shared vocabulary + monotonic ordering)", () => {
   })
 })
 
+describe("skillUpgradeCloneSchema (admin variant-clone payload)", () => {
+  it("requires rarity and accepts every rarity from the shared vocabulary", () => {
+    for (const rarity of [
+      "Inferior",
+      "Common",
+      "Uncommon",
+      "Rare",
+      "Epic",
+      "Ancient",
+      "Legendary",
+      "Mythical",
+      "Sacred",
+      "Divine",
+      "Unique",
+    ]) {
+      const parsed = skillUpgradeCloneSchema.safeParse({ rarity })
+      expect(parsed.success).toBe(true)
+      if (parsed.success) expect(parsed.data.rarity).toBe(rarity)
+    }
+    expect(skillUpgradeCloneSchema.safeParse({}).success).toBe(false)
+    expect(
+      skillUpgradeCloneSchema.safeParse({ rarity: "Mythic" }).success
+    ).toBe(false)
+    expect(skillUpgradeCloneSchema.safeParse({ rarity: 5 }).success).toBe(false)
+  })
+
+  it("trims a supplied name and enforces a 1..200 bound", () => {
+    const parsed = skillUpgradeCloneSchema.safeParse({
+      rarity: "Common",
+      name: "  Sunfire  ",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data.name).toBe("Sunfire")
+
+    // Blank after trimming is rejected.
+    expect(
+      skillUpgradeCloneSchema.safeParse({ rarity: "Common", name: "   " })
+        .success
+    ).toBe(false)
+    expect(
+      skillUpgradeCloneSchema.safeParse({ rarity: "Common", name: "" }).success
+    ).toBe(false)
+    // At most 200 chars.
+    expect(
+      skillUpgradeCloneSchema.safeParse({
+        rarity: "Common",
+        name: "x".repeat(200),
+      }).success
+    ).toBe(true)
+    expect(
+      skillUpgradeCloneSchema.safeParse({
+        rarity: "Common",
+        name: "x".repeat(201),
+      }).success
+    ).toBe(false)
+  })
+
+  it("defaults name to undefined so the service falls back to the source name", () => {
+    const parsed = skillUpgradeCloneSchema.safeParse({ rarity: "Uncommon" })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data.name).toBeUndefined()
+  })
+})
+
 describe("skill upgradeToStableIds (local shape)", () => {
   it("reads a legacy config without upgradeToStableIds as undefined (fallback)", () => {
     const parsed = skillConfigSchema.safeParse({
@@ -1976,19 +2041,19 @@ describe("skill upgradeToStableIds (local shape)", () => {
     expect(parsed.success).toBe(false)
   })
 
-  it("accepts exactly 50 entries and rejects 51", () => {
-    const fifty = Array.from({ length: 50 }, (_, i) => `skill-${i}`)
+  it("accepts exactly 500 entries and rejects 501", () => {
+    const fiveHundred = Array.from({ length: 500 }, (_, i) => `skill-${i}`)
     expect(
       skillConfigSchema.safeParse({
         track: "class",
-        upgradeToStableIds: fifty,
+        upgradeToStableIds: fiveHundred,
       }).success
     ).toBe(true)
-    const fiftyOne = Array.from({ length: 51 }, (_, i) => `skill-${i}`)
+    const fiveHundredOne = Array.from({ length: 501 }, (_, i) => `skill-${i}`)
     expect(
       skillConfigSchema.safeParse({
         track: "class",
-        upgradeToStableIds: fiftyOne,
+        upgradeToStableIds: fiveHundredOne,
       }).success
     ).toBe(false)
   })

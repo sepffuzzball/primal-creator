@@ -15,6 +15,7 @@ import {
   createCatalogItemInTransaction,
   createCharacter,
   createInitialState,
+  createSkillUpgradeVariant,
   deserializeState,
   evolveCharacter,
   experienceCharacter,
@@ -11087,6 +11088,652 @@ describe("catalog item transaction helpers (reusable create/update in one caller
       rarity: "Common",
       upgradeToStableIds: ["missing-skill"],
     })
+  })
+})
+
+describe("createSkillUpgradeVariant (admin skill variant clone)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function addSkill(opts: {
+    id: string
+    stableId: string
+    name?: string
+    description?: string | null
+    sourceUrl?: string | null
+    config?: Record<string, unknown>
+    archived?: boolean
+  }) {
+    dbMock.store.addCatalog({
+      id: opts.id,
+      kind: "skills",
+      stableId: opts.stableId,
+      name: opts.name ?? opts.stableId,
+      config: opts.config ?? {},
+      description: opts.description ?? null,
+      sourceUrl: opts.sourceUrl ?? null,
+      archived: opts.archived ?? false,
+    })
+  }
+
+  it("clones an Inferior skill to Common linking it as a direct successor (full effect/unknown metadata copy)", async () => {
+    const effects = [
+      {
+        phase: "flat",
+        condition: { kind: "always" },
+        amount: { strength: 2 },
+        stacking: "stack",
+      },
+      {
+        phase: "percent",
+        basisPoints: { agility: 500 },
+        stacking: "replace",
+        group: "g1",
+      },
+    ]
+    dbMock.store.addCatalog({
+      id: "archer",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: {},
+      description: null,
+      sourceUrl: null,
+      archived: false,
+    })
+    addSkill({
+      id: "fireball-inferior",
+      stableId: "fireball-inferior",
+      name: "Fireball",
+      description: "A fireball",
+      sourceUrl: "https://example.com/fireball",
+      config: {
+        track: "class",
+        rarity: "Inferior",
+        upgradeGroup: "fire",
+        classStableId: "archer",
+        effects,
+        unknownMetadata: { nested: [1, 2, 3] },
+      },
+    })
+    const result = await createSkillUpgradeVariant("fireball-inferior", {
+      rarity: "Common",
+    })
+    const item = result.item
+    expect(item.stableId).toBe("fireball-common")
+    expect(item.name).toBe("Fireball")
+    expect(item.description).toBe("A fireball")
+    expect(item.sourceUrl).toBe("https://example.com/fireball")
+    expect(item.grade).toBeNull()
+    expect(item.gradeDescriptions).toEqual({})
+    expect(item.config.rarity).toBe("Common")
+    expect(item.config.upgradeToStableIds).toEqual([])
+    expect(item.config.track).toBe("class")
+    expect(item.config.upgradeGroup).toBe("fire")
+    expect(item.config.classStableId).toBe("archer")
+    expect(item.config.effects).toEqual(effects)
+    expect(item.config.effects).not.toBe(effects)
+    expect(item.config.unknownMetadata).toEqual({ nested: [1, 2, 3] })
+    // The source is now explicitly linked to the clone; the full legacy successor
+    // set was empty so the only outgoing id is the clone.
+    expect(result.source.config.upgradeToStableIds).toEqual(["fireball-common"])
+    expect(result.source.config.rarity).toBe("Inferior")
+
+    // Chained clone: Common -> Uncommon. The Common clone is terminal, so its
+    // source is a direct successor branch appended to an explicit empty list.
+    const second = await createSkillUpgradeVariant(item.id, {
+      rarity: "Uncommon",
+    })
+    expect(second.item.stableId).toBe("fireball-uncommon")
+    expect(second.item.config.rarity).toBe("Uncommon")
+    expect(second.item.config.upgradeToStableIds).toEqual([])
+    expect(second.source.config.upgradeToStableIds).toEqual([
+      "fireball-uncommon",
+    ])
+    expect(second.source.config.rarity).toBe("Common")
+  })
+
+  it("links a no-upgradeGroup source ONLY to its clone (never unrelated ungrouped skills)", async () => {
+    // Regression: a legacy source with NO upgradeGroup has a null group during the
+    // legacy `upgradeGroup` + `rarity` fallback, which previously matched EVERY
+    // unrelated ungrouped skill's null group. "Basic Stealth" at Inferior would
+    // gather hundreds of unrelated entries as its successor set.
+    const effects = [
+      { phase: "flat", condition: { kind: "always" }, amount: { agility: 3 } },
+    ]
+    // `classStableId: "archer"` must resolve to an existing, unarchived class.
+    dbMock.store.addCatalog({
+      id: "archer",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: {},
+      archived: false,
+    })
+    addSkill({
+      id: "basic-stealth-inferior",
+      stableId: "basic-stealth-inferior",
+      name: "Basic Stealth",
+      description: "Sneak",
+      sourceUrl: "https://example.com/basic-stealth",
+      config: {
+        track: "class",
+        rarity: "Inferior",
+        classStableId: "archer",
+        effects,
+        unknownMetadata: { hide: true },
+      },
+    })
+    // Two unrelated ungrouped active skills, both STRICTLY higher rarity than the
+    // Inferior source: under the old bug they both leaked into the fallback set.
+    addSkill({
+      id: "unrelated-a-common",
+      stableId: "unrelated-a-common",
+      name: "Unrelated A",
+      config: { track: "race", rarity: "Common" },
+    })
+    addSkill({
+      id: "unrelated-b-uncommon",
+      stableId: "unrelated-b-uncommon",
+      name: "Unrelated B",
+      config: { track: "race", rarity: "Uncommon" },
+    })
+    // One grouped skill that must also never leak into the source's targets.
+    addSkill({
+      id: "grouped-common",
+      stableId: "grouped-common",
+      name: "Grouped",
+      config: { track: "class", rarity: "Common", upgradeGroup: "stealth" },
+    })
+
+    const result = await createSkillUpgradeVariant("basic-stealth-inferior", {
+      rarity: "Common",
+    })
+    const item = result.item
+    expect(item.stableId).toBe("basic-stealth-common")
+    expect(item.name).toBe("Basic Stealth")
+    expect(item.description).toBe("Sneak")
+    expect(item.sourceUrl).toBe("https://example.com/basic-stealth")
+    // The child is terminal and carries the full (deep-copied) source config at the
+    // requested rarity - no unrelated skill link is copied in.
+    expect(item.config.rarity).toBe("Common")
+    expect(item.config.upgradeToStableIds).toEqual([])
+    expect(item.config.track).toBe("class")
+    expect(item.config.classStableId).toBe("archer")
+    expect(item.config.effects).toEqual(effects)
+    expect(item.config.effects).not.toBe(effects)
+    expect(item.config.unknownMetadata).toEqual({ hide: true })
+    // The source's only outgoing target is the freshly cloned child - no unrelated
+    // ungrouped skill and no grouped skill is linked.
+    expect(result.source.config.upgradeToStableIds).toEqual([
+      "basic-stealth-common",
+    ])
+
+    // The Common clone is terminal; cloning it to Uncommon forms a direct chain
+    // (the explicit empty list branch appends, never gathers).
+    const second = await createSkillUpgradeVariant(item.id, {
+      rarity: "Uncommon",
+    })
+    expect(second.item.stableId).toBe("basic-stealth-uncommon")
+    expect(second.item.config.rarity).toBe("Uncommon")
+    expect(second.item.config.upgradeToStableIds).toEqual([])
+    expect(second.source.config.upgradeToStableIds).toEqual([
+      "basic-stealth-uncommon",
+    ])
+  })
+
+  it("supports an arbitrary/Unique rarity branch and a Unique source", async () => {
+    addSkill({
+      id: "moon-common",
+      stableId: "moon-common",
+      name: "Moon",
+      config: { track: "class", rarity: "Common", upgradeGroup: "arcane" },
+    })
+    const unique = await createSkillUpgradeVariant("moon-common", {
+      rarity: "Unique",
+    })
+    expect(unique.item.config.rarity).toBe("Unique")
+    // Unique is incomparable: it is never a strictly-higher fallback successor, but
+    // it is still appended as the direct branch.
+    expect(unique.item.config.upgradeToStableIds).toEqual([])
+    expect(unique.source.config.upgradeToStableIds).toEqual(["moon-unique"])
+
+    // Cloning FROM a Unique source: nothing is strictly higher, so only the clone.
+    addSkill({
+      id: "sun-unique",
+      stableId: "sun-unique",
+      name: "Sun",
+      config: { track: "race", rarity: "Unique", upgradeGroup: "arcane" },
+    })
+    const fromUnique = await createSkillUpgradeVariant("sun-unique", {
+      rarity: "Common",
+    })
+    expect(fromUnique.item.config.rarity).toBe("Common")
+    expect(fromUnique.source.config.upgradeToStableIds).toEqual(["sun-common"])
+  })
+
+  it("preserves every legacy same-group strictly-higher ordered rarity choice (regardless of gap)", async () => {
+    addSkill({
+      id: "blade-inferior",
+      stableId: "blade-inferior",
+      name: "Blade",
+      config: { track: "class", rarity: "Inferior", upgradeGroup: "blade" },
+    })
+    addSkill({
+      id: "blade-common",
+      stableId: "blade-common",
+      name: "Blade",
+      config: { track: "class", rarity: "Common", upgradeGroup: "blade" },
+    })
+    addSkill({
+      id: "blade-rare",
+      stableId: "blade-rare",
+      name: "Blade",
+      config: { track: "class", rarity: "Rare", upgradeGroup: "blade" },
+    })
+    addSkill({
+      id: "blade-epic",
+      stableId: "blade-epic",
+      name: "Blade",
+      config: { track: "class", rarity: "Epic", upgradeGroup: "blade" },
+    })
+    const result = await createSkillUpgradeVariant("blade-inferior", {
+      rarity: "Legendary",
+    })
+    // The clone is "blade-legendary". The legacy set is sorted ascending by rarity
+    // index (Common, Rare, Epic - a gap/jump over Uncommon is preserved), then the
+    // clone is appended last.
+    expect(result.item.config.rarity).toBe("Legendary")
+    expect(result.source.config.upgradeToStableIds).toEqual([
+      "blade-common",
+      "blade-rare",
+      "blade-epic",
+      "blade-legendary",
+    ])
+  })
+
+  it("appends a clone to an existing explicit branch list, preserving order", async () => {
+    addSkill({
+      id: "web-common",
+      stableId: "web-common",
+      name: "Web",
+      config: {
+        track: "race",
+        rarity: "Common",
+        upgradeGroup: "web",
+        upgradeToStableIds: ["web-rare-a", "web-rare-b"],
+      },
+    })
+    for (const [id, rarity] of [
+      ["web-rare-a", "Rare"],
+      ["web-rare-b", "Uncommon"],
+    ] as const) {
+      addSkill({
+        id,
+        stableId: id,
+        name: "Web",
+        config: { track: "race", rarity, upgradeGroup: "web" },
+      })
+    }
+    const result = await createSkillUpgradeVariant("web-common", {
+      rarity: "Epic",
+    })
+    expect(result.item.config.rarity).toBe("Epic")
+    expect(result.item.config.upgradeToStableIds).toEqual([])
+    // The explicit edge list is preserved and the clone is appended last.
+    expect(result.source.config.upgradeToStableIds).toEqual([
+      "web-rare-a",
+      "web-rare-b",
+      "web-epic",
+    ])
+  })
+
+  it("returns 409 when the derived name+rarity slug already exists (no random suffix)", async () => {
+    addSkill({
+      id: "firebolt-common",
+      stableId: "firebolt-common",
+      name: "Firebolt",
+      config: { track: "race", rarity: "Common", upgradeGroup: "fire" },
+    })
+    addSkill({
+      id: "firebolt-uncommon",
+      stableId: "firebolt-uncommon",
+      name: "Firebolt",
+      config: { track: "race", rarity: "Uncommon", upgradeGroup: "fire" },
+    })
+    await expect(
+      createSkillUpgradeVariant("firebolt-common", { rarity: "Uncommon" })
+    ).rejects.toMatchObject({ status: 409, code: "catalog_stable_id_conflict" })
+    // Nothing was written: no clone, no source link.
+    expect(dbMock.store.catalog.size).toBe(2)
+    expect(
+      (
+        dbMock.store.catalog.get("firebolt-common")!.config as {
+          upgradeToStableIds?: string[]
+        }
+      ).upgradeToStableIds
+    ).toBeUndefined()
+  })
+
+  it("rejects an archived source with 400 and writes nothing", async () => {
+    addSkill({
+      id: "old-common",
+      stableId: "old-common",
+      name: "Old",
+      config: { track: "class", rarity: "Common" },
+      archived: true,
+    })
+    await expect(
+      createSkillUpgradeVariant("old-common", { rarity: "Uncommon" })
+    ).rejects.toMatchObject({ status: 400, code: "skill_archived" })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rolls back when a cloned classStableId references an archived class (never silently dropped)", async () => {
+    dbMock.store.addCatalog({
+      id: "warrior",
+      kind: "classes",
+      stableId: "warrior",
+      name: "Warrior",
+      config: {},
+      archived: true,
+    })
+    addSkill({
+      id: "guard-common",
+      stableId: "guard-common",
+      name: "Guard",
+      config: {
+        track: "class",
+        rarity: "Common",
+        upgradeGroup: "guard",
+        classStableId: "warrior",
+      },
+    })
+    await expect(
+      createSkillUpgradeVariant("guard-common", { rarity: "Rare" })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // Whole transaction rolled back: no clone, source untouched. The seeded
+    // archived "warrior" class is itself a catalog row, so 2 entries remain.
+    expect(dbMock.store.catalog.size).toBe(2)
+    expect(
+      (
+        dbMock.store.catalog.get("guard-common")!.config as {
+          upgradeToStableIds?: string[]
+        }
+      ).upgradeToStableIds
+    ).toBeUndefined()
+  })
+
+  it("rolls back a broken pre-existing skill upgrade graph during the clone", async () => {
+    addSkill({
+      id: "dangling-common",
+      stableId: "dangling-common",
+      name: "Dangling",
+      config: {
+        track: "race",
+        rarity: "Common",
+        upgradeGroup: "x",
+        upgradeToStableIds: ["missing-skill"],
+      },
+    })
+    addSkill({
+      id: "good-common",
+      stableId: "good-common",
+      name: "Good",
+      config: { track: "class", rarity: "Common", upgradeGroup: "y" },
+    })
+    await expect(
+      createSkillUpgradeVariant("good-common", { rarity: "Uncommon" })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The child create's graph check ran before the insert, so nothing was written.
+    expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("maps a P2034 serialization conflict to 409", async () => {
+    addSkill({
+      id: "weapon-common",
+      stableId: "weapon-common",
+      name: "Weapon",
+      config: { track: "race", rarity: "Common", upgradeGroup: "w" },
+    })
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2034",
+    })
+    try {
+      await expect(
+        createSkillUpgradeVariant("weapon-common", { rarity: "Uncommon" })
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "catalog_serialization_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("maps a P2002 unique conflict to 409", async () => {
+    addSkill({
+      id: "shield-common",
+      stableId: "shield-common",
+      name: "Shield",
+      config: { track: "class", rarity: "Common", upgradeGroup: "s" },
+    })
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce({
+      name: "PrismaClientKnownRequestError",
+      code: "P2002",
+      meta: { target: ["kind", "stableId"] },
+    })
+    try {
+      await expect(
+        createSkillUpgradeVariant("shield-common", { rarity: "Uncommon" })
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "catalog_stable_id_conflict",
+      })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it("preserves nested custom metadata inside a valid skill effect and its optional condition in source and clone", async () => {
+    dbMock.store.addCatalog({
+      id: "archer",
+      kind: "classes",
+      stableId: "archer",
+      name: "Archer",
+      config: {},
+      description: null,
+      sourceUrl: null,
+      archived: false,
+    })
+    const effects = [
+      {
+        phase: "flat",
+        condition: {
+          kind: "levelAtLeast",
+          track: "class",
+          level: 5,
+          customConditionMeta: { note: "after-5", flags: ["a", "b"] },
+        },
+        amount: { strength: 3 },
+        stacking: "stack",
+        customEffectMeta: { flavor: "ignite", tags: ["fire", "dot"] },
+      },
+      {
+        phase: "percent",
+        basisPoints: { agility: 400 },
+        stacking: "replace",
+        group: "g1",
+        customEffectMeta: { flavor: "evasive" },
+      },
+    ]
+    addSkill({
+      id: "ember-inferior",
+      stableId: "ember-inferior",
+      name: "Ember",
+      config: {
+        track: "class",
+        rarity: "Inferior",
+        upgradeGroup: "ember",
+        classStableId: "archer",
+        effects,
+        unknownMetadata: { nested: [1, 2, 3] },
+        customRoot: { deep: { value: 42 } },
+      },
+    })
+    const result = await createSkillUpgradeVariant("ember-inferior", {
+      rarity: "Common",
+    })
+    const item = result.item
+    // The clone persists the deep-cloned RAW source config, so unknown nested
+    // metadata inside an effect (and inside its condition) survives exactly.
+    expect(item.config.effects).toEqual(effects)
+    expect(item.config.effects).not.toBe(effects)
+    expect(item.config.effects).not.toBe(result.source.config.effects)
+    expect(item.config.unknownMetadata).toEqual({ nested: [1, 2, 3] })
+    expect(item.config.customRoot).toEqual({ deep: { value: 42 } })
+    expect(item.config.rarity).toBe("Common")
+    // The source link rewrites the source from its OWN raw config, so the source's
+    // unknown nested metadata survives verbatim as well.
+    expect(result.source.config.effects).toEqual(effects)
+    expect(result.source.config.unknownMetadata).toEqual({ nested: [1, 2, 3] })
+    expect(result.source.config.customRoot).toEqual({ deep: { value: 42 } })
+    expect(result.source.config.rarity).toBe("Inferior")
+  })
+
+  it("rejects a clone whose source config carries an invalid known effect and writes nothing", async () => {
+    addSkill({
+      id: "broken-inferior",
+      stableId: "broken-inferior",
+      name: "Broken",
+      config: {
+        track: "class",
+        rarity: "Inferior",
+        upgradeGroup: "broken",
+        // A valid `flat` effect must carry `amount`; omitting it is an invalid
+        // known effect the Zod config schema rejects before any write.
+        effects: [
+          {
+            phase: "flat",
+            condition: { kind: "always" },
+            stacking: "stack",
+          },
+        ],
+      },
+    })
+    await expect(
+      createSkillUpgradeVariant("broken-inferior", { rarity: "Common" })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
+    // Rolled back: no clone row, source untouched.
+    expect(dbMock.store.catalog.size).toBe(1)
+    expect(
+      (
+        dbMock.store.catalog.get("broken-inferior")!.config as {
+          upgradeToStableIds?: string[]
+        }
+      ).upgradeToStableIds
+    ).toBeUndefined()
+  })
+
+  it("preserves 50+ legacy same-group strictly-higher variants and appends the clone edge (raised cap)", async () => {
+    addSkill({
+      id: "nova-inferior",
+      stableId: "nova-inferior",
+      name: "Nova",
+      config: { track: "class", rarity: "Inferior", upgradeGroup: "nova" },
+    })
+    const higherRarities = [
+      "Common",
+      "Uncommon",
+      "Rare",
+      "Epic",
+      "Ancient",
+      "Legendary",
+      "Mythical",
+      "Sacred",
+      "Divine",
+    ]
+    const higherStableIds: string[] = []
+    for (let i = 0; i < 55; i++) {
+      const stableId = `nova-h-${i}`
+      higherStableIds.push(stableId)
+      addSkill({
+        id: stableId,
+        stableId,
+        name: `Nova ${i}`,
+        config: {
+          track: "class",
+          rarity: higherRarities[i % higherRarities.length],
+          upgradeGroup: "nova",
+        },
+      })
+    }
+    const result = await createSkillUpgradeVariant("nova-inferior", {
+      rarity: "Legendary",
+    })
+    const targets = result.source.config.upgradeToStableIds as string[]
+    // 55 strictly-higher legacy variants PLUS the cloned child all survive; the
+    // old 50-entry schema cap would have rejected this, the raised cap allows it.
+    expect(targets).toHaveLength(56)
+    expect(targets[targets.length - 1]).toBe("nova-legendary")
+    for (const sid of higherStableIds) expect(targets).toContain(sid)
+    // The clone is explicitly terminal and carries the requested rarity.
+    expect(result.item.config.upgradeToStableIds).toEqual([])
+    expect(result.item.config.rarity).toBe("Legendary")
+  })
+
+  it("rejects 409 skill_upgrade_group_too_large and writes nothing when a legacy group would exceed 500 successors", async () => {
+    addSkill({
+      id: "flash-inferior",
+      stableId: "flash-inferior",
+      name: "Flash",
+      config: { track: "class", rarity: "Inferior", upgradeGroup: "flash" },
+    })
+    const higherRarities = [
+      "Common",
+      "Uncommon",
+      "Rare",
+      "Epic",
+      "Ancient",
+      "Legendary",
+      "Mythical",
+      "Sacred",
+      "Divine",
+    ]
+    for (let i = 0; i < 500; i++) {
+      const stableId = `flash-h-${i}`
+      addSkill({
+        id: stableId,
+        stableId,
+        name: `Flash ${i}`,
+        config: {
+          track: "class",
+          rarity: higherRarities[i % higherRarities.length],
+          upgradeGroup: "flash",
+        },
+      })
+    }
+    await expect(
+      createSkillUpgradeVariant("flash-inferior", { rarity: "Common" })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "skill_upgrade_group_too_large",
+    })
+    // Failed early, before any write: 500 higher variants + the seeded source, and
+    // no clone row and no source link (the source still has no upgradeToStableIds).
+    expect(dbMock.store.catalog.size).toBe(501)
+    expect(
+      (
+        dbMock.store.catalog.get("flash-inferior")!.config as {
+          upgradeToStableIds?: string[]
+        }
+      ).upgradeToStableIds
+    ).toBeUndefined()
   })
 })
 
