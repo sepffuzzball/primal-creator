@@ -2527,6 +2527,14 @@ export function CharacterDetail({
   const [catalogLoading, setCatalogLoading] = React.useState(false)
   const [assocBusy, setAssocBusy] = React.useState(false)
   const [skillsCatalog, setSkillsCatalog] = React.useState<CatalogItem[]>([])
+  const [expandedSkillDescriptions, setExpandedSkillDescriptions] =
+    React.useState<{ characterId: string; ids: Set<string> }>({
+      characterId: "",
+      ids: new Set(),
+    })
+  if (expandedSkillDescriptions.characterId !== id) {
+    setExpandedSkillDescriptions({ characterId: id, ids: new Set() })
+  }
   const [skillBusy, setSkillBusy] = React.useState(false)
   const [upgradeSource, setUpgradeSource] =
     React.useState<CharacterAssociationView | null>(null)
@@ -3720,6 +3728,34 @@ export function CharacterDetail({
   const skillAssociations = character.associations.filter(
     (a) => a.kind === "skill"
   )
+  const expandedSkillIds =
+    expandedSkillDescriptions.characterId === character.id
+      ? expandedSkillDescriptions.ids
+      : new Set<string>()
+  const describedSkillIds = skillAssociations
+    .filter((a) => Boolean(a.definitionDescription?.trim()))
+    .map((a) => a.id)
+  const allSkillDescriptionsExpanded =
+    describedSkillIds.length > 0 &&
+    describedSkillIds.every((id) => expandedSkillIds.has(id))
+  const toggleSkillDescription = (associationId: string) => {
+    setExpandedSkillDescriptions((current) => {
+      const ids = new Set(
+        current.characterId === character.id ? current.ids : []
+      )
+      if (ids.has(associationId)) ids.delete(associationId)
+      else ids.add(associationId)
+      return { characterId: character.id, ids }
+    })
+  }
+  const toggleAllSkillDescriptions = () => {
+    setExpandedSkillDescriptions({
+      characterId: character.id,
+      ids: allSkillDescriptionsExpanded
+        ? new Set()
+        : new Set(describedSkillIds),
+    })
+  }
 
   const trackHistory = (track: "race" | "class" | "profession") => {
     const matching = events ? eventsForTrack(events, track) : null
@@ -5451,9 +5487,21 @@ export function CharacterDetail({
                 <Separator />
 
                 <div>
-                  <h3 className="font-heading text-sm font-medium">
-                    Acquired skills
-                  </h3>
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="font-heading text-sm font-medium">
+                      Acquired skills
+                    </h3>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={describedSkillIds.length === 0}
+                      onClick={toggleAllSkillDescriptions}
+                    >
+                      {allSkillDescriptionsExpanded
+                        ? "Collapse descriptions"
+                        : "Expand descriptions"}
+                    </Button>
+                  </div>
                   <p className="text-xs text-muted-foreground">
                     Effects are synthesized live from the current catalog; the
                     stored history is unchanged. Archived skills no longer
@@ -5505,54 +5553,65 @@ export function CharacterDetail({
                           rarityRank(rarity) > rarityRank(a.rarity)
                         )
                       })
-                      const blocked =
-                        targets.length === 0
-                          ? upgradeEdges !== undefined
-                            ? "No active direct upgrade is currently available."
-                            : !a.rarity
-                              ? "Source rarity metadata unavailable"
-                              : !group
-                                ? "Upgrade group metadata unavailable"
-                                : "No active higher-rarity variant in this upgrade group"
-                          : null
+                      const descriptionAvailable = Boolean(
+                        a.definitionDescription?.trim()
+                      )
                       return (
                         <div
                           key={a.id}
                           className="rounded-lg border bg-input/20 p-2"
                         >
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="font-medium">{a.name}</span>
-                            {a.definitionArchived ? (
-                              <Badge variant="outline">Archived</Badge>
+                          <div className="flex items-center gap-2">
+                            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                              <span className="font-medium">{a.name}</span>
+                              {a.rarity ? (
+                                <SemanticBadge kind="rarity" value={a.rarity} />
+                              ) : null}
+                              {a.definitionArchived ? (
+                                <Badge variant="outline">Archived</Badge>
+                              ) : null}
+                            </div>
+                            {descriptionAvailable ? (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                aria-expanded={expandedSkillIds.has(a.id)}
+                                aria-label={`${expandedSkillIds.has(a.id) ? "Hide" : "Show"} description for ${a.name}`}
+                                onClick={() => toggleSkillDescription(a.id)}
+                              >
+                                {expandedSkillIds.has(a.id)
+                                  ? "Hide description"
+                                  : "Show description"}
+                              </Button>
                             ) : null}
-                            {a.rarity ? (
-                              <SemanticBadge kind="rarity" value={a.rarity} />
+                            {!a.definitionArchived && targets.length > 0 ? (
+                              <Button
+                                className="ml-auto shrink-0"
+                                size="sm"
+                                variant="outline"
+                                disabled={skillBusy}
+                                onClick={() => {
+                                  setUpgradeSource(a)
+                                  setUpgradeTargetId("")
+                                  setUpgradeSearch("")
+                                  setUpgradeReason("")
+                                }}
+                              >
+                                Upgrade skill
+                              </Button>
                             ) : null}
                           </div>
+                          {expandedSkillIds.has(a.id) &&
+                          descriptionAvailable ? (
+                            <p className="mt-1 text-xs whitespace-pre-wrap text-muted-foreground">
+                              {a.definitionDescription}
+                            </p>
+                          ) : null}
                           {a.upgradeGroup ? (
                             <div className="text-[0.6875rem] text-muted-foreground">
                               Upgrade group: {a.upgradeGroup}
                             </div>
                           ) : null}
-                          {blocked ? (
-                            <p className="text-[0.6875rem] text-muted-foreground">
-                              {blocked}
-                            </p>
-                          ) : (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              disabled={skillBusy}
-                              onClick={() => {
-                                setUpgradeSource(a)
-                                setUpgradeTargetId("")
-                                setUpgradeSearch("")
-                                setUpgradeReason("")
-                              }}
-                            >
-                              Upgrade skill
-                            </Button>
-                          )}
                         </div>
                       )
                     })}

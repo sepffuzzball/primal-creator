@@ -178,6 +178,15 @@ export interface CharacterAssociationView {
   kind:
     "title" | "equipment" | "skill" | "blessing" | "bloodline" | "transcendent"
   name: string
+  /**
+   * Current catalog prose for the linked definition, read from the live definition
+   * (`link.definition.description`) for EVERY association kind. Never falls back to
+   * the authored grade-specific `gradeDescription`; `null` when the definition
+   * carries no prose. Exposed even for an archived definition, so the UI already
+   * receives the current description and never has to consult the active-only skill
+   * catalog.
+   */
+  definitionDescription: string | null
   slot?: string
   upgradeGroup?: string
   /** Catalog grade of the linked definition (skills use this for tiers). */
@@ -1679,6 +1688,7 @@ function associationView(
     definitionId: link.definitionId,
     kind,
     name: link.definition.name,
+    definitionDescription: link.definition.description ?? null,
     definitionArchived: link.definition.archived,
   }
   if (kind === "equipment") {

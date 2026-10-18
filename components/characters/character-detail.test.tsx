@@ -735,6 +735,7 @@ function association(
     definitionId,
     name,
     definitionArchived: false,
+    definitionDescription: null,
     ...rest,
   } as import("@/lib/api").CharacterAssociationView
 }
@@ -1309,6 +1310,42 @@ describe("association panel separation", () => {
     expect(
       screen.queryByRole("heading", { name: "Inventory and equipment" })
     ).toBeNull()
+  })
+})
+
+describe("skill description disclosures", () => {
+  it("resets disclosure state when the route changes away and back without interaction", async () => {
+    const skill = association({
+      id: "skill-link",
+      kind: "skill",
+      definitionId: "skill-id",
+      name: "Quick Shot",
+      definitionDescription: "A precise ranged attack.",
+    })
+    const characterA = {
+      ...character,
+      associations: [skill],
+    } as typeof character
+    setupMock({ character: characterA })
+    characterB = { ...characterA, id: "chr-2", name: "Other" }
+    const view = render(<CharacterDetail />)
+    await flush()
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage skills" }))
+    const disclosure = () =>
+      screen.getByRole("button", { name: /description for Quick Shot/i })
+    fireEvent.click(disclosure())
+    expect(disclosure().getAttribute("aria-expanded")).toBe("true")
+
+    mockRouteId = "chr-2"
+    view.rerender(<CharacterDetail />)
+    await flush()
+    mockRouteId = "chr-1"
+    view.rerender(<CharacterDetail />)
+    await flush()
+
+    expect(disclosure().getAttribute("aria-expanded")).toBe("false")
+    expect(disclosure().textContent).toBe("Show description")
   })
 })
 
@@ -4297,6 +4334,97 @@ describe("equipment eligibility and skill upgrades", () => {
       ],
     }) as unknown as import("@/lib/api").CharacterDetail
 
+  it("toggles current catalog descriptions individually and globally", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "active",
+            kind: "skill",
+            definitionId: "a",
+            name: "Active",
+            definitionDescription: "Active\ndescription",
+          }),
+          association({
+            id: "archived",
+            kind: "skill",
+            definitionId: "b",
+            name: "Archived skill",
+            definitionArchived: true,
+            definitionDescription: "Archived description",
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    expect(
+      screen.queryByText(
+        (_, element) => element?.textContent === "Active\ndescription"
+      )
+    ).toBeNull()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show description for Active" })
+    )
+    expect(
+      screen.getByText(
+        (_, element) => element?.textContent === "Active\ndescription"
+      )
+    ).toBeTruthy()
+    expect(screen.queryByText("Archived description")).toBeNull()
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show description for Archived skill",
+      })
+    )
+    expect(screen.getByText("Archived description")).toBeTruthy()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Collapse descriptions" })
+    )
+    expect(
+      screen.queryByText(
+        (_, element) => element?.textContent === "Active\ndescription"
+      )
+    ).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Expand descriptions" }))
+    expect(
+      screen.getByText(
+        (_, element) => element?.textContent === "Active\ndescription"
+      )
+    ).toBeTruthy()
+    expect(screen.getByText("Archived description")).toBeTruthy()
+  })
+
+  it("disables global disclosure and omits upgrades for blank descriptions and unavailable sources", async () => {
+    setupMock({
+      character: {
+        ...character,
+        associations: [
+          association({
+            id: "blank",
+            kind: "skill",
+            definitionId: "a",
+            name: "Blank",
+            definitionDescription: "  ",
+          }),
+        ],
+      } as typeof character,
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    expect(
+      screen
+        .getByRole("button", { name: "Expand descriptions" })
+        .hasAttribute("disabled")
+    ).toBe(true)
+    expect(
+      screen.queryByRole("button", { name: "Show description for Blank" })
+    ).toBeNull()
+    expect(screen.queryByText("Upgrade group metadata unavailable")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
+  })
+
   it("loads skill catalog for owners, submits explicit higher-tier upgrade reason/version, and reloads", async () => {
     setupMock({
       character: sourceCharacter("Common"),
@@ -4310,7 +4438,10 @@ describe("equipment eligibility and skill upgrades", () => {
         ([url]) => url === "/api/catalog/skills"
       )
     ).toBe(true)
-    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    const upgradeButton = screen.getByRole("button", { name: "Upgrade skill" })
+    expect(upgradeButton.className).toContain("ml-auto")
+    expect(upgradeButton.parentElement?.className).toContain("flex")
+    fireEvent.click(upgradeButton)
     fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
     fireEvent.click(screen.getByText(/Ember II - Rare/))
     fireEvent.change(screen.getByLabelText("Reason"), {
@@ -4390,7 +4521,8 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getByText(/No active higher-rarity variant/)).toBeTruthy()
+    expect(screen.queryByText(/No active higher-rarity variant/)).toBeNull()
+    expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
     cleanup()
     setupMock({
       character: sourceCharacter("Rare"),
@@ -4402,7 +4534,8 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getByText(/No active higher-rarity variant/)).toBeTruthy()
+    expect(screen.queryByText(/No active higher-rarity variant/)).toBeNull()
+    expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
     cleanup()
     setupMock({
       character: sourceCharacter(undefined),
@@ -4411,7 +4544,7 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getByText(/Source rarity metadata unavailable/)).toBeTruthy()
+    expect(screen.queryByText(/Source rarity metadata unavailable/)).toBeNull()
     cleanup()
     setupMock({
       character: sourceCharacter("Common", true),
@@ -4420,12 +4553,12 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getByRole("button", { name: "Upgrade skill" })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
   })
 
   it("uses explicit direct stable-id edges including same, lower, Unique, cross-group and one-step branches", async () => {
     const source = {
-      ...sourceCharacter("Unique", true),
+      ...sourceCharacter("Unique", false),
       associations: [
         association({
           id: "skill-link",
@@ -4434,7 +4567,7 @@ describe("equipment eligibility and skill upgrades", () => {
           name: "Source",
           rarity: "Unique",
           upgradeGroup: "legacy",
-          definitionArchived: true,
+          definitionArchived: false,
           upgradeToStableIds: ["same-id", "lower-id", "unique-id", "child-id"],
         }),
       ],
@@ -4682,9 +4815,6 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(
-      screen.getByText("No active direct upgrade is currently available.")
-    ).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
 
     cleanup()

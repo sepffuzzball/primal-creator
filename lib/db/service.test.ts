@@ -18639,6 +18639,77 @@ describe("character detail grade-description exposure (owner-authorized detail)"
     const skill = detail.associations.find((a) => a.definitionId === "sk-3")!
     expect(skill.gradeDescription).toBe("Beam-F prose")
   })
+
+  it("serializes the current catalog description on an active skill association", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    seedDefinition("sk-live", "skills", "fireball", "Fireball", {
+      description: "Fireball current description",
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-live", "SKILL")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-live")!
+    expect(skill.kind).toBe("skill")
+    expect(skill.definitionArchived).toBe(false)
+    expect(skill.definitionDescription).toBe("Fireball current description")
+  })
+
+  it("serializes the current catalog description on an archived skill association", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    seedDefinition("sk-arch", "skills", "quench", "Quench", {
+      description: "Quench current description",
+      archived: true,
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-arch", "SKILL")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-arch")!
+    expect(skill.kind).toBe("skill")
+    expect(skill.definitionArchived).toBe(true)
+    expect(skill.definitionDescription).toBe("Quench current description")
+  })
+
+  it("serializes a null definitionDescription when the linked skill carries no catalog prose", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    seedDefinition("sk-null", "skills", "dash", "Dash", {
+      description: null,
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-null", "SKILL")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-null")!
+    expect(skill.definitionDescription).toBeNull()
+  })
+
+  it("never falls back to the authored grade prose for definitionDescription", async () => {
+    seedDefinition("race-h", "races", "human", "Human", {
+      gradeDescriptions: { C: "Human C prose" },
+    })
+    // The skill carries authored grade prose at its own grade band, but its legacy
+    // `description` is null: `definitionDescription` is sourced ONLY from the live
+    // `description`, never from the authored grade text.
+    seedDefinition("sk-grade", "skills", "ember", "Ember", {
+      description: null,
+      grade: "D",
+      gradeDescriptions: { D: "Ember D-grade prose" },
+    })
+    seedCharacterWith({ raceId: "race-h", raceGrade: "C" })
+    seedAssociation("sk-grade", "SKILL")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find(
+      (a) => a.definitionId === "sk-grade"
+    )!
+    // The authored grade prose is still exposed on `gradeDescription`...
+    expect(skill.gradeDescription).toBe("Ember D-grade prose")
+    // ...but `definitionDescription` stays null (only the legacy description feeds it).
+    expect(skill.definitionDescription).toBeNull()
+  })
 })
 
 describe("character list-item race grade / level / configured band", () => {
