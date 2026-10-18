@@ -19,6 +19,14 @@
   its rarity. (Evidence: a real adjustment in the source text: "Supreme Stealth
   Attack (Epic) --> (Rare)".)
 - **"Any skill can only be chosen once."**
+- Skills are **grade-free**: a `skills` catalog entry carries no catalog `grade`
+  band and no `gradeDescriptions` ladder (migration 20261017200000_skill_grade_removed
+  cleared any authored values and first archived them into the migration-only
+  `legacy_skill_grade_metadata` audit table). The `description` is the single
+  authored prose for the skill; eligibility at an offer is by config `track`
+  only, never a catalog grade. The grade at which a skill was earned is retained
+  as **provenance only** (`earnedGrade`) - it is recorded on the offer and never
+  gates any later behavior.
 - Skills are attached to Starting Skills of classes/professions and to learned
   choices; some skills are granted through blessings and bloodlines (see
   `docs/rules/blessings.md` and `docs/rules/bloodlines.md`).
@@ -86,7 +94,9 @@ for offers):
   classStableId?: string,
   // Ordered rarity tier (Inferior..Divine, plus the incomparable `Unique`).
   // A NEW or CONFIG-CHANGED skill must declare a valid rarity; a legacy entry
-  // without one stays readable and metadata-only-editable.
+  // without one stays readable and metadata-only-editable. Rarity is a display
+  // badge and drives ONLY the legacy `upgradeGroup` fallback; it never gates a
+  // declared `upgradeToStableIds` edge.
   rarity?: "Inferior" | "Common" | "Uncommon" | "Rare" | "Epic" | "Ancient"
     | "Legendary" | "Mythical" | "Sacred" | "Divine" | "Unique",
   // Declarative passive effects synthesized live into the character's status.
@@ -106,6 +116,18 @@ for offers):
   // per-effect stacking/replace group and is preserved as-is, so a single skill's
   // flat AND percent effects both apply.
   upgradeGroup?: string,
+  // DIRECT outgoing successor skill stableIds (the skill upgrade graph). ABSENT
+  // means the legacy `upgradeGroup` + `rarity` fallback resolves the successor at
+  // runtime; an explicit `[]` means the skill is terminal (no successor, no
+  // fallback); a nonempty list declares explicit targets - a skill may branch to
+  // several. An edge is authoritative: the runtime ignores rarity, track and
+  // upgrade group when following a declared edge, so a same-rarity, lower-rarity,
+  // `Unique`, cross-group or cross-track target is allowed. Each id must be a
+  // nonempty string and internally unique; the list is capped at 50. A self-link,
+  // a missing/wrong-kind target, a duplicate stableId or a cycle through the
+  // explicit-edge graph is a GRAPH error (validated by `validateSkillUpgradeGraph`),
+  // not a config-shape error.
+  upgradeToStableIds?: string[],
 }
 ```
 
@@ -118,9 +140,11 @@ for offers):
   requirement and no offer gating.
 - When a character **levels up** a class/profession track **or an independent
   (monster) race**, the service queries the unarchived `skills` catalog and keeps
-  only entries whose config `track` **exactly** matches the advanced track and
-  whose explicit catalog `grade` (when set) **exactly equals** the earned grade (no
-  inferred compatibility). The skill's `milestone` and `eligibleDefinitionStableIds`
+  only entries whose config `track` **exactly** matches the advanced track. A skill
+  carries no catalog grade band (migration 20261017200000_skill_grade_removed
+  cleared it), so it is never filtered by the earned grade - eligibility is by
+  config `track` ONLY, and a legacy skill row that still holds a non-null `grade`
+  is still matched. The skill's `milestone` and `eligibleDefinitionStableIds`
   are legacy annotations **ignored** for a scheduled credit: every matching-typed
   skill is offered at any credit milestone. The `choiceGroup` is also ignored - all
   surviving options collapse into the single `"standard"` offer.
@@ -135,8 +159,10 @@ for offers):
   snapshots (name + config), so a later catalog edit never rewrites what the
   character was actually offered. Quarter-only advances produce no offers.
 - At read time each snapped option is exposed with a **live** `description` (the
-  current catalog definition's authored grade prose at the offer's `earnedGrade`
-  when nonempty, else the legacy `description`, and `null` when no linked definition
+  current catalog definition's `description` - a skill carries no authored
+  grade-specific prose; only on a legacy skill row that still carries authored
+  `gradeDescriptions` is the text at the offer's snapshotted `earnedGrade`
+  preferred, else the `description`, and `null` when no linked definition
   resolves) alongside **snapshot-only** `rarity`, `skillType` and `classStableId`
   badges (each read from the immutable `configSnapshot`, never the live catalog
   config; a legacy snapshot's `skillType` falls back to the offer's own track). A
@@ -163,18 +189,36 @@ for offers):
   manifest skill.
 - The **explicit upgrade endpoint** (`POST
 /api/characters/[id]/skills/upgrade`, owner or admin) takes
-  `{definitionId, version, reason}` and upgrades the character's current linked
-  skill in an `upgradeGroup` to a strictly higher-ordered rarity variant of the
-  same group. The target must be an active `skills` entry carrying both a valid
-  `rarity` and a nonempty `upgradeGroup`; the character must hold EXACTLY ONE
-  other linked skill in that group with a strictly lower ordered rarity. Same /
-  missing / incomparable (`Unique`) / ambiguous (zero or multiple same-group
-  links) / not-strictly-higher cases are all rejected with 400
-  `skill_rarity_not_higher`. The replacement runs atomically (SERIALIZABLE, CAS
-  version increment, no XP cost), and the immutable `skill_upgrade` event
-  snapshots the from/to stable ids, names, rarities, descriptions, the reason and
-  the removed-link record. The removed source link may be an archived catalog
-  entry - its config is still read.
+  `{sourceDefinitionId?, definitionId, version, reason}` where `reason` is a
+  mandatory at-most-500-character note. A linked skill may be upgraded **at any
+  time** - there is no level/XP gate and no cost. Two flows are supported:
+  - **Explicit-edge source.** The caller may name the exact source to upgrade
+    from (`sourceDefinitionId`). When the named source's config declares its OWN
+    `upgradeToStableIds` field (including `[]`), the target `definitionId` MUST
+    be directly listed there: the upgrade follows the declared edge with NO
+    rarity / rank / track / group gate, so a same-rarity, lower-rarity, `Unique`,
+    cross-group or cross-track target is allowed. An explicit `[]` source is
+    terminal, so any target is rejected. The CHOSEN source link is removed
+    exactly once and its event recorded; the source may be an archived catalog
+    entry (its config is still read), but the target must be an active
+    (unarchived) `skills` entry. A nonempty target `upgradeGroup` that would
+    collide with ANY OTHER still-linked skill is rejected (`link_collision`)
+    rather than deleting that skill. Rejections are 400 `skill_upgrade_edge_missing`,
+    `catalog_archived`, `skill_source_not_linked`, and 409 `link_collision`.
+  - **Legacy target-only source (omitted).** When `sourceDefinitionId` is
+    omitted, the legacy same-group flow applies ONLY when every eligible linked
+    source is legacy (no own `upgradeToStableIds`); an explicit-edge source must
+    be named by the caller rather than silently removed, else 400
+    `skill_source_required`. The target must carry a valid ordered `rarity` and
+    a nonempty `upgradeGroup`, and the character must hold EXACTLY ONE other
+    linked skill in that group with a strictly lower ordered rarity; that link is
+    replaced (never stacked). Same / missing / incomparable (`Unique`) /
+    ambiguous (zero or multiple same-group links) / not-strictly-higher cases
+    are all rejected with 400 `skill_rarity_not_higher`. The removed source link
+    may be an archived catalog entry - its config is still read.
+    The replacement runs atomically (SERIALIZABLE, CAS version increment, no XP
+    cost), and the immutable `skill_upgrade` event snapshots the from/to stable ids,
+    names, rarities, descriptions, the reason and the removed-link record.
 - A catalog config edit that would change a **linked** skill's `rarity` or
   `upgradeGroup` is rejected with 409 `skill_rarity_conflict` (no write, prior
   snapshots never silently adjusted); metadata and description edits, and config
@@ -208,6 +252,43 @@ for offers):
   whose config has a legacy / missing rarity (snapshot restore) and to carry a
   higher-rarity variant with no prior same-group link; only a genuine same-group
   collision is rejected (`import_link_collision`), as before.
+
+## Skill upgrade graph (directed branching)
+
+A skill's successor is resolved either by a declared DIRECT edge or by the legacy
+fallback:
+
+- **`upgradeToStableIds` ABSENT** - the legacy `upgradeGroup` + `rarity` fallback
+  applies: the runtime orders the skill's `upgradeGroup` members by rarity and
+  derives the next strictly-higher rarity as the successor.
+- **`upgradeToStableIds: []`** - the skill is explicitly terminal: no successor at
+  all, and no fallback.
+- **`upgradeToStableIds: [id..]`** - explicit direct successor targets; a skill may
+  branch to several.
+
+Rarity and track never matter to an edge: a same-rarity, lower-rarity, `Unique`,
+cross-group or cross-track target is allowed. Because an edge is authoritative,
+following it ignores the `upgradeGroup` / `rarity` ladder and can move across
+groups or tracks.
+
+- **Validation.** Every skill write (catalog import and the MCP publisher)
+  validates the FINAL superimposed skill-upgrade graph across EVERY node,
+  archived ones included, via `validateSkillUpgradeBatch`
+  (`validateSkillUpgradeGraph`). Rejected in order: a duplicate stableId; a
+  self-link (`skill "X" lists itself in upgradeToStableIds`); a target that does
+  not resolve to a skill node (`skill "X" upgrades to missing stableId "Y"`); and
+  a cycle through the explicit-edge graph (`cycle detected: X -> Y -> X`). A NEW
+  or CHANGED outgoing edge of a proposed node that targets an ARCHIVED final node
+  is rejected (`skill "X" upgrades to archived skill "Y"`); an UNCHANGED
+  reference to an archived target stays allowed, including when the same batch
+  archives that target.
+- **Grouping.** Skills are grouped for display by their connected upgrade
+  component - the weakly-connected components of the explicit-edge graph
+  (`skillUpgradeComponents`) - so an edge chain/branch is shown as one group, and
+  a node with no explicit edges is a singleton component. A skill that declares no
+  `upgradeToStableIds` falls back to its legacy `upgradeGroup` for successor
+  derivation, which keeps it connected to its same-group family. Archived and
+  active nodes are treated equally.
 
 ## Skill-choice credit schedule (per grade)
 
@@ -256,8 +337,9 @@ deliberately differs from the grade-band `entryLevel` (0 for G, 10 for F); the
 skill-choice schedule overlays its own semantics.
 
 At a credit milestone the offer options come only from unarchived skills whose
-config `track` equals the advanced track and whose catalog `grade` (when set) equals
-the earned grade. The skill's `milestone`, `choiceGroup` and
+config `track` equals the advanced track. A skill carries no catalog grade band,
+so it is never filtered by the earned grade - eligibility is by config `track`
+ONLY. The skill's `milestone`, `choiceGroup` and
 `eligibleDefinitionStableIds` are all **ignored** at a credit milestone: every
 surviving skill collapses into the single `"standard"` offer (which is created even
 when the list is empty). Credits are never multiplied per matching skill. Options
@@ -277,13 +359,13 @@ exists to close that gap: it re-queries the unarchived `skills` catalog and appe
   `trackDefinitionStableId` both set) that are still active (not selected, not
   canceled) are considered. A legacy offer lacking provenance is left untouched.
 - **Eligibility is identical to the original credit** (shared helper,
-  `skillDefMatchesScheduledOffer`): the config `track` is exact, and the catalog
-  `grade` (when set) equals the saved earned grade exactly. The `milestone` /
-  `choiceGroup` / `eligibleDefinitionStableIds` annotations are ignored, and archived
-  skills never appear. The appended options are re-sorted deterministically in the
-  returned view (class tie matching the offer's `classStableIdAtEarn` first, then
-  name casefold, then stableId, then id); a nonmatching class-tied skill is never
-  hidden.
+  `skillDefMatchesScheduledOffer`): only the config `track` must be exact - a skill
+  carries no catalog grade band, so the saved earned grade never filters it. The
+  `milestone` / `choiceGroup` / `eligibleDefinitionStableIds` annotations are
+  ignored, and archived skills never appear. The appended options are re-sorted
+  deterministically in the returned view (class tie matching the offer's
+  `classStableIdAtEarn` first, then name casefold, then stableId, then id); a
+  nonmatching class-tied skill is never hidden.
 - **Immutability.** Existing option snapshots are never modified, even if the skill
   has since been edited or archived. Only new rows are appended; the DB unique
   `(offerId, definitionId)` plus `createMany({ skipDuplicates: true })` make a
@@ -455,4 +537,7 @@ optional and only meaningful on `races` / `classes` / `professions` configs.
 
 Skill rarity is used as a qualitative scale. The engine should treat the rarity
 ladder and the milestone schedule as **data/configuration**, not as hard-coded
-formulas, since neither is pinned by a source table.
+formulas, since neither is pinned by a source table. The skill upgrade graph
+(`upgradeToStableIds`) is likewise data: the engine follows declared DIRECT edges
+verbatim and falls back to the legacy `upgradeGroup`/`rarity` ordering only when a
+skill declares no edge, never synthesizing a successor on its own.

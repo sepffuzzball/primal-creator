@@ -222,6 +222,12 @@ model CatalogDefinition {
   stableId    String
   name        String
   description String?
+  // `grade` is the grade band for the graded kinds (races/classes/professions and
+  // any other banded definition). `gods`, `currencies` and `skills` carry no grade
+  // band: their `grade` must always be null (enforced by the `skills` CHECK
+  // constraint `catalog_definitions_skill_grade_check` added by migration
+  // 20261017200000_skill_grade_removed; a skills row is migrated to null and a
+  // non-null value is rejected on every write/import).
   grade       String?
   sourceUrl   String?
   archived    Boolean     @default(false)
@@ -231,7 +237,13 @@ model CatalogDefinition {
   // `grade` band (a legacy race whose `grade` is null may still carry a
   // description for its natural grade; a grade-cap row may carry text for any
   // band). Never auto-populated from `description`. The `{}` default means an
-  // entry with no authored grade text reads back as an empty map.
+  // entry with no authored grade text reads back as an empty map. `skills` carry
+  // no grade ladder, so their `gradeDescriptions` must stay empty (`{}`) or null -
+  // migration 20261017200000_skill_grade_removed clears any leftover value and the
+  // `skills` CHECK constraint rejects a non-empty map going forward. Any authored
+  // legacy skill grade / gradeDescriptions that migration archives is preserved in
+  // `legacy_skill_grade_metadata` (a migration-only audit table, not a skills
+  // feature) before the live row is cleared.
   gradeDescriptions Json     @default("{}")
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
@@ -501,4 +513,37 @@ model HouseRules {
   updatedAt DateTime @updatedAt
 
   @@map("house_rules")
+}
+
+// ------------------------------------------------------------------ //
+// Migration-only historical audit of removed skill grade data
+// ------------------------------------------------------------------ //
+//
+// A table that ONLY migration 20261017200000_skill_grade_removed writes. Before it
+// clears the pre-existing `grade` / `gradeDescriptions` value on every `skills`
+// catalog row, it archives each row carrying authored grade data here so that the
+// legacy value is not irretrievably lost. It is NOT a skills feature:
+//
+//   - No application/runtime/import/MCP/service path reads or writes it.
+//   - The Prisma client exposes it (so a schema/migration diff stays clean) but
+//     nothing queries it; the client model exists only to mirror the table.
+//   - There is deliberately NO relation to `CatalogDefinition`: it is keyed by the
+//     original catalog definition id, but with no FK, so the audit record survives
+//     even if the catalog row is later deleted.
+//
+// Columns are immutable by design: `archivedAt` is stamped once at insert and never
+// updated. `gradeDescriptions` is always a JSONB object (`{}` when none). This is
+// write-once historical data, never synthesized or exposed by the live feature.
+model LegacySkillGradeMetadata {
+  id                String   @id
+  // The catalog definition's stableId at the time it was archived.
+  stableId          String
+  // The grade band the skill row carried before it was cleared (null if none).
+  grade             String?
+  // Authored grade-specific prose (always an object; '{}' when none).
+  gradeDescriptions Json
+  // When the row was archived. Immutable; never updated after insert.
+  archivedAt        DateTime @default(now())
+
+  @@map("legacy_skill_grade_metadata")
 }

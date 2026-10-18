@@ -207,7 +207,14 @@ without leaking the token.
   retains omitted identity. Always declare them for a race.
 - A `skills` config needs `track` (`race`|`class`|`profession`), a valid
   `rarity` (a NEW skill requires one), and cannot mix `track`/`milestone`
-  incorrectly. A new `equipment` config requires a valid `slot` and `rarity`.
+  incorrectly. A `skills` entry **carries no catalog grade**: `grade` must be
+  stored as `null` and `gradeDescriptions` empty or omitted, otherwise the
+  publish is rejected up front (400 `invalid_grade` /
+  `invalid_grade_descriptions`). An optional `upgradeToStableIds` declares
+  DIRECT successor edges (see `docs/rules/skills.md`); the publisher validates
+  the FINAL skill upgrade graph before any write - a duplicate, self-link,
+  missing/wrong-kind target or cycle is 400, and a NEW edge to an ARCHIVED
+  target is 400. A new `equipment` config requires a valid `slot` and `rarity`.
   See `docs/rules/` for the per-kind details.
 
 ## Conflicts and retries

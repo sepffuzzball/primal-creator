@@ -3591,6 +3591,7 @@ export function CharacterDetail({
         `/api/characters/${character.id}/skills/upgrade`,
         {
           ...jsonInit("POST", {
+            sourceDefinitionId: upgradeSource.definitionId,
             definitionId: upgradeTargetId,
             version: character.version,
             reason: upgradeReason.trim(),
@@ -5399,12 +5400,6 @@ export function CharacterDetail({
                                         <span className="truncate font-medium">
                                           {opt.nameSnapshot}
                                         </span>
-                                        {opt.grade ? (
-                                          <SemanticBadge
-                                            kind="grade"
-                                            value={opt.grade}
-                                          />
-                                        ) : null}
                                         {opt.classPriority ? (
                                           <Badge variant="outline">
                                             Class match
@@ -5472,30 +5467,54 @@ export function CharacterDetail({
                 ) : (
                   <div className="flex flex-col gap-2">
                     {skillAssociations.map((a) => {
-                      const sourceRank = rarityRank(a.rarity)
+                      const upgradeEdges = (
+                        a as CharacterAssociationView & {
+                          upgradeToStableIds?: string[]
+                        }
+                      ).upgradeToStableIds
                       const group = a.upgradeGroup
+                      const owned = new Set(
+                        skillAssociations.map((entry) => entry.definitionId)
+                      )
+                      const otherUpgradeGroups = new Set(
+                        skillAssociations
+                          .filter(
+                            (entry) =>
+                              entry.kind === "skill" &&
+                              !entry.definitionArchived &&
+                              entry.definitionId !== a.definitionId
+                          )
+                          .map((entry) => entry.upgradeGroup)
+                          .filter((value): value is string => Boolean(value))
+                      )
                       const targets = skillsCatalog.filter((item) => {
                         const rarity =
                           typeof item.config.rarity === "string"
                             ? item.config.rarity
                             : undefined
+                        if (item.archived || owned.has(item.id)) return false
+                        const targetGroup = upgradeGroupFor(item)
+                        if (targetGroup && otherUpgradeGroups.has(targetGroup))
+                          return false
+                        if (upgradeEdges !== undefined)
+                          return upgradeEdges.includes(item.stableId)
                         return (
-                          !item.archived &&
                           Boolean(group) &&
                           item.config.upgradeGroup === group &&
-                          sourceRank >= 0 &&
-                          rarityRank(rarity) > sourceRank
+                          rarityRank(a.rarity) >= 0 &&
+                          rarityRank(rarity) > rarityRank(a.rarity)
                         )
                       })
-                      const blocked = !a.rarity
-                        ? "Source rarity metadata unavailable"
-                        : !group
-                          ? "Upgrade group metadata unavailable"
-                          : a.rarity === "Unique"
-                            ? "Unique rarity is incomparable"
-                            : targets.length === 0
-                              ? "No active higher-rarity variant in this upgrade group"
-                              : null
+                      const blocked =
+                        targets.length === 0
+                          ? upgradeEdges !== undefined
+                            ? "No active direct upgrade is currently available."
+                            : !a.rarity
+                              ? "Source rarity metadata unavailable"
+                              : !group
+                                ? "Upgrade group metadata unavailable"
+                                : "No active higher-rarity variant in this upgrade group"
+                          : null
                       return (
                         <div
                           key={a.id}
@@ -5506,19 +5525,10 @@ export function CharacterDetail({
                             {a.definitionArchived ? (
                               <Badge variant="outline">Archived</Badge>
                             ) : null}
-                            {a.grade ? (
-                              <SemanticBadge kind="grade" value={a.grade} />
-                            ) : null}
                             {a.rarity ? (
                               <SemanticBadge kind="rarity" value={a.rarity} />
                             ) : null}
                           </div>
-                          <p className="text-xs whitespace-pre-wrap text-muted-foreground">
-                            {a.grade
-                              ? (a.gradeDescription ??
-                                "No description for this grade")
-                              : null}
-                          </p>
                           {a.upgradeGroup ? (
                             <div className="text-[0.6875rem] text-muted-foreground">
                               Upgrade group: {a.upgradeGroup}
@@ -5551,13 +5561,37 @@ export function CharacterDetail({
 
                 {upgradeSource
                   ? (() => {
+                      const upgradeEdges = (
+                        upgradeSource as CharacterAssociationView & {
+                          upgradeToStableIds?: string[]
+                        }
+                      ).upgradeToStableIds
+                      const owned = new Set(
+                        skillAssociations.map((entry) => entry.definitionId)
+                      )
+                      const otherUpgradeGroups = new Set(
+                        skillAssociations
+                          .filter(
+                            (entry) =>
+                              entry.kind === "skill" &&
+                              !entry.definitionArchived &&
+                              entry.definitionId !== upgradeSource.definitionId
+                          )
+                          .map((entry) => entry.upgradeGroup)
+                          .filter((value): value is string => Boolean(value))
+                      )
                       const targets = skillsCatalog.filter((item) => {
                         const rarity =
                           typeof item.config.rarity === "string"
                             ? item.config.rarity
                             : undefined
+                        if (item.archived || owned.has(item.id)) return false
+                        const targetGroup = upgradeGroupFor(item)
+                        if (targetGroup && otherUpgradeGroups.has(targetGroup))
+                          return false
+                        if (upgradeEdges !== undefined)
+                          return upgradeEdges.includes(item.stableId)
                         return (
-                          !item.archived &&
                           item.config.upgradeGroup ===
                             upgradeSource.upgradeGroup &&
                           rarityRank(upgradeSource.rarity) >= 0 &&
@@ -5591,7 +5625,7 @@ export function CharacterDetail({
                             }}
                           >
                             <SelectTrigger aria-label="Upgrade target">
-                              <SelectValue placeholder="Select higher-rarity variant" />
+                              <SelectValue placeholder="Select direct upgrade" />
                             </SelectTrigger>
                             <SelectContent>
                               <SelectGroup>
@@ -5614,10 +5648,8 @@ export function CharacterDetail({
                                       value={target.id}
                                     >
                                       {target.name} -{" "}
-                                      {String(target.config.rarity)}
-                                      {target.description
-                                        ? ` - ${target.description}`
-                                        : ""}
+                                      {String(target.config.rarity)} -{" "}
+                                      {target.stableId}
                                     </SelectItem>
                                   ))}
                                 {targets.filter((target) => {

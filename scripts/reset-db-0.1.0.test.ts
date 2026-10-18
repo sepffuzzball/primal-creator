@@ -42,6 +42,7 @@ import {
   ARCHIVE_REQUIRED_OBJECTS,
   BASELINE_MIGRATION_NAME,
   CURRENCIES_MIGRATION_NAME,
+  SKILL_GRADE_REMOVED_MIGRATION_NAME,
   PGDMP_HEADER,
   archiveHeaderDbname,
   assertArchiveContainsObjects,
@@ -146,6 +147,7 @@ function mockDb(options: MockDbOptions = {}) {
     migrationRows = [
       { name: BASELINE_MIGRATION_NAME, finished_at: new Date() },
       { name: CURRENCIES_MIGRATION_NAME, finished_at: new Date() },
+      { name: SKILL_GRADE_REMOVED_MIGRATION_NAME, finished_at: new Date() },
     ],
     houseActive = true,
     foreignObjects = [],
@@ -795,14 +797,18 @@ describe("classifyPublicObjects", () => {
   })
 
   it("passes the archived 0001..0023 chain object set (superset allows it)", () => {
-    // The old chain is a SUBSET of the baseline: it omits the
+    // The old chain is a SUBSET of the deployed schema: it omits the
     // `_prisma_migrations_pkey` index/constraint Prisma adds when it creates the
-    // tracking table. The preflight must accept it as well.
+    // tracking table and the `catalog_definitions_skill_grade_check` CHECK the
+    // additive skill-grade-removal migration appends later. The preflight must
+    // accept this narrower set as well.
     const oldIndexRows = indexRows.filter(
       (r) => r.name !== "_prisma_migrations_pkey"
     )
     const oldConstraintRows = constraintRows.filter(
-      (r) => r.name !== "_prisma_migrations_pkey"
+      (r) =>
+        r.name !== "_prisma_migrations_pkey" &&
+        r.name !== "catalog_definitions_skill_grade_check"
     )
     expect(
       classifyPublicObjects([
@@ -862,6 +868,39 @@ describe("classifyPublicObjects", () => {
       },
     ])
     expect(unknown).toContain("users_extra_fk (constraint on users)")
+  })
+
+  it("accepts the skill-grade-removal migration CHECK on catalog_definitions", () => {
+    // The additive 20261017200000_skill_grade_removed migration appends
+    // `catalog_definitions_skill_grade_check` to the baseline. The preflight must
+    // classify it as owned, not foreign, or a migrate-deployed database (which
+    // really carries this constraint) can never be reset.
+    expect(APP_CONSTRAINTS.catalog_definitions).toContain(
+      "catalog_definitions_skill_grade_check"
+    )
+    const unknown = classifyPublicObjects([
+      {
+        kind: "constraint",
+        name: "catalog_definitions_skill_grade_check",
+        relkind: null,
+        table: "catalog_definitions",
+      },
+    ])
+    expect(unknown).toEqual([])
+  })
+
+  it("still rejects an unknown CHECK on catalog_definitions", () => {
+    const unknown = classifyPublicObjects([
+      {
+        kind: "constraint",
+        name: "catalog_definitions_grade_check",
+        relkind: null,
+        table: "catalog_definitions",
+      },
+    ])
+    expect(unknown).toContain(
+      "catalog_definitions_grade_check (constraint on catalog_definitions)"
+    )
   })
 
   it("rejects a user trigger attached to a known table", () => {
@@ -1502,7 +1541,18 @@ describe.skipIf(!dbIntegrationGate.run)("real-Postgres reset (opt-in)", () => {
         `CREATE TABLE public.users (id text PRIMARY KEY)`
       )
       await db.$executeRawUnsafe(
-        `CREATE TABLE public.catalog_definitions (id text PRIMARY KEY)`
+        `CREATE TABLE public.catalog_definitions (id text PRIMARY KEY, kind text NOT NULL, grade text, "gradeDescriptions" jsonb NOT NULL DEFAULT '{}'::jsonb)`
+      )
+      // Materialize the skill-grade-removal CHECK exactly as the additive
+      // 20261017200000_skill_grade_removed migration appends it, so the preflight
+      // against this isolated database must accept it (post-fix) rather than
+      // rejecting it as a foreign object. The named constraint is what the
+      // preflight checks; the expression is simplified because this throwaway
+      // table has a text `kind` column instead of the CatalogKind enum.
+      await db.$executeRawUnsafe(
+        `ALTER TABLE public.catalog_definitions
+           ADD CONSTRAINT catalog_definitions_skill_grade_check
+           CHECK (kind <> 'skills' OR (grade IS NULL AND "gradeDescriptions" = '{}'::jsonb))`
       )
       await db.$executeRawUnsafe(
         `CREATE TABLE public."_prisma_migrations" (id text)`

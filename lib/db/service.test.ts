@@ -5841,6 +5841,478 @@ describe("updateCatalogItem link-collision rejection", () => {
   })
 })
 
+describe("skill upgrade graph (explicit upgradeToStableIds)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedSkill(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: extra.name ?? `Skill ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function seedRace(id: string): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "races",
+      stableId: id,
+      name: `Race ${id}`,
+      config: { raceType: "enlightened", naturalGrade: "F" },
+    })
+  }
+
+  it("creates a skill with explicit outgoing edges to active skills", async () => {
+    seedSkill("sk-b", { track: "class", rarity: "Common" })
+    seedSkill("sk-c", { track: "profession", rarity: "Unique" })
+    const item = await createCatalogItem("skills", {
+      stableId: "sk-a",
+      name: "Skill A",
+      config: {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-b", "sk-c"],
+      },
+    })
+    expect(
+      (item.config as { upgradeToStableIds: string[] }).upgradeToStableIds
+    ).toEqual(["sk-b", "sk-c"])
+  })
+
+  it("accepts an explicitly terminal skill (upgradeToStableIds: [])", async () => {
+    const item = await createCatalogItem("skills", {
+      stableId: "sk-term",
+      name: "Skill Terminal",
+      config: { track: "class", rarity: "Common", upgradeToStableIds: [] },
+    })
+    expect(
+      (item.config as { upgradeToStableIds: string[] }).upgradeToStableIds
+    ).toEqual([])
+  })
+
+  it("allows same/lower rarity, Unique and cross-track targets", async () => {
+    seedSkill("sk-lower", { track: "class", rarity: "Inferior" })
+    seedSkill("sk-unique", { track: "class", rarity: "Unique" })
+    seedSkill("sk-cross", { track: "profession", rarity: "Common" })
+    const item = await createCatalogItem("skills", {
+      stableId: "sk-new",
+      name: "Skill New",
+      config: {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-lower", "sk-unique", "sk-cross"],
+      },
+    })
+    expect(
+      (item.config as { upgradeToStableIds: string[] }).upgradeToStableIds
+    ).toHaveLength(3)
+  })
+
+  it("rejects a create whose upgrade target does not exist (400 invalid_skill_upgrade_graph)", async () => {
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-a",
+        name: "Skill A",
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-missing"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+  })
+
+  it("rejects a create whose upgrade target exists but is not a skill (wrong kind, 400)", async () => {
+    seedRace("sk-wrong")
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-a",
+        name: "Skill A",
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-wrong"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-a",
+        name: "Skill A",
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-wrong"],
+        },
+      })
+    ).rejects.toThrow(/exists but is not a skill/)
+  })
+
+  it("rejects a self-link (400 invalid_skill_upgrade_graph)", async () => {
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-a",
+        name: "Skill A",
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-a"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+  })
+
+  it("rejects a duplicate stableId among skill nodes (400 invalid_skill_upgrade_graph)", async () => {
+    // Two existing skill rows collide on the same stableId.
+    dbMock.store.addCatalog({
+      id: "dup-row-1",
+      kind: "skills",
+      stableId: "dup",
+      name: "Dup 1",
+      config: { track: "class", rarity: "Common" },
+    })
+    dbMock.store.addCatalog({
+      id: "dup-row-2",
+      kind: "skills",
+      stableId: "dup",
+      name: "Dup 2",
+      config: { track: "class", rarity: "Common" },
+    })
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-a",
+        name: "Skill A",
+        config: { track: "class", rarity: "Common" },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+  })
+
+  it("rejects a cycle through explicit edges across existing rows", async () => {
+    seedSkill("sk-a", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-b"],
+    })
+    seedSkill("sk-b", { track: "class", rarity: "Common" })
+    await expect(
+      updateCatalogItem("skills", "sk-b", {
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-a"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+  })
+
+  it("rejects a NEWLY ADDED edge to an archived skill on create (400 skill_upgrade_archived_target)", async () => {
+    seedSkill(
+      "sk-arch",
+      { track: "class", rarity: "Common" },
+      { archived: true }
+    )
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-a",
+        name: "Skill A",
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-arch"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+  })
+
+  it("rejects a NEWLY ADDED edge to an archived skill on a config-changing patch", async () => {
+    seedSkill(
+      "sk-arch",
+      { track: "class", rarity: "Common" },
+      { archived: true }
+    )
+    seedSkill("sk-a", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-live"],
+    })
+    seedSkill("sk-live", { track: "class", rarity: "Common" })
+    await expect(
+      updateCatalogItem("skills", "sk-a", {
+        config: {
+          track: "class",
+          rarity: "Common",
+          upgradeToStableIds: ["sk-live", "sk-arch"],
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+  })
+
+  it("allows an UNCHANGED reference to an archived target on a config-changing patch", async () => {
+    seedSkill(
+      "sk-arch",
+      { track: "class", rarity: "Common" },
+      { archived: true }
+    )
+    seedSkill("sk-a", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-arch"],
+    })
+    const item = await updateCatalogItem("skills", "sk-a", {
+      config: {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-arch"],
+        effects: [{ phase: "flat", amount: { strength: 3 } }],
+      },
+    })
+    expect(
+      (item.config as { upgradeToStableIds: string[] }).upgradeToStableIds
+    ).toEqual(["sk-arch"])
+  })
+
+  it("does not reject a pre-existing archived-target reference elsewhere when creating a new skill", async () => {
+    seedSkill(
+      "sk-arch",
+      { track: "class", rarity: "Common" },
+      { archived: true }
+    )
+    seedSkill("sk-holder", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-arch"],
+    })
+    const item = await createCatalogItem("skills", {
+      stableId: "sk-new",
+      name: "Skill New",
+      config: {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-holder"],
+      },
+    })
+    expect(
+      (item.config as { upgradeToStableIds: string[] }).upgradeToStableIds
+    ).toEqual(["sk-holder"])
+  })
+
+  it("allows changing only outgoing edges even when the source skill is linked", async () => {
+    seedSkill("sk-1", {
+      track: "class",
+      rarity: "Common",
+      effects: [{ phase: "flat", amount: { strength: 5 } }],
+    })
+    seedSkill("sk-2", { track: "class", rarity: "Common" })
+    // Link sk-1 to a character (a live skill) and verify editing only its
+    // outgoing edges is permitted - rarity / upgradeGroup stay stable, so the
+    // immutability guard does not fire.
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "sk-1",
+      kind: "SKILL",
+    })
+    const item = await updateCatalogItem("skills", "sk-1", {
+      config: {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-2"],
+        effects: [{ phase: "flat", amount: { strength: 5 } }],
+      },
+    })
+    expect(
+      (item.config as { upgradeToStableIds: string[] }).upgradeToStableIds
+    ).toEqual(["sk-2"])
+  })
+
+  it("blocks a rename while any skill (including archived) references the old id as an upgrade target", async () => {
+    seedSkill("sk-a", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-b"],
+    })
+    seedSkill("sk-b", { track: "class", rarity: "Common" })
+    // sk-b is referenced as an active upgrade target; renaming it must be blocked.
+    await expect(
+      updateCatalogItem("skills", "sk-b", { stableId: "sk-b2" })
+    ).rejects.toMatchObject({ status: 409, code: "skill_stable_id_in_use" })
+
+    // An ARCHIVED skill also references sk-b: the rename stays blocked.
+    seedSkill(
+      "sk-arch",
+      {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-b"],
+      },
+      { archived: true }
+    )
+    await expect(
+      updateCatalogItem("skills", "sk-b", { stableId: "sk-b2" })
+    ).rejects.toMatchObject({ status: 409, code: "skill_stable_id_in_use" })
+  })
+
+  it("allows a rename when no skill references the old id as an upgrade target", async () => {
+    seedSkill("sk-b", { track: "class", rarity: "Common" })
+    const item = await updateCatalogItem("skills", "sk-b", {
+      stableId: "sk-b2",
+    })
+    expect(item.stableId).toBe("sk-b2")
+  })
+})
+
+describe("character skill association upgradeToStableIds view (authoritative outgoing edges)", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  function seedCharacterWithSkills() {
+    dbMock.store.addCharacter({
+      id: "chr-1",
+      ownerId: user.id,
+      name: "Test",
+      state: serializeState(createInitialState("integrated", null, null)),
+      version: 0,
+    })
+  }
+
+  function seedSkill(
+    id: string,
+    config: Record<string, unknown>,
+    extra: Partial<{ name: string; archived: boolean }> = {}
+  ): unknown {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills",
+      stableId: id,
+      name: extra.name ?? `Skill ${id}`,
+      config,
+      ...(extra.archived != null ? { archived: extra.archived } : {}),
+    })
+  }
+
+  function linkSkill(characterId: string, definitionId: string): void {
+    dbMock.store.addAssociation({
+      characterId,
+      definitionId,
+      kind: "SKILL",
+    })
+  }
+
+  it("omits upgradeToStableIds on a legacy linked source (legacy group fallback)", async () => {
+    seedCharacterWithSkills()
+    seedSkill("sk-legacy", {
+      track: "class",
+      rarity: "Common",
+      upgradeGroup: "tier",
+    })
+    linkSkill("chr-1", "sk-legacy")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find(
+      (a) => a.definitionId === "sk-legacy"
+    )!
+    expect(skill.kind).toBe("skill")
+    expect(skill.upgradeToStableIds).toBeUndefined()
+  })
+
+  it("exposes an explicitly terminal linked source as []", async () => {
+    seedCharacterWithSkills()
+    seedSkill("sk-term", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: [],
+    })
+    linkSkill("chr-1", "sk-term")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-term")!
+    expect(skill.kind).toBe("skill")
+    expect(skill.upgradeToStableIds).toEqual([])
+  })
+
+  it("exposes a branching linked source's declared target stableIds", async () => {
+    seedCharacterWithSkills()
+    seedSkill("sk-t1", { track: "class", rarity: "Common" })
+    seedSkill("sk-t2", { track: "profession", rarity: "Common" })
+    seedSkill("sk-branch", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-t1", "sk-t2"],
+    })
+    linkSkill("chr-1", "sk-branch")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find(
+      (a) => a.definitionId === "sk-branch"
+    )!
+    expect(skill.kind).toBe("skill")
+    expect(skill.upgradeToStableIds).toEqual(["sk-t1", "sk-t2"])
+  })
+
+  it("exposes an archived linked source's declared edges", async () => {
+    seedCharacterWithSkills()
+    seedSkill("sk-live", { track: "class", rarity: "Common" })
+    seedSkill(
+      "sk-arch",
+      { track: "class", rarity: "Common", upgradeToStableIds: ["sk-live"] },
+      { archived: true }
+    )
+    linkSkill("chr-1", "sk-arch")
+    const detail = await getCharacter("chr-1", user)
+    const skill = detail.associations.find((a) => a.definitionId === "sk-arch")!
+    expect(skill.kind).toBe("skill")
+    expect(skill.definitionArchived).toBe(true)
+    expect(skill.upgradeToStableIds).toEqual(["sk-live"])
+  })
+
+  it("never puts upgradeToStableIds on a non-skill association even when its config carries the key", async () => {
+    seedCharacterWithSkills()
+    dbMock.store.addCatalog({
+      id: "title-1",
+      kind: "titles",
+      stableId: "title-1",
+      name: "Title title-1",
+      config: { flat: { strength: 5 }, upgradeToStableIds: ["not-a-skill"] },
+    })
+    dbMock.store.addAssociation({
+      characterId: "chr-1",
+      definitionId: "title-1",
+      kind: "TITLE",
+    })
+    const detail = await getCharacter("chr-1", user)
+    const title = detail.associations.find((a) => a.definitionId === "title-1")!
+    expect(title.kind).toBe("title")
+    expect(title.upgradeToStableIds).toBeUndefined()
+  })
+})
+
 describe("updateCatalogItem race type in use", () => {
   beforeEach(() => {
     dbMock.store.reset()
@@ -10511,6 +10983,111 @@ describe("catalog item transaction helpers (reusable create/update in one caller
       improvement: { seriesId: "s1", rank: 1, minRaceGrade: "F" },
     })
   })
+
+  it("createCatalogItemInTransaction rejects a skill whose upgrade target does not exist (default validates the graph per item)", async () => {
+    await expect(
+      prisma.$transaction((tx) =>
+        createCatalogItemInTransaction(tx as DbClient, "skills", {
+          stableId: "skill-a",
+          name: "Skill A",
+          config: {
+            track: "race",
+            rarity: "Common",
+            upgradeToStableIds: ["missing-skill"],
+          },
+        })
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The failing graph check runs before the insert, so nothing persists.
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("createCatalogItemInTransaction skips the per-item skill upgrade graph check when skillGraphValidatedInBatch is set", async () => {
+    const item = (await prisma.$transaction((tx) =>
+      createCatalogItemInTransaction(
+        tx as DbClient,
+        "skills",
+        {
+          stableId: "skill-a",
+          name: "Skill A",
+          config: {
+            track: "race",
+            rarity: "Common",
+            upgradeToStableIds: ["missing-skill"],
+          },
+        },
+        { skillGraphValidatedInBatch: true }
+      )
+    )) as CatalogItem
+    expect(item.stableId).toBe("skill-a")
+    expect(item.config).toMatchObject({ track: "race", rarity: "Common" })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("updateCatalogItemInTransaction rejects a config patch that breaks the skill upgrade graph (default validates per item)", async () => {
+    dbMock.store.addCatalog({
+      id: "skill-1",
+      kind: "skills",
+      stableId: "skill-a",
+      name: "Skill A",
+      config: { track: "race", rarity: "Common" },
+    })
+    await expect(
+      prisma.$transaction((tx) =>
+        updateCatalogItemInTransaction(tx as DbClient, "skills", "skill-1", {
+          config: {
+            track: "race",
+            rarity: "Common",
+            upgradeToStableIds: ["missing-skill"],
+          },
+        })
+      )
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The failing graph check runs before the update, so the row is unchanged.
+    const row = dbMock.store.catalog.get("skill-1")!
+    expect(row.config).toMatchObject({ track: "race", rarity: "Common" })
+  })
+
+  it("updateCatalogItemInTransaction skips the per-item skill upgrade graph check when skillGraphValidatedInBatch is set", async () => {
+    dbMock.store.addCatalog({
+      id: "skill-1",
+      kind: "skills",
+      stableId: "skill-a",
+      name: "Skill A",
+      config: {
+        track: "race",
+        rarity: "Common",
+        upgradeToStableIds: ["missing-skill"],
+      },
+    })
+    const updated = (await prisma.$transaction((tx) =>
+      updateCatalogItemInTransaction(
+        tx as DbClient,
+        "skills",
+        "skill-1",
+        {
+          config: {
+            track: "race",
+            rarity: "Common",
+            upgradeToStableIds: ["missing-skill"],
+          },
+        },
+        { skillGraphValidatedInBatch: true }
+      )
+    )) as CatalogItem
+    expect(updated.stableId).toBe("skill-a")
+    expect(updated.config).toMatchObject({
+      track: "race",
+      rarity: "Common",
+      upgradeToStableIds: ["missing-skill"],
+    })
+  })
 })
 
 describe("skill offers (milestone choice model)", () => {
@@ -11353,12 +11930,13 @@ describe("skill offers (milestone choice model)", () => {
     expect(journal.skillOffers).toBeUndefined()
   })
 
-  it("offers any matching-track skill at a credit milestone regardless of milestone/choiceGroup/eligibleDefinitionStableIds, filtered only by grade", async () => {
+  it("offers any matching-track skill at a credit milestone regardless of milestone/choiceGroup/eligibleDefinitionStableIds/grade, matched by track only", async () => {
     seedClassCatalog("archer")
     seedCharacterForSkill(4, 3)
-    // The credit is for class level 5 (F milestone). These skills all match the
-    // class track and are offered because `milestone`, `choiceGroup` and
-    // `eligibleDefinitionStableIds` no longer gate a scheduled credit.
+    // The credit is for class level 5 (F milestone). A skill carries no catalog
+    // grade band, so any matching-track skill is offered regardless of the earned
+    // grade: `milestone`, `choiceGroup` and `eligibleDefinitionStableIds` no
+    // longer gate a scheduled credit.
     seedSkill("sk-any-milestone", {
       track: "class",
       milestone: 999,
@@ -11374,8 +11952,9 @@ describe("skill offers (milestone choice model)", () => {
       eligibleDefinitionStableIds: ["some-other-class"],
       effects: [],
     })
-    // A wrong-grade skill is still filtered out (grade is the only gate).
-    seedSkill("sk-wrong-grade", { track: "class", effects: [] }, { grade: "E" })
+    // A skill whose catalog grade differs from the earned grade is STILL offered:
+    // it is matched by config track only, never by a catalog grade.
+    seedSkill("sk-with-grade", { track: "class", effects: [] }, { grade: "E" })
     // A different-track skill is excluded (track must match exactly).
     seedSkill("sk-prof", { track: "profession", effects: [] })
     seedSkill("sk-race", { track: "race", effects: [] })
@@ -11389,6 +11968,7 @@ describe("skill offers (milestone choice model)", () => {
       "sk-any-milestone",
       "sk-custom-group",
       "sk-restricted",
+      "sk-with-grade",
     ])
   })
 
@@ -11566,16 +12146,19 @@ describe("skill offers (milestone choice model)", () => {
     })
   })
 
-  it("reflects live catalog description and grade-description edits after earn", async () => {
+  it("reflects live catalog description and grade-description edits after earn (a skill falls back to the description, never renders grade)", async () => {
     seedClassCatalog("archer")
     seedCharacterForSkill(0, 0)
+    // Seed a LEGACY skill row that still carries authored grade prose (as it may
+    // before migration 20261017200000_skill_grade_removed clears it). It is seeded
+    // directly, bypassing the create validation that rejects a non-empty map.
     dbMock.store.addCatalog({
       id: "sk-1",
       kind: "skills",
       stableId: "sk-1",
       name: "Skill One",
       description: "original description",
-      gradeDescriptions: {},
+      gradeDescriptions: { F: "grade prose" },
       config: { track: "class", rarity: "Common", effects: [] },
     })
     dbMock.store.skillOffers.push({
@@ -11600,27 +12183,30 @@ describe("skill offers (milestone choice model)", () => {
       configSnapshot: { track: "class", rarity: "Common" },
     })
 
+    // The authored grade prose at the snapshotted earn grade wins on a legacy
+    // row that still carries it.
     let option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
-    expect(option.description).toBe("original description")
+    expect(option.description).toBe("grade prose")
 
-    // A live catalog description edit is reflected in the read view.
+    // A live catalog description edit IS reflected, but a skill cannot carry
+    // authored grade prose via the create/update path, so the still-present
+    // legacy authored text keeps winning.
     await updateCatalogItem("skills", "sk-1", {
       description: "edited description",
     })
     option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
-    expect(option.description).toBe("edited description")
-
-    // Authored grade prose at the offer's earn grade wins over the legacy prose.
-    await updateCatalogItem("skills", "sk-1", {
-      gradeDescriptions: { F: "grade prose" },
-    })
-    option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
     expect(option.description).toBe("grade prose")
 
-    // A missing authored grade entry falls back to the legacy description.
+    // Clearing the (legacy) authored grade prose falls back to the live
+    // description - a skill carries no grade ladder, so pending offer prose is
+    // always the normal description once gradeDescriptions is cleared.
     await updateCatalogItem("skills", "sk-1", { gradeDescriptions: {} })
     option = (await getCharacter("chr-1", user)).skillOffers[0].options[0]
     expect(option.description).toBe("edited description")
+
+    // A skill option never renders a grade, even when the row still holds one.
+    expect("grade" in option).toBe(false)
+    expect(option.grade).toBeUndefined()
   })
 
   it("keeps the rarity, type and class tie on the earned snapshot despite a live catalog edit", async () => {
@@ -12876,6 +13462,470 @@ describe("skill explicit upgrade (POST /characters/[id]/skills/upgrade)", () => 
     expect(dbMock.store.associations).toHaveLength(1)
     expect(dbMock.store.associations[0].definitionId).toBe("sk-low")
     expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("upgrades along a declared direct edge regardless of rarity, track or group (arbitrary depth)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill(
+      "sk-a",
+      {
+        track: "class",
+        upgradeGroup: "grp",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-b"],
+        effects: [],
+      },
+      { description: "a tier" }
+    )
+    seedCatalogSkill(
+      "sk-b",
+      {
+        track: "race",
+        upgradeGroup: "other",
+        rarity: "Inferior",
+        upgradeToStableIds: ["sk-c"],
+        effects: [],
+      },
+      { description: "b tier" }
+    )
+    seedCatalogSkill("sk-c", {
+      track: "class",
+      rarity: "Common",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+
+    const first = await upgradeSkill(
+      "chr-1",
+      {
+        sourceDefinitionId: "sk-a",
+        definitionId: "sk-b",
+        version: 0,
+        reason: "hop1",
+      },
+      user
+    )
+    expect(first.character.version).toBe(1)
+    const firstSkills = first.character.associations
+      .filter((a) => a.kind === "skill")
+      .map((a) => a.definitionId)
+    expect(firstSkills).toEqual(["sk-b"])
+    const ev1 = dbMock.store.events.find((e) => e.kind === "skill_upgrade")!
+    expect(ev1.payload).toMatchObject({
+      from: { definitionId: "sk-a", stableId: "sk-a", rarity: "Common" },
+      to: { definitionId: "sk-b", stableId: "sk-b", rarity: "Inferior" },
+      upgradeGroup: "other",
+      removed: [{ definitionId: "sk-a", name: "Skill sk-a" }],
+    })
+
+    const second = await upgradeSkill(
+      "chr-1",
+      {
+        sourceDefinitionId: "sk-b",
+        definitionId: "sk-c",
+        version: 1,
+        reason: "hop2",
+      },
+      user
+    )
+    expect(second.character.version).toBe(2)
+    const secondSkills = second.character.associations
+      .filter((a) => a.kind === "skill")
+      .map((a) => a.definitionId)
+    expect(secondSkills).toEqual(["sk-c"])
+    const evs = dbMock.store.events.filter((e) => e.kind === "skill_upgrade")
+    expect(evs).toHaveLength(2)
+    const ev2 = evs[1]
+    expect(ev2.payload).toMatchObject({
+      from: { definitionId: "sk-b", stableId: "sk-b", rarity: "Inferior" },
+      to: { definitionId: "sk-c", stableId: "sk-c", rarity: "Common" },
+      upgradeGroup: null,
+      removed: [{ definitionId: "sk-b", name: "Skill sk-b" }],
+    })
+  })
+
+  it("rejects an explicit source whose own edge list does not name the target (non-edge)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      upgradeToStableIds: ["sk-b"],
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-c", {
+      track: "class",
+      rarity: "Common",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-a",
+          definitionId: "sk-c",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "skill_upgrade_edge_missing" })
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects an upgrade from an explicitly terminal source (upgradeToStableIds: [])", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      upgradeToStableIds: [],
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-b", {
+      track: "class",
+      rarity: "Rare",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-a",
+          definitionId: "sk-b",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "skill_upgrade_edge_missing" })
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects an explicit source that is not a linked skill on the character", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      upgradeToStableIds: ["sk-b"],
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-b", {
+      track: "class",
+      rarity: "Rare",
+      effects: [],
+    })
+    // Neither skill is linked, so the named source resolves to nothing.
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-a",
+          definitionId: "sk-b",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "skill_source_not_linked" })
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("requires an explicit source when a single same-group source declares an explicit edge (target-only bypass prevention)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-b"],
+      effects: [],
+    })
+    seedCatalogSkill("sk-b", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Rare",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+    // Omit the source: the sole same-group source is explicit, so the target-only
+    // flow must not silently remove it / bypass its edge list.
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        { definitionId: "sk-b", version: 0, reason: "x" },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "skill_source_required" })
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("removes ONLY the chosen source and leaves unrelated same-group links intact (source-specific selection)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-x"],
+      effects: [],
+    })
+    seedCatalogSkill("sk-b", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-x", {
+      track: "class",
+      rarity: "Unique",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+    linkSkill("chr-1", "sk-b")
+    const res = await upgradeSkill(
+      "chr-1",
+      {
+        sourceDefinitionId: "sk-a",
+        definitionId: "sk-x",
+        version: 0,
+        reason: "edge",
+      },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    const skills = res.character.associations
+      .filter((a) => a.kind === "skill")
+      .map((a) => a.definitionId)
+      .sort()
+    expect(skills).toEqual(["sk-b", "sk-x"])
+    const ev = dbMock.store.events.find((e) => e.kind === "skill_upgrade")!
+    expect(ev.payload).toMatchObject({
+      removed: [{ definitionId: "sk-a", name: "Skill sk-a" }],
+    })
+  })
+
+  it("rejects an explicit edge when the target group collides with a still-linked skill (rather than deleting it)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      upgradeGroup: "tierA",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-t"],
+      effects: [],
+    })
+    seedCatalogSkill("sk-b", {
+      track: "class",
+      upgradeGroup: "tierB",
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-t", {
+      track: "class",
+      upgradeGroup: "tierB",
+      rarity: "Rare",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+    linkSkill("chr-1", "sk-b")
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-a",
+          definitionId: "sk-t",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "link_collision" })
+    expect(dbMock.store.associations).toHaveLength(2)
+    expect(dbMock.store.events).toHaveLength(0)
+    expect(dbMock.store.characters.get("chr-1")!.version).toBe(0)
+  })
+
+  it("allows an explicit edge from an ARCHIVED source link, using its config", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill(
+      "sk-old",
+      {
+        track: "class",
+        rarity: "Common",
+        upgradeToStableIds: ["sk-new"],
+        effects: [],
+      },
+      { archived: true }
+    )
+    seedCatalogSkill("sk-new", {
+      track: "class",
+      rarity: "Unique",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-old")
+    const res = await upgradeSkill(
+      "chr-1",
+      {
+        sourceDefinitionId: "sk-old",
+        definitionId: "sk-new",
+        version: 0,
+        reason: "replace",
+      },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    const skills = res.character.associations
+      .filter((a) => a.kind === "skill")
+      .map((a) => a.definitionId)
+    expect(skills).toEqual(["sk-new"])
+  })
+
+  it("rejects an explicit edge to an ARCHIVED target (must be active)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-arch"],
+      effects: [],
+    })
+    seedCatalogSkill(
+      "sk-arch",
+      { track: "class", rarity: "Rare", effects: [] },
+      { archived: true }
+    )
+    linkSkill("chr-1", "sk-a")
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-a",
+          definitionId: "sk-arch",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "catalog_archived" })
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("allows an explicit legacy source only under the same-group strictly-higher-rarity fallback", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-low", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-high", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Rare",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-low")
+    const res = await upgradeSkill(
+      "chr-1",
+      {
+        sourceDefinitionId: "sk-low",
+        definitionId: "sk-high",
+        version: 0,
+        reason: "promote",
+      },
+      user
+    )
+    expect(res.character.version).toBe(1)
+    const skills = res.character.associations
+      .filter((a) => a.kind === "skill")
+      .map((a) => a.definitionId)
+    expect(skills).toEqual(["sk-high"])
+    const ev = dbMock.store.events.find((e) => e.kind === "skill_upgrade")!
+    expect(ev.payload).toMatchObject({
+      from: { definitionId: "sk-low", rarity: "Common" },
+      to: { definitionId: "sk-high", rarity: "Rare" },
+      upgradeGroup: "tier",
+    })
+  })
+
+  it("rejects an explicit legacy source that is not strictly higher or not in the same group", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-low", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-same", {
+      track: "class",
+      upgradeGroup: "tier",
+      rarity: "Common",
+      effects: [],
+    })
+    seedCatalogSkill("sk-other-group", {
+      track: "class",
+      upgradeGroup: "other",
+      rarity: "Rare",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-low")
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-low",
+          definitionId: "sk-same",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "skill_rarity_not_higher" })
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-low",
+          definitionId: "sk-other-group",
+          version: 0,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 400, code: "skill_rarity_not_higher" })
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(0)
+  })
+
+  it("rejects an explicit upgrade with a stale CAS version (409 version_conflict)", async () => {
+    seedCharacterWithSkills()
+    seedCatalogSkill("sk-a", {
+      track: "class",
+      rarity: "Common",
+      upgradeToStableIds: ["sk-b"],
+      effects: [],
+    })
+    seedCatalogSkill("sk-b", {
+      track: "class",
+      rarity: "Rare",
+      effects: [],
+    })
+    linkSkill("chr-1", "sk-a")
+    await expect(
+      upgradeSkill(
+        "chr-1",
+        {
+          sourceDefinitionId: "sk-a",
+          definitionId: "sk-b",
+          version: 5,
+          reason: "x",
+        },
+        user
+      )
+    ).rejects.toMatchObject({ status: 409, code: "version_conflict" })
+    expect(dbMock.store.associations).toHaveLength(1)
+    expect(dbMock.store.events).toHaveLength(0)
   })
 })
 
@@ -20802,7 +21852,7 @@ describe("refresh pending scheduled skill offers", () => {
     ).toHaveLength(2)
   })
 
-  it("respects the earned grade when matching (eligibleDefinitionStableIds is ignored)", async () => {
+  it("matches by track only (eligibleDefinitionStableIds and the catalog grade are ignored)", async () => {
     seedCharacterForRefresh()
     seedScheduledOffer("off-1", {
       level: 4,
@@ -20810,13 +21860,14 @@ describe("refresh pending scheduled skill offers", () => {
       trackDefinitionStableId: "archer",
       options: [],
     })
-    // Wrong earned grade -> excluded.
+    // A skill carrying a differing catalog grade is STILL matched: a skill has no
+    // grade band, so a scheduled credit matches by config track only.
     seedSkill(
-      "sk-wrong-grade",
+      "sk-with-grade",
       { track: "class", milestone: 4, effects: [] },
       { grade: "E" }
     )
-    // Correct grade. The eligibleDefinitionStableIds annotation is IGNORED for a
+    // The eligibleDefinitionStableIds annotation is IGNORED for a
     // scheduled credit, so the mage-restricted skill is now offered.
     seedSkill("sk-mage", {
       track: "class",
@@ -20824,7 +21875,6 @@ describe("refresh pending scheduled skill offers", () => {
       eligibleDefinitionStableIds: ["mage"],
       effects: [],
     })
-    // Correct grade -> included.
     seedSkill("sk-archer", {
       track: "class",
       milestone: 4,
@@ -20836,6 +21886,7 @@ describe("refresh pending scheduled skill offers", () => {
     expect(offer.options.map((o) => o.definitionId).sort()).toEqual([
       "sk-archer",
       "sk-mage",
+      "sk-with-grade",
     ])
   })
 
@@ -21316,5 +22367,117 @@ describe("catalog currencies create/update invariants", () => {
       archived: true,
     })
     expect(archived.archived).toBe(true)
+  })
+})
+
+describe("catalog skills create/update grade invariants", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("creates a skills entry with a null grade and an empty gradeDescriptions", async () => {
+    const item = await createCatalogItem("skills", {
+      stableId: "sk-fire",
+      name: "Fireball",
+      grade: null,
+      gradeDescriptions: {},
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    expect(item.kind).toBe("skills")
+    expect(item.grade).toBeNull()
+    expect(item.gradeDescriptions).toEqual({})
+  })
+
+  it("creates a skills entry when grade is omitted and gradeDescriptions is omitted", async () => {
+    const item = await createCatalogItem("skills", {
+      stableId: "sk-fire",
+      name: "Fireball",
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    expect(item.grade).toBeNull()
+    expect(item.gradeDescriptions).toEqual({})
+  })
+
+  it("rejects a skills entry with a non-null grade", async () => {
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-fire",
+        name: "Fireball",
+        grade: "S",
+        config: { track: "class", rarity: "Common", effects: [] },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a skills entry with a non-empty gradeDescriptions", async () => {
+    await expect(
+      createCatalogItem("skills", {
+        stableId: "sk-fire",
+        name: "Fireball",
+        gradeDescriptions: { G: "text" },
+        config: { track: "class", rarity: "Common", effects: [] },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("allows a skills PATCH that clears a legacy grade to null", async () => {
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Fireball",
+      grade: "E",
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    const item = await updateCatalogItem("skills", "sk-1", { grade: null })
+    expect(item.grade).toBeNull()
+  })
+
+  it("rejects a skills PATCH that sets a non-null grade", async () => {
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Fireball",
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-1", { grade: "A" })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+    // The row is unchanged - the existing null grade is preserved.
+    expect(dbMock.store.catalog.get("sk-1")!.grade).toBeNull()
+  })
+
+  it("rejects a skills PATCH with a non-empty gradeDescriptions", async () => {
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Fireball",
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    await expect(
+      updateCatalogItem("skills", "sk-1", {
+        gradeDescriptions: { F: "text" },
+      })
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
+  })
+
+  it("clears a skills entry's legacy gradeDescriptions when the PATCH sends {}", async () => {
+    dbMock.store.addCatalog({
+      id: "sk-1",
+      kind: "skills",
+      stableId: "sk-1",
+      name: "Fireball",
+      gradeDescriptions: { F: "text" },
+      config: { track: "class", rarity: "Common", effects: [] },
+    })
+    const item = await updateCatalogItem("skills", "sk-1", {
+      gradeDescriptions: {},
+    })
+    expect(item.gradeDescriptions).toEqual({})
+    expect(dbMock.store.catalog.get("sk-1")!.gradeDescriptions).toEqual({})
   })
 })

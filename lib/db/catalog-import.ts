@@ -59,8 +59,15 @@ import {
   normalizeCatalogKind,
   parseCatalogConfig,
   skillClassStableIdOf,
+  skillGradeDescriptionsForbidden,
+  skillGradeForbidden,
 } from "@/lib/server/schemas"
 import type { Grade } from "@/lib/rules"
+import {
+  validateSkillUpgradeBatch,
+  type SkillUpgradeNode,
+} from "@/lib/skills/upgrade-graph"
+import { createCatalogItemInTransaction } from "@/lib/db/service"
 
 // ------------------------------------------------------------------ //
 // Manifest types
@@ -226,6 +233,25 @@ function validateEntry(entry: WikiReviewedEntry): ValidatedEntry {
     throw badRequest(
       "invalid_grade_descriptions",
       `Manifest currency entry "${entry.stableId}" carries gradeDescriptions; currencies have no grade ladder`
+    )
+  }
+  // A skills entry likewise carries no catalog grade band (see
+  // `skillGradeForbidden`): a skill is offered to the advancing track by config
+  // `track` alone, never by a catalog grade, so a non-null grade is rejected
+  // before any write (migration 20261017200000_skill_grade_removed nulled any
+  // pre-existing skill grade).
+  if (skillGradeForbidden(kind, entry.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      `Manifest skill entry "${entry.stableId}" carries a grade; skills have no catalog grade band`
+    )
+  }
+  // A skills entry carries no grade ladder, so no grade-specific prose is legal: a
+  // non-empty gradeDescriptions map is rejected before any write.
+  if (skillGradeDescriptionsForbidden(kind, entry.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      `Manifest skill entry "${entry.stableId}" carries gradeDescriptions; skills have no grade ladder`
     )
   }
   const parsed = catalogCreateSchema.safeParse({
@@ -553,6 +579,61 @@ function assertManifestSkillClassRefs(
 }
 
 /**
+ * Validate the FINAL skill upgrade graph that this import would commit, using the
+ * same pure primitive the service layer uses. Existing skill rows are taken
+ * VERBATIM (archived included) so a reference to an existing target stays
+ * resolvable; proposed nodes are built from ONLY the new skills this import will
+ * actually create (an entry already occupying a (kind, stableId) key - even
+ * archived - is skipped and keeps its current archived state, so it is NOT
+ * treated as newly unarchived). Because the batch validator overlays every
+ * proposed node onto the persisted set and checks the FULL final graph, forward
+ * references work regardless of manifest order. A graph error is mapped to a 400
+ * import validation error (never a 500).
+ */
+function assertSkillUpgradeGraphBatch(
+  rows: readonly {
+    kind: string
+    stableId: string
+    archived: boolean
+    config: unknown
+  }[],
+  newEntries: readonly {
+    kind: string
+    stableId: string
+    config: Record<string, unknown>
+  }[]
+): void {
+  const existingNodes: SkillUpgradeNode[] = []
+  for (const row of rows) {
+    if (row.kind !== "skills") continue
+    existingNodes.push({
+      stableId: row.stableId,
+      archived: row.archived,
+      config: row.config ?? {},
+    })
+  }
+  const proposedNodes: SkillUpgradeNode[] = []
+  for (const entry of newEntries) {
+    if (entry.kind !== "skills") continue
+    proposedNodes.push({
+      stableId: entry.stableId,
+      archived: false,
+      config: entry.config,
+    })
+  }
+  const error = validateSkillUpgradeBatch(existingNodes, proposedNodes)
+  if (error != null) {
+    // Mirror the service layer's codes for the two kinds of graph failure: a
+    // structural defect (self-link, missing target, cycle, duplicate) versus a
+    // NEW edge to an ARCHIVED target.
+    const code = error.includes("archived skill")
+      ? "skill_upgrade_archived_target"
+      : "invalid_skill_upgrade_graph"
+    throw badRequest(code, error)
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row with that (kind, stableId) yet)
  * or `skip_existing` (a row already occupies the key, so it is never overwritten).
@@ -619,6 +700,7 @@ export async function previewWikiReviewedImport(
   assertManifestTitleSkillRefs(newEntries, unarchivedSkillStableIds)
   assertManifestGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
   assertManifestSkillClassRefs(newEntries, availableClassStableIds)
+  assertSkillUpgradeGraphBatch(rows, newEntries)
   let createCount = 0
   let skipCount = 0
   const resultEntries = validated.map((entry) => {
@@ -721,8 +803,21 @@ export async function applyWikiReviewedImport(
           unarchivedSkillStableIds
         )
         assertManifestSkillClassRefs(newEntries, availableClassStableIds)
-        const createdIds: string[] = []
+        assertSkillUpgradeGraphBatch(rows, newEntries)
+        // Create rows in TWO passes so a skill's per-item classStableId ref and the
+        // prevalidated upgrade graph can never observe an interim state. Every
+        // non-skill row is written first (the default raw path), then every new
+        // skill is written through the service-layer helper with the batch flag,
+        // because the FINAL skill upgrade graph was validated above against this
+        // same SERIALIZABLE snapshot. The returned entries and createdIds stay in
+        // manifest (input) order.
+        const createdIdByCreateIndex = new Map<number, string>()
+        const pendingSkillCreates: Array<{
+          entry: ValidatedEntry
+          createIndex: number
+        }> = []
         let skipCount = 0
+        let createIndexCounter = 0
         const resultEntries: CatalogImportEntryPreview[] = []
         for (const entry of validated) {
           const existingRow = byKey.get(keyOf(entry.kind, entry.stableId))
@@ -733,23 +828,53 @@ export async function applyWikiReviewedImport(
             )
             continue
           }
-          const row = await tx.catalogDefinition.create({
-            data: {
-              kind: entry.kind as never,
+          const createIndex = createIndexCounter++
+          resultEntries.push(toPreviewEntry(entry, "create"))
+          if (entry.kind === "skills") {
+            pendingSkillCreates.push({ entry, createIndex })
+          } else {
+            const row = await tx.catalogDefinition.create({
+              data: {
+                kind: entry.kind as never,
+                stableId: entry.stableId,
+                name: entry.name,
+                description: entry.description,
+                grade: entry.grade,
+                sourceUrl: entry.sourceUrl,
+                archived: false,
+                config: entry.config as Prisma.InputJsonValue,
+                gradeDescriptions:
+                  entry.gradeDescriptions as Prisma.InputJsonValue,
+              },
+            })
+            createdIdByCreateIndex.set(createIndex, row.id)
+          }
+        }
+        // Now that every non-skill row exists, create the new skills. Only these
+        // skill creates get the `skillGraphValidatedInBatch` flag, because the
+        // final graph was validated once up front; every other kind keeps the
+        // default per-item path.
+        for (const { entry, createIndex } of pendingSkillCreates) {
+          const item = await createCatalogItemInTransaction(
+            tx,
+            "skills",
+            {
               stableId: entry.stableId,
               name: entry.name,
               description: entry.description,
               grade: entry.grade,
               sourceUrl: entry.sourceUrl,
               archived: false,
-              config: entry.config as Prisma.InputJsonValue,
-              gradeDescriptions:
-                entry.gradeDescriptions as Prisma.InputJsonValue,
+              config: entry.config,
+              gradeDescriptions: entry.gradeDescriptions,
             },
-          })
-          createdIds.push(row.id)
-          resultEntries.push(toPreviewEntry(entry, "create"))
+            { skillGraphValidatedInBatch: true }
+          )
+          createdIdByCreateIndex.set(createIndex, item.id)
         }
+        const createdIds = [...createdIdByCreateIndex.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([, id]) => id)
         return {
           source: "wiki-reviewed" as const,
           entries: resultEntries,

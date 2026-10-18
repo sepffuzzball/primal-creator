@@ -69,8 +69,15 @@ import {
   normalizeCatalogKind,
   parseCatalogConfig,
   skillClassStableIdOf,
+  skillGradeDescriptionsForbidden,
+  skillGradeForbidden,
 } from "@/lib/server/schemas"
 import { assertModernConfig, type CatalogKind } from "@/lib/db/catalog-import"
+import {
+  validateSkillUpgradeBatch,
+  type SkillUpgradeNode,
+} from "@/lib/skills/upgrade-graph"
+import { createCatalogItemInTransaction } from "@/lib/db/service"
 import type { Grade } from "@/lib/rules"
 
 // ------------------------------------------------------------------ //
@@ -446,6 +453,26 @@ function validateBulkEntry(raw: RawBulkEntry): BulkCatalogEntry {
     throw badRequest(
       "invalid_grade_descriptions",
       `Bulk row ${row}: a currencies entry carries gradeDescriptions; currencies have no grade ladder`
+    )
+  }
+  // A skills entry likewise carries no catalog grade band (see
+  // `skillGradeForbidden`): a skill is offered to the advancing track by config
+  // `track` alone, never by a catalog grade, so a non-null grade is rejected
+  // before any write (migration 20261017200000_skill_grade_removed nulled any
+  // pre-existing skill grade).
+  if (skillGradeForbidden(kind, grade)) {
+    throw badRequest(
+      "invalid_grade",
+      `Bulk row ${row}: a skills entry carries no catalog grade (got "${String(grade)}")`
+    )
+  }
+  // A skills entry carries no grade ladder, so no grade-specific prose is legal: a
+  // non-empty gradeDescriptions map (already normalized) is rejected before any
+  // write.
+  if (skillGradeDescriptionsForbidden(kind, gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      `Bulk row ${row}: a skills entry carries gradeDescriptions; skills have no grade ladder`
     )
   }
   const sourceUrl = optionalNullableString(raw.sourceUrl, row, "sourceUrl")
@@ -1067,6 +1094,57 @@ function assertBulkSkillClassRefs(
 }
 
 /**
+ * Validate the FINAL skill upgrade graph this upload would commit, using the same
+ * pure primitive the service layer uses. Existing skill rows are taken VERBATIM
+ * (archived included) so a reference to an existing target stays resolvable;
+ * proposed nodes are built from ONLY the new skills this upload will actually
+ * create (an entry already occupying a (kind, stableId) key - even archived - is
+ * skipped and keeps its current archived state, so it is NOT treated as newly
+ * unarchived). Because the batch validator overlays every proposed node onto the
+ * persisted set and checks the FULL final graph, forward references work
+ * regardless of upload row order. A graph error is mapped to a 400 import
+ * validation error (never a 500).
+ */
+function assertSkillUpgradeGraphBatch(
+  rows: readonly {
+    kind: string
+    stableId: string
+    archived: boolean
+    config: unknown
+  }[],
+  newEntries: readonly BulkCatalogEntry[]
+): void {
+  const existingNodes: SkillUpgradeNode[] = []
+  for (const row of rows) {
+    if (row.kind !== "skills") continue
+    existingNodes.push({
+      stableId: row.stableId,
+      archived: row.archived,
+      config: row.config ?? {},
+    })
+  }
+  const proposedNodes: SkillUpgradeNode[] = []
+  for (const entry of newEntries) {
+    if (entry.kind !== "skills") continue
+    proposedNodes.push({
+      stableId: entry.stableId,
+      archived: false,
+      config: entry.config,
+    })
+  }
+  const error = validateSkillUpgradeBatch(existingNodes, proposedNodes)
+  if (error != null) {
+    // Mirror the service layer's codes for the two kinds of graph failure: a
+    // structural defect (self-link, missing target, cycle, duplicate) versus a
+    // NEW edge to an ARCHIVED target.
+    const code = error.includes("archived skill")
+      ? "skill_upgrade_archived_target"
+      : "invalid_skill_upgrade_graph"
+    throw badRequest(code, `Bulk upgrade graph error: ${error}`)
+  }
+}
+
+/**
  * Compute the import against the live database without mutating anything. The
  * returned per-entry status is `create` (no row occupies that (kind, stableId)
  * yet) or `skip_existing` (a row already occupies the key, so it is never
@@ -1136,6 +1214,7 @@ export async function previewBulkImport(
   assertBulkTitleSkillRefs(newEntries, unarchivedSkillStableIds)
   assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
   assertBulkSkillClassRefs(newEntries, availableClassStableIds)
+  assertSkillUpgradeGraphBatch(rows, newEntries)
 
   let createCount = 0
   let skipCount = 0
@@ -1248,13 +1327,30 @@ export async function applyBulkImport(
         assertBulkTitleSkillRefs(newEntries, unarchivedSkillStableIds)
         assertBulkGradeGrantedSkillRefs(newEntries, unarchivedSkillStableIds)
         assertBulkSkillClassRefs(newEntries, availableClassStableIds)
+        assertSkillUpgradeGraphBatch(rows, newEntries)
 
         const creationOrder = entries
           .map((entry, index) => ({ entry, index }))
           .filter((item) => statuses[item.index] === "create")
 
-        const createdIds: string[] = []
+        // Create rows in TWO passes so a skill's per-item classStableId ref and the
+        // prevalidated upgrade graph can never observe an interim state. Every
+        // non-skill row is written first (the default raw path), then every new
+        // skill is written through the service-layer helper with the batch flag,
+        // because the FINAL skill upgrade graph was validated above against this
+        // same SERIALIZABLE snapshot. The returned createdIds stay in upload order.
+        const createdIdByCreateIndex = new Map<number, string>()
+        const pendingSkillCreates: Array<{
+          entry: BulkCatalogEntry
+          createIndex: number
+        }> = []
+        let createIndexCounter = 0
         for (const { entry } of creationOrder) {
+          const createIndex = createIndexCounter++
+          if (entry.kind === "skills") {
+            pendingSkillCreates.push({ entry, createIndex })
+            continue
+          }
           const row = await tx.catalogDefinition.create({
             data: {
               kind: entry.kind as never,
@@ -1269,8 +1365,29 @@ export async function applyBulkImport(
                 entry.gradeDescriptions as Prisma.InputJsonValue,
             },
           })
-          createdIds.push(row.id)
+          createdIdByCreateIndex.set(createIndex, row.id)
         }
+        for (const { entry, createIndex } of pendingSkillCreates) {
+          const item = await createCatalogItemInTransaction(
+            tx,
+            "skills",
+            {
+              stableId: entry.stableId,
+              name: entry.name,
+              description: entry.description,
+              grade: entry.grade,
+              sourceUrl: entry.sourceUrl,
+              archived: false,
+              config: entry.config,
+              gradeDescriptions: entry.gradeDescriptions,
+            },
+            { skillGraphValidatedInBatch: true }
+          )
+          createdIdByCreateIndex.set(createIndex, item.id)
+        }
+        const createdIds = [...createdIdByCreateIndex.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([, id]) => id)
 
         let createCount = 0
         let skipCount = 0

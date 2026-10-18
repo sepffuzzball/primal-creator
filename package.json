@@ -1,6 +1,6 @@
 {
   "name": "primal-creator",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "private": true,
   "scripts": {
@@ -14,6 +14,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "mcp:catalog": "tsx scripts/mcp/catalog-server.ts",
+    "mcp:publish-skill-links": "node scripts/mcp/publish-skill-links.mjs",
     "db:seed": "prisma db seed",
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",

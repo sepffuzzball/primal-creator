@@ -34,6 +34,28 @@ function skillEntry(stableId: string, name = stableId): WikiReviewedEntry {
   }
 }
 
+/** A new skill entry whose config declares explicit `upgradeToStableIds` edges. */
+function skillWithUpgrade(
+  stableId: string,
+  targets: string[],
+  extra: Record<string, unknown> = {}
+): WikiReviewedEntry {
+  return {
+    kind: "skills",
+    stableId,
+    name: stableId,
+    description: `Description for ${stableId}`,
+    sourceUrl: `https://example.com/${stableId}`,
+    config: {
+      track: "race",
+      effects: [],
+      rarity: "Common",
+      upgradeToStableIds: targets,
+      ...extra,
+    },
+  }
+}
+
 function equipmentEntry(
   stableId: string,
   config: Record<string, unknown>,
@@ -551,7 +573,7 @@ describe("catalog import (unit, mocked db)", () => {
     }
     await expect(applyWikiReviewedImport([entry])).rejects.toMatchObject({
       status: 400,
-      code: "validation",
+      code: "invalid_grade_descriptions",
     })
     expect(dbMock.store.catalog.size).toBe(0)
   })
@@ -1454,6 +1476,185 @@ describe("catalog import (unit, mocked db)", () => {
       status: 400,
       code: "invalid_config",
       message: expect.stringContaining('"track"'),
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  // ------------------------------------------------------------------ //
+  // Skill upgrade graph among newly created skills
+  // ------------------------------------------------------------------ //
+
+  it("accepts a forward upgrade reference between two new skills regardless of manifest order (preview and apply)", async () => {
+    // skill-base upgrades to skill-advanced even though the target appears LATER in
+    // the manifest; the final-graph batch validator is order-independent.
+    const manifest: WikiReviewedEntry[] = [
+      skillWithUpgrade("skill-base", ["skill-advanced"]),
+      skillWithUpgrade("skill-advanced", []),
+    ]
+    const preview = await previewWikiReviewedImport(manifest)
+    expect(preview.createCount).toBe(2)
+    expect(preview.skipCount).toBe(0)
+    expect(dbMock.store.catalog.size).toBe(0)
+    const applied = await applyWikiReviewedImport(manifest)
+    expect(applied.createCount).toBe(2)
+    expect(applied.skipCount).toBe(0)
+    const base = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "skill-base"
+    )!
+    expect(base.config).toMatchObject({
+      upgradeToStableIds: ["skill-advanced"],
+    })
+    const advanced = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "skill-advanced"
+    )!
+    expect(advanced.config).toMatchObject({ upgradeToStableIds: [] })
+  })
+
+  it("accepts a multilevel upgrade chain A -> B -> C among new skills", async () => {
+    const manifest: WikiReviewedEntry[] = [
+      skillWithUpgrade("skill-a", ["skill-b"]),
+      skillWithUpgrade("skill-b", ["skill-c"]),
+      skillWithUpgrade("skill-c", []),
+    ]
+    const applied = await applyWikiReviewedImport(manifest)
+    expect(applied.createCount).toBe(3)
+    expect(applied.skipCount).toBe(0)
+    const a = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "skill-a"
+    )!
+    expect(a.config).toMatchObject({ upgradeToStableIds: ["skill-b"] })
+  })
+
+  it("rejects a cycle that spans an existing skill and a new skill (preview and apply, no write)", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: {
+        track: "race",
+        effects: [],
+        rarity: "Common",
+        upgradeToStableIds: ["skill-a"],
+      },
+      archived: false,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      skillWithUpgrade("skill-a", ["existing-skill"]),
+    ]
+    await expect(previewWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(applyWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The pre-existing skill is untouched and nothing new was written.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rejects a new skill that upgrades to a missing stableId (preview and apply, no write)", async () => {
+    const manifest: WikiReviewedEntry[] = [
+      skillWithUpgrade("skill-a", ["ghost"]),
+    ]
+    await expect(previewWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(applyWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a new skill that lists itself in upgradeToStableIds (preview and apply, no write)", async () => {
+    const manifest: WikiReviewedEntry[] = [
+      skillWithUpgrade("skill-self", ["skill-self"]),
+    ]
+    await expect(previewWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(applyWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("does not treat a skipped archived existing skill as newly unarchived, rejecting a new skill's edge to it", async () => {
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { track: "race", effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const manifest: WikiReviewedEntry[] = [
+      // The manifest also lists the archived skill; because the row already exists,
+      // that entry is skipped (status skip_existing) and the skill stays archived.
+      skillWithUpgrade("arch-skill", []),
+      skillWithUpgrade("skill-a", ["arch-skill"]),
+    ]
+    await expect(previewWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+    await expect(applyWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+    // The pre-existing archived skill is left untouched; nothing was written.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rolls back the whole manifest (no partial writes) when a later new skill breaks the upgrade graph", async () => {
+    const manifest: WikiReviewedEntry[] = [
+      skillEntry("fine-skill"),
+      skillWithUpgrade("bad-skill", ["ghost"]),
+    ]
+    await expect(applyWikiReviewedImport(manifest)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The final-graph check runs before ANY write, so the valid first skill was
+    // never persisted.
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  // ------------------------------------------------------------------ //
+  // Skill grade ban
+  // ------------------------------------------------------------------ //
+
+  it("rejects a manifest skill that carries a non-null grade (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      { ...skillEntry("graded-skill"), grade: "S" },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a manifest skill that carries non-empty gradeDescriptions (preview and apply, no write)", async () => {
+    const bad: WikiReviewedEntry[] = [
+      { ...skillEntry("gd-skill"), gradeDescriptions: { G: "text" } },
+    ]
+    await expect(previewWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
+    })
+    await expect(applyWikiReviewedImport(bad)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_grade_descriptions",
     })
     expect(dbMock.store.catalog.size).toBe(0)
   })

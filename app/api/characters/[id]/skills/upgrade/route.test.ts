@@ -52,6 +52,30 @@ describe("POST /api/characters/[id]/skills/upgrade", () => {
     )
   })
 
+  it("forwards an explicit sourceDefinitionId to the service when supplied", async () => {
+    const res = await POST(
+      upgradeReq({
+        sourceDefinitionId: "sk-low",
+        definitionId: "sk-high",
+        version: 3,
+        reason: "because",
+      }),
+      ctx()
+    )
+    expect(res.status).toBe(200)
+    expect(upgradeSkillMock).toHaveBeenCalledTimes(1)
+    expect(upgradeSkillMock).toHaveBeenCalledWith(
+      "chr-1",
+      {
+        sourceDefinitionId: "sk-low",
+        definitionId: "sk-high",
+        version: 3,
+        reason: "because",
+      },
+      user
+    )
+  })
+
   it("returns 400 for a payload with no usable upgrade shape", async () => {
     const res = await POST(upgradeReq({ version: 0 }), ctx())
     expect(res.status).toBe(400)

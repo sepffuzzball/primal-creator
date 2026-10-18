@@ -789,6 +789,27 @@ describe("validation", () => {
     ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
   })
 
+  it("rejects a skills entry that carries a non-null grade", async () => {
+    await expect(
+      previewManagedCatalog([skillRow("skill-1", {}, { grade: "S" })])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade" })
+  })
+
+  it("rejects a skills entry that carries a non-empty gradeDescriptions", async () => {
+    await expect(
+      previewManagedCatalog([
+        skillRow("skill-1", {}, { gradeDescriptions: { G: "text" } }),
+      ])
+    ).rejects.toMatchObject({ status: 400, code: "invalid_grade_descriptions" })
+  })
+
+  it("accepts a skills entry with an explicit null grade", async () => {
+    const result = await previewManagedCatalog([
+      skillRow("skill-1", {}, { grade: null }),
+    ])
+    expect(result.changes[0].status).toBe("create")
+  })
+
   it("rejects a currencies entry that carries a non-empty config", async () => {
     await expect(
       previewManagedCatalog([
@@ -862,5 +883,219 @@ describe("validation", () => {
       ])
     ).rejects.toMatchObject({ status: 400, code: "invalid_config" })
     expect(dbMock.store.catalog.size).toBe(0)
+  })
+})
+
+// ------------------------------------------------------------------ //
+// Skill upgrade graph
+// ------------------------------------------------------------------ //
+
+describe("skill upgrade graph", () => {
+  function findSkill(stableId: string) {
+    return [...dbMock.store.catalog.values()].find(
+      (r) => r.kind === "skills" && r.stableId === stableId
+    )
+  }
+
+  function seedSkill(
+    id: string,
+    stableId: string,
+    config: Record<string, unknown>,
+    extra: Record<string, unknown> = {}
+  ) {
+    return dbMock.store.addCatalog({
+      id,
+      kind: "skills" as const,
+      stableId,
+      name: `Skill ${stableId}`,
+      config: {
+        track: "race",
+        effects: [],
+        rarity: "Common",
+        ...config,
+      },
+      ...extra,
+    })
+  }
+
+  it("previews and applies a new pair with a forward skill-target reference", async () => {
+    // `skill-a` upgrades to `skill-b`; both are NEW. The batch must validate the
+    // FINAL graph (not an interim state) so the forward reference succeeds.
+    const entries = [
+      skillRow("skill-a", { upgradeToStableIds: ["skill-b"] }),
+      skillRow("skill-b", {}),
+    ]
+    const preview = await previewManagedCatalog(entries)
+    expect(preview.changes).toHaveLength(2)
+    expect(preview.changes.every((c) => c.status === "create")).toBe(true)
+
+    const applied = await applyManagedCatalog(entries, preview.previewTicket)
+    expect(applied.changes).toHaveLength(2)
+    expect(applied.changes.every((c) => c.status === "create")).toBe(true)
+
+    const a = findSkill("skill-a")!
+    const b = findSkill("skill-b")!
+    expect(a.config).toMatchObject({ upgradeToStableIds: ["skill-b"] })
+    expect(b.config).not.toHaveProperty("upgradeToStableIds")
+  })
+
+  it("reverses an existing edge in one batch without an interim cycle", async () => {
+    // Persisted: skill-z upgrades to skill-a. The batch reverses it by making
+    // skill-a upgrade to skill-z while skill-z becomes terminal. `skill-a` is
+    // written before `skill-z` (sorted by stableId), so WITHOUT prevalidation the
+    // write would first create an interim A<->Z cycle; the batch-validated flag
+    // must let it succeed with only the FINAL graph checked.
+    seedSkill("skill-z-row", "skill-z", { upgradeToStableIds: ["skill-a"] })
+    seedSkill("skill-a-row", "skill-a", {})
+
+    const entries = [
+      skillRow("skill-a", { upgradeToStableIds: ["skill-z"] }),
+      skillRow("skill-z", { upgradeToStableIds: [] }),
+    ]
+    const preview = await previewManagedCatalog(entries)
+    expect(preview.changes).toHaveLength(2)
+    expect(preview.changes.every((c) => c.status === "update")).toBe(true)
+
+    const applied = await applyManagedCatalog(entries, preview.previewTicket)
+    expect(applied.changes.every((c) => c.status === "update")).toBe(true)
+
+    const a = findSkill("skill-a")!
+    const z = findSkill("skill-z")!
+    expect(a.config).toMatchObject({ upgradeToStableIds: ["skill-z"] })
+    expect(z.config).toMatchObject({ upgradeToStableIds: [] })
+  })
+
+  it("allows branch, depth and cross-rarity upgrade targets", async () => {
+    // skill-a branches to b + c; b upgrades further (depth) to d; targets carry
+    // the same (Common) and a different (Uncommon) rarity. None of these are
+    // rejected - rarity and track never matter to the upgrade graph.
+    const entries = [
+      skillRow("skill-a", { upgradeToStableIds: ["skill-b", "skill-c"] }),
+      skillRow("skill-b", { upgradeToStableIds: ["skill-d"] }),
+      skillRow("skill-c", {}),
+      skillRow("skill-d", { rarity: "Uncommon" }),
+    ]
+    const preview = await previewManagedCatalog(entries)
+    expect(preview.changes).toHaveLength(4)
+    expect(preview.changes.every((c) => c.status === "create")).toBe(true)
+
+    const applied = await applyManagedCatalog(entries, preview.previewTicket)
+    expect(applied.changes.every((c) => c.status === "create")).toBe(true)
+  })
+
+  it("rejects a cycle formed through existing rows", async () => {
+    seedSkill("skill-a-row", "skill-a", { upgradeToStableIds: ["skill-b"] })
+    seedSkill("skill-b-row", "skill-b", {})
+    // Changing every existing target ref (skill-b -> skill-a) while leaving
+    // skill-a -> skill-b intact produces a cycle through the persisted rows.
+    await expect(
+      previewManagedCatalog([
+        skillRow("skill-b", { upgradeToStableIds: ["skill-a"] }),
+      ])
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // No write, no partial section: the persisted rows are untouched.
+    expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("allows an unchanged reference to an archived upgrade target", async () => {
+    seedSkill("arch-skill-row", "arch-skill", {}, { archived: true })
+    seedSkill("skill-a-row", "skill-a", {
+      upgradeToStableIds: ["arch-skill"],
+    })
+    // A config-change that KEEPS the reference to the archived target is allowed.
+    // Adding `milestone` makes the config differ (so it is a real update) while
+    // the a->archived edge is unchanged - the archive-service path may not reject
+    // it.
+    const result = await previewManagedCatalog([
+      skillRow("skill-a", {
+        upgradeToStableIds: ["arch-skill"],
+        milestone: 2,
+      }),
+    ])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0].status).toBe("update")
+    expect(result.changes[0].after.config).toMatchObject({
+      upgradeToStableIds: ["arch-skill"],
+    })
+  })
+
+  it("rejects a new edge to an archived upgrade target", async () => {
+    seedSkill("arch-skill-row", "arch-skill", {}, { archived: true })
+    // A brand-new skill that upgrades to an archived skill is rejected.
+    await expect(
+      previewManagedCatalog([
+        skillRow("skill-a", { upgradeToStableIds: ["arch-skill"] }),
+      ])
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("preserves prior edges when a skill update omits its config", async () => {
+    seedSkill("skill-a-row", "skill-a", { upgradeToStableIds: ["skill-b"] })
+    seedSkill("skill-b-row", "skill-b", {})
+    // A metadata-only rename omits `config`; MCP semantics preserve the stored
+    // config (and therefore the existing a->b edge).
+    const result = await previewManagedCatalog([
+      {
+        kind: "skills" as const,
+        stableId: "skill-a",
+        name: "Skill A renamed",
+      },
+    ])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0].status).toBe("update")
+    expect(result.changes[0].after.config).toMatchObject({
+      upgradeToStableIds: ["skill-b"],
+    })
+  })
+
+  it("rolls back the preview and mints no ticket on an invalid skill graph", async () => {
+    const ticketSpy = vi.spyOn(mcpCatalogAuth, "issueMcpPreviewTicket")
+    // An existing a->b row plus a proposed b->a row that keeps a->b is a cycle.
+    seedSkill("skill-a-row", "skill-a", { upgradeToStableIds: ["skill-b"] })
+    seedSkill("skill-b-row", "skill-b", {})
+    await expect(
+      previewManagedCatalog([
+        skillRow("skill-b", { upgradeToStableIds: ["skill-a"] }),
+      ])
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    expect(ticketSpy).not.toHaveBeenCalled()
+    expect(dbMock.store.catalog.size).toBe(2)
+  })
+
+  it("leaves unrelated catalog rows untouched when editing skill edges", async () => {
+    dbMock.store.addCatalog({
+      id: "unrelated-item",
+      kind: "items",
+      stableId: "potion",
+      name: "Potion",
+      config: { markup: 2 },
+    })
+    seedSkill("skill-a-row", "skill-a", {})
+    const entries = [
+      skillRow("skill-a", { upgradeToStableIds: ["skill-b"] }),
+      skillRow("skill-b", {}),
+    ]
+    const preview = await previewManagedCatalog(entries)
+    const applied = await applyManagedCatalog(entries, preview.previewTicket)
+    expect(applied.changes).toHaveLength(2)
+
+    const item = findCatalog("unrelated-item")!
+    expect(item.kind).toBe("items")
+    expect(item.name).toBe("Potion")
+    expect(item.config).toMatchObject({ markup: 2 })
+    // The unrelated row's timestamps were never touched (no unrelated write).
+    expect(item.updatedAt).toBe(
+      dbMock.store.catalog.get("unrelated-item")!.updatedAt
+    )
   })
 })

@@ -49,6 +49,8 @@ import {
   requiredGradeNullForbidden,
   skillClassStableIdOf,
   skillConfigSchema,
+  skillGradeDescriptionsForbidden,
+  skillGradeForbidden,
   skillUpgradeSchema,
   specialAbilitiesSchema,
   titleConfigSchema,
@@ -1889,6 +1891,107 @@ describe("skill rarity (shared vocabulary + monotonic ordering)", () => {
       }).success
     ).toBe(false)
   })
+
+  it("skillUpgradeSchema accepts an optional nonempty sourceDefinitionId", () => {
+    // Omitted source is valid (legacy target-only flow).
+    const omitted = skillUpgradeSchema.safeParse({
+      definitionId: "sk-2",
+      version: 1,
+      reason: "because",
+    })
+    expect(omitted.success).toBe(true)
+    if (omitted.success) expect(omitted.data.sourceDefinitionId).toBeUndefined()
+
+    // A present source must be a nonempty string.
+    const present = skillUpgradeSchema.safeParse({
+      sourceDefinitionId: "sk-low",
+      definitionId: "sk-high",
+      version: 1,
+      reason: "because",
+    })
+    expect(present.success).toBe(true)
+    if (present.success) {
+      expect(present.data.sourceDefinitionId).toBe("sk-low")
+    }
+
+    expect(
+      skillUpgradeSchema.safeParse({
+        sourceDefinitionId: "",
+        definitionId: "sk-high",
+        version: 1,
+        reason: "because",
+      }).success
+    ).toBe(false)
+  })
+})
+
+describe("skill upgradeToStableIds (local shape)", () => {
+  it("reads a legacy config without upgradeToStableIds as undefined (fallback)", () => {
+    const parsed = skillConfigSchema.safeParse({
+      track: "class",
+      milestone: 4,
+      rarity: "Common",
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.upgradeToStableIds).toBeUndefined()
+    }
+  })
+
+  it("accepts an explicit empty list (explicitly terminal)", () => {
+    const parsed = skillConfigSchema.safeParse({
+      track: "class",
+      upgradeToStableIds: [],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.upgradeToStableIds).toEqual([])
+    }
+  })
+
+  it("accepts a nonempty, internally unique list", () => {
+    const parsed = skillConfigSchema.safeParse({
+      track: "class",
+      upgradeToStableIds: ["skill-a", "skill-b"],
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.upgradeToStableIds).toEqual(["skill-a", "skill-b"])
+    }
+  })
+
+  it("rejects a duplicate upgradeToStableIds entry", () => {
+    const parsed = skillConfigSchema.safeParse({
+      track: "class",
+      upgradeToStableIds: ["skill-a", "skill-a"],
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("rejects a blank upgradeToStableIds entry", () => {
+    const parsed = skillConfigSchema.safeParse({
+      track: "class",
+      upgradeToStableIds: [""],
+    })
+    expect(parsed.success).toBe(false)
+  })
+
+  it("accepts exactly 50 entries and rejects 51", () => {
+    const fifty = Array.from({ length: 50 }, (_, i) => `skill-${i}`)
+    expect(
+      skillConfigSchema.safeParse({
+        track: "class",
+        upgradeToStableIds: fifty,
+      }).success
+    ).toBe(true)
+    const fiftyOne = Array.from({ length: 51 }, (_, i) => `skill-${i}`)
+    expect(
+      skillConfigSchema.safeParse({
+        track: "class",
+        upgradeToStableIds: fiftyOne,
+      }).success
+    ).toBe(false)
+  })
 })
 
 describe("gradeDescriptionsSchema (catalog grade-specific prose)", () => {
@@ -2200,6 +2303,61 @@ describe("currencies catalog kind invariants", () => {
     it("rejects a non-object config", () => {
       expect(currencyConfigSchema.safeParse([]).success).toBe(false)
       expect(currencyConfigSchema.safeParse(null).success).toBe(false)
+    })
+  })
+})
+
+describe("skills catalog kind invariants", () => {
+  describe("skillGradeForbidden (skills carry no catalog grade)", () => {
+    it("allows a skills entry with a null grade and with a missing (undefined) grade", () => {
+      expect(skillGradeForbidden("skills", null)).toBe(false)
+      expect(skillGradeForbidden("skills", undefined)).toBe(false)
+    })
+
+    it("rejects a skills entry with any non-null grade value", () => {
+      for (const grade of ["G", "F", "E", "D", "C", "B", "A", "S"]) {
+        expect(skillGradeForbidden("skills", grade)).toBe(true)
+      }
+    })
+
+    it("is only triggered for the skills kind", () => {
+      // A graded race/class/profession (and all other graded kinds) never trips
+      // the skill invariant.
+      expect(skillGradeForbidden("races", "S")).toBe(false)
+      expect(skillGradeForbidden("classes", "B")).toBe(false)
+      expect(skillGradeForbidden("professions", "A")).toBe(false)
+      expect(skillGradeForbidden("titles", "C")).toBe(false)
+      expect(skillGradeForbidden("equipment", "D")).toBe(false)
+      expect(skillGradeForbidden("gods", "C")).toBe(false)
+      expect(skillGradeForbidden("currencies", "A")).toBe(false)
+      // A non-skill kind with a null grade is also fine.
+      expect(skillGradeForbidden("items", null)).toBe(false)
+      expect(skillGradeForbidden("bloodlines", undefined)).toBe(false)
+    })
+  })
+
+  describe("skillGradeDescriptionsForbidden (skills carry no grade ladder)", () => {
+    it("allows a skills entry with omitted, null, or empty gradeDescriptions", () => {
+      expect(skillGradeDescriptionsForbidden("skills", undefined)).toBe(false)
+      expect(skillGradeDescriptionsForbidden("skills", null)).toBe(false)
+      expect(skillGradeDescriptionsForbidden("skills", {})).toBe(false)
+    })
+
+    it("rejects a skills entry with a non-empty gradeDescriptions map", () => {
+      expect(skillGradeDescriptionsForbidden("skills", { G: "text" })).toBe(
+        true
+      )
+      expect(skillGradeDescriptionsForbidden("skills", { S: "top" })).toBe(true)
+    })
+
+    it("is only triggered for the skills kind", () => {
+      expect(skillGradeDescriptionsForbidden("gods", { G: "text" })).toBe(false)
+      expect(skillGradeDescriptionsForbidden("titles", { A: "text" })).toBe(
+        false
+      )
+      expect(skillGradeDescriptionsForbidden("currencies", { G: "text" })).toBe(
+        false
+      )
     })
   })
 })

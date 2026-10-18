@@ -449,6 +449,16 @@ export interface CharacterAssociationView {
   tier?: string
   /** Rarity tier, present on equipment and skill links that declare one. */
   rarity?: string
+  /**
+   * Authoritative DIRECT outgoing upgrade target skill stableIds, present ONLY on
+   * a skill association (serialized from the linked skill definition's parsed
+   * config). The OWN-field distinction is preserved: an absent field (undefined)
+   * means the legacy `upgradeGroup` + `rarity` fallback applies; an explicit `[]`
+   * means the skill is terminal (no successor, no fallback); a nonempty list names
+   * the exact target stableIds (a skill may branch to several). Never present on a
+   * non-skill association, regardless of its config.
+   */
+  upgradeToStableIds?: string[]
   /** Whether an equipment link is soulbound (metadata only; no transfer mechanic). */
   soulbound?: boolean
   /** Level / race-type requirements an equipment link declares, when any. */

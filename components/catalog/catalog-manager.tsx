@@ -50,6 +50,10 @@ import {
 } from "@/components/ui/table"
 import { ATTRIBUTE_KEYS } from "@/lib/api"
 import {
+  skillUpgradeComponents,
+  skillUpgradeTargets,
+} from "@/lib/skills/upgrade-graph"
+import {
   EQUIPMENT_RARITIES,
   EQUIPMENT_SLOTS,
   EQUIPMENT_UNIQUE_RARITY,
@@ -233,6 +237,9 @@ export function CatalogManager({ kind }: { kind: string }) {
     Array<{ stableId: string; name: string }>
   >([])
   const [skills, setSkills] = React.useState<CatalogItem[]>([])
+  const [skillReferences, setSkillReferences] = React.useState<CatalogItem[]>(
+    []
+  )
   const [classChoices, setClassChoices] = React.useState<CatalogItem[] | null>(
     null
   )
@@ -436,6 +443,9 @@ export function CatalogManager({ kind }: { kind: string }) {
   const saveRef = React.useRef<() => Promise<void>>(async () => {})
   const [showArchived, setShowArchived] = React.useState(false)
   const [expandedSeries, setExpandedSeries] = React.useState<
+    Record<string, boolean>
+  >({})
+  const [expandedSkillTrees, setExpandedSkillTrees] = React.useState<
     Record<string, boolean>
   >({})
   const [unarchiving, setUnarchiving] = React.useState<string | null>(null)
@@ -742,14 +752,25 @@ export function CatalogManager({ kind }: { kind: string }) {
   React.useEffect(() => {
     if (
       !(
-        ["equipment", "races", "classes", "professions", "titles"] as string[]
+        [
+          "equipment",
+          "races",
+          "classes",
+          "professions",
+          "titles",
+          "skills",
+        ] as string[]
       ).includes(kind)
     )
       return
     let active = true
     apiFetch<CatalogListResponse>("/api/catalog/skills")
       .then((response) => {
-        if (active) setSkills(response.items.filter((skill) => !skill.archived))
+        if (active) {
+          const activeSkills = response.items.filter((skill) => !skill.archived)
+          setSkills(activeSkills)
+          setSkillReferences(activeSkills)
+        }
       })
       .catch(() => {
         if (active) setSkills([])
@@ -758,6 +779,21 @@ export function CatalogManager({ kind }: { kind: string }) {
       active = false
     }
   }, [kind])
+
+  React.useEffect(() => {
+    if (!isAdmin || kind !== "skills") return
+    let active = true
+    apiFetch<CatalogListResponse>("/api/catalog/skills?includeArchived=1")
+      .then((response) => {
+        if (active) setSkillReferences(response.items)
+      })
+      .catch(() => {
+        if (active) setSkillReferences([])
+      })
+    return () => {
+      active = false
+    }
+  }, [kind, isAdmin])
 
   React.useEffect(() => {
     let active = true
@@ -792,6 +828,100 @@ export function CatalogManager({ kind }: { kind: string }) {
         item.stableId.toLowerCase().includes(q)
     )
   }, [items, query, isAdmin, showArchived])
+
+  const visibleSkillGroups = React.useMemo(() => {
+    if (kind !== "skills" || !items) return []
+    const source = items.filter((item) =>
+      isAdmin && showArchived ? true : !item.archived
+    )
+    const nodes = source.map((item) => ({
+      stableId: item.stableId,
+      archived: item.archived,
+      config: item.config,
+    }))
+    // Explicit edges are grouped by the shared graph helper. Legacy groups are
+    // then joined into the same weak components without changing edge direction.
+    const parent = new Map<string, string>(
+      nodes.map((node) => [node.stableId, node.stableId])
+    )
+    const root = (id: string): string => {
+      const current = parent.get(id) ?? id
+      if (current === id) return id
+      const result = root(current)
+      parent.set(id, result)
+      return result
+    }
+    const join = (a: string, b: string) => {
+      const ra = root(a)
+      const rb = root(b)
+      if (ra !== rb) parent.set(rb, ra)
+    }
+    for (const component of skillUpgradeComponents(nodes))
+      for (const id of component.slice(1)) join(component[0], id)
+    const legacyGroups = new Map<string, string[]>()
+    for (const node of nodes) {
+      const config = isRecord(node.config) ? node.config : {}
+      if (typeof config.upgradeGroup !== "string") continue
+      legacyGroups.set(config.upgradeGroup, [
+        ...(legacyGroups.get(config.upgradeGroup) ?? []),
+        node.stableId,
+      ])
+    }
+    for (const ids of legacyGroups.values()) {
+      for (const sourceId of ids) {
+        const sourceNode = nodes.find((node) => node.stableId === sourceId)!
+        const sourceConfig = isRecord(sourceNode.config)
+          ? sourceNode.config
+          : {}
+        if (skillUpgradeTargets(sourceConfig) !== undefined) continue
+        const sourceRarity =
+          typeof sourceConfig.rarity === "string"
+            ? EQUIPMENT_RARITIES.indexOf(
+                sourceConfig.rarity as (typeof EQUIPMENT_RARITIES)[number]
+              )
+            : -1
+        if (sourceRarity < 0) continue
+        for (const targetId of ids) {
+          if (targetId === sourceId) continue
+          const targetNode = nodes.find((node) => node.stableId === targetId)!
+          const targetConfig = isRecord(targetNode.config)
+            ? targetNode.config
+            : {}
+          const targetRarity =
+            typeof targetConfig.rarity === "string"
+              ? EQUIPMENT_RARITIES.indexOf(
+                  targetConfig.rarity as (typeof EQUIPMENT_RARITIES)[number]
+                )
+              : -1
+          if (targetRarity > sourceRarity) join(sourceId, targetId)
+        }
+      }
+    }
+    const grouped = new Map<string, CatalogItem[]>()
+    for (const node of nodes) {
+      const key = root(node.stableId)
+      const entry = source.find((item) => item.stableId === node.stableId)
+      if (entry) grouped.set(key, [...(grouped.get(key) ?? []), entry])
+    }
+    const q = query.trim().toLocaleLowerCase()
+    return [...grouped.values()]
+      .map((group) => {
+        const isLegacyOnly = group.every((item) => {
+          const config = isRecord(item.config) ? item.config : {}
+          return skillUpgradeTargets(config) === undefined
+        })
+        const matches =
+          !q ||
+          group.some((item) =>
+            `${item.name} ${item.stableId}`.toLocaleLowerCase().includes(q)
+          )
+        const entries = (matches ? group : []).sort((a, b) =>
+          a.name.localeCompare(b.name)
+        )
+        return { group, entries, isLegacyOnly }
+      })
+      .filter(({ entries }) => entries.length > 0)
+  }, [items, kind, isAdmin, showArchived, query])
 
   const rankedSeries = React.useMemo(() => {
     if (kind !== "titles") return []
@@ -1370,7 +1500,8 @@ export function CatalogManager({ kind }: { kind: string }) {
             ...(form.description !== (editing?.description ?? "")
               ? { description: form.description }
               : {}),
-            ...(!isCurrency &&
+            ...(kind !== "skills" &&
+            !isCurrency &&
             stableStringify(form.gradeDescriptions) !==
               stableStringify(
                 (
@@ -1389,7 +1520,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                   ),
                 }
               : {}),
-            ...(!isCurrency &&
+            ...(kind !== "skills" &&
+            !isCurrency &&
             kind !== "gods" &&
             form.grade.trim() &&
             (kind !== "races" ||
@@ -1401,7 +1533,8 @@ export function CatalogManager({ kind }: { kind: string }) {
                   : editing.grade))
               ? { grade: form.grade }
               : {}),
-            ...(!isCurrency &&
+            ...(kind !== "skills" &&
+            !isCurrency &&
             OPTIONAL_GRADE_KINDS.includes(kind) &&
             editing &&
             form.grade !== (editing.grade ?? "")
@@ -1579,7 +1712,9 @@ export function CatalogManager({ kind }: { kind: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
-                {isCurrency ? null : <TableHead>Grade</TableHead>}
+                {isCurrency || kind === "skills" ? null : (
+                  <TableHead>Grade</TableHead>
+                )}
                 <TableHead>Stable id</TableHead>
                 <TableHead>Source</TableHead>
                 {isAdmin ? (
@@ -1591,7 +1726,15 @@ export function CatalogManager({ kind }: { kind: string }) {
               {visible.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={isAdmin ? 5 : 4}
+                    colSpan={
+                      isAdmin
+                        ? isCurrency || kind === "skills"
+                          ? 4
+                          : 5
+                        : isCurrency || kind === "skills"
+                          ? 3
+                          : 4
+                    }
                     className="text-center text-muted-foreground"
                   >
                     No catalog entries match.
@@ -1599,13 +1742,270 @@ export function CatalogManager({ kind }: { kind: string }) {
                 </TableRow>
               ) : (
                 <>
+                  {kind === "skills"
+                    ? visibleSkillGroups.map(
+                        ({ group, entries, isLegacyOnly }) => {
+                          const groupKey = group
+                            .map((entry) => entry.stableId)
+                            .sort()
+                            .join("|")
+                          const expanded =
+                            query.trim() !== "" ||
+                            (expandedSkillTrees[groupKey] ?? false)
+                          const byId = new Map(
+                            group.map((entry) => [entry.stableId, entry])
+                          )
+                          const parents = new Map<string, string[]>()
+                          const children = new Map<string, string[]>()
+                          for (const entry of group) {
+                            const config = isRecord(entry.config)
+                              ? entry.config
+                              : {}
+                            for (const target of skillUpgradeTargets(config) ??
+                              []) {
+                              if (!byId.has(target)) continue
+                              parents.set(target, [
+                                ...(parents.get(target) ?? []),
+                                entry.stableId,
+                              ])
+                              children.set(entry.stableId, [
+                                ...(children.get(entry.stableId) ?? []),
+                                target,
+                              ])
+                            }
+                          }
+                          const depth = new Map<string, number>(
+                            group
+                              .filter((entry) => !parents.has(entry.stableId))
+                              .map((entry) => [entry.stableId, 0])
+                          )
+                          for (let pass = 0; pass < group.length; pass++) {
+                            for (const [from, targets] of children) {
+                              const fromDepth = depth.get(from)
+                              if (fromDepth === undefined) continue
+                              for (const target of targets) {
+                                const nextDepth = fromDepth + 1
+                                if (
+                                  depth.get(target) === undefined ||
+                                  nextDepth < depth.get(target)!
+                                )
+                                  depth.set(target, nextDepth)
+                              }
+                            }
+                          }
+                          const nodesInGroup = entries
+                            .map((entry) => ({
+                              entry,
+                              depth: depth.get(entry.stableId) ?? 0,
+                            }))
+                            .sort(
+                              (a, b) =>
+                                a.depth - b.depth ||
+                                a.entry.name.localeCompare(b.entry.name)
+                            )
+                          if (group.length === 1) {
+                            const single = group[0]
+                            const rarity =
+                              isRecord(single.config) &&
+                              typeof single.config.rarity === "string"
+                                ? single.config.rarity
+                                : "Unspecified rarity"
+                            return (
+                              <TableRow key={single.id}>
+                                <TableCell className="font-medium">
+                                  {single.name}
+                                  {single.archived ? (
+                                    <span className="ml-2 rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                                      Archived
+                                    </span>
+                                  ) : null}
+                                  <Badge variant="secondary" className="ml-2">
+                                    {rarity}
+                                  </Badge>
+                                </TableCell>
+                                <TableCell className="font-mono text-[0.6875rem]">
+                                  {single.stableId}
+                                </TableCell>
+                                <TableCell>
+                                  {single.sourceUrl ? (
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      aria-label="Open source"
+                                      onClick={() =>
+                                        openSource(single.sourceUrl)
+                                      }
+                                    >
+                                      <LinkIcon />
+                                    </Button>
+                                  ) : (
+                                    "-"
+                                  )}
+                                </TableCell>
+                                {isAdmin ? (
+                                  <TableCell className="text-right">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      aria-label="Edit"
+                                      onClick={() => openEdit(single)}
+                                    >
+                                      <PencilIcon />
+                                    </Button>
+                                    {single.archived ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={unarchiving === single.id}
+                                        onClick={() => unarchive(single)}
+                                      >
+                                        <ArchiveRestoreIcon />
+                                        Unarchive
+                                      </Button>
+                                    ) : null}
+                                  </TableCell>
+                                ) : null}
+                              </TableRow>
+                            )
+                          }
+                          return (
+                            <React.Fragment key={`skill-group-${groupKey}`}>
+                              <TableRow>
+                                <TableCell colSpan={isAdmin ? 4 : 3}>
+                                  <button
+                                    type="button"
+                                    aria-expanded={expanded}
+                                    aria-label={`${expanded ? "Collapse" : "Expand"} ${isLegacyOnly ? "skill group" : "skill tree"} ${groupKey}`}
+                                    className="font-medium"
+                                    onClick={() =>
+                                      setExpandedSkillTrees((current) => ({
+                                        ...current,
+                                        [groupKey]: !expanded,
+                                      }))
+                                    }
+                                  >
+                                    {expanded ? "▾" : "▸"}{" "}
+                                    {isLegacyOnly
+                                      ? "Skill group"
+                                      : "Skill tree"}
+                                  </button>
+                                  <span className="ml-2 text-xs text-muted-foreground">
+                                    {group.length} skills
+                                  </span>
+                                </TableCell>
+                              </TableRow>
+                              {expanded
+                                ? nodesInGroup.map(
+                                    ({ entry, depth: nodeDepth }) => {
+                                      const config = isRecord(entry.config)
+                                        ? entry.config
+                                        : {}
+                                      const rarity =
+                                        typeof config.rarity === "string"
+                                          ? config.rarity
+                                          : "Unspecified rarity"
+                                      const incoming = (
+                                        parents.get(entry.stableId) ?? []
+                                      ).map((id) => byId.get(id)?.name ?? id)
+                                      const outgoing = (
+                                        children.get(entry.stableId) ?? []
+                                      ).map((id) => byId.get(id)?.name ?? id)
+                                      return (
+                                        <TableRow key={entry.id}>
+                                          <TableCell
+                                            className="font-medium"
+                                            style={{
+                                              paddingInlineStart: `${1 + Math.min(nodeDepth, 6) * 1.25}rem`,
+                                            }}
+                                          >
+                                            {entry.name}
+                                            {entry.archived ? (
+                                              <span className="ml-2 rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                                                Archived
+                                              </span>
+                                            ) : null}
+                                            <Badge
+                                              variant="secondary"
+                                              className="ml-2"
+                                            >
+                                              {rarity}
+                                            </Badge>
+                                            {outgoing.length ? (
+                                              <p className="mt-1 text-xs text-muted-foreground">
+                                                Upgrades to:{" "}
+                                                {outgoing.join(", ")}
+                                              </p>
+                                            ) : null}
+                                            {incoming.length ? (
+                                              <p className="mt-1 text-xs text-muted-foreground">
+                                                From: {incoming.join(", ")}
+                                              </p>
+                                            ) : null}
+                                          </TableCell>
+                                          <TableCell className="font-mono text-[0.6875rem]">
+                                            {entry.stableId}
+                                          </TableCell>
+                                          <TableCell>
+                                            {entry.sourceUrl ? (
+                                              <Button
+                                                variant="ghost"
+                                                size="icon-xs"
+                                                aria-label="Open source"
+                                                onClick={() =>
+                                                  openSource(entry.sourceUrl)
+                                                }
+                                              >
+                                                <LinkIcon />
+                                              </Button>
+                                            ) : (
+                                              "-"
+                                            )}
+                                          </TableCell>
+                                          {isAdmin ? (
+                                            <TableCell className="text-right">
+                                              <Button
+                                                variant="ghost"
+                                                size="icon-sm"
+                                                aria-label={`Edit ${entry.name}`}
+                                                onClick={() => openEdit(entry)}
+                                              >
+                                                <PencilIcon />
+                                              </Button>
+                                              {entry.archived ? (
+                                                <Button
+                                                  variant="outline"
+                                                  size="sm"
+                                                  disabled={
+                                                    unarchiving === entry.id
+                                                  }
+                                                  onClick={() =>
+                                                    unarchive(entry)
+                                                  }
+                                                >
+                                                  <ArchiveRestoreIcon />
+                                                  Unarchive
+                                                </Button>
+                                              ) : null}
+                                            </TableCell>
+                                          ) : null}
+                                        </TableRow>
+                                      )
+                                    }
+                                  )
+                                : null}
+                            </React.Fragment>
+                          )
+                        }
+                      )
+                    : null}
                   {visible
                     .filter(
                       (item) =>
-                        kind !== "titles" ||
+                        (kind !== "titles" && kind !== "skills") ||
                         !isRecord(item.config) ||
                         !isRecord(item.config.improvement)
                     )
+                    .filter(() => kind !== "skills")
                     .map((item) => (
                       <TableRow key={item.id}>
                         <TableCell className="font-medium">
@@ -1616,7 +2016,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                             </span>
                           ) : null}
                         </TableCell>
-                        {isCurrency ? null : (
+                        {isCurrency || kind === "skills" ? null : (
                           <TableCell>{item.grade ?? "-"}</TableCell>
                         )}
                         <TableCell className="font-mono text-[0.6875rem]">
@@ -1832,6 +2232,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                 />
               </div>
               {kind === "items" ||
+              kind === "skills" ||
               isCurrency ||
               !form.grade ||
               ![...GRADES].includes(form.grade as (typeof GRADES)[number]) ? (
@@ -1870,6 +2271,7 @@ export function CatalogManager({ kind }: { kind: string }) {
                 </details>
               )}
               {!isCurrency &&
+                kind !== "skills" &&
                 kind !== "items" &&
                 (!!form.grade ||
                 ["races", "classes", "professions", "skills"].includes(kind) ? (
@@ -3073,6 +3475,176 @@ export function CatalogManager({ kind }: { kind: string }) {
                         )}
                       </section>
                     ) : null}
+                    {kind === "skills"
+                      ? (() => {
+                          const targets =
+                            skillUpgradeTargets(structuredConfig) ?? []
+                          const explicit =
+                            skillUpgradeTargets(structuredConfig) !== undefined
+                          const selected = [...new Set(targets)]
+                          const available = skills.filter(
+                            (skill) =>
+                              skill.stableId !== editing?.stableId &&
+                              !skill.archived &&
+                              !selected.includes(skill.stableId)
+                          )
+                          const incoming = skillReferences.filter(
+                            (skill) =>
+                              skill.stableId !== editing?.stableId &&
+                              (
+                                skillUpgradeTargets(skill.config) ?? []
+                              ).includes(editing?.stableId ?? "")
+                          )
+                          return (
+                            <section
+                              aria-label="Skill upgrade paths"
+                              className="flex flex-col gap-2 rounded-md border p-3"
+                            >
+                              <label className="flex items-center gap-2 text-sm font-medium">
+                                <input
+                                  aria-label="Use explicit upgrade paths"
+                                  type="checkbox"
+                                  checked={explicit}
+                                  disabled={!structuredConfig}
+                                  onChange={(event) => {
+                                    if (event.target.checked)
+                                      setConfigValue("upgradeToStableIds", [])
+                                    else {
+                                      const config = {
+                                        ...(structuredConfig ?? {}),
+                                      }
+                                      delete config.upgradeToStableIds
+                                      setForm((current) => ({
+                                        ...current,
+                                        configText: JSON.stringify(
+                                          config,
+                                          null,
+                                          2
+                                        ),
+                                      }))
+                                    }
+                                  }}
+                                />
+                                Author direct upgrade paths
+                              </label>
+                              <p className="text-xs text-muted-foreground">
+                                Explicit empty paths make this skill terminal.
+                                Turning this off restores legacy upgrade-group
+                                rarity fallback.
+                              </p>
+                              {explicit ? (
+                                <>
+                                  <Label htmlFor="skill-upgrade-target">
+                                    Upgrades to
+                                  </Label>
+                                  <select
+                                    id="skill-upgrade-target"
+                                    aria-label="Upgrade target"
+                                    className="h-auto max-h-48 overflow-y-auto rounded-md border bg-background px-3 text-sm"
+                                    size={Math.min(
+                                      8,
+                                      Math.max(2, available.length + 1)
+                                    )}
+                                    value=""
+                                    disabled={!structuredConfig}
+                                    onChange={(event) => {
+                                      const id = event.target.value
+                                      if (id && !selected.includes(id))
+                                        setConfigValue("upgradeToStableIds", [
+                                          ...selected,
+                                          id,
+                                        ])
+                                    }}
+                                  >
+                                    <option value="">
+                                      Choose an active skill
+                                    </option>
+                                    {available.map((skill) => (
+                                      <option
+                                        key={skill.stableId}
+                                        value={skill.stableId}
+                                      >
+                                        {skill.name} ({skill.stableId})
+                                      </option>
+                                    ))}
+                                  </select>
+                                  {selected.length ? (
+                                    <ul className="flex flex-col gap-1">
+                                      {selected.map((id) => (
+                                        <li
+                                          key={id}
+                                          className="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1.5 text-sm"
+                                        >
+                                          <span>
+                                            {skillReferences.find(
+                                              (skill) => skill.stableId === id
+                                            )?.name ?? id}
+                                            <span className="ml-2 font-mono text-xs text-muted-foreground">
+                                              {id}
+                                            </span>
+                                            {skillReferences.find(
+                                              (skill) => skill.stableId === id
+                                            )?.archived ? (
+                                              <span className="ml-2 text-xs text-muted-foreground">
+                                                Archived existing target
+                                              </span>
+                                            ) : null}
+                                          </span>
+                                          <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="sm"
+                                            aria-label={`Remove upgrade target ${id}`}
+                                            onClick={() =>
+                                              setConfigValue(
+                                                "upgradeToStableIds",
+                                                selected.filter(
+                                                  (target) => target !== id
+                                                )
+                                              )
+                                            }
+                                          >
+                                            Remove
+                                          </Button>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  ) : (
+                                    <p className="text-xs text-muted-foreground">
+                                      No direct successors; this is explicitly
+                                      terminal.
+                                    </p>
+                                  )}
+                                </>
+                              ) : null}
+                              {editing ? (
+                                <div className="flex flex-col gap-1 border-t pt-2">
+                                  <p className="text-sm font-medium">
+                                    Upgrades from
+                                  </p>
+                                  {incoming.length ? (
+                                    incoming.map((skill) => (
+                                      <p
+                                        key={skill.stableId}
+                                        className="text-sm text-muted-foreground"
+                                      >
+                                        {skill.name}{" "}
+                                        <span className="font-mono text-xs">
+                                          ({skill.stableId})
+                                        </span>
+                                      </p>
+                                    ))
+                                  ) : (
+                                    <p className="text-xs text-muted-foreground">
+                                      No explicit incoming paths.
+                                    </p>
+                                  )}
+                                </div>
+                              ) : null}
+                            </section>
+                          )
+                        })()
+                      : null}
                     <Label htmlFor="cat-rarity">Rarity</Label>
                     <select
                       id="cat-rarity"

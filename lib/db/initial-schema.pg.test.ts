@@ -48,8 +48,18 @@ const BASELINE_MIGRATION_NAME = "20261016000000_initial_0_1_0"
 // applied-migration set or the full application table set must account for it.
 const CURRENCIES_MIGRATION_NAME = "20261017000000_currencies"
 
-// The 12 application tables the final schema creates (everything except the
-// Prisma tracking table `_prisma_migrations`).
+// The additive skill grade removal migration layered on top of the baseline and
+// the currencies migration. It clears any pre-existing skill `grade` /
+// `gradeDescriptions` and adds a CHECK constraint enforcing the skill grade
+// invariant. Like the currencies migration it must be accounted for by any test
+// that asserts the applied-migration set.
+const SKILL_GRADE_REMOVED_MIGRATION_NAME = "20261017200000_skill_grade_removed"
+
+// The 13 application tables the final schema creates (everything except the
+// Prisma tracking table `_prisma_migrations`). The 13th,
+// `legacy_skill_grade_metadata`, is a migration-only audit table created by the
+// skill-grade-removal migration; it is never read or written by the application
+// but is part of the deployed schema.
 const APP_TABLES = [
   "assets",
   "catalog_definitions",
@@ -59,6 +69,7 @@ const APP_TABLES = [
   "character_inventory_items",
   "characters",
   "house_rules",
+  "legacy_skill_grade_metadata",
   "progression_events",
   "skill_offer_options",
   "skill_offers",
@@ -396,14 +407,15 @@ describe.skipIf(!gate.run)(
               "pg_stat_statements_reset",
             ])
 
-            // The baseline and its additive currencies migration are recorded as
-            // applied.
+            // The baseline and its additive currencies and skill-grade-removal
+            // migrations are recorded as applied.
             const migs = (await db.$queryRawUnsafe(
               `SELECT migration_name AS name, finished_at FROM public."_prisma_migrations" ORDER BY started_at`
             )) as Array<{ name: string; finished_at: Date | null }>
             expect(migs.map((m) => m.name)).toEqual([
               BASELINE_MIGRATION_NAME,
               CURRENCIES_MIGRATION_NAME,
+              SKILL_GRADE_REMOVED_MIGRATION_NAME,
             ])
             expect(migs[0].finished_at).not.toBeNull()
           } finally {
@@ -542,11 +554,12 @@ describe.skipIf(!gate.run)("prisma 0.1.0 initial baseline schema", () => {
     expect(rows.map((r) => r.migration_name)).toEqual([
       BASELINE_MIGRATION_NAME,
       CURRENCIES_MIGRATION_NAME,
+      SKILL_GRADE_REMOVED_MIGRATION_NAME,
     ])
     expect(rows[0].finished_at).not.toBeNull()
   })
 
-  it("creates exactly the 12 application tables", async () => {
+  it("creates exactly the 13 application tables", async () => {
     const rows = await prisma.$queryRaw<
       Array<{ table_name: string }>
     >`SELECT table_name FROM information_schema.tables
@@ -558,15 +571,17 @@ describe.skipIf(!gate.run)("prisma 0.1.0 initial baseline schema", () => {
     expect(appNames).toEqual([...APP_TABLES])
   })
 
-  it("adds the quantity and blessing-tier CHECK constraints", async () => {
+  it("adds the quantity, blessing-tier and skill-grade CHECK constraints", async () => {
     const rows = await prisma.$queryRaw<Array<{ conname: string }>>`
       SELECT conname FROM pg_constraint
       WHERE conname IN (
         'character_inventory_items_quantity_check',
-        'character_associations_blessing_tier_check'
+        'character_associations_blessing_tier_check',
+        'catalog_definitions_skill_grade_check'
       )
     `
     expect(rows.map((r) => r.conname).sort()).toEqual([
+      "catalog_definitions_skill_grade_check",
       "character_associations_blessing_tier_check",
       "character_inventory_items_quantity_check",
     ])

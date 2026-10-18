@@ -36,12 +36,26 @@
  * target. The reference set is exactly the in-batch identity edges the
  * transactional helpers validate (equipment `requiredGodStableId` /
  * `grantedSkillStableIds`; race/class/profession `gradeGrantedSkillStableIds`;
- * title `grantedSkillStableIds`; skill `classStableId`). A reference to an
- * existing (or archived) row outside
- * the batch is validated by the helper itself, which already rejects a missing or
- * archived target. A cycle is impossible to satisfy and is rejected with a 400
- * `catalog_dependency_cycle` BEFORE any write; a valid forward reference is
- * ordered correctly and succeeds.
+ * title `grantedSkillStableIds`; skill `classStableId` plus its explicit
+ * `upgradeToStableIds` targets). A reference to an existing (or archived) row
+ * outside the batch is validated by the helper itself, which already rejects a
+ * missing or archived target. A cycle is impossible to satisfy and is rejected
+ * with a 400 `catalog_dependency_cycle` BEFORE any write; a valid forward
+ * reference is ordered correctly and succeeds.
+ *
+ * Skill upgrade graph: in BOTH preview and apply the publisher overlays the
+ * proposed skills (using exact MCP create/update semantics) onto the persisted
+ * skill set INCLUDING archived rows and validates the FINAL graph once via
+ * `validateSkillUpgradeBatch` BEFORE any write. A structural defect (duplicate,
+ * self-link, missing/wrong-kind target, cycle) is a 400 `invalid_skill_upgrade_graph`;
+ * a NEW edge to an ARCHIVED target is a 400 `skill_upgrade_archived_target`; an
+ * unchanged reference to an archived target stays allowed; and an existing
+ * ARCHIVED skill being proposed is rejected with 409 `catalog_archived_conflict`.
+ * Because this preflight is authoritative, skill create/config-changed writes are
+ * materialized with `{skillGraphValidatedInBatch:true}` so the per-item service
+ * graph check is skipped - this is what lets an existing A->B edge be reversed to
+ * B->A in one batch without an interim cycle. (These same edges also feed the
+ * topo sorter, which only orders a target that is a NEW batch key.)
  */
 
 import { createHash } from "node:crypto"
@@ -57,8 +71,15 @@ import {
   gradeDescriptionsSchema,
   gradeSchema,
   skillClassStableIdOf,
+  skillGradeDescriptionsForbidden,
+  skillGradeForbidden,
 } from "@/lib/server/schemas"
 import type { CatalogKind } from "@/lib/db/catalog-import"
+import {
+  skillUpgradeTargets,
+  validateSkillUpgradeBatch,
+  type SkillUpgradeNode,
+} from "@/lib/skills/upgrade-graph"
 import {
   createCatalogItemInTransaction,
   updateCatalogItemInTransaction,
@@ -442,6 +463,25 @@ function validateBatch(input: readonly unknown[]): ManagedCatalogEntry[] {
         'Currencies carry no grade ladder: "gradeDescriptions" must be empty or omitted'
       )
     }
+    // A skills entry carries no catalog grade band (migration
+    // 20261017200000_skill_grade_removed nulled any pre-existing skill grade) and
+    // no grade ladder, so a non-null grade or a non-empty gradeDescriptions map
+    // is rejected up front, before any database write. The per-entity service
+    // create/update helpers enforce the same invariants (see `skillGradeForbidden`
+    // / `skillGradeDescriptionsForbidden`); this is the shared pure
+    // pre-validation.
+    if (skillGradeForbidden(entry.kind, entry.grade)) {
+      throw badRequest(
+        "invalid_grade",
+        'Skills carry no catalog grade: a skills entry must store "grade" as null'
+      )
+    }
+    if (skillGradeDescriptionsForbidden(entry.kind, entry.gradeDescriptions)) {
+      throw badRequest(
+        "invalid_grade_descriptions",
+        'Skills carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+      )
+    }
     const key = keyOf(entry.kind, entry.stableId)
     if (seen.has(key)) {
       throw badRequest(
@@ -506,6 +546,16 @@ function refsOf(entry: ManagedCatalogEntry): Array<[string, string]> {
   if (entry.kind === "skills") {
     const classStableId = skillClassStableIdOf(config)
     if (classStableId) out.push(["classes", classStableId])
+    // A skill's explicit `upgradeToStableIds` targets are only an ordering hint
+    // (a target that is itself a NEW batch skill should be written first). The
+    // topo sorter only adds an edge for a target that is a NEW batch key, so an
+    // existing target (already in the database) never becomes a dependency, and
+    // the skill upgrade graph itself - validated later by
+    // `validateSkillUpgradeBatch` - remains the authority on cycles and missing
+    // targets.
+    for (const target of skillUpgradeTargets(config) ?? []) {
+      out.push(["skills", target])
+    }
   }
   return out
 }
@@ -599,6 +649,94 @@ function prepareBatch(
   }
   const sorted = topoSortEntries(entries, existingKeys)
   return { byKey, sorted }
+}
+
+// ------------------------------------------------------------------ //
+// Skill upgrade graph preflight
+// ------------------------------------------------------------------ //
+
+/**
+ * Validate the FINAL skill upgrade graph the batch would commit, BEFORE any
+ * write, using the same pure primitive as the service layer. Persisted skill
+ * rows are taken VERBATIM (archived included) so a reference to an existing
+ * target stays resolvable. Proposed skill entries overlay the persisted rows
+ * using exact MCP semantics:
+ *
+ *   - an existing row whose `config` is OMITTED in the entry preserves its
+ *     persisted config;
+ *   - a PROVIDED `config` is a FULL replacement (never a merge);
+ *   - a brand-new skill defaults its config to `{}`;
+ *   - an existing ARCHIVED skill being proposed is rejected with 409
+ *     `catalog_archived_conflict` (a managed publish is create-active only).
+ *
+ * The returned graph errors are 400s: a structural defect (duplicate, self-link,
+ * missing/wrong-kind target, cycle) is `invalid_skill_upgrade_graph`, and a NEW
+ * edge to an ARCHIVED target is `skill_upgrade_archived_target`. An unchanged
+ * reference to an archived target stays allowed. Rarity/track never matter.
+ *
+ * This runs in BOTH preview and apply against the same SERIALIZABLE snapshot,
+ * and is the AUTHORITY on the skill upgrade graph (the topo ordering above is
+ * only a write-order hint). It is what lets an existing A->B edge be reversed to
+ * B->A in a single batch: because the whole final graph is validated once here
+ * and the per-item service graph checks are skipped (via the
+ * `skillGraphValidatedInBatch` flag set inside `materializeChanges`), no single
+ * write ever validates an interim graph that is temporarily cyclic.
+ */
+function assertSkillUpgradeGraphBatch(
+  rows: readonly CatalogRowLike[],
+  entries: readonly ManagedCatalogEntry[]
+): void {
+  const existingNodes: SkillUpgradeNode[] = []
+  const existingByKey = new Map<string, CatalogRowLike>()
+  for (const row of rows) {
+    if (row.kind !== "skills") continue
+    existingNodes.push({
+      stableId: row.stableId,
+      archived: row.archived ?? false,
+      config: row.config ?? {},
+    })
+    existingByKey.set(keyOf("skills", row.stableId), row)
+  }
+
+  const proposedNodes: SkillUpgradeNode[] = []
+  for (const entry of entries) {
+    if (entry.kind !== "skills") continue
+    const existingRow = existingByKey.get(keyOf("skills", entry.stableId))
+    if (existingRow === undefined) {
+      // New create: a managed create is always active; an omitted config flattens
+      // to the service default `{}`.
+      proposedNodes.push({
+        stableId: entry.stableId,
+        archived: false,
+        config: entry.config ?? {},
+      })
+      continue
+    }
+    // An existing ARCHIVED key cannot be the current subject of a managed
+    // publish (it is create-active only) - reject exactly as materialize would.
+    if (existingRow.archived) {
+      throw conflict(
+        "catalog_archived_conflict",
+        `Catalog entry "${entry.stableId}" (${entry.kind}) is archived; a managed publish requires an active entry and cannot unarchive it`
+      )
+    }
+    proposedNodes.push({
+      stableId: entry.stableId,
+      archived: existingRow.archived ?? false,
+      config:
+        entry.config !== undefined ? entry.config : (existingRow.config ?? {}),
+    })
+  }
+
+  const error = validateSkillUpgradeBatch(existingNodes, proposedNodes)
+  if (error != null) {
+    // Mirror the service layer's two graph-failure codes: a structural defect
+    // versus a NEW edge to an ARCHIVED target.
+    const code = error.includes("archived skill")
+      ? "skill_upgrade_archived_target"
+      : "invalid_skill_upgrade_graph"
+    throw badRequest(code, error)
+  }
 }
 
 // ------------------------------------------------------------------ //
@@ -728,7 +866,10 @@ async function materializeChanges(
       const after = await createCatalogItemInTransaction(
         tx,
         entry.kind,
-        createInput(entry)
+        createInput(entry),
+        entry.kind === "skills"
+          ? { skillGraphValidatedInBatch: true }
+          : undefined
       )
       changes.push({
         kind: entry.kind,
@@ -764,7 +905,8 @@ async function materializeChanges(
       tx,
       entry.kind,
       existingRow.id,
-      buildPatch(entry)
+      buildPatch(entry),
+      entry.kind === "skills" ? { skillGraphValidatedInBatch: true } : undefined
     )
     changes.push({
       kind: entry.kind,
@@ -857,6 +999,7 @@ export async function previewManagedCatalog(
         const rows = await tx.catalogDefinition.findMany({})
         stateDigest = computeManagedStateDigest(rows)
         const { byKey, sorted } = prepareBatch(rows, normalized)
+        assertSkillUpgradeGraphBatch(rows, normalized)
         changes = await materializeChanges(tx, byKey, sorted)
         throw PREVIEW_ROLLBACK_SENTINEL
       },
@@ -905,6 +1048,7 @@ export async function applyManagedCatalog(
         const stateDigest = computeManagedStateDigest(rows)
         verifyMcpPreviewTicket(previewTicket, payloadDigest, stateDigest)
         const { byKey, sorted } = prepareBatch(rows, normalized)
+        assertSkillUpgradeGraphBatch(rows, normalized)
         const changes = await materializeChanges(tx, byKey, sorted)
         return {
           changes: toInputOrder(changes, normalized),

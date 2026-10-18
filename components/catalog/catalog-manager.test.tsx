@@ -3,9 +3,13 @@ import * as React from "react"
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { ApiError, apiFetch } from "@/lib/api"
+import { ApiError, apiFetch, type CatalogItem } from "@/lib/api"
 import { CatalogManager } from "@/components/catalog/catalog-manager"
-import { bloodlineConfigSchema } from "@/lib/server/schemas"
+import {
+  bloodlineConfigSchema,
+  parseCatalogConfig,
+  skillConfigSchema,
+} from "@/lib/server/schemas"
 
 // --- Module mocks --------------------------------------------------------- //
 
@@ -3137,6 +3141,246 @@ describe("CatalogManager bulk imports", () => {
   })
 })
 
+describe("skill upgrade trees", () => {
+  afterEach(() => cleanup())
+
+  const skill = (
+    id: string,
+    name: string,
+    config: Record<string, unknown>,
+    archived = false
+  ) => ({
+    ...item,
+    id,
+    kind: "skills",
+    stableId: id,
+    name,
+    archived,
+    grade: "A",
+    gradeDescriptions: { A: "legacy grade text" },
+    config: { rarity: "Common", track: "race", ...config } as Record<
+      string,
+      unknown
+    >,
+  })
+
+  function seed(entries: CatalogItem[]) {
+    const mock = apiFetch as unknown as ReturnType<typeof vi.fn>
+    mock.mockReset()
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: entries }
+      if (url === "/api/catalog/skills?includeArchived=1")
+        return { items: entries }
+      if (url === "/api/catalog/classes") return { items: [] }
+      if (init?.method === "PATCH") return { item: entries[0] }
+      if (init?.method === "POST") return { item: entries[0] }
+      throw new Error(`unexpected ${url}`)
+    })
+    return mock
+  }
+
+  it("groups branches, shows all incoming parents once, legacy groups, and expands matching search results", async () => {
+    const entries = [
+      skill("root", "Root", { upgradeToStableIds: ["left", "right"] }),
+      skill("left", "Left branch", { upgradeToStableIds: ["shared"] }),
+      skill("right", "Right branch", { upgradeToStableIds: ["shared"] }),
+      skill("shared", "Shared apex", { upgradeToStableIds: [] }),
+      skill("legacy-a", "Legacy A", {
+        upgradeGroup: "old-chain",
+        rarity: "Common",
+      }),
+      skill("legacy-b", "Legacy B", {
+        upgradeGroup: "old-chain",
+        rarity: "Epic",
+      }),
+      skill("solo", "Solo", {}),
+    ]
+    seed(entries)
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    expect(
+      screen.getAllByRole("button", { name: /^Expand skill tree/ })[0]
+    ).toBeTruthy()
+    fireEvent.click(
+      screen.getAllByRole("button", { name: /^Expand skill tree/ })[0]
+    )
+    expect(
+      screen.getByText("Upgrades to: Left branch, Right branch")
+    ).toBeTruthy()
+    expect(screen.getByText("From: Left branch, Right branch")).toBeTruthy()
+    expect(screen.getAllByText("Shared apex")).toHaveLength(1)
+    expect(screen.getAllByText("Common").length).toBeGreaterThan(0)
+    expect(
+      screen.getByRole("button", { name: /Expand skill group/ })
+    ).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Search"), {
+      target: { value: "shared" },
+    })
+    expect(screen.getByText("Root")).toBeTruthy()
+    expect(screen.getByText("Shared apex")).toBeTruthy()
+    expect(screen.queryByText("Solo")).toBeNull()
+    expect(screen.queryByText("Grade")).toBeNull()
+  })
+
+  it("keeps explicit terminal skills in separate groups despite matching group labels", async () => {
+    seed([
+      skill("terminal-one", "Terminal One", {
+        upgradeGroup: "shared",
+        rarity: "Common",
+        upgradeToStableIds: [],
+      }),
+      skill("terminal-two", "Terminal Two", {
+        upgradeGroup: "shared",
+        rarity: "Epic",
+        upgradeToStableIds: [],
+      }),
+    ])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    expect(screen.getAllByText("Terminal One")).toHaveLength(1)
+    expect(screen.getAllByText("Terminal Two")).toHaveLength(1)
+    expect(
+      screen.queryByRole("button", { name: /Expand skill tree/ })
+    ).toBeNull()
+  })
+
+  it("uses archived skill references for inbound paths and existing targets only", async () => {
+    const source = skill(
+      "source",
+      "Source",
+      {
+        upgradeToStableIds: ["current"],
+      },
+      true
+    )
+    const current = skill("current", "Current", { upgradeToStableIds: ["old"] })
+    const old = skill("old", "Old archived target", {}, true)
+    const mock = seed([current])
+    mock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/catalog/skills") return { items: [current] }
+      if (url === "/api/catalog/skills?includeArchived=1")
+        return { items: [source, current, old] }
+      if (url === "/api/catalog/classes") return { items: [] }
+      if (init?.method === "PATCH") return { item: current }
+      throw new Error(`unexpected ${url}`)
+    })
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByLabelText("Show archived"))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: /Expand skill tree/ }))
+    fireEvent.click(screen.getByLabelText("Edit Current"))
+    const picker = screen.getByLabelText("Upgrade target") as HTMLSelectElement
+    expect([...picker.options].some((option) => option.value === "old")).toBe(
+      false
+    )
+    expect(screen.getAllByText("Old archived target")).toHaveLength(2)
+    expect(screen.getAllByText("Source").length).toBeGreaterThan(1)
+  })
+
+  it("authors stable-ID successors, preserves config, supports terminal and legacy fallback, and omits grade metadata", async () => {
+    const original = {
+      ...skill("source", "Source skill", {
+        track: "class",
+        rarity: "Rare",
+        effects: [{ phase: "flat", amount: { strength: 7 } }],
+        upgradeGroup: "legacy-chain",
+        custom: { retained: true },
+      }),
+      grade: null,
+      gradeDescriptions: {},
+    }
+    const target = skill("target", "Target skill", { rarity: "Epic" })
+    const archivedTarget = skill("archived-target", "Archived target", {}, true)
+    const mock = seed([original, target, archivedTarget])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getAllByLabelText("Edit")[0])
+    expect(screen.getByLabelText("Use explicit upgrade paths")).toBeTruthy()
+    fireEvent.click(screen.getByLabelText("Use explicit upgrade paths"))
+    const picker = screen.getByLabelText("Upgrade target") as HTMLSelectElement
+    expect([...picker.options].map((option) => option.value)).toContain(
+      "target"
+    )
+    expect([...picker.options].map((option) => option.value)).not.toContain(
+      "archived-target"
+    )
+    expect([...picker.options].map((option) => option.value)).not.toContain(
+      "source"
+    )
+    fireEvent.change(picker, { target: { value: "target" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove upgrade target target" })
+    )
+    fireEvent.change(picker, { target: { value: "target" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    let call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    let body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body).not.toHaveProperty("grade")
+    expect(body).not.toHaveProperty("gradeDescriptions")
+    expect(original.grade).toBeNull()
+    expect(original.gradeDescriptions).toEqual({})
+    expect(body.config).toMatchObject({
+      upgradeToStableIds: ["target"],
+      rarity: "Rare",
+      track: "class",
+      effects: original.config.effects,
+      upgradeGroup: "legacy-chain",
+      custom: { retained: true },
+    })
+    expect(skillConfigSchema.safeParse(body.config).success).toBe(true)
+    expect(parseCatalogConfig("skills", body.config)).toEqual(body.config)
+    cleanup()
+
+    mock.mockClear()
+    seed([skill("terminal", "Terminal", { upgradeToStableIds: [] }), target])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getAllByLabelText("Edit")[0])
+    expect(
+      (screen.getByLabelText("Use explicit upgrade paths") as HTMLInputElement)
+        .checked
+    ).toBe(true)
+    expect(
+      screen.getByText("No direct successors; this is explicitly terminal.")
+    ).toBeTruthy()
+    fireEvent.click(screen.getByLabelText("Use explicit upgrade paths"))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "PATCH"
+    )
+    body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body.config).not.toHaveProperty("upgradeToStableIds")
+  })
+
+  it("creates skills without grade or gradeDescriptions while retaining rarity", async () => {
+    const mock = seed([])
+    render(<CatalogManager kind="skills" />)
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "New entry" }))
+    fireEvent.change(screen.getByLabelText(/Name/), {
+      target: { value: "New skill" },
+    })
+    fireEvent.change(screen.getByLabelText("Rarity"), {
+      target: { value: "Common" },
+    })
+    fireEvent.click(screen.getByRole("option", { name: "Race" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await flush()
+    const call = mock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "POST"
+    )
+    const body = JSON.parse((call?.[1] as RequestInit).body as string)
+    expect(body).not.toHaveProperty("grade")
+    expect(body).not.toHaveProperty("gradeDescriptions")
+    expect(body.config.rarity).toBe("Common")
+  })
+})
+
 describe("grade descriptions and equipment stats", () => {
   afterEach(() => cleanup())
 
@@ -3184,7 +3428,7 @@ describe("grade descriptions and equipment stats", () => {
   }
 
   it.each(["races", "skills"])(
-    "POSTs grade descriptions for %s",
+    "POSTs grade descriptions only for graded catalogs, not %s skills",
     async (kind) => {
       const mock = mockKind(kind)
       render(<CatalogManager kind={kind} />)
@@ -3196,9 +3440,14 @@ describe("grade descriptions and equipment stats", () => {
       if (kind === "races")
         fireEvent.click(screen.getByRole("option", { name: "G" }))
       else fireEvent.click(screen.getByRole("option", { name: "Race" }))
-      fireEvent.change(screen.getByLabelText("G-grade description"), {
-        target: { value: "  Grade G copy  " },
-      })
+      if (kind === "races")
+        fireEvent.change(screen.getByLabelText("G-grade description"), {
+          target: { value: "  Grade G copy  " },
+        })
+      else {
+        expect(screen.queryByLabelText("Grade")).toBeNull()
+        expect(screen.queryByLabelText("Descriptions by grade")).toBeNull()
+      }
       fireEvent.change(screen.getByLabelText("Config (JSON)"), {
         target: {
           value:
@@ -3215,9 +3464,14 @@ describe("grade descriptions and equipment stats", () => {
       })
       fireEvent.click(screen.getByRole("button", { name: "Save" }))
       await flush()
-      expect(bodyOf(mock, "POST").gradeDescriptions).toEqual({
-        G: "Grade G copy",
-      })
+      if (kind === "races")
+        expect(bodyOf(mock, "POST").gradeDescriptions).toEqual({
+          G: "Grade G copy",
+        })
+      else {
+        expect(bodyOf(mock, "POST")).not.toHaveProperty("grade")
+        expect(bodyOf(mock, "POST")).not.toHaveProperty("gradeDescriptions")
+      }
     }
   )
 
@@ -3237,19 +3491,29 @@ describe("grade descriptions and equipment stats", () => {
       await flush()
       fireEvent.click(screen.getByLabelText("Edit"))
       await flush()
-      fireEvent.change(screen.getByLabelText("G-grade description"), {
-        target: { value: "G text" },
-      })
+      if (kind === "gods")
+        fireEvent.change(screen.getByLabelText("G-grade description"), {
+          target: { value: "G text" },
+        })
+      else {
+        expect(screen.queryByLabelText("Grade descriptions")).toBeNull()
+        expect(screen.queryByLabelText("G-grade description")).toBeNull()
+      }
       fireEvent.click(screen.getByRole("button", { name: "Save" }))
       await flush()
-      expect(bodyOf(mock, "PATCH")).toMatchObject({
-        gradeDescriptions: { G: "G text" },
-      })
+      if (kind === "gods")
+        expect(bodyOf(mock, "PATCH")).toMatchObject({
+          gradeDescriptions: { G: "G text" },
+        })
+      else {
+        expect(bodyOf(mock, "PATCH")).not.toHaveProperty("grade")
+        expect(bodyOf(mock, "PATCH")).not.toHaveProperty("gradeDescriptions")
+      }
       expect(bodyOf(mock, "PATCH")).not.toHaveProperty("config")
     }
   )
 
-  it("renders eight grade tabs without general-description fallback and hides the general field when graded", async () => {
+  it("hides grade UI for skills and retains its general description", async () => {
     const graded = catalogItem("skills", {
       grade: "A",
       description: "general text",
@@ -3260,21 +3524,14 @@ describe("grade descriptions and equipment stats", () => {
     await flush()
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
-    expect(screen.getAllByRole("tab")).toHaveLength(8)
-    expect(screen.queryByLabelText("Description")).toBeNull()
+    expect(screen.queryByRole("tab")).toBeNull()
+    expect(screen.queryByLabelText("Grade descriptions")).toBeNull()
     expect(
-      (screen.getByLabelText("G-grade description") as HTMLTextAreaElement)
-        .value
-    ).toBe("")
-    expect(screen.getByText("No description for this grade")).toBeTruthy()
-    fireEvent.click(screen.getByRole("tab", { name: "A" }))
-    expect(
-      (screen.getByLabelText("A-grade description") as HTMLTextAreaElement)
-        .value
-    ).toBe("A text")
+      (screen.getByLabelText("Description") as HTMLTextAreaElement).value
+    ).toBe("general text")
   })
 
-  it("clears a grade description by sending an empty map and keeps the general field for ungraded items", async () => {
+  it("keeps the general description without submitting skill grade metadata", async () => {
     const legacy = catalogItem("skills", {
       grade: null,
       description: "General",
@@ -3286,12 +3543,11 @@ describe("grade descriptions and equipment stats", () => {
     fireEvent.click(screen.getByLabelText("Edit"))
     await flush()
     expect(screen.getByLabelText("Description")).toBeTruthy()
-    fireEvent.change(screen.getByLabelText("G-grade description"), {
-      target: { value: "   " },
-    })
+    expect(screen.queryByLabelText("G-grade description")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     await flush()
-    expect(bodyOf(mock, "PATCH").gradeDescriptions).toEqual({})
+    expect(bodyOf(mock, "PATCH")).not.toHaveProperty("grade")
+    expect(bodyOf(mock, "PATCH")).not.toHaveProperty("gradeDescriptions")
   })
 
   it("edits flat/percent stats sparsely, retains unknown keys, and rejects invalid values", async () => {

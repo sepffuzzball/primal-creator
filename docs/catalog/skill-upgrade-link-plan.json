@@ -1,0 +1,456 @@
+{
+  "kind": "skills",
+  "snapshotCount": 332,
+  "archivedCount": 0,
+  "edgeCount": 32,
+  "upgradeLinks": [
+    {
+      "source": {
+        "stableId": "alchemical-flame",
+        "name": "Alchemical Flame",
+        "rarity": "Common"
+      },
+      "targets": [
+        {
+          "stableId": "alchemical-flame-uncommon",
+          "name": "Alchemical Flame",
+          "rarity": "Uncommon"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "arcane-powershot-epic",
+        "name": "Arcane Powershot",
+        "rarity": "Epic"
+      },
+      "targets": [
+        {
+          "stableId": "arcane-powershot-ancient",
+          "name": "Arcane Powershot",
+          "rarity": "Ancient"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "archers-eye",
+        "name": "Archer's Eye",
+        "rarity": "Common"
+      },
+      "targets": [
+        {
+          "stableId": "hunters-sight",
+          "name": "Hunter's Sight",
+          "rarity": "Uncommon"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "big-game-hunter",
+        "name": "Big Game Hunter",
+        "rarity": "Rare"
+      },
+      "targets": [
+        {
+          "stableId": "big-game-arcane-hunter",
+          "name": "Big Game Arcane Hunter",
+          "rarity": "Epic"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "blood-of-the-malefic-viper-ancient",
+        "name": "Blood of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "blood-of-the-malefic-viper-legendary",
+          "name": "Blood of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "blood-of-the-malefic-viper-epic",
+        "name": "Blood of the Malefic Viper",
+        "rarity": "Epic"
+      },
+      "targets": [
+        {
+          "stableId": "blood-of-the-malefic-viper-ancient",
+          "name": "Blood of the Malefic Viper",
+          "rarity": "Ancient"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "brew-potion-inferior",
+        "name": "Brew Potion",
+        "rarity": "Inferior"
+      },
+      "targets": [
+        {
+          "stableId": "brew-potion",
+          "name": "Brew Potion",
+          "rarity": "Common"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "concoct-poison",
+        "name": "Concoct Poison",
+        "rarity": "Common"
+      },
+      "targets": [
+        {
+          "stableId": "concoct-poison-uncommon",
+          "name": "Concoct Poison",
+          "rarity": "Uncommon"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "concoct-poison-inferior",
+        "name": "Concoct Poison",
+        "rarity": "Inferior"
+      },
+      "targets": [
+        {
+          "stableId": "concoct-poison",
+          "name": "Concoct Poison",
+          "rarity": "Common"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "concoct-poison-uncommon",
+        "name": "Concoct Poison",
+        "rarity": "Uncommon"
+      },
+      "targets": [
+        {
+          "stableId": "concoct-poison-rare",
+          "name": "Concoct Poison",
+          "rarity": "Rare"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "craft-elixir",
+        "name": "Craft Elixir",
+        "rarity": "Common"
+      },
+      "targets": [
+        {
+          "stableId": "craft-elixir-uncommon",
+          "name": "Craft Elixir",
+          "rarity": "Uncommon"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "distill-powder-uncommon",
+        "name": "Distill Powder",
+        "rarity": "Uncommon"
+      },
+      "targets": [
+        {
+          "stableId": "distill-powder-rare",
+          "name": "Distill Powder",
+          "rarity": "Rare"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "fangs-of-man-ancient",
+        "name": "Fangs of Man",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "fangs-of-man-legendary",
+          "name": "Fangs of Man",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "fangs-of-man-epic",
+        "name": "Fangs of Man",
+        "rarity": "Epic"
+      },
+      "targets": [
+        {
+          "stableId": "fangs-of-man-ancient",
+          "name": "Fangs of Man",
+          "rarity": "Ancient"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "fangs-of-the-malefic-viper-ancient",
+        "name": "Fangs of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "fangs-of-the-malefic-viper-legendary",
+          "name": "Fangs of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "herbology-inferior",
+        "name": "Herbology",
+        "rarity": "Inferior"
+      },
+      "targets": [
+        {
+          "stableId": "herbology",
+          "name": "Herbology",
+          "rarity": "Common"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "identify-inferior",
+        "name": "Identify",
+        "rarity": "Inferior"
+      },
+      "targets": [
+        {
+          "stableId": "identify-common",
+          "name": "Identify",
+          "rarity": "Common"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "malefic-vipers-poison-epic",
+        "name": "Malefic Viper's Poison",
+        "rarity": "Epic"
+      },
+      "targets": [
+        {
+          "stableId": "malefic-vipers-poison-ancient",
+          "name": "Malefic Viper's Poison",
+          "rarity": "Ancient"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "malefic-vipers-poison-rare",
+        "name": "Malefic Viper's Poison",
+        "rarity": "Rare"
+      },
+      "targets": [
+        {
+          "stableId": "malefic-vipers-poison-epic",
+          "name": "Malefic Viper's Poison",
+          "rarity": "Epic"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "moment-of-the-primal-hunter-legendary",
+        "name": "Moment of the Primal Hunter",
+        "rarity": "Legendary"
+      },
+      "targets": [
+        {
+          "stableId": "moment-of-the-primal-hunter-mythical",
+          "name": "Moment of the Primal Hunter",
+          "rarity": "Mythical"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "palate-of-the-malefic-viper-ancient",
+        "name": "Palate of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "palate-of-the-malefic-viper-legendary",
+          "name": "Palate of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "pride-of-the-malefic-viper-ancient",
+        "name": "Pride of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "pride-of-the-malefic-viper-legendary",
+          "name": "Pride of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "sagacity-of-the-malefic-viper-ancient",
+        "name": "Sagacity of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "sagacity-of-the-malefic-viper-legendary",
+          "name": "Sagacity of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "sagacity-of-the-malefic-viper-legendary",
+        "name": "Sagacity of the Malefic Viper",
+        "rarity": "Legendary"
+      },
+      "targets": [
+        {
+          "stableId": "sagacity-of-the-malefic-viper-mythical",
+          "name": "Sagacity of the Malefic Viper",
+          "rarity": "Mythical"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "scales-of-the-malefic-viper-ancient",
+        "name": "Scales of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "scales-of-the-malefic-viper-legendary",
+          "name": "Scales of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "sense-of-the-malefic-viper-ancient",
+        "name": "Sense of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "sense-of-the-malefic-viper-legendary",
+          "name": "Sense of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "sense-of-the-malefic-viper-epic",
+        "name": "Sense of the Malefic Viper",
+        "rarity": "Epic"
+      },
+      "targets": [
+        {
+          "stableId": "sense-of-the-malefic-viper-ancient",
+          "name": "Sense of the Malefic Viper",
+          "rarity": "Ancient"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "sense-of-the-malefic-viper-rare",
+        "name": "Sense of the Malefic Viper",
+        "rarity": "Rare"
+      },
+      "targets": [
+        {
+          "stableId": "sense-of-the-malefic-viper-epic",
+          "name": "Sense of the Malefic Viper",
+          "rarity": "Epic"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "touch-of-the-malefic-viper",
+        "name": "Touch of the Malefic Viper",
+        "rarity": "Rare"
+      },
+      "targets": [
+        {
+          "stableId": "touch-of-the-malefic-viper-epic",
+          "name": "Touch of the Malefic Viper",
+          "rarity": "Epic"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "touch-of-the-malefic-viper-ancient",
+        "name": "Touch of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "touch-of-the-malefic-viper-legendary",
+          "name": "Touch of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "touch-of-the-malefic-viper-epic",
+        "name": "Touch of the Malefic Viper",
+        "rarity": "Epic"
+      },
+      "targets": [
+        {
+          "stableId": "touch-of-the-malefic-viper-ancient",
+          "name": "Touch of the Malefic Viper",
+          "rarity": "Ancient"
+        }
+      ]
+    },
+    {
+      "source": {
+        "stableId": "wings-of-the-malefic-viper-ancient",
+        "name": "Wings of the Malefic Viper",
+        "rarity": "Ancient"
+      },
+      "targets": [
+        {
+          "stableId": "wings-of-the-malefic-viper-legendary",
+          "name": "Wings of the Malefic Viper",
+          "rarity": "Legendary"
+        }
+      ]
+    }
+  ]
+}

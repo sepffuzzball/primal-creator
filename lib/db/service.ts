@@ -90,6 +90,8 @@ import {
   rarityOrderIndex,
   requiredGradeNullForbidden,
   skillClassStableIdOf,
+  skillGradeDescriptionsForbidden,
+  skillGradeForbidden,
   titleImprovementSchema,
   legacyRingPositionForConfig,
   type BlessingTier,
@@ -110,6 +112,11 @@ import {
 import { badRequest, conflict, forbidden, notFound } from "@/lib/server/errors"
 import { PORTRAIT_KIND, portraitAssetUrl } from "@/lib/storage/portraits"
 import type { SessionUser } from "@/lib/auth/session"
+import {
+  skillUpgradeTargets,
+  validateSkillUpgradeGraph,
+  type SkillUpgradeNode,
+} from "@/lib/skills/upgrade-graph"
 
 // ------------------------------------------------------------------ //
 // Types
@@ -195,6 +202,16 @@ export interface CharacterAssociationView {
   rarity?: string
   /** Whether an equipment link is soulbound (metadata only; no transfer mechanic). */
   soulbound?: boolean
+  /**
+   * Authoritative DIRECT outgoing upgrade target skill stableIds, present ONLY on
+   * a skill association (serialized from the linked skill definition's parsed
+   * config). The OWN-field distinction is preserved: an absent field (undefined)
+   * means the legacy `upgradeGroup` + `rarity` fallback applies; an explicit `[]`
+   * means the skill is terminal (no successor, no fallback); a nonempty list names
+   * the exact target stableIds (a skill may branch to several). Never present on a
+   * non-skill association, regardless of its config.
+   */
+  upgradeToStableIds?: string[]
   /** Level / race-type / divine-patron requirements an equipment link declares, when any. */
   requirements?: EquipmentRequirements
   /**
@@ -250,10 +267,13 @@ export interface SkillOfferOptionView {
   archived: boolean
   /**
    * Live prose for the offered option, read from the CURRENT catalog definition
-   * (never the immutable `nameSnapshot`). The authored grade-specific text at the
-   * offer's snapshotted `earnedGrade` is preferred when it is nonempty; otherwise
-   * the definition's legacy `description` is used. `null` when the linked
-   * definition is missing (no catalog match) or carries no prose at all.
+   * (never the immutable `nameSnapshot`). A skill carries no grade-specific prose
+   * (migration 20261017200000_skill_grade_removed cleared any authored
+   * `gradeDescriptions`), so this is always the definition's `description`. The
+   * authored grade-specific text at the offer's snapshotted `earnedGrade` is still
+   * preferred on a legacy skill row that carries it; otherwise the legacy
+   * `description` is used. `null` when the linked definition is missing (no
+   * catalog match) or carries no prose at all.
    */
   description: string | null
   /**
@@ -275,7 +295,12 @@ export interface SkillOfferOptionView {
    * when the snapshot declares none.
    */
   classStableId: string | null
-  /** Catalog tier grade of the offered definition, when set. */
+  /**
+   * Catalog tier grade of the offered definition, when set. A skill offer option
+   * never carries one - a skill has no catalog grade band (migration
+   * 20261017200000_skill_grade_removed), so `grade` is always omitted on a skill
+   * option even when the row still holds a legacy value.
+   */
   grade?: string
   /**
    * Whether the option is priority-tied to the offer's snapshotted earned class.
@@ -1704,12 +1729,23 @@ function associationView(
       }
     }
   }
-  if (kind === "skill" || kind === "transcendent") {
+  // A transcendent association may carry an optional catalog grade band, but a
+  // skill association never does: a skill has no catalog grade (migration
+  // 20261017200000_skill_grade_removed), so `grade` is never rendered on a skill,
+  // even when the row still holds a legacy value.
+  if (kind === "transcendent") {
     if (link.definition.grade) view.grade = link.definition.grade
   }
   if (kind === "skill") {
     const rarity = config.rarity as string | undefined
     if (rarity) view.rarity = rarity
+    // Authoritative DIRECT outgoing upgrade targets, serialized from the linked
+    // skill definition's parsed config with the OWN-field distinction preserved:
+    // `undefined` (field absent) leaves the property omitted so the legacy
+    // `upgradeGroup` + `rarity` fallback applies; `[]` renders as an explicitly
+    // terminal skill; a nonempty list names the exact target stableIds.
+    const upgradeTargets = skillUpgradeTargets(config)
+    if (upgradeTargets !== undefined) view.upgradeToStableIds = upgradeTargets
   }
   // Authored grade prose at the definition's OWN grade band, for any graded
   // linked definition (skills/equipment/titles/etc). Never the character race
@@ -1789,10 +1825,12 @@ function compareSkillOfferOptions(
 
 /**
  * Resolve the LIVE prose for a skill-offer option from its current catalog
- * definition. The authored grade-specific text at the offer's snapshotted
- * `earnedGrade` is preferred when nonempty; otherwise the definition's legacy
- * `description` is used. `null` when the definition is missing (no catalog match)
- * or carries no prose at all. Never the immutable `nameSnapshot`.
+ * definition. A skill carries no authored grade-specific prose (migration
+ * 20261017200000_skill_grade_removed cleared any `gradeDescriptions`), so the
+ * definition's `description` is returned; the authored grade text at the offer's
+ * snapshotted `earnedGrade` is preferred only on a legacy skill row that still
+ * carries it. `null` when the definition is missing (no catalog match) or carries
+ * no prose at all. Never the immutable `nameSnapshot`.
  */
 function skillOptionLiveDescription(
   definition:
@@ -1894,7 +1932,9 @@ function skillOfferView(
         rarity,
         skillType,
         classStableId: skillClassStableIdOf(cs),
-        ...(o.definition?.grade ? { grade: o.definition.grade } : {}),
+        // A skill option never carries a grade: a skill has no catalog grade band
+        // (migration 20261017200000_skill_grade_removed), so `grade` is omitted
+        // even when the row still holds a legacy value.
         classPriority: skillOptionClassPriority(cs, classSnapshot),
       }
     }),
@@ -2935,26 +2975,22 @@ export async function archiveCharacter(
 /**
  * Whether an unarchived `skills` catalog definition matches a schedule-credit
  * (milestone) credit offer. A scheduled credit offers ANY active skill matching
- * the earned track type exactly plus an EXACT catalog grade when the skill sets
- * one; the skill's `milestone`, `choiceGroup` and `eligibleDefinitionStableIds`
- * are LEGACY annotations that no longer restrict scheduled-credit eligibility. The
- * skill's own `choiceGroup` is deliberately ignored - all matches collapse into
- * the single "standard" offer. Shared by the initial credit offer AND by
- * `refreshPendingSkillOffers`, so a refresh never appends an option the original
- * credit would have rejected.
+ * the earned track type exactly; the skill's `milestone`, `choiceGroup` and
+ * `eligibleDefinitionStableIds` are LEGACY annotations that no longer restrict
+ * scheduled-credit eligibility. A skill carries no catalog grade band (migration
+ * 20261017200000_skill_grade_removed nulled it), so eligibility is by config
+ * `track` ONLY - a legacy skill row that still holds a non-null `grade` is still
+ * matched, and never filtered by the earned grade. The skill's own `choiceGroup`
+ * is deliberately ignored - all matches collapse into the single "standard"
+ * offer. Shared by the initial credit offer AND by `refreshPendingSkillOffers`,
+ * so a refresh never appends an option the original credit would have rejected.
  */
 function skillDefMatchesScheduledOffer(
-  def: { grade: string | null; config: unknown },
-  offer: { track: string; earnedGrade: string }
+  def: { config: unknown },
+  offer: { track: string }
 ): boolean {
   const config = parseCatalogConfig("skills", def.config ?? {})
-  if (config.track !== offer.track) return false
-  // Grade, when specified, must match the earned grade exactly. For a graded
-  // class/profession track this is the TRACK's own grade (independent of the race
-  // grade); for an ungraded current track it falls back to the race grade. Only
-  // the catalog `grade` column is consulted - `milestone` no longer gates.
-  if (def.grade && def.grade !== offer.earnedGrade) return false
-  return true
+  return config.track === offer.track
 }
 
 /**
@@ -2970,9 +3006,11 @@ function skillDefMatchesScheduledOffer(
  * `"standard"` - regardless of any skill config `choiceGroup` - and it is created
  * even when zero unarchived skills match (a zero-option milestone credit). The
  * offer options are the unarchived `skills` catalog entries whose config `track`
- * exactly matches the advanced track and whose catalog `grade` (when set) equals
- * the earned grade (no inferred compatibility). The skill's `milestone`,
- * `choiceGroup` and `eligibleDefinitionStableIds` are LEGACY annotations ignored
+ * exactly matches the advanced track. A skill carries no catalog grade band
+ * (migration 20261017200000_skill_grade_removed), so it is never filtered by the
+ * earned grade - a legacy skill row that still holds a `grade` is still offered
+ * (no inferred compatibility). The skill's `milestone`, `choiceGroup` and
+ * `eligibleDefinitionStableIds` are LEGACY annotations ignored
  * for scheduled-credit eligibility; every matching-typed skill is offered at any
  * credit milestone. Options are ordered deterministically BEFORE insert: a skill
  * whose `classStableId` matches the snapshotted class (`classStableIdAtEarn`)
@@ -3021,15 +3059,11 @@ async function createSkillOffersForAdvance(
   for (const def of skillDefs) {
     // The skill config `choiceGroup` is deliberately IGNORED for a schedule
     // credit: all matching options collapse into a single "standard" offer so a
-    // credit is never multiplied. The track/grade eligibility is shared with
+    // credit is never multiplied. The track eligibility is shared with
     // `refreshPendingSkillOffers` so a refresh never inserts an option the
-    // original credit would have rejected.
-    if (
-      !skillDefMatchesScheduledOffer(
-        { grade: def.grade, config: def.config },
-        { track, earnedGrade: offerGrade }
-      )
-    ) {
+    // original credit would have rejected. A skill carries no catalog grade band,
+    // so it is matched by config `track` only, regardless of the earned grade.
+    if (!skillDefMatchesScheduledOffer({ config: def.config }, { track })) {
       continue
     }
     eligible.push({
@@ -5083,10 +5117,11 @@ export async function skillCharacter(
  * catalog and appends ONLY genuinely new eligible options via `createMany` with
  * `skipDuplicates` (the DB unique `(offerId, definitionId)` is the last line of
  * defense). Eligibility uses the exact same rules as the original credit
- * (`skillDefMatchesScheduledOffer`): the config `track` is exact, the `milestone`
- * equals the offer level, the catalog grade (when set) equals the earned grade,
- * and `eligibleDefinitionStableIds` (when present) includes the saved track
- * stableId. The skill's own `choiceGroup` is ignored. Existing option snapshots
+ * (`skillDefMatchesScheduledOffer`): the config `track` is exact - a skill carries
+ * no catalog grade band, so a skill is matched by track only, regardless of the
+ * earned grade (a legacy skill row that still holds a `grade` is still matched).
+ * The `milestone`, `choiceGroup` and `eligibleDefinitionStableIds` are legacy
+ * annotations that no longer gate a scheduled credit. Existing option snapshots
  * are never modified - even if the skill has since been archived or edited - and
  * archived skills never appear.
  *
@@ -5175,8 +5210,8 @@ export async function refreshPendingSkillOffers(
             if (existing.has(def.id)) continue
             if (
               !skillDefMatchesScheduledOffer(
-                { grade: def.grade, config: def.config },
-                { track: offer.track, earnedGrade: offer.earnedGrade }
+                { config: def.config },
+                { track: offer.track }
               )
             ) {
               continue
@@ -5218,35 +5253,47 @@ export async function refreshPendingSkillOffers(
 }
 
 type SkillUpgradeInput = {
+  /** Optional exact source skill link to upgrade from (explicit path). */
+  sourceDefinitionId?: string
   definitionId: string
   version: number
   reason: string
 }
 
 /**
- * Upgrade a character's linked skill to a strictly higher-ordered rarity variant
- * of the same `upgradeGroup`.
+ * Upgrade a character's linked skill.
  *
  * The owner or an admin supplies the id of an ACTIVE (unarchived) `skills` entry
- * that carries BOTH a valid `rarity` and a nonempty `upgradeGroup`, plus a
- * mandatory reason. The character must currently hold EXACTLY ONE other linked
- * skill in that same upgrade group with a strictly LOWER ordered rarity; that
- * existing link is replaced (never stacked). Rejections are all 400
- * `skill_rarity_not_higher`:
- *   - the target name is not an active skills entry, lacks a rarity / group, or
- *     is itself already linked,
- *   - the target rarity is missing or incomparable (`Unique`),
- *   - the character holds zero same-group links (nothing to upgrade) or more
- *     than one (ambiguous), or
- *   - the (single) same-group link's rarity is missing/incomparable or not
- *     strictly lower.
+ * (`definitionId`) plus a mandatory reason and a CAS `version`. There are two
+ * supported flows:
  *
- * The replacement runs under SERIALIZABLE isolation with the same CAS version
- * increment as select/grant; there is no XP cost. The removed source link may be
- * an ARCHIVED catalog entry - its config is still read to determine its rarity /
- * group so an archived source can be upgraded away from. The immutable
- * `skill_upgrade` event snapshots the from/to stable ids, names, rarities,
- * descriptions, the reason, and the removed-link record.
+ * 1. EXPLICIT EDGE (the caller also supplies `sourceDefinitionId`). The exact
+ *    source must be a linked SKILL association on the character. When that
+ *    source's config declares its OWN `upgradeToStableIds` field (including `[]`),
+ *    the target's stableId MUST be directly listed there: the upgrade follows the
+ *    declared DIRECT edge, with NO rarity / upgrade-group / track / level gate
+ *    (a same-rarity, lower-rarity, `Unique`, cross-group or cross-track target is
+ *    allowed). `[]` means the source is explicitly terminal, so any target is
+ *    rejected. When the named source is legacy (no own `upgradeToStableIds`), it
+ *    is allowed only under the legacy same-`upgradeGroup` + strictly higher
+ *    ordered rarity fallback. Only the CHOSEN source link is removed; a nonempty
+ *    target upgrade group that would collide with ANY OTHER still-linked skill is
+ *    rejected (`link_collision`) rather than deleting that skill. The source may
+ *    be an ARCHIVED catalog entry - its config is still read.
+ *
+ * 2. LEGACY TARGET-ONLY (`sourceDefinitionId` omitted). The current unambiguous
+ *    same-group target-only flow is retained, but ONLY when every eligible linked
+ *    source is legacy (no own `upgradeToStableIds`); an explicit-edge source must
+ *    be named by the caller rather than silently removed / its list bypassed
+ *    (400 `skill_source_required`). The target must carry a valid ordered rarity
+ *    and a nonempty `upgradeGroup`, and the character must hold EXACTLY ONE other
+ *    linked skill in that group with a strictly LOWER ordered rarity; that link
+ *    is replaced (never stacked). Rejections are 400 `skill_rarity_not_higher`.
+ *
+ * Both flows run under SERIALIZABLE isolation with the same CAS version increment
+ * as select/grant; there is no XP cost. The immutable `skill_upgrade` event
+ * snapshots the from/to stable ids, names, rarities, descriptions, the reason,
+ * the removed-link record, and a nullable upgrade group.
  */
 export async function upgradeSkill(
   id: string,
@@ -5279,22 +5326,10 @@ export async function upgradeSkill(
         }
         const defConfig = parseCatalogConfig("skills", def.config ?? {})
         const targetGroup = upgradeGroupForConfig(defConfig)
-        if (targetGroup == null) {
-          throw badRequest(
-            "skill_rarity_not_higher",
-            `Skill "${def.name}" has no "upgradeGroup", so it cannot upgrade a linked skill`
-          )
-        }
         const targetRarity = skillRarityOf({
           kind: "skills",
           config: def.config ?? {},
         })
-        if (targetRarity == null) {
-          throw badRequest(
-            "skill_rarity_not_higher",
-            `Skill "${def.name}" has no ordered "rarity" (missing or incomparable "Unique"), so it cannot upgrade a linked skill`
-          )
-        }
         if (
           row.associations.some(
             (a) => a.definitionId === def.id && a.kind === "SKILL"
@@ -5306,52 +5341,183 @@ export async function upgradeSkill(
           )
         }
 
-        // The same-group source links (excluding the target). Exactly one is
-        // required; an archived source is allowed and its config still read.
-        const sources = row.associations.filter(
-          (a) =>
-            a.kind === "SKILL" &&
-            a.definitionId !== def.id &&
-            skillUpgradeGroup(a.definition) === targetGroup
-        )
-        if (sources.length === 0) {
+        // Resolve the exact source link. Null when the caller omits it and the
+        // legacy target-only flow applies.
+        const sourceLink =
+          input.sourceDefinitionId != null
+            ? (row.associations.find(
+                (a) =>
+                  a.kind === "SKILL" &&
+                  a.definitionId === input.sourceDefinitionId
+              ) ?? null)
+            : null
+        if (input.sourceDefinitionId != null && sourceLink == null) {
           throw badRequest(
-            "skill_rarity_not_higher",
-            `Skill "${def.name}" cannot upgrade: no linked skill in upgrade group "${targetGroup}" to replace`
+            "skill_source_not_linked",
+            `Skill source "${input.sourceDefinitionId}" is not a linked skill on this character`
           )
         }
-        if (sources.length > 1) {
-          throw badRequest(
-            "skill_rarity_not_higher",
-            `Skill "${def.name}" cannot upgrade: more than one linked skill in upgrade group "${targetGroup}" (ambiguous)`
-          )
-        }
-        const source = sources[0]
-        const sourceDef = source.definition
-        const sourceRarity = skillRarityOf(sourceDef)
-        // Strictly higher ordered rarity than the single source link.
-        assertSkillRarityMonotonic(
-          {
-            definitionId: def.id,
-            name: def.name,
-            rarity: targetRarity,
-          },
-          [
-            {
-              definitionId: source.definitionId,
-              name: sourceDef.name,
-              rarity: sourceRarity,
-            },
-          ]
-        )
 
-        const removed = await removeSameUpgradeGroupSkills(
-          tx,
-          id,
-          row.associations,
-          def.id,
-          targetGroup
-        )
+        // Captured for the immutable journal: the removed link snapshot + the
+        // removal set.
+        let removedDefinitionId: string
+        let removedStableId: string
+        let removedName: string
+        let removedDescription: string | null
+        let removedRarity: string | undefined
+        let removed: Array<{ definitionId: string; name: string }>
+
+        if (sourceLink != null) {
+          // ---- Explicit source path ----
+          const sourceDef = sourceLink.definition
+          if (!sourceDef) {
+            throw badRequest(
+              "skill_source_not_linked",
+              `Skill source "${input.sourceDefinitionId}" has no catalog definition`
+            )
+          }
+          removedDefinitionId = sourceDef.id
+          removedStableId = sourceDef.stableId
+          removedName = sourceDef.name
+          removedDescription = sourceDef.description
+          removedRarity = skillRarityOf(sourceDef)
+
+          const sourceTargets = skillUpgradeTargets(sourceDef.config ?? {})
+          if (sourceTargets === undefined) {
+            // Legacy source: only the same-group strictly-higher-rarity fallback.
+            const sourceGroup = skillUpgradeGroup(sourceDef)
+            if (
+              sourceGroup == null ||
+              targetGroup == null ||
+              sourceGroup !== targetGroup
+            ) {
+              throw badRequest(
+                "skill_rarity_not_higher",
+                `Skill "${def.name}" cannot upgrade "${sourceDef.name}": they are not in the same upgrade group`
+              )
+            }
+            assertSkillRarityMonotonic(
+              { definitionId: def.id, name: def.name, rarity: targetRarity },
+              [
+                {
+                  definitionId: sourceDef.id,
+                  name: sourceDef.name,
+                  rarity: removedRarity,
+                },
+              ]
+            )
+          } else {
+            // Explicit-edge source: the target stableId MUST be directly listed.
+            if (!sourceTargets.includes(def.stableId)) {
+              throw badRequest(
+                "skill_upgrade_edge_missing",
+                `Skill "${def.name}" is not a declared upgrade target of "${sourceDef.name}"`
+              )
+            }
+          }
+
+          // A declared edge may cross groups, so a nonempty target upgrade group
+          // must not collide with ANY OTHER still-linked skill (reject, never
+          // delete that skill). Archived definitions are inert and skipped.
+          if (targetGroup != null) {
+            for (const link of row.associations) {
+              if (link.kind !== "SKILL") continue
+              if (link.definitionId === def.id) continue
+              if (link.definitionId === sourceLink.definitionId) continue
+              const otherDef = link.definition
+              if (!otherDef || otherDef.archived) continue
+              if (skillUpgradeGroup(otherDef) === targetGroup) {
+                throw conflict(
+                  "link_collision",
+                  `Skill "${def.name}" shares upgrade group "${targetGroup}" with the still-linked skill "${otherDef.name}"`
+                )
+              }
+            }
+          }
+
+          // Remove ONLY the chosen source link.
+          await tx.characterAssociation.deleteMany({
+            where: { characterId: id, definitionId: sourceLink.definitionId },
+          })
+          removed = [{ definitionId: sourceDef.id, name: sourceDef.name }]
+        } else {
+          // ---- Legacy target-only flow (source omitted) ----
+          if (targetGroup == null) {
+            throw badRequest(
+              "skill_rarity_not_higher",
+              `Skill "${def.name}" has no "upgradeGroup", so it cannot upgrade a linked skill`
+            )
+          }
+          if (targetRarity == null) {
+            throw badRequest(
+              "skill_rarity_not_higher",
+              `Skill "${def.name}" has no ordered "rarity" (missing or incomparable "Unique"), so it cannot upgrade a linked skill`
+            )
+          }
+
+          // The same-group source links (excluding the target). Exactly one is
+          // required; an archived source is allowed and its config still read.
+          const sources = row.associations.filter(
+            (a) =>
+              a.kind === "SKILL" &&
+              a.definitionId !== def.id &&
+              skillUpgradeGroup(a.definition) === targetGroup
+          )
+          if (sources.length === 0) {
+            throw badRequest(
+              "skill_rarity_not_higher",
+              `Skill "${def.name}" cannot upgrade: no linked skill in upgrade group "${targetGroup}" to replace`
+            )
+          }
+          if (sources.length > 1) {
+            throw badRequest(
+              "skill_rarity_not_higher",
+              `Skill "${def.name}" cannot upgrade: more than one linked skill in upgrade group "${targetGroup}" (ambiguous)`
+            )
+          }
+
+          // Retain the same-group target-only flow only when the single linked
+          // source is legacy (no own upgradeToStableIds). An explicit-edge source
+          // must be named by the caller so its edge list is not bypassed.
+          const source = sources[0]
+          const sourceDef = source.definition
+          const sourceRarity = skillRarityOf(sourceDef)
+          if (skillUpgradeTargets(sourceDef.config ?? {}) !== undefined) {
+            throw badRequest(
+              "skill_source_required",
+              `Skill "${def.name}" cannot pick a source automatically: "${sourceDef.name}" declares an explicit upgrade edge, so pass "sourceDefinitionId"`
+            )
+          }
+          // Strictly higher ordered rarity than the single source link.
+          assertSkillRarityMonotonic(
+            {
+              definitionId: def.id,
+              name: def.name,
+              rarity: targetRarity,
+            },
+            [
+              {
+                definitionId: source.definitionId,
+                name: sourceDef.name,
+                rarity: sourceRarity,
+              },
+            ]
+          )
+
+          removedDefinitionId = sourceDef.id
+          removedStableId = sourceDef.stableId
+          removedName = sourceDef.name
+          removedDescription = sourceDef.description
+          removedRarity = sourceRarity
+          removed = await removeSameUpgradeGroupSkills(
+            tx,
+            id,
+            row.associations,
+            def.id,
+            targetGroup
+          )
+        }
+
         await tx.characterAssociation.create({
           data: {
             characterId: id,
@@ -5380,20 +5546,20 @@ export async function upgradeSkill(
               definitionId: def.id,
               reason: input.reason,
               from: {
-                definitionId: sourceDef.id,
-                stableId: sourceDef.stableId,
-                name: sourceDef.name,
-                rarity: sourceRarity ?? null,
-                description: sourceDef.description,
+                definitionId: removedDefinitionId,
+                stableId: removedStableId,
+                name: removedName,
+                rarity: removedRarity ?? null,
+                description: removedDescription,
               },
               to: {
                 definitionId: def.id,
                 stableId: def.stableId,
                 name: def.name,
-                rarity: targetRarity,
+                rarity: targetRarity ?? null,
                 description: def.description,
               },
-              upgradeGroup: targetGroup,
+              upgradeGroup: targetGroup ?? null,
               removed,
               upgradedAt: new Date().toISOString(),
             } as unknown as Prisma.InputJsonValue,
@@ -9458,6 +9624,33 @@ export async function getMcpCatalogEntry(
   return catalogItem(row)
 }
 
+/**
+ * Optional per-write controls for the transactional catalog write cores
+ * (`createCatalogItemInTransaction` / `updateCatalogItemInTransaction`).
+ *
+ * `skillGraphValidatedInBatch` may ONLY be set true after the caller has already
+ * validated the FINAL full skill upgrade graph against the same SERIALIZABLE
+ * transaction snapshot the write will commit in: every explicit skill upgrade
+ * edge across the whole graph (including target existence/kind, self-links,
+ * duplicate stableIds, cycles, and the newly-added/changed-edge active-target
+ * policy) must have been checked once up front. Intended for importers and the
+ * MCP publisher, which sequence many catalog writes atomically and prevalidate
+ * the complete final graph once rather than letting each sequential write
+ * re-validate an intermediate graph that is temporarily invalid (dangling
+ * references or cycles) while the batch is still in progress.
+ *
+ * When set true, ONLY the per-item `assertSkillUpgradeGraph` check is skipped.
+ * Every other guard still runs: skill config schema parsing, the grade /
+ * gradeDescriptions ban, linked rarity/upgrade-group immutability, stableId
+ * rename protections, god/granted/grade-granted/title-granted skill references,
+ * the skill classStableId ref, link-collision, race-type-in-use, and equipment
+ * position checks. Omitted (or false) keeps the current per-item validation and
+ * is what public CRUD relies on.
+ */
+export type CatalogItemWriteOptions = {
+  skillGraphValidatedInBatch?: true
+}
+
 export type CreateCatalogItemInput = {
   stableId?: string
   name: string
@@ -9485,7 +9678,8 @@ export type CreateCatalogItemInput = {
 export async function createCatalogItemInTransaction(
   tx: DbClient,
   kind: string,
-  input: CreateCatalogItemInput
+  input: CreateCatalogItemInput,
+  options?: CatalogItemWriteOptions
 ): Promise<CatalogItem> {
   kind = normalizeCatalogKind(kind)
   // A gods entry carries no catalog grade band: divine power / blessing tier live
@@ -9515,6 +9709,26 @@ export async function createCatalogItemInTransaction(
     throw badRequest(
       "invalid_grade_descriptions",
       'Currencies carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+    )
+  }
+  // A skills entry likewise carries no catalog grade band (see
+  // `skillGradeForbidden`): a skill is offered to the advancing track by config
+  // `track` alone, never by a catalog grade, so `grade` must be null/omitted. A
+  // non-null grade on a new skill is rejected before any write (migration
+  // 20261017200000_skill_grade_removed nulled any pre-existing skill grade).
+  if (skillGradeForbidden(kind, input.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'Skills carry no catalog grade: a skills entry must store "grade" as null'
+    )
+  }
+  // A skills entry carries no grade ladder, so no grade-specific prose is legal:
+  // gradeDescriptions must be empty (`{}`) or omitted. A non-empty map on a new
+  // skill is rejected before any write.
+  if (skillGradeDescriptionsForbidden(kind, input.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      'Skills carry no grade ladder: "gradeDescriptions" must be empty or omitted'
     )
   }
   const config = parseConfigOr400(kind, input.config ?? {})
@@ -9603,6 +9817,20 @@ export async function createCatalogItemInTransaction(
   // existing class (a new class-tie selection must be ACTIVE).
   if (kind === "skills") {
     await assertSkillClassRef(tx, config, null)
+    // A NEW skill write must also participate in a valid global skill upgrade
+    // graph: every explicit outgoing edge (a newly added edge is always new on
+    // a create) must target a currently ACTIVE skill, and no edge may be a
+    // self-link, a missing/wrong-kind target, or part of a cycle. Skipped only
+    // when the caller prevalidated the final full graph in the same SERIALIZABLE
+    // transaction (`skillGraphValidatedInBatch`); the class-tie ref check above
+    // still runs.
+    if (options?.skillGraphValidatedInBatch !== true) {
+      await assertSkillUpgradeGraph(tx, {
+        sourceStableId: stableId,
+        sourceConfig: config,
+        sourceArchived: input.archived ?? false,
+      })
+    }
   }
   const row = await tx.catalogDefinition.create({
     data: {
@@ -9850,6 +10078,137 @@ async function assertSkillClassRef(
 }
 
 /**
+ * Represent the prospective state of the skill being created or edited for
+ * upgrade-graph validation: its (renamed) stableId, parsed config, archived
+ * flag, and - on an update - the existing row id to exclude from the node set
+ * and the PRIOR config whose outgoing edges must stay untouched.
+ */
+type SkillGraphSource = {
+  /** The existing catalog row id to EXCLUDE from the node set (update only). */
+  sourceRowId?: string
+  /** The prospective stableId (may differ from the stored one on a rename). */
+  sourceStableId: string
+  /** The prospective parsed config (may differ on a config-changing update). */
+  sourceConfig: Record<string, unknown>
+  /** The prospective archived flag (may differ on an archival toggle). */
+  sourceArchived: boolean
+  /**
+   * The PRIOR config's outgoing edges, used to decide which targets are newly
+   * added/changed (must target active skills) vs unchanged (an archived-target
+   * reference may remain). `null` on a create (every edge is new).
+   */
+  previousConfig?: Record<string, unknown> | null
+}
+
+/**
+ * Validate the GLOBAL skill upgrade graph for a skill create or config-changed
+ * update, reusing the pure helpers from `lib/skills/upgrade-graph.ts`.
+ *
+ * Reads EVERY skill definition (including archived) in the transaction snapshot,
+ * overlays the prospective source node (the skill being created/edited, with its
+ * prospective stableId and config - so a rename or config change is validated as
+ * it will commit), and validates references plus global directed acyclicity
+ * across the whole skill graph, archived nodes included. Rejects with a 400:
+ *   - a target that does not exist (`invalid_skill_upgrade_graph`, "missing");
+ *   - a target that exists but is NOT a skill (`invalid_skill_upgrade_graph`,
+ *     "wrong kind");
+ *   - a self-link, a duplicate node stableId, or a cycle
+ *     (`invalid_skill_upgrade_graph`);
+ *   - a NEWLY ADDED / changed outgoing edge that targets an ARCHIVED skill
+ *     (`skill_upgrade_archived_target`). An unchanged archived-target reference
+ *     already present in the prior config is permitted, and the archived target
+ *     simply stays unavailable to upgrade.
+ *
+ * Rarity and track are ignored: an edge to a same/lower-rarity, `Unique`, or
+ * cross-track target is allowed. `upgradeToStableIds: []` is allowed (an
+ * explicitly terminal skill). No-op unless the source is a `skills` definition.
+ */
+async function assertSkillUpgradeGraph(
+  tx: DbClient,
+  source: SkillGraphSource
+): Promise<void> {
+  const rows = await tx.catalogDefinition.findMany({
+    where: { kind: "skills" },
+  })
+  const nodes: SkillUpgradeNode[] = []
+  for (const row of rows) {
+    if (row.id === source.sourceRowId) continue
+    nodes.push({
+      stableId: row.stableId,
+      archived: row.archived,
+      config: row.config ?? {},
+    })
+  }
+  nodes.push({
+    stableId: source.sourceStableId,
+    archived: source.sourceArchived,
+    config: source.sourceConfig,
+  })
+
+  const skillIds = new Set(nodes.map((n) => n.stableId))
+
+  // Resolve every explicit target across the whole graph (archived nodes
+  // included) against the skill node set. A target that exists in the catalog
+  // but is not a `skills` row is a "wrong kind" reference; one that does not
+  // exist at all is "missing".
+  let allStableIds: Set<string> | null = null
+  const resolveTarget = async (
+    target: string,
+    fromStableId: string
+  ): Promise<void> => {
+    if (skillIds.has(target)) return
+    if (allStableIds == null) {
+      const allRows = await tx.catalogDefinition.findMany({})
+      allStableIds = new Set(allRows.map((r) => r.stableId))
+    }
+    if (allStableIds.has(target)) {
+      throw badRequest(
+        "invalid_skill_upgrade_graph",
+        `Skill "${fromStableId}" upgrades to "${target}" which exists but is not a skill`
+      )
+    }
+    throw badRequest(
+      "invalid_skill_upgrade_graph",
+      `Skill "${fromStableId}" upgrades to missing stableId "${target}"`
+    )
+  }
+
+  for (const node of nodes) {
+    const targets = skillUpgradeTargets(node.config) ?? []
+    for (const target of targets) {
+      await resolveTarget(target, node.stableId)
+    }
+  }
+
+  // Structural graph validation: duplicate stableIds, self-links, and cycles.
+  const graphError = validateSkillUpgradeGraph(nodes)
+  if (graphError != null) {
+    throw badRequest("invalid_skill_upgrade_graph", graphError)
+  }
+
+  // Active-target policy: newly ADDED / changed outgoing edges of the source
+  // skill must target a currently ACTIVE (unarchived) skill. An unchanged
+  // archived-target reference stays allowed. On a create every edge is new, so
+  // every target must be active. `[]` (terminal) has no edges and is allowed.
+  const newTargets = skillUpgradeTargets(source.sourceConfig) ?? []
+  const previousTargets = source.previousConfig
+    ? (skillUpgradeTargets(source.previousConfig) ?? [])
+    : []
+  const addedOrChanged = newTargets.filter(
+    (target) => !previousTargets.includes(target)
+  )
+  for (const target of addedOrChanged) {
+    const targetNode = nodes.find((n) => n.stableId === target)
+    if (targetNode && targetNode.archived) {
+      throw badRequest(
+        "skill_upgrade_archived_target",
+        `Skill "${source.sourceStableId}" upgrades to archived skill "${target}"`
+      )
+    }
+  }
+}
+
+/**
  * Verify that an equipment config's equipment-granted passive-skill references
  * (`grantedSkillStableIds`) all resolve to an existing, unarchived `skills`
  * catalog definition. Used on a NEW / config-changing equipment write so a config
@@ -10078,6 +10437,30 @@ async function assertSkillStableIdRename(
       `Skill "${existingStableId}" is granted by ${titleRefs.length} title entr${titleRefs.length === 1 ? "y" : "ies"} (${titleRefs.join(", ")}); renaming it would leave those grants dangling`
     )
   }
+  // A skill rename must ALSO be blocked while any SKILL config's
+  // `upgradeToStableIds` (for ANY entry, including archived skill rows) names the
+  // old id - otherwise the explicit upgrade edge silently dangles and the
+  // successor is lost. Read every skill row (including archived) so a config
+  // that still references an archived definition is protected. No automatic
+  // rewrite: the rename is rejected, not the reference updated.
+  const skillRows = await tx.catalogDefinition.findMany({
+    where: { kind: "skills" },
+  })
+  const upgradeRefs: Array<{ kind: string; stableId: string }> = []
+  for (const row of skillRows) {
+    const cfg = parseCatalogConfig("skills", row.config ?? {})
+    const targets = skillUpgradeTargets(cfg) ?? []
+    if (targets.includes(existingStableId)) {
+      upgradeRefs.push({ kind: "skills", stableId: row.stableId })
+    }
+  }
+  if (upgradeRefs.length > 0) {
+    const labels = upgradeRefs.map((r) => `${r.kind}:${r.stableId}`).join(", ")
+    throw conflict(
+      "skill_stable_id_in_use",
+      `Skill "${existingStableId}" is referenced as an upgrade target by ${upgradeRefs.length} skill entr${upgradeRefs.length === 1 ? "y" : "ies"} (${labels}); renaming it would leave those upgrade edges dangling`
+    )
+  }
 }
 
 /**
@@ -10264,7 +10647,8 @@ export async function updateCatalogItemInTransaction(
   tx: DbClient,
   kind: string,
   id: string,
-  patch: UpdateCatalogItemPatch
+  patch: UpdateCatalogItemPatch,
+  options?: CatalogItemWriteOptions
 ): Promise<CatalogItem> {
   kind = normalizeCatalogKind(kind)
   // A gods entry carries no catalog grade band (see `godGradeForbidden`): a PATCH
@@ -10304,6 +10688,25 @@ export async function updateCatalogItemInTransaction(
     throw badRequest(
       "invalid_grade_descriptions",
       'Currencies carry no grade ladder: "gradeDescriptions" must be empty or omitted'
+    )
+  }
+  // A skills entry carries no catalog grade band (see `skillGradeForbidden`): a
+  // PATCH that tries to set a non-null grade on a skill is rejected before any
+  // write; `grade: null` (or omitting grade) is the only legal value. A migrated
+  // skill already stores `grade IS NULL`, so clearing it is a harmless no-op.
+  if (skillGradeForbidden(kind, patch.grade)) {
+    throw badRequest(
+      "invalid_grade",
+      'Skills carry no catalog grade: a skills entry must store "grade" as null'
+    )
+  }
+  // A skills entry carries no grade ladder, so a PATCH that tries to set a
+  // non-empty gradeDescriptions map is rejected before any write; an omitted value
+  // preserves the stored (empty) map.
+  if (skillGradeDescriptionsForbidden(kind, patch.gradeDescriptions)) {
+    throw badRequest(
+      "invalid_grade_descriptions",
+      'Skills carry no grade ladder: "gradeDescriptions" must be empty or omitted'
     )
   }
   const existing = await tx.catalogDefinition.findUnique({ where: { id } })
@@ -10528,6 +10931,24 @@ export async function updateCatalogItemInTransaction(
       parseCatalogConfig("skills", existing.config ?? {}),
       finalConfig
     )
+    // A config-changing skill PATCH must also keep the global skill upgrade graph
+    // valid: newly added / changed outgoing edges must target a currently ACTIVE
+    // skill (an unchanged archived-target reference may remain), and no edge may
+    // be a self-link, a missing/wrong-kind target, or part of a cycle. A patch
+    // that only edits metadata (no `config`) does not change the graph and is
+    // not re-validated here. Skipped only when the caller prevalidated the final
+    // full graph in the same SERIALIZABLE transaction
+    // (`skillGraphValidatedInBatch`); the linked rarity/upgrade-group immutability
+    // check above still runs.
+    if (patch.config != null && options?.skillGraphValidatedInBatch !== true) {
+      await assertSkillUpgradeGraph(tx, {
+        sourceRowId: id,
+        sourceStableId: patch.stableId ?? existing.stableId,
+        sourceConfig: finalConfig,
+        sourceArchived: finalArchived,
+        previousConfig: parseCatalogConfig("skills", existing.config ?? {}),
+      })
+    }
   }
   const row = await tx.catalogDefinition.update({
     where: { id },

@@ -41,8 +41,9 @@
  *      client backends (the app must be stopped first). Preflight NEVER mutates.
  *   6. ONLY after every check passes, spawns the local Prisma CLI
  *      `migrate reset --force --skip-seed` and then `db seed`.
- *   7. Verifies the result (12 tables, active house_rules, the baseline plus its
- *      additive currencies migration, >= 41 catalog entries, one seeded admin).
+ *   7. Verifies the result (13 tables, active house_rules, the baseline plus its
+ *      additive currencies and skill-grade-removal migrations, >= 41 catalog
+ *      entries, one seeded admin).
  *      Every error AFTER
  *      the reset has started instructs the operator to keep the app offline and
  *      to restore the backup; nothing after that stage is ever labelled "setup".
@@ -87,7 +88,21 @@ export const BASELINE_MIGRATION_NAME = "20261016000000_initial_0_1_0"
  */
 export const CURRENCIES_MIGRATION_NAME = "20261017000000_currencies"
 
-/** The 12 application tables the final schema creates (excluding _prisma_migrations). */
+/**
+ * The additive skill-grade-removal migration layered on top of the baseline and
+ * the currencies migration. It is part of the normal `prisma migrate deploy`
+ * run, so any assertion on the applied-migration set (the reset verification
+ * included) must account for it.
+ */
+export const SKILL_GRADE_REMOVED_MIGRATION_NAME =
+  "20261017200000_skill_grade_removed"
+
+/**
+ * The 13 application tables the final schema creates (excluding
+ * `_prisma_migrations`). The 13th, `legacy_skill_grade_metadata`, is a
+ * migration-only audit table created by the skill-grade-removal migration; it is
+ * never read or written by the application but is part of the deployed schema.
+ */
 export const APP_TABLES = [
   "assets",
   "catalog_definitions",
@@ -97,6 +112,7 @@ export const APP_TABLES = [
   "character_inventory_items",
   "characters",
   "house_rules",
+  "legacy_skill_grade_metadata",
   "progression_events",
   "skill_offer_options",
   "skill_offers",
@@ -160,6 +176,7 @@ export const APP_INDEXES = {
     "catalog_definitions_pkey",
   ],
   house_rules: ["house_rules_pkey"],
+  legacy_skill_grade_metadata: ["legacy_skill_grade_metadata_pkey"],
   progression_events: [
     "progression_events_characterId_createdAt_idx",
     "progression_events_pkey",
@@ -180,9 +197,12 @@ export const APP_INDEXES = {
 }
 
 /**
- * EXACT constraint names per app table, again sourced from the real PG catalogs
- * of both the old 0001..0023 chain and the 0.1.0 baseline (identical). Any
- * constraint on a known table whose name is not listed here is foreign.
+ * EXACT constraint names per app table. The set covers the old 0001..0023 chain
+ * and the 0.1.0 baseline (identical), PLUS the CHECK constraint that the additive
+ * skill-grade-removal migration (20261017200000_skill_grade_removed) appends to
+ * `catalog_definitions` - the deployed schema is the baseline plus the additive
+ * currencies and skill-grade-removal migrations. Any constraint on a known table
+ * whose name is not listed here is foreign.
  */
 export const APP_CONSTRAINTS = {
   users: ["users_pkey"],
@@ -213,8 +233,12 @@ export const APP_CONSTRAINTS = {
     "character_currency_balances_definitionId_fkey",
     "character_currency_balances_pkey",
   ],
-  catalog_definitions: ["catalog_definitions_pkey"],
+  catalog_definitions: [
+    "catalog_definitions_pkey",
+    "catalog_definitions_skill_grade_check",
+  ],
   house_rules: ["house_rules_pkey"],
+  legacy_skill_grade_metadata: ["legacy_skill_grade_metadata_pkey"],
   progression_events: [
     "progression_events_characterId_fkey",
     "progression_events_pkey",
@@ -1089,7 +1113,11 @@ export async function verifyReset(options) {
   const expectedTables = [...(options.expectedTables ?? APP_TABLES)].sort()
   const baseline = options.baseline ?? BASELINE_MIGRATION_NAME
   const minCatalog = options.minCatalog ?? 41
-  const expectedMigrations = [baseline, CURRENCIES_MIGRATION_NAME]
+  const expectedMigrations = [
+    baseline,
+    CURRENCIES_MIGRATION_NAME,
+    SKILL_GRADE_REMOVED_MIGRATION_NAME,
+  ]
 
   const tableRows = await db.$queryRawUnsafe(
     `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`
@@ -1125,7 +1153,7 @@ export async function verifyReset(options) {
       ok: false,
       reason: `expected the applied migrations [${expectedMigrations.join(
         ", "
-      )}] (the baseline plus its additive currencies migration), found [${appliedNames.join(
+      )}] (the baseline plus its additive currencies and skill-grade-removal migrations), found [${appliedNames.join(
         ", "
       )}]`,
     }
@@ -1171,7 +1199,9 @@ function parseArgs(argv) {
     // Any non-leading `--` is a stray separator and must be rejected.
     if (raw === "--") {
       if (i !== 0) {
-        throw new Error(`Unexpected separator "--" (only a single leading one is allowed)`)
+        throw new Error(
+          `Unexpected separator "--" (only a single leading one is allowed)`
+        )
       }
       continue
     }
@@ -1348,7 +1378,7 @@ export async function main(options = {}) {
     }
 
     log(
-      `0.1.0 reset complete: ${BASELINE_MIGRATION_NAME} and ${CURRENCIES_MIGRATION_NAME} applied, 12 tables present, ` +
+      `0.1.0 reset complete: ${BASELINE_MIGRATION_NAME}, ${CURRENCIES_MIGRATION_NAME} and ${SKILL_GRADE_REMOVED_MIGRATION_NAME} applied, 13 tables present, ` +
         `house_rules active, >= 41 catalog entries, admin seeded. ` +
         `If you need to roll back, restore the backup: pg_restore --clean --if-exists --no-owner -d "<DATABASE_URL>" ${backupFile}`
     )

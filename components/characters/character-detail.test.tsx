@@ -4319,7 +4319,12 @@ describe("equipment eligibility and skill upgrades", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm upgrade" }))
     await flush()
     expect(upgradePostsForTest).toEqual([
-      { definitionId: "target", version: 3, reason: "Training" },
+      {
+        sourceDefinitionId: "old-skill",
+        definitionId: "target",
+        version: 3,
+        reason: "Training",
+      },
     ])
     expect(activeCharacter.associations[0]?.definitionId).toBe("target")
     expect(
@@ -4368,11 +4373,16 @@ describe("equipment eligibility and skill upgrades", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm upgrade" }))
     await flush()
     expect(upgradePostsForTest).toEqual([
-      { definitionId: "eligible", version: 3, reason: "Training" },
+      {
+        sourceDefinitionId: "old-skill",
+        definitionId: "eligible",
+        version: 3,
+        reason: "Training",
+      },
     ])
   })
 
-  it("blocks Unique, lower/equal, and missing source rarity; archived source metadata remains upgradeable", async () => {
+  it("keeps legacy rarity restrictions while explicit direct edges allow any rarity and archived source", async () => {
     setupMock({
       character: sourceCharacter("Unique", true),
       skills: [skill("target", "Higher", "Divine")],
@@ -4380,7 +4390,7 @@ describe("equipment eligibility and skill upgrades", () => {
     await renderDetail()
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
-    expect(screen.getByText(/Unique rarity is incomparable/)).toBeTruthy()
+    expect(screen.getByText(/No active higher-rarity variant/)).toBeTruthy()
     cleanup()
     setupMock({
       character: sourceCharacter("Rare"),
@@ -4411,6 +4421,281 @@ describe("equipment eligibility and skill upgrades", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
     await flush()
     expect(screen.getByRole("button", { name: "Upgrade skill" })).toBeTruthy()
+  })
+
+  it("uses explicit direct stable-id edges including same, lower, Unique, cross-group and one-step branches", async () => {
+    const source = {
+      ...sourceCharacter("Unique", true),
+      associations: [
+        association({
+          id: "skill-link",
+          kind: "skill",
+          definitionId: "old-skill",
+          name: "Source",
+          rarity: "Unique",
+          upgradeGroup: "legacy",
+          definitionArchived: true,
+          upgradeToStableIds: ["same-id", "lower-id", "unique-id", "child-id"],
+        }),
+      ],
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: source,
+      skills: [
+        catalogItem({
+          id: "same",
+          stableId: "same-id",
+          name: "Same",
+          kind: "skills",
+          config: { rarity: "Unique", upgradeGroup: "elsewhere" },
+        }),
+        catalogItem({
+          id: "lower",
+          stableId: "lower-id",
+          name: "Lower",
+          kind: "skills",
+          config: { rarity: "Common", upgradeGroup: "elsewhere" },
+        }),
+        catalogItem({
+          id: "unique",
+          stableId: "unique-id",
+          name: "Unique",
+          kind: "skills",
+          config: { rarity: "Unique" },
+        }),
+        catalogItem({
+          id: "child",
+          stableId: "child-id",
+          name: "Child",
+          kind: "skills",
+          config: { rarity: "Rare" },
+        }),
+        catalogItem({
+          id: "grandchild",
+          stableId: "grandchild-id",
+          name: "Grandchild",
+          kind: "skills",
+          config: { rarity: "Divine" },
+        }),
+        catalogItem({
+          id: "archived-target",
+          stableId: "archived-id",
+          name: "Archived target",
+          kind: "skills",
+          archived: true,
+          config: { rarity: "Rare" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    expect(screen.getByText(/Same - Unique - same-id/)).toBeTruthy()
+    expect(screen.getByText(/Lower - Common - lower-id/)).toBeTruthy()
+    expect(screen.getByText(/Unique - Unique - unique-id/)).toBeTruthy()
+    expect(screen.queryByText(/Grandchild/)).toBeNull()
+    expect(screen.queryByText(/Archived target/)).toBeNull()
+  })
+
+  it("filters explicit upgrade targets colliding with another linked skill group but permits source-group and ungrouped targets", async () => {
+    const source = {
+      ...sourceCharacter("Common"),
+      associations: [
+        association({
+          id: "source-link",
+          kind: "skill",
+          definitionId: "old-skill",
+          name: "Source",
+          rarity: "Common",
+          upgradeGroup: "ember",
+          upgradeToStableIds: ["collision", "same-source-group", "no-group"],
+        }),
+        association({
+          id: "other-link",
+          kind: "skill",
+          definitionId: "other-skill",
+          name: "Other",
+          upgradeGroup: "frost",
+          upgradeToStableIds: ["independent-target"],
+        }),
+      ],
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: source,
+      skills: [
+        catalogItem({
+          id: "collision",
+          stableId: "collision",
+          name: "Collision",
+          kind: "skills",
+          config: { rarity: "Rare", upgradeGroup: "frost" },
+        }),
+        catalogItem({
+          id: "same",
+          stableId: "same-source-group",
+          name: "Same source group",
+          kind: "skills",
+          config: { rarity: "Rare", upgradeGroup: "ember" },
+        }),
+        catalogItem({
+          id: "none",
+          stableId: "no-group",
+          name: "No group",
+          kind: "skills",
+          config: { rarity: "Rare" },
+        }),
+        catalogItem({
+          id: "independent",
+          stableId: "independent-target",
+          name: "Independent target",
+          kind: "skills",
+          config: { rarity: "Rare" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(
+      screen.getAllByRole("button", { name: "Upgrade skill" })
+    ).toHaveLength(2)
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Upgrade skill" })[0]!
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    expect(screen.queryByText(/Collision/)).toBeNull()
+    expect(screen.getByText(/Same source group/)).toBeTruthy()
+    expect(screen.getByText(/No group/)).toBeTruthy()
+  })
+
+  it("allows a target group linked only by an archived other skill", async () => {
+    const source = {
+      ...sourceCharacter("Common"),
+      associations: [
+        association({
+          id: "source-link",
+          kind: "skill",
+          definitionId: "old-skill",
+          name: "Source",
+          rarity: "Common",
+          upgradeGroup: "ember",
+          upgradeToStableIds: ["collision"],
+        }),
+        association({
+          id: "archived-other-link",
+          kind: "skill",
+          definitionId: "archived-other",
+          name: "Archived Other",
+          upgradeGroup: "frost",
+          definitionArchived: true,
+        }),
+      ],
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: source,
+      skills: [
+        catalogItem({
+          id: "collision",
+          stableId: "collision",
+          name: "Collision",
+          kind: "skills",
+          config: { rarity: "Rare", upgradeGroup: "frost" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByRole("button", { name: "Upgrade skill" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    expect(screen.getByText(/Collision - Rare - collision/)).toBeTruthy()
+  })
+
+  it("blocks a target group linked by an active other skill", async () => {
+    const source = {
+      ...sourceCharacter("Common"),
+      associations: [
+        association({
+          id: "source-link",
+          kind: "skill",
+          definitionId: "old-skill",
+          name: "Source",
+          rarity: "Common",
+          upgradeGroup: "ember",
+          upgradeToStableIds: ["collision"],
+        }),
+        association({
+          id: "active-other-link",
+          kind: "skill",
+          definitionId: "active-other",
+          name: "Active Other",
+          upgradeGroup: "frost",
+        }),
+      ],
+    } as unknown as import("@/lib/api").CharacterDetail
+    setupMock({
+      character: source,
+      skills: [
+        catalogItem({
+          id: "collision",
+          stableId: "collision",
+          name: "Collision",
+          kind: "skills",
+          config: { rarity: "Rare", upgradeGroup: "frost" },
+        }),
+      ],
+    })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
+  })
+
+  it("distinguishes an explicit empty upgrade list from an absent list on a linked source", async () => {
+    const candidate = catalogItem({
+      id: "candidate",
+      stableId: "candidate",
+      name: "Candidate",
+      kind: "skills",
+      config: { rarity: "Rare", upgradeGroup: "ember" },
+    })
+    const withEdges = (upgradeToStableIds?: string[]) =>
+      ({
+        ...sourceCharacter("Common"),
+        associations: [
+          association({
+            id: "source-link",
+            kind: "skill",
+            definitionId: "old-skill",
+            name: "Source",
+            rarity: "Common",
+            upgradeGroup: "ember",
+            ...(upgradeToStableIds === undefined ? {} : { upgradeToStableIds }),
+          }),
+        ],
+      }) as unknown as import("@/lib/api").CharacterDetail
+
+    setupMock({ character: withEdges([]), skills: [candidate] })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(
+      screen.getByText("No active direct upgrade is currently available.")
+    ).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Upgrade skill" })).toBeNull()
+
+    cleanup()
+    setupMock({ character: withEdges(), skills: [candidate] })
+    await renderDetail()
+    fireEvent.click(screen.getByRole("tab", { name: "Skills" }))
+    await flush()
+    expect(screen.getByRole("button", { name: "Upgrade skill" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade skill" }))
+    fireEvent.click(screen.getByRole("button", { name: "Upgrade target" }))
+    expect(screen.getByText(/Candidate - Rare/)).toBeTruthy()
   })
 
   it("surfaces rejected upgrade without claiming success and reloads latest character", async () => {

@@ -746,11 +746,28 @@ export const skillGrantSchema = z.object({
 
 /**
  * An explicit skill-upgrade request. The owner or an admin upgrades the
- * character's linked skill in an `upgradeGroup` to a strictly higher-ordered
- * rarity variant. `reason` is a mandatory at-most-500-character note recorded
- * into the `skill_upgrade` journal; `version` is the CAS token.
+ * character's linked skill.
+ *
+ * The character may hold several linked skills, so the caller may name the exact
+ * source to upgrade from (`sourceDefinitionId`, optional). When an explicit
+ * source is named AND its config declares its own `upgradeToStableIds` field
+ * (including `[]`), the target `definitionId` MUST be directly listed there: the
+ * upgrade follows the DECLARED direct edge, regardless of target rarity, track
+ * or upgrade group. When the named source is legacy (no `upgradeToStableIds`),
+ * the source is allowed only under the legacy same-group + strictly higher
+ * ordered rarity fallback. When `sourceDefinitionId` is omitted, the legacy
+ * unambiguous same-group target-only flow is used, but only when every eligible
+ * linked source is legacy (no explicit field) - an explicit-edge source must be
+ * named by the caller rather than silently removed / its edge list bypassed.
+ *
+ * `reason` is a mandatory at-most-500-character note recorded into the
+ * `skill_upgrade` journal; `version` is the CAS token.
  */
 export const skillUpgradeSchema = z.object({
+  // Optional exact source skill link to upgrade from. When omitted, the legacy
+  // unambiguous same-group target-only flow applies (and requires every eligible
+  // linked source to be legacy).
+  sourceDefinitionId: z.string().min(1).optional(),
   definitionId: z.string().min(1),
   version: z.number().int().nonnegative(),
   reason: z.string().min(1).max(500),
@@ -842,6 +859,51 @@ export function currencyGradeDescriptionsForbidden(
   gradeDescriptions: unknown
 ): boolean {
   if (kind !== "currencies") return false
+  if (gradeDescriptions == null) return false
+  if (
+    typeof gradeDescriptions !== "object" ||
+    Array.isArray(gradeDescriptions)
+  ) {
+    return true
+  }
+  return Object.keys(gradeDescriptions).length > 0
+}
+
+/**
+ * A `skills` catalog entry, like a `gods`/`currencies` entry, carries no grade
+ * band: a skill's choice-credit offering is matched to the advancing track by
+ * its config `track` only, never by a catalog grade, so the shared
+ * `catalog_definitions.grade` column is always null for it. Migration
+ * 20261017200000_skill_grade_removed nulled any pre-existing skill grade, and the
+ * resulting CHECK constraint (plus this helper) reject a non-null grade on every
+ * write path.
+ *
+ * Returns true when `kind` is `skills` AND `grade` is a non-null value, which is
+ * exactly the case the create/update service path must reject with 400
+ * `invalid_grade`. Mirrors `godGradeForbidden` / `currencyGradeForbidden` so
+ * every catalog write path shares the same invariant rather than inlining
+ * kind-specific logic.
+ */
+export function skillGradeForbidden(kind: string, grade: unknown): boolean {
+  return kind === "skills" && grade != null
+}
+
+/**
+ * A `skills` catalog entry carries no grade-specific prose: unlike the graded
+ * kinds it has no grade ladder, so `gradeDescriptions` must be empty (`{}`) or
+ * omitted (`undefined`). A non-empty map on a skill write is rejected before any
+ * write.
+ *
+ * Returns true when `kind` is `skills` AND `gradeDescriptions` is a non-empty
+ * object, which is exactly the case the service path must reject with 400
+ * `invalid_grade_descriptions`. A null/omitted value (or an empty `{}` map) is
+ * legal.
+ */
+export function skillGradeDescriptionsForbidden(
+  kind: string,
+  gradeDescriptions: unknown
+): boolean {
+  if (kind !== "skills") return false
   if (gradeDescriptions == null) return false
   if (
     typeof gradeDescriptions !== "object" ||
@@ -1449,6 +1511,14 @@ export type SkillEffect = z.infer<typeof catalogEffectSchema>
  * entry, valid on ANY track. It is PRIORITY ONLY: it never restricts eligibility
  * and is used solely to deterministically order offer options so a skill tied to
  * the earned class sorts first.
+ *
+ * `upgradeToStableIds` is an optional array of DIRECT outgoing successor skill
+ * stableIds (the skill upgrade graph). Absent means the legacy `upgradeGroup` +
+ * `rarity` fallback resolves the successor at runtime; an explicit `[]` means the
+ * skill is terminal (no fallback); a nonempty list declares explicit targets (a
+ * skill may branch to several). Only the local shape is validated here (each id
+ * nonempty, internally unique, capped at 50); reference and cycle validation is
+ * performed later by `validateSkillUpgradeGraph`.
  */
 export const skillConfigSchema = z
   .object({
@@ -1460,8 +1530,31 @@ export const skillConfigSchema = z
     effects: z.array(skillEffectSchema).optional(),
     upgradeGroup: z.string().optional(),
     rarity: raritySchema.optional(),
+    // Optional DIRECT outgoing successor skill stableIds. ABSENT means the legacy
+    // `upgradeGroup` + `rarity` fallback applies; an explicit `[]` means the skill
+    // is explicitly terminal (no fallback). Each id must be a nonempty string and
+    // internally unique; the list is capped at 50. A self-link and a missing /
+    // duplicate target are GRAPH errors (validated by `validateSkillUpgradeGraph`),
+    // not shape errors, and are never rejected here.
+    upgradeToStableIds: z.array(z.string().min(1)).max(50).optional(),
   })
   .passthrough()
+  .superRefine((config, ctx) => {
+    if (config.upgradeToStableIds != null) {
+      const seen = new Set<string>()
+      for (const id of config.upgradeToStableIds) {
+        if (seen.has(id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `"${id}" is listed more than once in "upgradeToStableIds"`,
+            path: ["upgradeToStableIds"],
+          })
+          break
+        }
+        seen.add(id)
+      }
+    }
+  })
 
 /**
  * Detect a `skills` config that does not declare a valid `rarity`. A NEW or

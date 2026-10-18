@@ -43,6 +43,19 @@ function skill(
   }
 }
 
+/** A new skill upload whose config declares explicit `upgradeToStableIds` edges. */
+function skillWithUpgrade(stableId: string, targets: string[]) {
+  return {
+    ...skill("skills", stableId),
+    config: {
+      track: "race",
+      effects: [],
+      rarity: "Common",
+      upgradeToStableIds: targets,
+    },
+  }
+}
+
 function god(stableId: string) {
   return {
     kind: "gods",
@@ -386,7 +399,7 @@ describe("bulk JSON parsing and validation", () => {
       "json",
       jsonContent([
         {
-          ...skill("skills", "a"),
+          ...race("a"),
           gradeDescriptions: { G: "  hello  ", S: "world" },
         },
       ])
@@ -558,10 +571,10 @@ describe("bulk CSV parsing and validation", () => {
   it("parses an authored gradeDescriptions JSON object cell from CSV and trims values", () => {
     const content = csvContent([
       {
-        kind: "skills",
+        kind: "races",
         stableId: "a",
         name: "A",
-        config: '{"track":"race","effects":[],"rarity":"Common"}',
+        config: '{"raceType":"enlightened","naturalGrade":"F"}',
         gradeDescriptions: '{"G":"  hello  ","S":"world"}',
       },
     ])
@@ -793,14 +806,14 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
       "json",
       jsonContent([
         {
-          ...skill("skills", "gd-skill"),
+          ...race("gd-race"),
           gradeDescriptions: { G: "A grade G blurb" },
         },
       ])
     )
     await applyBulkImport(entries, "digest")
     const row = [...dbMock.store.catalog.values()].find(
-      (r) => r.stableId === "gd-skill"
+      (r) => r.stableId === "gd-race"
     )!
     expect(row.gradeDescriptions).toEqual({ G: "A grade G blurb" })
   })
@@ -820,10 +833,10 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
   it("apply persists gradeDescriptions from a CSV upload", async () => {
     const content = csvContent([
       {
-        kind: "skills",
+        kind: "races",
         stableId: "csv-gd",
         name: "Csv Gd",
-        config: '{"track":"race","effects":[],"rarity":"Common"}',
+        config: '{"raceType":"enlightened","naturalGrade":"F"}',
         gradeDescriptions: '{"B":"A B-grade blurb"}',
       },
     ])
@@ -1587,6 +1600,193 @@ describe("bulk catalog import preview/apply (unit, mocked db)", () => {
     expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
       /Bulk row 1: .*"track"/i
     )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+})
+
+describe("bulk skill grade ban and upgrade graph", () => {
+  beforeEach(() => {
+    dbMock.store.reset()
+  })
+
+  it("rejects a skills row that carries a non-null catalog grade (parse-time, no write)", () => {
+    const bad = { ...skill("skills", "graded-skill"), grade: "S" }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({ status: 400, code: "invalid_grade" })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: a skills entry carries no catalog grade/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a skills row that carries a non-empty gradeDescriptions (parse-time, no write)", () => {
+    const bad = {
+      ...skill("skills", "graded-skill"),
+      gradeDescriptions: { G: "A grade G blurb" },
+    }
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      expect.objectContaining({
+        status: 400,
+        code: "invalid_grade_descriptions",
+      })
+    )
+    expect(() => parseBulkEntries("json", jsonContent([bad]))).toThrowError(
+      /Bulk row 1: a skills entry carries gradeDescriptions/i
+    )
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("accepts skills that upgrade forward in any row order (preview and apply)", async () => {
+    // skill-a lists skill-b as its target, but skill-b appears LATER in the upload.
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skillWithUpgrade("skill-a", ["skill-b"]),
+        skillWithUpgrade("skill-b", []),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(2)
+    expect(preview.skipCount).toBe(0)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(2)
+    expect(applied.skipCount).toBe(0)
+    const a = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "skill-a"
+    )!
+    expect(a.config).toMatchObject({ upgradeToStableIds: ["skill-b"] })
+    const b = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "skill-b"
+    )!
+    expect(b.config).toMatchObject({ upgradeToStableIds: [] })
+  })
+
+  it("accepts a multilevel upgrade chain A -> B -> C among new skills", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skillWithUpgrade("skill-a", ["skill-b"]),
+        skillWithUpgrade("skill-b", ["skill-c"]),
+        skillWithUpgrade("skill-c", []),
+      ])
+    )
+    const preview = await previewBulkImport(entries, "digest")
+    expect(preview.createCount).toBe(3)
+    expect(preview.skipCount).toBe(0)
+    const applied = await applyBulkImport(entries, "digest")
+    expect(applied.createCount).toBe(3)
+    expect(applied.skipCount).toBe(0)
+    const a = [...dbMock.store.catalog.values()].find(
+      (r) => r.stableId === "skill-a"
+    )!
+    expect(a.config).toMatchObject({ upgradeToStableIds: ["skill-b"] })
+  })
+
+  it("rejects a cycle that spans an existing skill and a new skill (preview and apply, no write)", async () => {
+    dbMock.store.addCatalog({
+      id: "existing-skill",
+      kind: "skills",
+      stableId: "existing-skill",
+      name: "Existing Skill",
+      config: {
+        track: "race",
+        effects: [],
+        rarity: "Common",
+        upgradeToStableIds: ["skill-a"],
+      },
+      archived: false,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([skillWithUpgrade("skill-a", ["existing-skill"])])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The pre-existing skill is untouched and nothing new was written.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rejects a new skill that upgrades to a missing stableId (preview and apply, no write)", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([skillWithUpgrade("skill-a", ["ghost"])])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("rejects a new skill that lists itself in upgradeToStableIds (preview and apply, no write)", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([skillWithUpgrade("skill-self", ["skill-self"])])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    expect(dbMock.store.catalog.size).toBe(0)
+  })
+
+  it("does not treat a skipped archived existing skill as newly unarchived, rejecting a new skill's edge to it", async () => {
+    dbMock.store.addCatalog({
+      id: "arch-skill",
+      kind: "skills",
+      stableId: "arch-skill",
+      name: "Archived Skill",
+      config: { track: "race", effects: [], rarity: "Common" },
+      archived: true,
+    })
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skillWithUpgrade("arch-skill", []),
+        skillWithUpgrade("skill-a", ["arch-skill"]),
+      ])
+    )
+    await expect(previewBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "skill_upgrade_archived_target",
+    })
+    // The pre-existing archived skill is left untouched; nothing was written.
+    expect(dbMock.store.catalog.size).toBe(1)
+  })
+
+  it("rolls back the whole upload (no partial writes) when a later new skill breaks the upgrade graph", async () => {
+    const entries = parseBulkEntries(
+      "json",
+      jsonContent([
+        skill("skills", "fine-skill"),
+        skillWithUpgrade("bad-skill", ["ghost"]),
+      ])
+    )
+    await expect(applyBulkImport(entries, "digest")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_skill_upgrade_graph",
+    })
+    // The final-graph check runs before ANY write, so the valid first skill was
+    // never persisted.
     expect(dbMock.store.catalog.size).toBe(0)
   })
 })
