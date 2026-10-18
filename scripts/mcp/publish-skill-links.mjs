@@ -1318,6 +1318,12 @@ export async function verifyApplied(client, plan, sourceSnapshot) {
 
 /**
  * Parse CLI args. Unknown flags fail closed.
+ *
+ * pnpm forwards the standalone `--` separator to the script, so the documented
+ * `pnpm mcp:publish-skill-links -- --execute --confirm '...'` reaches this module
+ * as a leading `--` in `args`. Exactly ONE such leading standalone `--` is
+ * tolerated and ignored; any other `--` (a duplicate, mid-argument or trailing
+ * separator) fails closed like any unknown flag.
  * @param {string[]} args
  * @returns {{ execute: boolean, confirm: string|null, help: boolean }}
  */
@@ -1325,8 +1331,10 @@ export function parseArgs(args) {
   let execute = false
   let confirm = null
   let help = false
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]
+  // Strip exactly one leading standalone `--` pnpm separator.
+  const rest = args.length > 0 && args[0] === "--" ? args.slice(1) : args
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]
     if (arg === "--help" || arg === "-h") {
       help = true
       continue
@@ -1336,7 +1344,7 @@ export function parseArgs(args) {
       continue
     }
     if (arg === "--confirm") {
-      const value = args[i + 1]
+      const value = rest[i + 1]
       if (value == null) {
         throw new CatalogError("--confirm requires a value", 0)
       }
@@ -1348,6 +1356,7 @@ export function parseArgs(args) {
       confirm = arg.slice("--confirm=".length)
       continue
     }
+    // Any remaining `--` is a stray/duplicate/mid-argument separator.
     throw new CatalogError(`Unknown argument: ${arg}`, 0)
   }
   return { execute, confirm, help }

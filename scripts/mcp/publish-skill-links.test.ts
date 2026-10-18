@@ -495,6 +495,58 @@ describe("parseArgs", () => {
   it("rejects an unknown flag", () => {
     expect(() => parseArgs(["--bogus"])).toThrow(/Unknown argument/)
   })
+
+  it("tolerates the leading `--` pnpm separator as a bare dry-run", () => {
+    // pnpm forwards the standalone `--` separator, so the documented
+    // `pnpm mcp:publish-skill-links -- ` reaches us as a single leading `--`.
+    expect(parseArgs(["--"])).toEqual({
+      execute: false,
+      confirm: null,
+      help: false,
+    })
+  })
+
+  it("tolerates one leading `--` before --execute and --confirm", () => {
+    expect(parseArgs(["--", "--execute", "--confirm", CONFIRM_PHRASE])).toEqual(
+      {
+        execute: true,
+        confirm: CONFIRM_PHRASE,
+        help: false,
+      }
+    )
+  })
+
+  it("tolerates one leading `--` before --help", () => {
+    expect(parseArgs(["--", "--help"])).toEqual({
+      execute: false,
+      confirm: null,
+      help: true,
+    })
+  })
+
+  it("rejects a duplicate leading `--`", () => {
+    expect(() => parseArgs(["--", "--", "--execute"])).toThrow(
+      /Unknown argument/
+    )
+  })
+
+  it("rejects a mid-argument `--`", () => {
+    expect(() =>
+      parseArgs(["--execute", "--", "--confirm", CONFIRM_PHRASE])
+    ).toThrow(/Unknown argument/)
+  })
+
+  it("rejects a mid-argument `--` after a leading separator", () => {
+    expect(() =>
+      parseArgs(["--", "--execute", "--", "--confirm", CONFIRM_PHRASE])
+    ).toThrow(/Unknown argument/)
+  })
+
+  it("rejects a trailing `--`", () => {
+    expect(() =>
+      parseArgs(["--execute", "--confirm", CONFIRM_PHRASE, "--"])
+    ).toThrow(/Unknown argument/)
+  })
 })
 
 // ------------------------------------------------------------------ //
@@ -541,6 +593,36 @@ describe("default dry run", () => {
         c.method === "GET" && new URL(c.url).pathname === CATALOG_ENTRY_PATH
     )
     expect(entryGets.length).toBeGreaterThan(0)
+  })
+
+  it("ignores the pnpm-forwarded `--` separator and still never applies", async () => {
+    // pnpm forwards the standalone `--` separator, so the documented
+    // `pnpm mcp:publish-skill-links -- ` reaches the script as a leading `--`.
+    const h = harness()
+    const result = await run({
+      env: validEnv(),
+      argv: ["--"],
+      fetchImpl: h.fetchImpl,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.mode).toBe("dry-run")
+    expect(result.applied).toBeNull()
+    expect(result.verification).toBeNull()
+
+    // The separator must not trigger an apply.
+    const applyPosts = h.calls.filter(
+      (c) =>
+        c.method === "POST" && new URL(c.url).pathname === CATALOG_APPLY_PATH
+    )
+    expect(applyPosts).toHaveLength(0)
+
+    // It still performed the dry-run preview.
+    const previewPosts = h.calls.filter(
+      (c) =>
+        c.method === "POST" && new URL(c.url).pathname === CATALOG_PREVIEW_PATH
+    )
+    expect(previewPosts).toHaveLength(1)
   })
 
   it("does not touch the network before config is resolved", async () => {
@@ -762,6 +844,27 @@ describe("execute and confirmation", () => {
     expect(previewBody).not.toBeNull()
     expect(applyBody).not.toBeNull()
     expect(applyBody.entries).toEqual(previewBody.entries)
+  })
+
+  it("applies when pnpm forwards the `--` separator before --execute/--confirm", async () => {
+    // Mirrors the documented invocation exactly:
+    //   pnpm mcp:publish-skill-links -- --execute --confirm 'PUBLISH 32 SKILL LINKS'
+    const h = harness()
+    const result = await run({
+      env: validEnv(),
+      argv: ["--", "--execute", "--confirm", CONFIRM_PHRASE],
+      fetchImpl: h.fetchImpl,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.mode).toBe("applied")
+    expect(result.applied).not.toBeNull()
+
+    const applyPosts = h.calls.filter(
+      (c) =>
+        c.method === "POST" && new URL(c.url).pathname === CATALOG_APPLY_PATH
+    )
+    expect(applyPosts).toHaveLength(1)
   })
 })
 
